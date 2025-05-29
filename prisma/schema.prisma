@@ -43,6 +43,7 @@ model MovieReviews {
   id Int @id @default(autoincrement())
   userId String
   movieId Int
+  rating Int
   movie Movie @relation(fields: [movieId], references: [id])
   user User @relation(fields: [userId], references: [id])
   @@unique([userId, movieId])

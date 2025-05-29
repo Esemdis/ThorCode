@@ -25,6 +25,19 @@ async function findUser({ userId }) {
           },
         },
       },
+      movieReviews: {
+        take: 3,
+        select: {
+          id: true,
+          movie: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
+          rating: true,
+        },
+      },
     },
   });
 }

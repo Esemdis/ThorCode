@@ -1,6 +1,5 @@
 const express = require("express");
 const router = express.Router();
-const { validationResult, param } = require("express-validator");
 const prisma = require("../../utils/prisma");
 const axios = require("axios");
 
@@ -12,144 +11,117 @@ const registerLimiter = rateLimit({
   message: { error: "Too many registration attempts, please try again later." },
 });
 const auth = require("../../middleware/auth");
-const roleCheck = require("../../middleware/roleCheck");
-const STEAM_API_KEY = process.env.STEAM_API_KEY; // Set this in your .env
 
-router.post(
-  "/:id",
-  auth,
-  param("id").isInt().withMessage("Invalid Steam user ID format"),
-  async (req, res) => {
-    try {
-      const errors = validationResult(req);
-      // Check for validation errors
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
+router.post("/me", auth, registerLimiter, async (req, res) => {
+  try {
+    const userId = req.user.id;
 
-      const userId = req.user.id;
-      const tmdbId = req.params.id;
-
-      const existingUser = await prisma.user.findUnique({
-        select: { id: true },
-        where: { steamId: parseInt(steamId), id: userId },
-      });
-
-      if (existingUser && existingUser?.id !== userId) {
-        return res
-          .status(400)
-          .json({ error: "Steam user already registered." });
-      }
-
-      const lastGameTime = await prisma.gameTime.findFirst({
-        where: { userId },
-        orderBy: { updated_at: "desc" },
-      });
-
-      if (
-        lastGameTime &&
-        new Date() - new Date(lastGameTime.updated_at) < 24 * 60 * 60 * 1000 && // 24 hours in milliseconds
-        req.user.role !== "ADMIN" // Allow admins to bypass this check
-      ) {
-        return res
-          .status(429)
-          .json({ error: "You can only update your top games once per day." });
-      }
-      let topGames = [];
-      try {
-        const { data } = await axios.get(
-          "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/",
-          {
-            params: {
-              key: STEAM_API_KEY,
-              steamid: steamId,
-              include_appinfo: true,
-              include_played_free_games: true,
-            },
-          }
-        );
-
-        if (!data.response?.games || data.response.games.length === 0) {
-          return res.status(404).json({
-            error: "No games found for this Steam user.",
-          });
-        }
-        // Sort games by playtime_forever (descending) and take top 5
-        topGames = data.response.games
-          .sort((a, b) => b.playtime_forever - a.playtime_forever)
-          .slice(0, 5);
-
-        // Format the top games
-        topGames.forEach((game) => {
-          game.playtime_forever = Math.round(game.playtime_forever / 60); // Convert minutes to hours
-          game.name = game.name || "Unknown Game"; // Fallback for missing names
-        });
-      } catch (error) {
-        console.error("Error fetching users steam games:", error);
-        if (error.status === 429) {
-          return res.status(429).json({
-            error: "Steam API rate limit exceeded. Please try again later.",
-          });
-        }
-
-        return res.status(500).json({ error: "Internal server error" });
-      }
-
-      // Upsert Game and GameTime for each top game
-      const upsertedGameIds = [];
-      for (const game of topGames) {
-        const dbGame = await prisma.game.upsert({
-          where: { appid: game.appid },
-          update: { name: game.name || "Unknown Game" },
-          create: {
-            appid: game.appid,
-            name: game.name || "Unknown Game",
-          },
-        });
-
-        // Upsert GameTime for the user and game
-        await prisma.gameTime.upsert({
-          where: {
-            userId_gameId: {
-              userId,
-              gameId: dbGame.id,
-            },
-          },
-          update: {
-            updated_at: new Date(),
-            play_time: game.playtime_forever,
-          },
-          create: {
-            userId,
-            gameId: dbGame.id,
-            updated_at: new Date(),
-            play_time: game.playtime_forever,
-          },
-        });
-
-        upsertedGameIds.push(dbGame.id);
-      }
-
-      await prisma.gameTime.deleteMany({
-        where: {
+    const oauth = await prisma.oauth.findUnique({
+      where: {
+        userId_provider: {
           userId,
-          gameId: { notIn: upsertedGameIds },
+          provider: "tmdb",
+        },
+      },
+      select: {
+        providerUserId: true, // TMDb account ID
+        accessToken: true, // TMDb session ID
+      },
+    });
+    if (!oauth || !oauth.providerUserId || !oauth.accessToken) {
+      return res.status(400).json({
+        error: "You must link your TMDB account first.",
+      });
+    }
+    let movies = [];
+
+    try {
+      // Fetch the user's rated movies from TMDb
+      const { data } = await axios.get(
+        `https://api.themoviedb.org/3/account/${oauth.providerUserId}/rated/movies`,
+        {
+          params: {
+            api_key: process.env.TMDB_API_KEY,
+            session_id: oauth.accessToken,
+          },
+        }
+      );
+
+      movies = data.results.map((movie) => ({
+        name: movie.original_title,
+        rating: movie.rating,
+        id: movie.id,
+      }));
+
+      if (!data.results || data.results.length === 0) {
+        return res.status(404).json({
+          error: "No rated movies found for this TMDb user.",
+        });
+      }
+    } catch (error) {
+      console.error("Error fetching users TMDB:", error);
+      if (error.status === 429) {
+        return res.status(429).json({
+          error: "TMDB API rate limit exceeded. Please try again later.",
+        });
+      }
+
+      return res.status(500).json({ error: "Internal server error" });
+    }
+
+    const upsertedMovieIds = [];
+    for (const movie of movies) {
+      // Upsert Movie
+      const dbMovie = await prisma.movie.upsert({
+        where: { id: movie.id },
+        update: { name: movie.name },
+        create: {
+          id: movie.id,
+          name: movie.name,
         },
       });
 
-      res.json({
-        message: "Top games updated!",
-        games: topGames.map((g) => ({
-          appid: g.appid,
-          name: g.name,
-          hours: g.playtime_forever,
-        })),
+      // Upsert MovieReviews for the user and movie
+      await prisma.movieReviews.upsert({
+        where: {
+          userId_movieId: {
+            userId,
+            movieId: dbMovie.id,
+          },
+        },
+        update: {
+          rating: movie.rating,
+        },
+        create: {
+          userId,
+          movieId: dbMovie.id,
+          rating: movie.rating,
+        },
       });
-    } catch (error) {
-      console.error("Error fetching steam user games:", error);
-      res.status(500).json({ error: "Internal server error" });
+
+      upsertedMovieIds.push(dbMovie.id);
     }
+
+    // Optionally, remove reviews for movies not in the latest top list
+    await prisma.movieReviews.deleteMany({
+      where: {
+        userId,
+        movieId: { notIn: upsertedMovieIds },
+      },
+    });
+    res.json({
+      message: "Top movies updated!",
+      movies,
+    });
+  } catch (error) {
+    console.error(
+      "Error fetching TMDb reviewed movies:",
+      error?.response?.data || error.message
+    );
+    res
+      .status(500)
+      .json({ error: "Failed to fetch reviewed movies from TMDb" });
   }
-);
+});
 
 module.exports = router;

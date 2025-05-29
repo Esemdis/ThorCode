@@ -31,12 +31,12 @@ router.post(
       const userId = req.user.id;
       const steamId = req.params.id;
 
-      const existingUser = await prisma.user.findUnique({
+      const existingUser = await prisma.user.findFirst({
         select: { id: true },
-        where: { steamId: parseInt(steamId) },
+        where: { steamId: parseInt(steamId), id: { not: userId } },
       });
 
-      if (existingUser && existingUser.id !== userId) {
+      if (existingUser) {
         return res
           .status(400)
           .json({ error: "Steam user already registered." });
