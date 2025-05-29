@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const prisma = require("../../../utils/prisma");
+const prisma = require("../../utils/prisma");
 const axios = require("axios");
 
 const rateLimit = require("express-rate-limit");
@@ -10,13 +10,20 @@ const registerLimiter = rateLimit({
   max: 5, // limit each IP to 5 requests per windowMs
   message: { error: "Too many registration attempts, please try again later." },
 });
-const auth = require("../../../middleware/auth");
-const { cacheData, getCachedData } = require("../../../utils/cache");
+const auth = require("../../middleware/auth");
+const { cacheData, getCachedData } = require("../../utils/cache");
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const callbackUrl = process.env.CALLBACK_URL + "/oauth/tmdb/callback";
 
 router.get("/", auth, async (req, res) => {
   try {
+    const userId = req.user.id;
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+
+    if (!user) {
+      return res.status(400).json({ error: "User not found" });
+    }
+
     // Get a request token from TMDb
     const { data } = await axios.get(
       "https://api.themoviedb.org/3/authentication/token/new",

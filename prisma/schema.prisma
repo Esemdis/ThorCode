@@ -24,11 +24,29 @@ model User {
   deleted_at    DateTime?
   gameTimes     GameTime[]
   oauths        Oauth[]
+  movieReviews MovieReviews[]
+
 }
 
 enum Role {
   USER
   ADMIN
+}
+
+model Movie {
+  id Int @id @default(autoincrement())
+  name String
+  movieReviews MovieReviews[]
+}
+
+model MovieReviews {
+  id Int @id @default(autoincrement())
+  userId String
+  movieId Int
+  movie Movie @relation(fields: [movieId], references: [id])
+  user User @relation(fields: [userId], references: [id])
+  @@unique([userId, movieId])
+
 }
 
 model Game {
