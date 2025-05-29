@@ -17,7 +17,6 @@ const STEAM_API_KEY = process.env.STEAM_API_KEY; // Set this in your .env
 
 router.post(
   "/:id",
-  registerLimiter,
   auth,
   param("id").isInt().withMessage("Invalid Steam user ID format"),
   async (req, res) => {
@@ -29,14 +28,14 @@ router.post(
       }
 
       const userId = req.user.id;
-      const steamId = req.params.id;
+      const tmdbId = req.params.id;
 
       const existingUser = await prisma.user.findUnique({
         select: { id: true },
-        where: { steamId: parseInt(steamId) },
+        where: { steamId: parseInt(steamId), id: userId },
       });
 
-      if (existingUser && existingUser.id !== userId) {
+      if (existingUser && existingUser?.id !== userId) {
         return res
           .status(400)
           .json({ error: "Steam user already registered." });

@@ -120,7 +120,7 @@ router.post(
 router.get("/me", auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const user = await findUser({ id: userId });
+    const user = await findUser({ userId });
 
     if (!user) {
       return res.status(404).json({ error: "User not found" });
