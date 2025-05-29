@@ -61,4 +61,5 @@ model Oauth {
   updatedAt     DateTime @updatedAt
 
   @@unique([provider, providerUserId])
+  @@unique([userId, provider])
 }

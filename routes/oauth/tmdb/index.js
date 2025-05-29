@@ -11,7 +11,7 @@ const registerLimiter = rateLimit({
   message: { error: "Too many registration attempts, please try again later." },
 });
 const auth = require("../../../middleware/auth");
-const { cacheData } = require("../../../utils/cache");
+const { cacheData, getCachedData } = require("../../../utils/cache");
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const callbackUrl = process.env.CALLBACK_URL + "/oauth/tmdb/callback";
 
@@ -23,8 +23,8 @@ router.get("/", auth, async (req, res) => {
       { params: { api_key: TMDB_API_KEY } }
     );
     const requestToken = data.request_token;
-    console.log("TMDb request token:", requestToken);
-    const state = cacheData({
+
+    const state = await cacheData({
       prefix: "tmdb_oauth",
       data: `${requestToken}&user=${req.user.id}`,
     });
@@ -42,17 +42,17 @@ router.get("/", auth, async (req, res) => {
   }
 });
 
-router.get("/callback", auth, async (req, res) => {
+router.get("/callback", registerLimiter, auth, async (req, res) => {
   try {
     const { request_token } = req.query;
     const userId = req.user.id;
+    const state = req.query.state;
     if (!request_token) {
       return res.status(400).json({ error: "Missing request_token" });
     }
 
-    const validToken = await cacheData({
-      prefix: "tmdb_oauth",
-      data: `${request_token}&user=${userId}`,
+    const validToken = await getCachedData({
+      key: state,
     });
 
     // Validate the user and request_token
@@ -79,10 +79,20 @@ router.get("/callback", auth, async (req, res) => {
     const tmdbUserId = accountRes.data.id;
 
     // Save sessionId in your Oauth table for this user
-    await prisma.oauth.create({
-      data: {
+    await prisma.oauth.upsert({
+      where: {
+        userId_provider: {
+          userId,
+          provider: "tmdb",
+        },
+      },
+      update: {
+        providerUserId: String(tmdbUserId),
+        accessToken: sessionId,
+      },
+      create: {
         provider: "tmdb",
-        providerUserId: String(tmdbUserId), // You can fetch account details from TMDb if needed
+        providerUserId: String(tmdbUserId),
         accessToken: sessionId,
         userId,
       },
