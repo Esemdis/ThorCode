@@ -17,6 +17,7 @@ const jwt = require("jsonwebtoken");
 const auth = require("../middleware/auth");
 const roleCheck = require("../middleware/roleCheck");
 const { paginationValidation } = require("../utils/validation/pagination");
+const findUser = require("../utils/findUser");
 
 router.post(
   "/register",
@@ -108,7 +109,7 @@ router.post(
       // Return the user and token
       res
         .status(201)
-        .json({ message: "User registered successfully", user, token });
+        .json({ message: "User logged in successfully", user, token });
     } catch (error) {
       console.error("Error during login:");
       return res.status(500).json({ error: "Internal server error" });
@@ -119,10 +120,7 @@ router.post(
 router.get("/me", auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const user = await prisma.user.findUnique({
-      select: { id: true, email: true, role: true, createdAt: true },
-      where: { id: userId },
-    });
+    const user = await findUser({ id: userId });
 
     if (!user) {
       return res.status(404).json({ error: "User not found" });
@@ -195,10 +193,8 @@ router.get(
       }
 
       // Fetch user by ID
-      const user = await prisma.user.findFirst({
-        select: { id: true, email: true, role: true, createdAt: true },
-        where: { id: req.params.id },
-      });
+      console.log("Fetching user with ID:", req.params.id);
+      const user = await findUser({ userId: req.params.id });
 
       if (!user) {
         return res.status(404).json({ error: "User not found" });

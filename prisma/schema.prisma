@@ -19,13 +19,31 @@ model User {
   email         String           @unique
   passwordHash  String
   role          Role             @default(USER)
-  createdAt     DateTime         @default(now())
-  updatedAt     DateTime         @updatedAt
-  active        Boolean          @default(true)
+  created_at    DateTime         @default(now())
+  steamId       Int?
   deleted_at    DateTime?
+  gameTimes GameTime[]
 }
 
 enum Role {
   USER
   ADMIN
+}
+
+model Game {
+  id     Int    @id @default(autoincrement())
+  appid  Int    @unique
+  name   String
+  gameTimes GameTime[]
+}
+
+model GameTime {
+  id Int @id @default(autoincrement())
+  gameId Int
+  game   Game  @relation(fields: [gameId], references: [id])
+  updated_at DateTime @default(now())
+  play_time Int?
+  userId String
+  user User @relation(fields: [userId], references: [id])
+    @@unique([userId, gameId])
 }
