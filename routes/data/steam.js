@@ -4,20 +4,18 @@ const { validationResult, param } = require("express-validator");
 const prisma = require("../../utils/prisma");
 const axios = require("axios");
 
-const rateLimit = require("express-rate-limit");
-// Rate limiter: max 5 requests per 15 minutes per IP
-const registerLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // limit each IP to 5 requests per windowMs
-  message: { error: "Too many registration attempts, please try again later." },
-});
 const auth = require("../../middleware/auth");
 const roleCheck = require("../../middleware/roleCheck");
 const STEAM_API_KEY = process.env.STEAM_API_KEY; // Set this in your .env
+const { rateLimiter } = require("../../utils/rateLimiter");
+// Defaults to 5 requests per 15 minutes per IP
+const rateLimit = rateLimiter({
+  message: "Too many requests to the Steam data route, please try again later.",
+});
 
 router.post(
   "/:id",
-  registerLimiter,
+  rateLimit,
   auth,
   param("id").isInt().withMessage("Invalid Steam user ID format"),
   async (req, res) => {
@@ -152,5 +150,21 @@ router.post(
     }
   }
 );
+// List all games in the DB
+router.get("/games", auth, roleCheck(["ADMIN"]), async (req, res) => {
+  try {
+    const games = await prisma.game.findMany({
+      orderBy: { name: "asc" },
+      select: {
+        appid: true,
+        name: true,
+      },
+    });
 
+    res.json(games);
+  } catch (error) {
+    console.error("Error fetching games:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 module.exports = router;

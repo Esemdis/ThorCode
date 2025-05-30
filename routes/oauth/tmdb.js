@@ -3,13 +3,12 @@ const router = express.Router();
 const prisma = require("../../utils/prisma");
 const axios = require("axios");
 
-const rateLimit = require("express-rate-limit");
-// Rate limiter: max 5 requests per 15 minutes per IP
-const registerLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // limit each IP to 5 requests per windowMs
-  message: { error: "Too many registration attempts, please try again later." },
+const { rateLimiter } = require("../../utils/rateLimiter");
+// Defaults to 5 requests per 15 minutes per IP
+const rateLimit = rateLimiter({
+  message: "Too many requests to the TMDB Oauth route, please try again later.",
 });
+
 const auth = require("../../middleware/auth");
 const { cacheData, getCachedData } = require("../../utils/cache");
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
@@ -49,7 +48,7 @@ router.get("/", auth, async (req, res) => {
   }
 });
 
-router.get("/callback", registerLimiter, auth, async (req, res) => {
+router.get("/callback", rateLimit, auth, async (req, res) => {
   try {
     const { request_token } = req.query;
     const userId = req.user.id;

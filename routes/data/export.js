@@ -2,14 +2,17 @@ const express = require("express");
 const router = express.Router();
 const prisma = require("../../utils/prisma");
 const axios = require("axios");
-const auth = require("../../middleware/auth");
-const { rateLimiter } = require("../../utils/rateLimiter");
-// Defaults to 5 requests per 15 minutes per IP
-const rateLimit = rateLimiter({
-  message: "Too many requests to the TMDB data point, please try again later.",
-});
 
-router.post("/me", auth, rateLimit, async (req, res) => {
+const rateLimit = require("express-rate-limit");
+// Rate limiter: max 5 requests per 15 minutes per IP
+const registerLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // limit each IP to 5 requests per windowMs
+  message: { error: "Too many registration attempts, please try again later." },
+});
+const auth = require("../../middleware/auth");
+
+router.post("/me", auth, registerLimiter, async (req, res) => {
   try {
     const userId = req.user.id;
 

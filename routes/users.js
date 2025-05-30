@@ -3,25 +3,23 @@ const router = express.Router();
 const { validationResult, param } = require("express-validator");
 const bcrypt = require("bcrypt");
 const prisma = require("../utils/prisma");
-const rateLimit = require("express-rate-limit");
 const multer = require("multer");
 const userValidation = require("../utils/validation/user");
 const upload = multer();
-// Rate limiter: max 5 requests per 15 minutes per IP
-const registerLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // limit each IP to 5 requests per windowMs
-  message: { error: "Too many registration attempts, please try again later." },
-});
 const jwt = require("jsonwebtoken");
 const auth = require("../middleware/auth");
 const roleCheck = require("../middleware/roleCheck");
 const { paginationValidation } = require("../utils/validation/pagination");
 const findUser = require("../utils/findUser");
+const { rateLimiter } = require("../utils/rateLimiter");
+// Defaults to 5 requests per 15 minutes per IP
+const rateLimit = rateLimiter({
+  message: "Too many requests to the users route, please try again later.",
+});
 
 router.post(
   "/register",
-  registerLimiter,
+  rateLimit,
   upload.none(),
   userValidation,
   async (req, res) => {
@@ -60,7 +58,7 @@ router.post(
 
 router.post(
   "/login",
-  registerLimiter,
+  rateLimit,
   upload.none(),
   userValidation,
   async (req, res) => {
