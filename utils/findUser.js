@@ -1,44 +1,66 @@
 // Find specific user in the database
 
-const prisma = require("./prisma");
+const supabase = require("./supabase");
 
-async function findUser({ userId }) {
-  return prisma.user.findUnique({
-    where: { id: userId },
-    select: {
-      id: true,
-      email: true,
-      role: true,
-      created_at: true,
-      gameTimes: {
-        orderBy: { play_time: "desc" },
-        take: 3,
-        select: {
-          play_time: true,
-          updated_at: true,
-          game: {
-            select: {
-              id: true,
-              name: true,
-              appid: true,
-            },
-          },
-        },
-      },
-      movieReviews: {
-        take: 3,
-        select: {
-          id: true,
-          movie: {
-            select: {
-              id: true,
-              name: true,
-            },
-          },
-          rating: true,
-        },
-      },
-    },
-  });
+async function findUserById({ userId }) {
+  const { data: user, error } = await supabase
+    .from("users")
+    .select(
+      `
+      id,
+      email,
+      role,
+      created_at,
+      game_times (
+        play_time,
+        updated_at,
+        game:game (
+          id,
+          name,
+          appid
+        )
+      ),
+      movie_reviews (
+        id,
+        rating,
+        movie:movie (
+          id,
+          name
+        )
+      )
+    `
+    )
+    .eq("id", userId)
+    .single();
+
+  if (error) throw error;
+  console.log(user);
+  // Limit to top 3 gameTimes and movieReviews in JS (Supabase doesn't support per-relation limit/order in one query)
+  user.game_times = (user.game_times || [])
+    .sort((a, b) => b.play_time - a.play_time)
+    .slice(0, 3);
+
+  user.movie_reviews = (user.movie_reviews || []).slice(0, 3);
+
+  return user;
 }
-module.exports = findUser;
+async function findUserByEmail({ email }) {
+  const { data: user, error } = await supabase
+    .from("users")
+    .select(
+      `
+      id,
+      email,
+      role,
+      created_at,
+      password_hash
+      `
+    )
+    .eq("email", email)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  return user;
+}
+module.exports = { findUserById, findUserByEmail };

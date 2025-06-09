@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const prisma = require("../../utils/prisma");
+const supabase = require("../../utils/supabase");
 const axios = require("axios");
 
 const { rateLimiter } = require("../../utils/rateLimiter");
@@ -17,9 +17,14 @@ const callbackUrl = process.env.CALLBACK_URL + "/oauth/tmdb/callback";
 router.get("/", auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const user = await prisma.user.findUnique({ where: { id: userId } });
+    // Supabase: fetch user by id
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("id")
+      .eq("id", userId)
+      .single();
 
-    if (!user) {
+    if (error || !user) {
       return res.status(400).json({ error: "User not found" });
     }
 
@@ -66,8 +71,6 @@ router.get("/callback", rateLimit, auth, async (req, res) => {
       return res.status(400).json({ error: "Invalid request_token" });
     }
 
-    // await
-
     // Exchange request_token for session_id
     const { data } = await axios.post(
       `https://api.themoviedb.org/3/authentication/session/new?api_key=${TMDB_API_KEY}`,
@@ -84,26 +87,22 @@ router.get("/callback", rateLimit, auth, async (req, res) => {
     });
     const tmdbUserId = accountRes.data.id;
 
-    // Save sessionId in your Oauth table for this user
-    await prisma.oauth.upsert({
-      where: {
-        userId_provider: {
-          userId,
-          provider: "tmdb",
-        },
-      },
-      update: {
-        providerUserId: String(tmdbUserId),
-        accessToken: sessionId,
-      },
-      create: {
-        provider: "tmdb",
-        providerUserId: String(tmdbUserId),
-        accessToken: sessionId,
-        userId,
-      },
-    });
-
+    try {
+      const user = await supabase.from("oauth").upsert(
+        [
+          {
+            provider: "tmdb",
+            provider_user_id: String(tmdbUserId),
+            access_token: sessionId,
+            user: userId,
+          },
+        ],
+        { onConflict: "user,provider" }
+      );
+    } catch (error) {
+      console.error("Error fetching TMDb user ID:", error);
+      return res.status(500).json({ error: "Failed to fetch TMDb user ID" });
+    }
     res.json({ session_id: sessionId, tmdb_user_id: tmdbUserId });
   } catch (error) {
     console.error(

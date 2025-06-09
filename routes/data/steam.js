@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const { validationResult, param } = require("express-validator");
-const prisma = require("../../utils/prisma");
+const supabase = require("../../utils/supabase");
 const axios = require("axios");
 
 const auth = require("../../middleware/auth");
@@ -29,10 +29,13 @@ router.post(
       const userId = req.user.id;
       const steamId = req.params.id;
 
-      const existingUser = await prisma.user.findFirst({
-        select: { id: true },
-        where: { steamId: parseInt(steamId), id: { not: userId } },
-      });
+      // Check if Steam user already registered
+      const { data: existingUser, error: existingUserError } = await supabase
+        .from("users")
+        .select("id")
+        .eq("steam_id", parseInt(steamId))
+        .neq("id", userId)
+        .maybeSingle();
 
       if (existingUser) {
         return res
@@ -40,15 +43,19 @@ router.post(
           .json({ error: "Steam user already registered." });
       }
 
-      const lastGameTime = await prisma.gameTime.findFirst({
-        where: { userId },
-        orderBy: { updated_at: "desc" },
-      });
+      // Get last gameTime for user
+      const { data: lastGameTime, error: lastGameTimeError } = await supabase
+        .from("game_times")
+        .select("updated_at")
+        .eq("user", userId)
+        .order("updated_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
 
       if (
         lastGameTime &&
-        new Date() - new Date(lastGameTime.updated_at) < 24 * 60 * 60 * 1000 && // 24 hours in milliseconds
-        req.user.role !== "ADMIN" // Allow admins to bypass this check
+        new Date() - new Date(lastGameTime.updated_at) < 24 * 60 * 60 * 1000 &&
+        req.user.role !== "ADMIN"
       ) {
         return res
           .status(429)
@@ -97,44 +104,37 @@ router.post(
       // Upsert Game and GameTime for each top game
       const upsertedGameIds = [];
       for (const game of topGames) {
-        const dbGame = await prisma.game.upsert({
-          where: { appid: game.appid },
-          update: { name: game.name || "Unknown Game" },
-          create: {
-            appid: game.appid,
-            name: game.name || "Unknown Game",
-          },
-        });
+        // Upsert Game
+        const { data: dbGame } = await supabase
+          .from("games")
+          .upsert([{ appid: game.appid, name: game.name }], {
+            onConflict: "appid",
+          })
+          .select()
+          .single();
 
-        // Upsert GameTime for the user and game
-        await prisma.gameTime.upsert({
-          where: {
-            userId_gameId: {
-              userId,
-              gameId: dbGame.id,
+        // Upsert GameTime
+        await supabase.from("game_times").upsert(
+          [
+            {
+              user: userId,
+              game: dbGame.id,
+              updated_at: new Date().toISOString(),
+              play_time: game.playtime_forever,
             },
-          },
-          update: {
-            updated_at: new Date(),
-            play_time: game.playtime_forever,
-          },
-          create: {
-            userId,
-            gameId: dbGame.id,
-            updated_at: new Date(),
-            play_time: game.playtime_forever,
-          },
-        });
+          ],
+          { onConflict: "user,game" }
+        );
 
         upsertedGameIds.push(dbGame.id);
       }
 
-      await prisma.gameTime.deleteMany({
-        where: {
-          userId,
-          gameId: { notIn: upsertedGameIds },
-        },
-      });
+      // Remove gameTimes not in top list
+      await supabase
+        .from("game_time")
+        .delete()
+        .match({ userId })
+        .not("game", "in", `(${upsertedGameIds.join(",")})`);
 
       res.json({
         message: "Top games updated!",
@@ -153,13 +153,14 @@ router.post(
 // List all games in the DB
 router.get("/games", auth, roleCheck(["ADMIN"]), async (req, res) => {
   try {
-    const games = await prisma.game.findMany({
-      orderBy: { name: "asc" },
-      select: {
-        appid: true,
-        name: true,
-      },
-    });
+    const { data: games, error } = await supabase
+      .from("games")
+      .select("appid, name")
+      .order("name", { ascending: true });
+
+    if (error) {
+      throw error;
+    }
 
     res.json(games);
   } catch (error) {

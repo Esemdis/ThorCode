@@ -2,16 +2,19 @@ const express = require("express");
 const router = express.Router();
 const { validationResult, param } = require("express-validator");
 const bcrypt = require("bcrypt");
-const prisma = require("../utils/prisma");
 const multer = require("multer");
-const userValidation = require("../utils/validation/user");
+const { v4: uuidv4 } = require("uuid");
 const upload = multer();
 const jwt = require("jsonwebtoken");
+
+const userValidation = require("../utils/validation/user");
 const auth = require("../middleware/auth");
 const roleCheck = require("../middleware/roleCheck");
 const { paginationValidation } = require("../utils/validation/pagination");
-const findUser = require("../utils/findUser");
+const { findUserById, findUserByEmail } = require("../utils/findUser");
 const { rateLimiter } = require("../utils/rateLimiter");
+const supabase = require("../utils/supabase");
+
 // Defaults to 5 requests per 15 minutes per IP
 const rateLimit = rateLimiter({
   message: "Too many requests to the users route, please try again later.",
@@ -32,7 +35,7 @@ router.post(
       const { email, password } = req.body;
 
       // Check if user already exists
-      const existingUser = await prisma.user.findUnique({ where: { email } });
+      const existingUser = await findUserByEmail({ email });
       if (existingUser) {
         return res.status(409).json({ error: "Email already in use" });
       }
@@ -40,13 +43,22 @@ router.post(
       // Hash the password
       const passwordHash = await bcrypt.hash(password, 10);
 
-      const user = await prisma.user.create({
-        data: {
-          email,
-          passwordHash,
-        },
-        select: { id: true, email: true },
-      });
+      const { data: user, error: insertError } = await supabase
+        .from("users")
+        .insert([
+          {
+            id: uuidv4().replace(/-/g, ""),
+            email,
+            password_hash: passwordHash,
+          },
+        ])
+        .select("id, email")
+        .single();
+
+      if (insertError) {
+        console.error("Error inserting user:", insertError);
+        return res.status(500).json({ error: "Error creating user" });
+      }
 
       res.status(201).json({ message: "User registered successfully", user });
     } catch (error) {
@@ -71,7 +83,7 @@ router.post(
       const { email, password } = req.body;
 
       // Check if user already exists
-      const existingUser = await prisma.user.findUnique({ where: { email } });
+      const existingUser = await findUserByEmail({ email });
       if (!existingUser) {
         return res.status(403).json({ error: "Invalid credentials" });
       }
@@ -79,7 +91,7 @@ router.post(
       // Hash the password
       const passwordCompare = await bcrypt.compare(
         password,
-        existingUser.passwordHash
+        existingUser.password_hash
       );
 
       if (!passwordCompare) {
@@ -109,7 +121,7 @@ router.post(
         .status(201)
         .json({ message: "User logged in successfully", user, token });
     } catch (error) {
-      console.error("Error during login:");
+      console.error("Error during login:", error);
       return res.status(500).json({ error: "Internal server error" });
     }
   }
@@ -118,7 +130,7 @@ router.post(
 router.get("/me", auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const user = await findUser({ userId });
+    const user = await findUserById({ userId });
 
     if (!user) {
       return res.status(404).json({ error: "User not found" });
@@ -146,26 +158,35 @@ router.get(
 
       const page = parseInt(req.query.page) || 1;
       const limit = parseInt(req.query.limit) || 10;
-      const skip = (page - 1) * limit;
+      const from = (page - 1) * limit;
+      const to = from + limit - 1;
 
-      // Fetch total count for frontend pagination
-      const total = await prisma.user.count();
+      // Fetch users with pagination
+      const { data: users, error } = await supabase
+        .from("users")
+        .select("id, email, role, created_at", { count: "exact" })
+        .order("created_at", { ascending: false })
+        .range(from, to);
 
-      const users = await prisma.user.findMany({
-        select: { id: true, email: true, role: true, createdAt: true },
-        skip,
-        take: limit,
-      });
+      if (!users) {
+        return res.status(404).json({ error: "No users found" });
+      }
 
-      if (skip >= total) {
+      if (error) {
+        console.error("Error fetching users:", error);
+        return res.status(500).json({ error: "Internal server error" });
+      }
+
+      const total = users?.length > 0 && users[0].count ? users[0].count : 0;
+      const totalPages = Math.ceil((users?.length ? users.length : 0) / limit);
+
+      if (!users || users.length === 0) {
         return res.status(404).json({
-          error: `No users found on that page. The last page possible with your current limit is ${Math.ceil(
-            total / limit
-          )}`,
+          error: `No users found on that page. The last page possible with your current limit is ${totalPages}`,
         });
       }
 
-      res.json({ users, page, totalPages: Math.ceil(total / limit), total });
+      res.json({ users, page, totalPages, total });
     } catch (error) {
       console.error("Error fetching users:", error);
       res.status(500).json({ error: "Internal server error" });
@@ -173,7 +194,7 @@ router.get(
   }
 );
 
-const cuidRegex = /^c[a-z0-9]{24}$/;
+const cuidRegex = /^[a-z0-9]{32}$/;
 router.get(
   "/:id",
   auth,
@@ -192,7 +213,7 @@ router.get(
 
       // Fetch user by ID
       console.log("Fetching user with ID:", req.params.id);
-      const user = await findUser({ userId: req.params.id });
+      const user = await findUserById({ userId: req.params.id });
 
       if (!user) {
         return res.status(404).json({ error: "User not found" });
