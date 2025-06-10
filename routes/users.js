@@ -8,12 +8,13 @@ const upload = multer();
 const jwt = require("jsonwebtoken");
 
 const userValidation = require("../utils/validation/user");
-const auth = require("../middleware/auth");
-const roleCheck = require("../middleware/roleCheck");
+const auth = require("../auth/verifyJWT");
+const roleCheck = require("../middlewares/roleCheck");
 const { paginationValidation } = require("../utils/validation/pagination");
 const { findUserById, findUserByEmail } = require("../utils/findUser");
 const { rateLimiter } = require("../utils/rateLimiter");
 const supabase = require("../utils/supabase");
+const signJWT = require("../auth/signJWT");
 
 // Defaults to 5 requests per 15 minutes per IP
 const rateLimit = rateLimiter({
@@ -106,15 +107,7 @@ router.post(
 
       // If you want to be safer, you could insert the token into the DB
       // and check it on every request, but for simplicity, we will just sign it here and trust the expiry.
-      const token = jwt.sign(
-        {
-          id: user.id,
-          email: user.email,
-          role: user.role,
-        },
-        process.env.JWT_SECRET,
-        { expiresIn: "8h" }
-      );
+      const token = await signJWT({ user });
 
       // Return the user and token
       res
@@ -162,7 +155,11 @@ router.get(
       const to = from + limit - 1;
 
       // Fetch users with pagination
-      const { data: users, error } = await supabase
+      const {
+        data: users,
+        count,
+        error,
+      } = await supabase
         .from("users")
         .select("id, email, role, created_at", { count: "exact" })
         .order("created_at", { ascending: false })
@@ -176,8 +173,8 @@ router.get(
         console.error("Error fetching users:", error);
         return res.status(500).json({ error: "Internal server error" });
       }
-
-      const total = users?.length > 0 && users[0].count ? users[0].count : 0;
+      console.log(users);
+      const total = count;
       const totalPages = Math.ceil((users?.length ? users.length : 0) / limit);
 
       if (!users || users.length === 0) {

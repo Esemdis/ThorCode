@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 const supabase = require("../../utils/supabase");
 const axios = require("axios");
-const auth = require("../../middleware/auth");
+const auth = require("../../auth/verifyJWT");
 const { rateLimiter } = require("../../utils/rateLimiter");
 // Defaults to 5 requests per 15 minutes per IP
 const rateLimit = rateLimiter({

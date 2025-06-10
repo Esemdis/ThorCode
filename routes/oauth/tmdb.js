@@ -9,7 +9,7 @@ const rateLimit = rateLimiter({
   message: "Too many requests to the TMDB Oauth route, please try again later.",
 });
 
-const auth = require("../../middleware/auth");
+const auth = require("../../auth/verifyJWT");
 const { cacheData, getCachedData } = require("../../utils/cache");
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const callbackUrl = process.env.CALLBACK_URL + "/oauth/tmdb/callback";

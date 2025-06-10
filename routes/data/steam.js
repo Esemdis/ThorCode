@@ -4,8 +4,8 @@ const { validationResult, param } = require("express-validator");
 const supabase = require("../../utils/supabase");
 const axios = require("axios");
 
-const auth = require("../../middleware/auth");
-const roleCheck = require("../../middleware/roleCheck");
+const auth = require("../../auth/verifyJWT");
+const roleCheck = require("../../middlewares/roleCheck");
 const STEAM_API_KEY = process.env.STEAM_API_KEY; // Set this in your .env
 const { rateLimiter } = require("../../utils/rateLimiter");
 // Defaults to 5 requests per 15 minutes per IP
