@@ -1,7 +1,14 @@
 const { v4: uuidv4 } = require("uuid");
 const { Redis } = require("ioredis");
+const client = new Redis(process.env.REDIS_URL, { tls: {} });
 
-const client = new Redis({ url: process.env.REDIS_URL });
+client.on("connect", () => console.log("Redis connected"));
+client.on("ready", () => console.log("Redis ready"));
+client.on("close", () => console.log("Redis connection closed"));
+client.on("reconnecting", () => console.log("Redis reconnecting..."));
+client.on("error", (err) => {
+  console.error("Redis connection error:", err);
+});
 
 function generateCacheKey(prefix) {
   return `${prefix}:${uuidv4()}`;

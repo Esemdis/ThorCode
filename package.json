@@ -6,7 +6,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "nodemon index.js",
-    "dev": "doppler run -c dev -- npm start"
+    "dev": "doppler run -c dev -- npm start",
+    "prd": "doppler run -c prd -- npm start"
   },
   "author": "",
   "license": "ISC",
