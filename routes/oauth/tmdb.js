@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const supabase = require("../../utils/supabase");
+const prisma = require("../../prisma/client");
 const axios = require("axios");
 
 const { rateLimiter } = require("../../utils/rateLimiter");
@@ -17,14 +17,13 @@ const callbackUrl = process.env.CALLBACK_URL + "/oauth/tmdb/callback";
 router.get("/", auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    // Supabase: fetch user by id
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("id")
-      .eq("id", userId)
-      .single();
+    // Prisma: fetch user by id
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true },
+    });
 
-    if (error || !user) {
+    if (!user) {
       return res.status(400).json({ error: "User not found" });
     }
 
@@ -88,20 +87,29 @@ router.get("/callback", rateLimit, auth, async (req, res) => {
     const tmdbUserId = accountRes.data.id;
 
     try {
-      const user = await supabase.from("oauth").upsert(
-        [
-          {
-            provider: "tmdb",
-            provider_user_id: String(tmdbUserId),
-            access_token: sessionId,
+      await prisma.oauth.upsert({
+        where: {
+          user_provider: {
             user: userId,
+            provider: "tmdb",
           },
-        ],
-        { onConflict: "user,provider" }
-      );
+        },
+        update: {
+          provider_user_id: String(tmdbUserId),
+          access_token: sessionId,
+        },
+        create: {
+          provider: "tmdb",
+          provider_user_id: String(tmdbUserId),
+          access_token: sessionId,
+          user: userId,
+        },
+      });
     } catch (error) {
-      console.error("Error fetching TMDb user ID:", error);
-      return res.status(500).json({ error: "Failed to fetch TMDb user ID" });
+      console.error("Error upserting TMDb OAuth data:", error);
+      return res
+        .status(500)
+        .json({ error: "Failed to upsert TMDb OAuth data" });
     }
     res.json({ session_id: sessionId, tmdb_user_id: tmdbUserId });
   } catch (error) {

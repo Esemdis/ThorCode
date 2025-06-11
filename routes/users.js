@@ -13,7 +13,7 @@ const roleCheck = require("../middlewares/roleCheck");
 const { paginationValidation } = require("../utils/validation/pagination");
 const { findUserById, findUserByEmail } = require("../utils/findUser");
 const { rateLimiter } = require("../utils/rateLimiter");
-const supabase = require("../utils/supabase");
+const prisma = require("../prisma/client");
 const signJWT = require("../auth/signJWT");
 
 // Defaults to 5 requests per 15 minutes per IP
@@ -36,7 +36,9 @@ router.post(
       const { email, password } = req.body;
 
       // Check if user already exists
-      const existingUser = await findUserByEmail({ email });
+      const existingUser = await prisma.user.findUnique({
+        where: { email },
+      });
       if (existingUser) {
         return res.status(409).json({ error: "Email already in use" });
       }
@@ -44,22 +46,14 @@ router.post(
       // Hash the password
       const passwordHash = await bcrypt.hash(password, 10);
 
-      const { data: user, error: insertError } = await supabase
-        .from("users")
-        .insert([
-          {
-            id: uuidv4().replace(/-/g, ""),
-            email,
-            password_hash: passwordHash,
-          },
-        ])
-        .select("id, email")
-        .single();
-
-      if (insertError) {
-        console.error("Error inserting user:", insertError);
-        return res.status(500).json({ error: "Error creating user" });
-      }
+      const user = await prisma.user.create({
+        data: {
+          id: uuidv4().replace(/-/g, ""),
+          email,
+          password_hash: passwordHash,
+        },
+        select: { id: true, email: true },
+      });
 
       res.status(201).json({ message: "User registered successfully", user });
     } catch (error) {
@@ -84,7 +78,9 @@ router.post(
       const { email, password } = req.body;
 
       // Check if user already exists
-      const existingUser = await findUserByEmail({ email });
+      const existingUser = await prisma.user.findUnique({
+        where: { email },
+      });
       if (!existingUser) {
         return res.status(403).json({ error: "Invalid credentials" });
       }
@@ -123,11 +119,51 @@ router.post(
 router.get("/me", auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const user = await findUserById({ userId });
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        created_at: true,
+        gameTimes: {
+          select: {
+            play_time: true,
+            updated_at: true,
+            game: {
+              select: {
+                id: true,
+                name: true,
+                appid: true,
+              },
+            },
+          },
+        },
+        movieReviews: {
+          select: {
+            id: true,
+            rating: true,
+            movie: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+          },
+        },
+      },
+    });
 
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
+
+    // Limit to top 3 gameTimes and movieReviews in JS
+    user.gameTimes = (user.gameTimes || [])
+      .sort((a, b) => b.play_time - a.play_time)
+      .slice(0, 3);
+
+    user.movieReviews = (user.movieReviews || []).slice(0, 3);
 
     res.json({ user });
   } catch (error) {
@@ -149,33 +185,22 @@ router.get(
         return res.status(400).json({ errors: errors.array() });
       }
 
+      // Fetch users with pagination
       const page = parseInt(req.query.page) || 1;
       const limit = parseInt(req.query.limit) || 10;
-      const from = (page - 1) * limit;
-      const to = from + limit - 1;
+      const skip = (page - 1) * limit;
 
-      // Fetch users with pagination
-      const {
-        data: users,
-        count,
-        error,
-      } = await supabase
-        .from("users")
-        .select("id, email, role, created_at", { count: "exact" })
-        .order("created_at", { ascending: false })
-        .range(from, to);
+      const [users, total] = await Promise.all([
+        prisma.user.findMany({
+          skip,
+          take: limit,
+          orderBy: { created_at: "desc" },
+          select: { id: true, email: true, role: true, created_at: true },
+        }),
+        prisma.user.count(),
+      ]);
 
-      if (!users) {
-        return res.status(404).json({ error: "No users found" });
-      }
-
-      if (error) {
-        console.error("Error fetching users:", error);
-        return res.status(500).json({ error: "Internal server error" });
-      }
-      console.log(users);
-      const total = count;
-      const totalPages = Math.ceil((users?.length ? users.length : 0) / limit);
+      const totalPages = Math.ceil(total / limit);
 
       if (!users || users.length === 0) {
         return res.status(404).json({
@@ -209,12 +234,51 @@ router.get(
       }
 
       // Fetch user by ID
-      console.log("Fetching user with ID:", req.params.id);
-      const user = await findUserById({ userId: req.params.id });
+      const user = await prisma.user.findUnique({
+        where: { id: req.params.id },
+        select: {
+          id: true,
+          email: true,
+          role: true,
+          created_at: true,
+          gameTimes: {
+            select: {
+              play_time: true,
+              updated_at: true,
+              game: {
+                select: {
+                  id: true,
+                  name: true,
+                  appid: true,
+                },
+              },
+            },
+          },
+          movieReviews: {
+            select: {
+              id: true,
+              rating: true,
+              movie: {
+                select: {
+                  id: true,
+                  name: true,
+                },
+              },
+            },
+          },
+        },
+      });
 
       if (!user) {
         return res.status(404).json({ error: "User not found" });
       }
+
+      // Limit to top 3 gameTimes and movieReviews in JS
+      user.gameTimes = (user.gameTimes || [])
+        .sort((a, b) => b.play_time - a.play_time)
+        .slice(0, 3);
+
+      user.movieReviews = (user.movieReviews || []).slice(0, 3);
 
       res.json({ user });
     } catch (error) {

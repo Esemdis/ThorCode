@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const supabase = require("../utils/supabase");
+const prisma = require("../../prisma/client");
 const axios = require("axios");
 
 const rateLimit = require("express-rate-limit");
@@ -16,20 +16,28 @@ router.post("/me", auth, registerLimiter, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("provider_user_id, access_token")
-      .eq("id", userId)
-      .single();
+    // Fetch TMDB oauth info for the user
+    const userOauth = await prisma.oauth.findUnique({
+      where: {
+        user_provider: {
+          user: userId,
+          provider: "tmdb",
+        },
+      },
+      select: {
+        provider_user_id: true,
+        access_token: true,
+      },
+    });
 
-    if (!user || !user.provider_user_id || !user.access_token) {
+    if (!userOauth || !userOauth.provider_user_id || !userOauth.access_token) {
       return res.status(400).json({
         error: "You must link your TMDB account first.",
       });
     }
     res.json({
       message: "Top movies updated!",
-      user,
+      user: userOauth,
     });
   } catch (error) {
     console.error(

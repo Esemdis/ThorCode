@@ -1,0 +1,74 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String        @id @default(uuid())
+  email        String        @unique
+  password_hash String?
+  role  Role   @default(USER)
+  created_at   DateTime      @default(now())
+  steam_id     Int?          @unique
+  game_times   GameTime[]    @relation("UserGameTimes")
+  movie_reviews MovieReview[] @relation("UserMovieReviews")
+  oauth        OAuth[]       @relation("UserOauth")
+}
+
+model Game {
+  id     Int      @id @default(autoincrement())
+  appid  Int      @unique
+  name   String
+  game_times GameTime[] @relation("GameGameTimes")
+}
+
+model GameTime {
+  id         Int      @id @default(autoincrement())
+  user       String
+  game       Int
+  play_time  Int
+  updated_at DateTime  @default(now())
+  user_rel   User      @relation("UserGameTimes", fields: [user], references: [id])
+  game_rel   Game      @relation("GameGameTimes", fields: [game], references: [id])
+
+  @@unique([user, game], name: "user_game")
+}
+
+model Movie {
+  id      Int      @id @default(autoincrement())
+  tmdb_id Int      @unique
+  name    String
+  movie_reviews MovieReview[] @relation("MovieMovieReviews")
+}
+
+model MovieReview {
+  id      Int      @id @default(autoincrement())
+  user    String
+  movie   Int
+  rating  Int
+  user_rel  User   @relation("UserMovieReviews", fields: [user], references: [id])
+  movie_rel Movie  @relation("MovieMovieReviews", fields: [movie], references: [id])
+
+  @@unique([user, movie], name: "user_movie")
+}
+
+model OAuth {
+  id               Int      @id @default(autoincrement())
+  provider         String
+  provider_user_id String
+  access_token     String
+  user             String
+  user_rel         User     @relation("UserOauth", fields: [user], references: [id])
+
+  @@unique([user, provider], name: "user_provider")
+}
+
+enum Role {
+  USER
+  ADMIN
+  MODERATOR
+}

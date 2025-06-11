@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const supabase = require("../../utils/supabase");
+const prisma = require("../../prisma/client");
 const axios = require("axios");
 const auth = require("../../auth/verifyJWT");
 const { rateLimiter } = require("../../utils/rateLimiter");
@@ -14,19 +14,20 @@ router.post("/me", auth, rateLimit, async (req, res) => {
     const userId = req.user.id;
 
     // Fetch oauth row for TMDB
-    const { data: oauth, error: oauthError } = await supabase
-      .from("oauth")
-      .select("provider_user_id, access_token")
-      .eq("user", userId)
-      .eq("provider", "tmdb")
-      .single();
+    const oauth = await prisma.oauth.findUnique({
+      where: {
+        user_provider: {
+          user: userId,
+          provider: "tmdb",
+        },
+      },
+      select: {
+        provider_user_id: true,
+        access_token: true,
+      },
+    });
 
-    if (
-      oauthError ||
-      !oauth ||
-      !oauth.provider_user_id ||
-      !oauth.access_token
-    ) {
+    if (!oauth || !oauth.provider_user_id || !oauth.access_token) {
       return res.status(400).json({
         error: "You must link your TMDB account first.",
       });
@@ -73,26 +74,29 @@ router.post("/me", auth, rateLimit, async (req, res) => {
       try {
         console.log("Processing movie:", movie);
         // Upsert Movie
-        const { data: dbMovie, error: movieError } = await supabase
-          .from("movies")
-          .upsert([{ tmdb_id: movie.id, name: movie.name }], {
-            onConflict: "tmdb_id",
-          })
-          .select("id, name")
-          .maybeSingle();
-        console.log("DB Movie:", dbMovie, movieError);
-        // Upsert MovieReviews for the user and movie
-        await supabase.from("movie_reviews").upsert(
-          [
-            {
+        const dbMovie = await prisma.movie.upsert({
+          where: { tmdb_id: movie.id },
+          update: { name: movie.name },
+          create: { tmdb_id: movie.id, name: movie.name },
+          select: { id: true, name: true },
+        });
+
+        // Upsert MovieReview for the user and movie
+        await prisma.movieReview.upsert({
+          where: {
+            user_movie: {
               user: userId,
               movie: dbMovie.id,
-              rating: movie.rating,
             },
-          ],
-          { onConflict: "user,movie" }
-        );
-        console.log("Upserted movie:", dbMovie);
+          },
+          update: { rating: movie.rating },
+          create: {
+            user: userId,
+            movie: dbMovie.id,
+            rating: movie.rating,
+          },
+        });
+
         upsertedMovieIds.push(movie.id);
       } catch (error) {
         console.error("Error processing movie:", movie, error);
@@ -101,11 +105,12 @@ router.post("/me", auth, rateLimit, async (req, res) => {
     }
 
     // Optionally, remove reviews for movies not in the latest top list
-    await supabase
-      .from("movieReviews")
-      .delete()
-      .match({ user: userId })
-      .not("movie", "in", `(${upsertedMovieIds.join(",")})`);
+    await prisma.movieReview.deleteMany({
+      where: {
+        user: userId,
+        movie: { notIn: upsertedMovieIds },
+      },
+    });
 
     res.json({
       message: "Top movies updated!",
