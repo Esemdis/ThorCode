@@ -34,20 +34,6 @@ A modular and production-ready Node.js backend built with Express. This project 
   CI/CD	GitHub Actions (planned)
   Monitoring	Datadog / OpenTelemetry (planned)
 
-🗂️ Project Structure
-
-├── middleware/
-│   └── auth.js, roleCheck.js
-├── routes/
-│   ├── data/       # steam, tmdb, weather, export
-│   └── oauth/      # tmdb OAuth login
-├── utils/
-│   ├── validation/
-│   ├── cache.js, findUser.js, rateLimiter.js, etc.
-├── prisma/         # (if using Prisma)
-├── .env_example
-├── index.js
-
 🛠 Setup Instructions
 1. Clone & Install
 
