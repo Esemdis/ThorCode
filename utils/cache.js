@@ -1,6 +1,23 @@
 const { v4: uuidv4 } = require("uuid");
 const { Redis } = require("ioredis");
-const client = new Redis(process.env.REDIS_URL, { tls: {} });
+const client = new Redis(process.env.REDIS_URL, {
+  tls: {},
+  retryDelayOnFailover: 300000, // 5 minutes
+  maxRetriesPerRequest: 3,
+  lazyConnect: true,
+  retryDelayOnClusterDown: 300000, // 5 minutes
+  retryStrategy: (times) => {
+    // Exponential backoff with max delay of 5 minutes
+    const delay = Math.min(times * 2000, 300000); // Max 5 minutes
+    console.log(`Redis retry attempt ${times}, waiting ${delay}ms`);
+    return delay;
+  },
+  reconnectOnError: (err) => {
+    // Only reconnect on specific errors, not DNS resolution failures
+    const targetError = "READONLY";
+    return err.message.includes(targetError);
+  }
+});
 
 client.on("connect", () => console.log("Redis connected"));
 client.on("ready", () => console.log("Redis ready"));

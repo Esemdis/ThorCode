@@ -67,5 +67,3 @@ This API can serve as:
   A portfolio project demonstrating backend architecture, auth flows, and API integration
 
   A modular boilerplate for future freelance/consulting projects
-
-  A testbed for comparing Supabase vs. Prisma/Postgres workflows

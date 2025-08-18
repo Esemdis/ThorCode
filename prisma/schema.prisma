@@ -8,21 +8,22 @@ datasource db {
 }
 
 model User {
-  id           String        @id @default(uuid())
-  email        String        @unique
+  id            String        @id @default(uuid())
+  email         String        @unique
   password_hash String?
-  role  Role   @default(USER)
-  created_at   DateTime      @default(now())
-  steam_id     Int?          @unique
-  game_times   GameTime[]    @relation("UserGameTimes")
+  role          Role          @default(USER)
+  created_at    DateTime      @default(now())
+  steam_id      Int?          @unique
+  game_times    GameTime[]    @relation("UserGameTimes")
   movie_reviews MovieReview[] @relation("UserMovieReviews")
-  oauth        OAuth[]       @relation("UserOauth")
+  oauth         OAuth[]       @relation("UserOauth")
+  wishlists     Wishlist[]    @relation("UserWishlists")
 }
 
 model Game {
-  id     Int      @id @default(autoincrement())
-  appid  Int      @unique
-  name   String
+  id         Int        @id @default(autoincrement())
+  appid      Int        @unique
+  name       String
   game_times GameTime[] @relation("GameGameTimes")
 }
 
@@ -31,40 +32,100 @@ model GameTime {
   user       String
   game       Int
   play_time  Int
-  updated_at DateTime  @default(now())
-  user_rel   User      @relation("UserGameTimes", fields: [user], references: [id])
-  game_rel   Game      @relation("GameGameTimes", fields: [game], references: [id])
+  updated_at DateTime @default(now())
+  game_rel   Game     @relation("GameGameTimes", fields: [game], references: [id])
+  user_rel   User     @relation("UserGameTimes", fields: [user], references: [id])
 
   @@unique([user, game], name: "user_game")
 }
 
 model Movie {
-  id      Int      @id @default(autoincrement())
-  tmdb_id Int      @unique
-  name    String
+  id            Int           @id @default(autoincrement())
+  tmdb_id       Int           @unique
+  name          String
   movie_reviews MovieReview[] @relation("MovieMovieReviews")
 }
 
 model MovieReview {
-  id      Int      @id @default(autoincrement())
-  user    String
-  movie   Int
-  rating  Int
-  user_rel  User   @relation("UserMovieReviews", fields: [user], references: [id])
+  id        Int    @id @default(autoincrement())
+  user      String
+  movie     Int
+  rating    Int
   movie_rel Movie  @relation("MovieMovieReviews", fields: [movie], references: [id])
+  user_rel  User   @relation("UserMovieReviews", fields: [user], references: [id])
 
   @@unique([user, movie], name: "user_movie")
 }
 
 model OAuth {
-  id               Int      @id @default(autoincrement())
+  id               Int    @id @default(autoincrement())
   provider         String
   provider_user_id String
   access_token     String
   user             String
-  user_rel         User     @relation("UserOauth", fields: [user], references: [id])
+  user_rel         User   @relation("UserOauth", fields: [user], references: [id])
 
   @@unique([user, provider], name: "user_provider")
+}
+
+model Band {
+  id              Int                     @id @default(autoincrement())
+  name            String                  @unique
+  ticketmaster_id String                  @unique
+  concerts        ConcertBandReference[]  @relation("BandConcerts")
+  wishlists       WishlistBandReference[] @relation("BandWishlists")
+}
+
+model Concert {
+  id                Int                    @id @default(autoincrement())
+  country           String
+  venue             String
+  created_at        DateTime
+  on_sale           Boolean
+  city              String
+  concert_date      DateTime?
+  event_id          String?                @unique
+  latitude          String?                @db.VarChar
+  longitude         String?                @db.VarChar
+  metadata          String?
+  name              String?
+  ticket_sale_start DateTime?              @db.Timestamp(6)
+  url               String?
+  bands             ConcertBandReference[] @relation("ConcertBands")
+}
+
+model Country {
+  id   Int    @id @default(autoincrement())
+  name String
+  iso  String
+}
+
+model ConcertBandReference {
+  id          Int     @id @default(autoincrement())
+  concert     Int
+  band        Int
+  band_rel    Band    @relation("BandConcerts", fields: [band], references: [id])
+  concert_rel Concert @relation("ConcertBands", fields: [concert], references: [id])
+
+  @@unique([concert, band], name: "concert_band")
+}
+
+model Wishlist {
+  id       Int                     @id @default(autoincrement())
+  name     String                  @unique
+  user_id  String
+  user_rel User                    @relation("UserWishlists", fields: [user_id], references: [id])
+  bands    WishlistBandReference[] @relation("WishlistBands")
+}
+
+model WishlistBandReference {
+  id           Int      @id @default(autoincrement())
+  band_id      Int
+  wishlist_id  Int
+  band_rel     Band     @relation("BandWishlists", fields: [band_id], references: [id])
+  wishlist_rel Wishlist @relation("WishlistBands", fields: [wishlist_id], references: [id])
+
+  @@unique([band_id, wishlist_id], name: "band_wishlist")
 }
 
 enum Role {
