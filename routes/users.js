@@ -107,7 +107,7 @@ router.post(
 
       // Return the user and token
       res
-        .status(201)
+        .status(200)
         .json({ message: "User logged in successfully", user, token });
     } catch (error) {
       console.error("Error during login:", error);

@@ -91,6 +91,7 @@ model Concert {
   name              String?
   ticket_sale_start DateTime?              @db.Timestamp(6)
   url               String?
+  festival          Boolean?               @default(false)
   bands             ConcertBandReference[] @relation("ConcertBands")
 }
 
