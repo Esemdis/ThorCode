@@ -96,7 +96,8 @@ router.post(
   "/bands",
   rateLimit,
   auth,
-  body("name").isString().notEmpty().withMessage("Band name is required"),
+  body("name").optional().isString().notEmpty().withMessage("Band name must be a non-empty string"),
+  body("ticketmaster_id").optional().isString().notEmpty().withMessage("Ticketmaster ID must be a non-empty string"),
   body("wishlistId").optional().isInt().withMessage("Wishlist ID must be an integer"),
   async (req, res) => {
     try {
@@ -105,11 +106,32 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const bandName = req.body.name;
-      const band = await prisma.band.findUnique({
-        where: { name: bandName },
-        select: { name: true },
-      });
+      const { name, ticketmaster_id, wishlistId } = req.body;
+
+      // Validate that either name or ticketmaster_id is provided
+      if (!name && !ticketmaster_id) {
+        return res.status(400).json({
+          error: "Either 'name' or 'ticketmaster_id' must be provided"
+        });
+      }
+
+      const bandName = name ? name.trim() : null;
+      const ticketmasterId = ticketmaster_id ? ticketmaster_id.trim() : null;
+
+      // Check if band already exists in the database
+      let band = null;
+
+      if (ticketmasterId) {
+        band = await prisma.band.findUnique({
+          where: { ticketmaster_id: ticketmasterId },
+          select: { name: true },
+        });
+      } else if (bandName) {
+        band = await prisma.band.findUnique({
+          where: { name: bandName },
+          select: { name: true },
+        });
+      }
 
       if (band) {
         return res.status(409).json({ error: "Band already exists." });
@@ -117,16 +139,32 @@ router.post(
 
       let foundBand;
       try {
-        // Fetch band data from Ticketmaster API
-        foundBand = await axios.get(`${ticketmasterURL}attractions.json`, {
-          params: {
-            apikey: process.env.TICKETMASTER_KEY,
-            keyword: bandName,
-          },
-        });
+        if (ticketmasterId) {
+          // Fetch band data by Ticketmaster ID
+          foundBand = await axios.get(`${ticketmasterURL}attractions/${ticketmasterId}.json`, {
+            params: {
+              apikey: process.env.TICKETMASTER_KEY,
+            },
+          });
 
-        if (foundBand.data._embedded.attractions.length === 0) {
-          return res.status(404).json({ error: "No band found." });
+          if (!foundBand.data) {
+            return res.status(404).json({ error: "Band not found with that Ticketmaster ID" });
+          }
+
+          // For ID-based search, the response structure is different
+          foundBand.data._embedded = { attractions: [foundBand.data] };
+        } else {
+          // Fetch band data from Ticketmaster API by name
+          foundBand = await axios.get(`${ticketmasterURL}attractions.json`, {
+            params: {
+              apikey: process.env.TICKETMASTER_KEY,
+              keyword: bandName,
+            },
+          });
+
+          if (foundBand.data._embedded.attractions.length === 0) {
+            return res.status(404).json({ error: "No band found." });
+          }
         }
       } catch (error) {
         if (error.status === 404) {
@@ -151,12 +189,20 @@ router.post(
       let events;
       // Fetch events from Ticketmaster API
       try {
+        const eventParams = {
+          countryCode: countries.map(country => country.iso),
+          apikey: process.env.TICKETMASTER_KEY,
+        };
+
+        // Use attractionId if we have a ticketmaster_id, otherwise use keyword
+        if (ticketmasterId) {
+          eventParams.attractionId = bandData.id;
+        } else {
+          eventParams.keyword = bandData.name;
+        }
+
         events = await axios.get(`${ticketmasterURL}events.json`, {
-          params: {
-            countryCode: countries.map(country => country.iso),
-            apikey: process.env.TICKETMASTER_KEY,
-            keyword: bandName,
-          },
+          params: eventParams,
         });
       } catch (error) {
         if (error.status === 404) {
@@ -192,10 +238,10 @@ router.post(
         }
       }
 
-      if (req.body.wishlistId) {
+      if (wishlistId) {
         await prisma.wishlistBandReference.create({
           data: {
-            wishlist_id: req.body.wishlistId,
+            wishlist_id: wishlistId,
             band_id: newBand.id
           }
         });
@@ -207,7 +253,14 @@ router.post(
         ticketmaster_id: newBand.ticketmaster_id,
         concerts: uniqueEvents.map(event => ({
           name: event.name,
-          concert_date: event.concert_date ? new Date(event.concert_date).toLocaleString() : "",
+          concert_date: event.concert_date ? new Date(event.concert_date).toLocaleString('en-GB', {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            timeZone: 'Europe/Stockholm'
+          }) : "",
           venue: event.venue,
           city: event.city,
           country: event.country,
@@ -345,6 +398,13 @@ router.get("/wishlists/:id",
           }
 
           if (!concertsMap.has(eventId)) {
+            const wishlistBands = concert.bands
+              .map(b => ({
+                id: b.band_rel.id,
+                name: b.band_rel.name
+              }))
+              .filter(band => bandIds.includes(band.id)); // Only include bands that are in the wishlist
+
             concertsMap.set(eventId, {
               id: concert.id,
               name: concert.name,
@@ -357,12 +417,8 @@ router.get("/wishlists/:id",
               concert_date: concert.concert_date,
               festival: concert.festival,
               url: concert.url,
-              participating_bands: concert.bands
-                .map(b => ({
-                  id: b.band_rel.id,
-                  name: b.band_rel.name
-                }))
-                .filter(band => bandIds.includes(band.id)) // Only include bands that are in the wishlist
+              participating_bands: wishlistBands,
+              wishlist_band_count: wishlistBands.length
             });
           }
         });
@@ -522,7 +578,8 @@ router.post(
     auth,
     roleCheck(["ADMIN"]),
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
-    body("name").isString().notEmpty().withMessage("Band name is required"),
+    body("name").optional().isString().notEmpty().withMessage("Band name must be a non-empty string"),
+    body("ticketmaster_id").optional().isString().notEmpty().withMessage("Ticketmaster ID must be a non-empty string"),
   ],
   rateLimit,
   async (req, res) => {
@@ -536,7 +593,18 @@ router.post(
       }
 
       const wishlistId = parseInt(req.params.id, 10);
-      const bandName = req.body.name.trim();
+      const { name, ticketmaster_id } = req.body;
+
+      // Validate that either name or ticketmaster_id is provided
+      if (!name && !ticketmaster_id) {
+        return res.status(400).json({
+          error: "Either 'name' or 'ticketmaster_id' must be provided"
+        });
+      }
+
+      // Sanitize inputs
+      const bandName = name ? name.trim() : null;
+      const ticketmasterId = ticketmaster_id ? ticketmaster_id.trim() : null;
 
       // Check if wishlist exists and belongs to the user
       const existingWishlist = await prisma.wishlist.findUnique({
@@ -552,26 +620,55 @@ router.post(
       }
 
       // Check if band already exists in the database
-      let band = await prisma.band.findUnique({
-        where: { name: bandName },
-        select: { id: true, name: true, ticketmaster_id: true },
-      });
+      let band = null;
+
+      if (ticketmasterId) {
+        // Search by Ticketmaster ID first if provided
+        band = await prisma.band.findUnique({
+          where: { ticketmaster_id: ticketmasterId },
+          select: { id: true, name: true, ticketmaster_id: true },
+        });
+      } else if (bandName) {
+        // Search by name if no Ticketmaster ID provided
+        band = await prisma.band.findUnique({
+          where: { name: bandName },
+          select: { id: true, name: true, ticketmaster_id: true },
+        });
+      }
 
       let newBandCreated = false;
 
       // If band doesn't exist, create it
       if (!band) {
         try {
-          // Fetch band data from Ticketmaster API
-          const foundBand = await axios.get(`${ticketmasterURL}attractions.json`, {
-            params: {
-              apikey: process.env.TICKETMASTER_KEY,
-              keyword: bandName,
-            },
-          });
+          let foundBand;
 
-          if (!foundBand.data._embedded || !foundBand.data._embedded.attractions || foundBand.data._embedded.attractions.length === 0) {
-            return res.status(404).json({ error: "Band not found on Ticketmaster" });
+          if (ticketmasterId) {
+            // Fetch band data by Ticketmaster ID
+            foundBand = await axios.get(`${ticketmasterURL}attractions/${ticketmasterId}.json`, {
+              params: {
+                apikey: process.env.TICKETMASTER_KEY,
+              },
+            });
+
+            if (!foundBand.data) {
+              return res.status(404).json({ error: "Band not found with that Ticketmaster ID" });
+            }
+
+            // For ID-based search, the response structure is different
+            foundBand.data._embedded = { attractions: [foundBand.data] };
+          } else {
+            // Fetch band data by name (existing logic)
+            foundBand = await axios.get(`${ticketmasterURL}attractions.json`, {
+              params: {
+                apikey: process.env.TICKETMASTER_KEY,
+                keyword: bandName,
+              },
+            });
+
+            if (!foundBand.data._embedded || !foundBand.data._embedded.attractions || foundBand.data._embedded.attractions.length === 0) {
+              return res.status(404).json({ error: "Band not found on Ticketmaster" });
+            }
           }
 
           const bandData = foundBand.data._embedded.attractions[0];
@@ -588,12 +685,20 @@ router.post(
 
           // Fetch and add concerts for the new band
           try {
+            const eventParams = {
+              countryCode: countries.map(country => country.iso),
+              apikey: process.env.TICKETMASTER_KEY,
+            };
+
+            // Use attractionId if we have a ticketmaster_id, otherwise use keyword
+            if (ticketmasterId) {
+              eventParams.attractionId = bandData.id;
+            } else {
+              eventParams.keyword = bandData.name;
+            }
+
             const events = await axios.get(`${ticketmasterURL}events.json`, {
-              params: {
-                countryCode: countries.map(country => country.iso),
-                apikey: process.env.TICKETMASTER_KEY,
-                keyword: bandName,
-              },
+              params: eventParams,
             });
 
             if (events.data._embedded && events.data._embedded.events && events.data._embedded.events.length > 0) {
@@ -772,5 +877,62 @@ router.delete(
     }
   }
 );
+
+// Search bands on Ticketmaster to get their IDs (helpful for disambiguation)
+router.get("/bands/ticketmaster-search", async (req, res) => {
+  try {
+    const { q, limit = 10 } = req.query;
+
+    if (!q || q.trim().length < 2) {
+      return res.json([]);
+    }
+
+    const searchTerm = q.trim();
+
+    try {
+      const response = await axios.get(`${ticketmasterURL}attractions.json`, {
+        params: {
+          apikey: process.env.TICKETMASTER_KEY,
+          keyword: searchTerm,
+          size: Math.min(parseInt(limit, 10), 20), // Cap at 20 for API limits
+        },
+      });
+
+      if (!response.data._embedded || !response.data._embedded.attractions) {
+        return res.json([]);
+      }
+
+      const bands = response.data._embedded.attractions.map(attraction => ({
+        id: attraction.id,
+        name: attraction.name,
+        url: attraction.url || null,
+        // Include image if available
+        image: attraction.images && attraction.images.length > 0
+          ? attraction.images[0].url
+          : null,
+        // Include genre if available
+        classifications: attraction.classifications
+          ? attraction.classifications.map(c => ({
+            genre: c.genre?.name || null,
+            subGenre: c.subGenre?.name || null
+          })).filter(c => c.genre || c.subGenre)
+          : []
+      }));
+
+      res.json(bands);
+    } catch (error) {
+      if (error.response?.status === 404) {
+        return res.json([]);
+      } else if (error.response?.status === 429) {
+        return res.status(429).json({ error: "Too many requests to Ticketmaster, please try again later" });
+      }
+      console.error("Error searching Ticketmaster:", error);
+      return res.status(500).json({ error: "Failed to search Ticketmaster" });
+    }
+  } catch (error) {
+    console.error("Error in Ticketmaster search:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 module.exports = router;
