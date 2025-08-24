@@ -222,143 +222,7 @@ router.post(
     }
   }
 );
-router.post(
-  "/wishlist",
-  [
-    auth,
-    roleCheck(["ADMIN"]),
-    body("name").isString().notEmpty().withMessage("Wishlist name is required"),
-    body("bandIds").isArray().withMessage("Band IDs must be an array").optional(),
-  ],
-  rateLimit,
-  async (req, res) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
 
-      const wishlistName = req.body.name;
-      const existingWishlist = await prisma.wishlist.findFirst({
-        where: {
-          name: wishlistName,
-          user_id: req.user.id  // Changed from user_rel to user_id
-        },
-      });
-
-      if (existingWishlist) {
-        return res.status(409).json({ error: "Wishlist already exists." });
-      }
-
-      // Create the new wishlist
-      const newWishlist = await prisma.wishlist.create({
-        data: {
-          name: wishlistName,
-          user_id: req.user.id,
-        },
-      });
-
-      // Add bands to the wishlist
-      if (req.body.bandIds && req.body.bandIds.length > 0) {
-        await prisma.wishlistBandReference.createMany({
-          data: req.body.bandIds.map(bandId => ({
-            wishlist_id: newWishlist.id,
-            band_id: bandId,
-          })),
-        },
-        );
-      }
-
-      res.json(newWishlist);
-    } catch (error) {
-      console.error("Error fetching Ticketmaster data:", error);
-      res.status(500).json({ error: "Internal server error" });
-    }
-  }
-);
-router.patch(
-  "/wishlist/:id",
-  [
-    auth,
-    roleCheck(["ADMIN"]),
-    param("id").isInt().withMessage("Wishlist ID must be an integer"),
-    body("bandIds").isArray().withMessage("Band IDs must be an array"),
-  ],
-  rateLimit,
-  async (req, res) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
-
-      const wishlistId = parseInt(req.params.id, 10);
-      const existingWishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
-      });
-
-      if (!existingWishlist) {
-        return res.status(404).json({ error: "Wishlist not found." });
-      }
-
-      // First, validate that all band IDs exist in the database
-      if (req.body.bandIds && req.body.bandIds.length > 0) {
-        const existingBands = await prisma.band.findMany({
-          where: {
-            id: {
-              in: req.body.bandIds
-            }
-          },
-          select: { id: true }
-        });
-
-        const existingBandIds = existingBands.map(band => band.id);
-        const invalidBandIds = req.body.bandIds.filter(id => !existingBandIds.includes(id));
-
-        if (invalidBandIds.length > 0) {
-          return res.status(400).json({
-            error: "Some band IDs don't exist",
-            invalidBandIds
-          });
-        }
-      }
-
-      // Delete existing references
-      await prisma.wishlistBandReference.deleteMany({
-        where: {
-          wishlist_id: wishlistId
-        }
-      });
-
-      // Create new references with validated band IDs
-      if (req.body.bandIds && req.body.bandIds.length > 0) {
-        await prisma.wishlistBandReference.createMany({
-          data: req.body.bandIds.map(bandId => ({
-            wishlist_id: wishlistId,
-            band_id: bandId,
-          })),
-        });
-      }
-
-      // Get the updated wishlist with bands
-      const updatedWishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
-        include: {
-          bands: {
-            include: {
-              band_rel: true
-            }
-          }
-        }
-      });
-
-      res.json(updatedWishlist);
-    } catch (error) {
-      console.error("Error updating wishlist:", error);
-      res.status(500).json({ error: "Internal server error" });
-    }
-  }
-);
 router.get(
   "/wishlists",
   [
@@ -379,7 +243,7 @@ router.get(
     }
   }
 );
-router.get("/wishlist/:id",
+router.get("/wishlists/:id",
   [
     auth,
     roleCheck(["ADMIN"]),
@@ -493,10 +357,12 @@ router.get("/wishlist/:id",
               concert_date: concert.concert_date,
               festival: concert.festival,
               url: concert.url,
-              participating_bands: concert.bands.map(b => ({
-                id: b.band_rel.id,
-                name: b.band_rel.name
-              }))
+              participating_bands: concert.bands
+                .map(b => ({
+                  id: b.band_rel.id,
+                  name: b.band_rel.name
+                }))
+                .filter(band => bandIds.includes(band.id)) // Only include bands that are in the wishlist
             });
           }
         });
@@ -549,8 +415,325 @@ router.get("/wishlist/:id",
     }
   }
 );
+
+// Create a new wishlist
+router.post(
+  "/wishlists",
+  [
+    auth,
+    roleCheck(["ADMIN"]),
+    body("name")
+      .trim()
+      .isLength({ min: 1, max: 100 })
+      .withMessage("Wishlist name must be between 1 and 100 characters"),
+  ],
+  rateLimit,
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          error: "Validation failed",
+          details: errors.array()
+        });
+      }
+
+      const { name } = req.body;
+
+      // Create the new wishlist
+      const newWishlist = await prisma.wishlist.create({
+        data: {
+          name: name.trim(),
+          user_id: req.user.id,
+        },
+        include: {
+          bands: true,
+        },
+      });
+
+      res.status(201).json(newWishlist);
+    } catch (error) {
+      console.error("Error creating wishlist:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// Update a wishlist name
+router.put(
+  "/wishlists/:id",
+  [
+    auth,
+    roleCheck(["ADMIN"]),
+    param("id").isInt().withMessage("Wishlist ID must be an integer"),
+    body("name")
+      .trim()
+      .isLength({ min: 1, max: 100 })
+      .withMessage("Wishlist name must be between 1 and 100 characters"),
+  ],
+  rateLimit,
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          error: "Validation failed",
+          details: errors.array()
+        });
+      }
+
+      const wishlistId = parseInt(req.params.id, 10);
+      const { name } = req.body;
+
+      // Check if wishlist exists and belongs to the user
+      const existingWishlist = await prisma.wishlist.findUnique({
+        where: { id: wishlistId },
+      });
+
+      if (!existingWishlist) {
+        return res.status(404).json({ error: "Wishlist not found" });
+      }
+
+      if (existingWishlist.user_id !== req.user.id) {
+        return res.status(403).json({ error: "Access denied" });
+      }
+
+      // Update the wishlist
+      const updatedWishlist = await prisma.wishlist.update({
+        where: { id: wishlistId },
+        data: { name: name.trim() },
+        include: {
+          bands: true,
+        },
+      });
+
+      res.json(updatedWishlist);
+    } catch (error) {
+      console.error("Error updating wishlist:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// Add a band to a wishlist (create band if it doesn't exist)
+router.post(
+  "/wishlists/:id/bands",
+  [
+    auth,
+    roleCheck(["ADMIN"]),
+    param("id").isInt().withMessage("Wishlist ID must be an integer"),
+    body("name").isString().notEmpty().withMessage("Band name is required"),
+  ],
+  rateLimit,
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          error: "Validation failed",
+          details: errors.array()
+        });
+      }
+
+      const wishlistId = parseInt(req.params.id, 10);
+      const bandName = req.body.name.trim();
+
+      // Check if wishlist exists and belongs to the user
+      const existingWishlist = await prisma.wishlist.findUnique({
+        where: { id: wishlistId },
+      });
+
+      if (!existingWishlist) {
+        return res.status(404).json({ error: "Wishlist not found" });
+      }
+
+      if (existingWishlist.user_id !== req.user.id) {
+        return res.status(403).json({ error: "Access denied" });
+      }
+
+      // Check if band already exists in the database
+      let band = await prisma.band.findUnique({
+        where: { name: bandName },
+        select: { id: true, name: true, ticketmaster_id: true },
+      });
+
+      let newBandCreated = false;
+
+      // If band doesn't exist, create it
+      if (!band) {
+        try {
+          // Fetch band data from Ticketmaster API
+          const foundBand = await axios.get(`${ticketmasterURL}attractions.json`, {
+            params: {
+              apikey: process.env.TICKETMASTER_KEY,
+              keyword: bandName,
+            },
+          });
+
+          if (!foundBand.data._embedded || !foundBand.data._embedded.attractions || foundBand.data._embedded.attractions.length === 0) {
+            return res.status(404).json({ error: "Band not found on Ticketmaster" });
+          }
+
+          const bandData = foundBand.data._embedded.attractions[0];
+
+          // Create band in database
+          band = await prisma.band.create({
+            data: {
+              name: bandData.name,
+              ticketmaster_id: bandData.id,
+            },
+          });
+
+          newBandCreated = true;
+
+          // Fetch and add concerts for the new band
+          try {
+            const events = await axios.get(`${ticketmasterURL}events.json`, {
+              params: {
+                countryCode: countries.map(country => country.iso),
+                apikey: process.env.TICKETMASTER_KEY,
+                keyword: bandName,
+              },
+            });
+
+            if (events.data._embedded && events.data._embedded.events && events.data._embedded.events.length > 0) {
+              const uniqueEvents = await removeDuplicateEvents(events.data._embedded.events);
+
+              for (const event of uniqueEvents) {
+                const existingConcert = await findConcert({ event });
+                if (!existingConcert) {
+                  await addConcert({ band, event });
+                } else {
+                  await addToExistingConcert({
+                    concert: existingConcert,
+                    band,
+                    event,
+                  });
+                }
+              }
+            }
+          } catch (eventError) {
+            console.warn("Could not fetch events for band, but band was created:", eventError.message);
+            // Continue anyway - band was created successfully
+          }
+
+        } catch (error) {
+          if (error.response?.status === 404) {
+            return res.status(404).json({ error: "Band not found on Ticketmaster" });
+          } else if (error.response?.status === 429) {
+            return res.status(429).json({ error: "Too many requests to Ticketmaster, please try again later" });
+          }
+          console.error("Error fetching band from Ticketmaster:", error);
+          return res.status(500).json({ error: "Failed to fetch band information" });
+        }
+      }
+
+      // Check if band is already in the wishlist
+      const existingReference = await prisma.wishlistBandReference.findFirst({
+        where: {
+          wishlist_id: wishlistId,
+          band_id: band.id,
+        },
+      });
+
+      if (existingReference) {
+        return res.status(409).json({ error: "Band is already in this wishlist" });
+      }
+
+      // Add band to wishlist
+      await prisma.wishlistBandReference.create({
+        data: {
+          wishlist_id: wishlistId,
+          band_id: band.id,
+        },
+      });
+
+      // Return success response
+      res.status(201).json({
+        message: newBandCreated
+          ? "Band created and added to wishlist successfully"
+          : "Band added to wishlist successfully",
+        band: {
+          id: band.id,
+          name: band.name,
+          ticketmaster_id: band.ticketmaster_id,
+        },
+        newBandCreated,
+      });
+
+    } catch (error) {
+      console.error("Error adding band to wishlist:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// Remove a band from a wishlist
 router.delete(
-  "/wishlist/:id",
+  "/wishlists/:id/bands/:bandId",
+  [
+    auth,
+    roleCheck(["ADMIN"]),
+    param("id").isInt().withMessage("Wishlist ID must be an integer"),
+    param("bandId").isInt().withMessage("Band ID must be an integer"),
+  ],
+  rateLimit,
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          error: "Validation failed",
+          details: errors.array()
+        });
+      }
+
+      const wishlistId = parseInt(req.params.id, 10);
+      const bandId = parseInt(req.params.bandId, 10);
+
+      // Check if wishlist exists and belongs to the user
+      const existingWishlist = await prisma.wishlist.findUnique({
+        where: { id: wishlistId },
+      });
+
+      if (!existingWishlist) {
+        return res.status(404).json({ error: "Wishlist not found" });
+      }
+
+      if (existingWishlist.user_id !== req.user.id) {
+        return res.status(403).json({ error: "Access denied" });
+      }
+
+      // Check if the band is in the wishlist
+      const existingReference = await prisma.wishlistBandReference.findFirst({
+        where: {
+          wishlist_id: wishlistId,
+          band_id: bandId,
+        },
+      });
+
+      if (!existingReference) {
+        return res.status(404).json({ error: "Band not found in this wishlist" });
+      }
+
+      // Remove the band from the wishlist
+      await prisma.wishlistBandReference.delete({
+        where: {
+          id: existingReference.id,
+        },
+      });
+
+      res.json({ message: "Band removed from wishlist successfully" });
+
+    } catch (error) {
+      console.error("Error removing band from wishlist:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+router.delete(
+  "/wishlists/:id",
   [
     auth,
     roleCheck(["ADMIN"]),
@@ -568,7 +751,16 @@ router.delete(
         return res.status(404).json({ error: "Wishlist not found." });
       }
 
-      // Delete the wishlist
+      if (existingWishlist.user_id !== req.user.id) {
+        return res.status(403).json({ error: "Access denied" });
+      }
+
+      // Delete related wishlist_band_references first
+      await prisma.wishlistBandReference.deleteMany({
+        where: { wishlist_id: wishlistId },
+      });
+
+      // Then delete the wishlist
       await prisma.wishlist.delete({
         where: { id: wishlistId },
       });
