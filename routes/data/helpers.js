@@ -4,6 +4,7 @@ module.exports = {
   findConcert,
   removeDuplicateEvents,
   addToExistingConcert,
+  handleError,
 };
 async function addConcert({ band, event }) {
 
@@ -104,4 +105,27 @@ async function removeDuplicateEvents(events) {
 
   return uniqueEvents;
 }
+const errorMessages = {
+  events: {
+    404: { error: "No events found for this band." },
+    429: { error: "Too many requests, please try again later." },
+    500: { error: "Internal server error" },
+  },
+  band: {
+    404: { error: "Band not found with that Ticketmaster ID" },
+    409: { error: "Band already exists." },
+    500: { error: "Internal server error" },
+  },
+  wishlist: {
+    404: { error: "Wishlist not found." },
+    500: { error: "Internal server error" },
+  },
+};
 
+function handleError(module, status) {
+  const moduleErrors = errorMessages[module];
+  if (moduleErrors && moduleErrors[status]) {
+    return moduleErrors[status];
+  }
+  return { error: "An unknown error occurred." };
+}
