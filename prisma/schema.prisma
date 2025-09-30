@@ -132,5 +132,5 @@ model WishlistBandReference {
 enum Role {
   USER
   ADMIN
-  MODERATOR
+  SYSTEM
 }

@@ -1,28 +1,27 @@
-const express = require("express");
+const express = require('express');
 const router = express.Router();
-const { validationResult, param } = require("express-validator");
-const bcrypt = require("bcrypt");
-const multer = require("multer");
-const { v4: uuidv4 } = require("uuid");
+const { validationResult, param } = require('express-validator');
+const bcrypt = require('bcrypt');
+const multer = require('multer');
+const { v4: uuidv4 } = require('uuid');
 const upload = multer();
-const jwt = require("jsonwebtoken");
+const jwt = require('jsonwebtoken');
 
-const userValidation = require("../utils/validation/user");
-const auth = require("../auth/verifyJWT");
-const roleCheck = require("../middlewares/roleCheck");
-const { paginationValidation } = require("../utils/validation/pagination");
-const { findUserById, findUserByEmail } = require("../utils/findUser");
-const { rateLimiter } = require("../utils/rateLimiter");
-const prisma = require("../prisma/client");
-const signJWT = require("../auth/signJWT");
+const userValidation = require('../utils/validation/user');
+const auth = require('../auth/verifyJWT');
+const roleCheck = require('../middlewares/roleCheck');
+const { paginationValidation } = require('../utils/validation/pagination');
+const { rateLimiter } = require('../utils/rateLimiter');
+const prisma = require('../prisma/client');
+const signJWT = require('../auth/signJWT');
 
 // Defaults to 5 requests per 15 minutes per IP
 const rateLimit = rateLimiter({
-  message: "Too many requests to the users route, please try again later.",
+  message: 'Too many requests to the users route, please try again later.',
 });
 
 router.post(
-  "/register",
+  '/register',
   rateLimit,
   upload.none(),
   userValidation,
@@ -40,7 +39,7 @@ router.post(
         where: { email },
       });
       if (existingUser) {
-        return res.status(409).json({ error: "Email already in use" });
+        return res.status(409).json({ error: 'Email already in use' });
       }
 
       // Hash the password
@@ -48,23 +47,23 @@ router.post(
 
       const user = await prisma.user.create({
         data: {
-          id: uuidv4().replace(/-/g, ""),
+          id: uuidv4().replace(/-/g, ''),
           email,
           password_hash: passwordHash,
         },
         select: { id: true, email: true },
       });
 
-      res.status(201).json({ message: "User registered successfully", user });
+      res.status(201).json({ message: 'User registered successfully', user });
     } catch (error) {
-      console.error("Error during registration:", error);
-      res.status(500).json({ error: "Internal server error" });
+      console.error('Error during registration:', error);
+      res.status(500).json({ error: 'Internal server error' });
     }
-  }
+  },
 );
 
 router.post(
-  "/login",
+  '/login',
   rateLimit,
   upload.none(),
   userValidation,
@@ -82,23 +81,23 @@ router.post(
         where: { email },
       });
       if (!existingUser) {
-        return res.status(403).json({ error: "Invalid credentials" });
+        return res.status(403).json({ error: 'Invalid credentials' });
       }
 
       // Hash the password
       const passwordCompare = await bcrypt.compare(
         password,
-        existingUser.password_hash
+        existingUser.password_hash,
       );
 
       if (!passwordCompare) {
-        return res.status(401).json({ error: "Invalid credentials" });
+        return res.status(401).json({ error: 'Invalid credentials' });
       }
 
       const user = {
         id: existingUser.id,
         email: existingUser.email,
-        role: existingUser.role || "USER", // Default to USER if no role is set
+        role: existingUser.role || 'USER', // Default to USER if no role is set
       };
 
       // If you want to be safer, you could insert the token into the DB
@@ -108,15 +107,15 @@ router.post(
       // Return the user and token
       res
         .status(200)
-        .json({ message: "User logged in successfully", user, token });
+        .json({ message: 'User logged in successfully', user, token });
     } catch (error) {
-      console.error("Error during login:", error);
-      return res.status(500).json({ error: "Internal server error" });
+      console.error('Error during login:', error);
+      return res.status(500).json({ error: 'Internal server error' });
     }
-  }
+  },
 );
 
-router.get("/me", auth, async (req, res) => {
+router.get('/me', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     const user = await prisma.user.findUnique({
@@ -155,7 +154,7 @@ router.get("/me", auth, async (req, res) => {
     });
 
     if (!user) {
-      return res.status(404).json({ error: "User not found" });
+      return res.status(404).json({ error: 'User not found' });
     }
 
     // Limit to top 3 gameTimes and movieReviews in JS
@@ -167,15 +166,15 @@ router.get("/me", auth, async (req, res) => {
 
     res.json({ user });
   } catch (error) {
-    console.error("Error fetching user:", error);
-    res.status(500).json({ error: "Internal server error" });
+    console.error('Error fetching user:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 router.get(
-  "/",
+  '/',
   auth,
-  roleCheck(["ADMIN"]),
+  roleCheck(['ADMIN']),
   paginationValidation,
   async (req, res) => {
     try {
@@ -194,7 +193,7 @@ router.get(
         prisma.user.findMany({
           skip,
           take: limit,
-          orderBy: { created_at: "desc" },
+          orderBy: { created_at: 'desc' },
           select: { id: true, email: true, role: true, created_at: true },
         }),
         prisma.user.count(),
@@ -210,21 +209,21 @@ router.get(
 
       res.json({ users, page, totalPages, total });
     } catch (error) {
-      console.error("Error fetching users:", error);
-      res.status(500).json({ error: "Internal server error" });
+      console.error('Error fetching users:', error);
+      res.status(500).json({ error: 'Internal server error' });
     }
-  }
+  },
 );
 
 const cuidRegex = /^[a-z0-9]{32}$/;
 router.get(
-  "/:id",
+  '/:id',
   auth,
-  roleCheck(["ADMIN"]),
-  param("id")
+  roleCheck(['ADMIN']),
+  param('id')
     .isString()
     .matches(cuidRegex)
-    .withMessage("Invalid user ID format"),
+    .withMessage('Invalid user ID format'),
   async (req, res) => {
     try {
       const errors = validationResult(req);
@@ -270,7 +269,7 @@ router.get(
       });
 
       if (!user) {
-        return res.status(404).json({ error: "User not found" });
+        return res.status(404).json({ error: 'User not found' });
       }
 
       // Limit to top 3 gameTimes and movieReviews in JS
@@ -282,10 +281,10 @@ router.get(
 
       res.json({ user });
     } catch (error) {
-      console.error("Error fetching user:", error);
-      res.status(500).json({ error: "Internal server error" });
+      console.error('Error fetching user:', error);
+      res.status(500).json({ error: 'Internal server error' });
     }
-  }
+  },
 );
 
 module.exports = router;

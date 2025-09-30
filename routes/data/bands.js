@@ -144,7 +144,7 @@ router.post(
   '/bands/:bandId/sync-concerts',
   rateLimit,
   auth,
-  roleCheck(['ADMIN']),
+  roleCheck(['ADMIN', 'SYSTEM']),
   async (req, res) => {
     const { bandId } = req.params;
     try {
@@ -175,7 +175,7 @@ router.post(
         response.data._embedded.events.length === 0
       ) {
         return res
-          .status(404)
+          .status(200)
           .json({ error: 'No events found for this band.' });
       }
 
