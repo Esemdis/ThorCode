@@ -1,41 +1,42 @@
-const express = require("express");
+const express = require('express');
 const router = express.Router();
-const { validationResult, body } = require("express-validator");
-const axios = require("axios");
+const { validationResult, body, query } = require('express-validator');
+const axios = require('axios');
 const {
   addConcert,
   findConcert,
   addToExistingConcert,
   removeDuplicateEvents,
   handleError,
-} = require("./helpers");
+} = require('./helpers');
 
-const auth = require("../../auth/verifyJWT");
-const { rateLimiter } = require("../../utils/rateLimiter");
-const prisma = require("../../prisma/client");
+const auth = require('../../auth/verifyJWT');
+const { rateLimiter } = require('../../utils/rateLimiter');
+const prisma = require('../../prisma/client');
 
 // Defaults to 5 requests per 15 minutes per IP
-const ticketmasterURL = "https://app.ticketmaster.com/discovery/v2/";
+const ticketmasterURL = 'https://app.ticketmaster.com/discovery/v2/';
 const rateLimit = rateLimiter({
-  message: "Too many requests to the Ticketmaster data route, please try again later.",
+  message:
+    'Too many requests to the Ticketmaster data route, please try again later.',
 });
 const countries = [
-  { name: "Germany", iso: "DE" },
-  { name: "Austria", iso: "AT" },
-  { name: "Netherlands", iso: "NL" },
-  { name: "Denmark", iso: "DK" },
-  { name: "Belgium", iso: "BE" },
-  { name: "Norway", iso: "NO" },
-  { name: "Switzerland", iso: "CH" },
-  { name: "Spain", iso: "ES" },
-  { name: "Sweden", iso: "SE" },
-  { name: "Finland", iso: "FI" },
-  { name: "Poland", iso: "PL" },
-  { name: "United Kingdom", iso: "GB" },
+  { name: 'Germany', iso: 'DE' },
+  { name: 'Austria', iso: 'AT' },
+  { name: 'Netherlands', iso: 'NL' },
+  { name: 'Denmark', iso: 'DK' },
+  { name: 'Belgium', iso: 'BE' },
+  { name: 'Norway', iso: 'NO' },
+  { name: 'Switzerland', iso: 'CH' },
+  { name: 'Spain', iso: 'ES' },
+  { name: 'Sweden', iso: 'SE' },
+  { name: 'Finland', iso: 'FI' },
+  { name: 'Poland', iso: 'PL' },
+  { name: 'United Kingdom', iso: 'GB' },
 ];
 
 // Search bands by name for autocomplete
-router.get("/bands/search", async (req, res) => {
+router.get('/bands/search', async (req, res) => {
   try {
     const { q, limit = 10 } = req.query;
 
@@ -49,7 +50,7 @@ router.get("/bands/search", async (req, res) => {
       where: {
         name: {
           contains: searchTerm,
-          mode: "insensitive",
+          mode: 'insensitive',
         },
       },
       select: {
@@ -58,7 +59,7 @@ router.get("/bands/search", async (req, res) => {
       },
       orderBy: [
         {
-          name: "asc",
+          name: 'asc',
         },
       ],
       take: parseInt(limit, 10),
@@ -66,8 +67,12 @@ router.get("/bands/search", async (req, res) => {
 
     // Sort results to prioritize matches that start with the search term
     const sortedBands = bands.sort((a, b) => {
-      const aStartsWith = a.name.toLowerCase().startsWith(searchTerm.toLowerCase());
-      const bStartsWith = b.name.toLowerCase().startsWith(searchTerm.toLowerCase());
+      const aStartsWith = a.name
+        .toLowerCase()
+        .startsWith(searchTerm.toLowerCase());
+      const bStartsWith = b.name
+        .toLowerCase()
+        .startsWith(searchTerm.toLowerCase());
 
       if (aStartsWith && !bStartsWith) return -1;
       if (!aStartsWith && bStartsWith) return 1;
@@ -76,13 +81,13 @@ router.get("/bands/search", async (req, res) => {
 
     res.json(sortedBands);
   } catch (error) {
-    console.error("Error searching bands:", error);
-    res.status(500).json({ error: "Internal server error" });
+    console.error('Error searching bands:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // List all bands in the DB
-router.get("/bands", async (req, res) => {
+router.get('/bands', async (req, res) => {
   try {
     const bands = await prisma.band.findMany({
       select: {
@@ -92,18 +97,101 @@ router.get("/bands", async (req, res) => {
     });
     res.json(bands);
   } catch (error) {
-    console.error("Error fetching bands:", error);
-    res.status(500).json({ error: "Internal server error" });
+    console.error('Error fetching bands:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 router.post(
-  "/bands",
+  '/bands/:bandId/sync-concerts',
   rateLimit,
   auth,
-  body("name").optional().isString().notEmpty().withMessage("Band name must be a non-empty string"),
-  body("ticketmaster_id").optional().isString().notEmpty().withMessage("Ticketmaster ID must be a non-empty string"),
-  body("wishlistId").optional().isInt().withMessage("Wishlist ID must be an integer"),
+  async (req, res) => {
+    const { bandId } = req.params;
+    try {
+      // Fetch the band from the database
+      const band = await prisma.band.findUnique({
+        where: { id: parseInt(bandId) },
+      });
+
+      if (!band) {
+        return res.status(404).json({ error: 'Band not found' });
+      }
+      console.log(band.ticketmaster_id);
+
+      // Fetch concerts from Ticketmaster API using the correct endpoint
+      const eventParams = {
+        countryCode: countries.map((country) => country.iso),
+        apikey: process.env.TICKETMASTER_KEY,
+        attractionId: band.ticketmaster_id,
+      };
+
+      const response = await axios.get(`${ticketmasterURL}events.json`, {
+        params: eventParams,
+      });
+
+      if (
+        !response.data._embedded ||
+        !response.data._embedded.events ||
+        response.data._embedded.events.length === 0
+      ) {
+        return res
+          .status(404)
+          .json({ error: 'No events found for this band.' });
+      }
+
+      const events = response.data._embedded.events;
+
+      const uniqueEvents = await removeDuplicateEvents(events);
+
+      for (const event of uniqueEvents) {
+        const existingConcert = await findConcert({ event });
+        if (!existingConcert) {
+          await addConcert({ band, event });
+        } else {
+          await addToExistingConcert({
+            concert: existingConcert,
+            band,
+            event,
+          });
+        }
+      }
+
+      res.status(200).json({ message: 'Concerts synced successfully' });
+    } catch (error) {
+      if (error.response?.status === 404) {
+        return res
+          .status(404)
+          .json({ error: 'No events found for this band.' });
+      } else if (error.response?.status === 429) {
+        return res
+          .status(429)
+          .json({ error: 'Too many requests, please try again later.' });
+      }
+      console.error('Error syncing concerts:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+);
+
+router.post(
+  '/bands',
+  rateLimit,
+  auth,
+  body('name')
+    .optional()
+    .isString()
+    .notEmpty()
+    .withMessage('Band name must be a non-empty string'),
+  body('ticketmaster_id')
+    .optional()
+    .isString()
+    .notEmpty()
+    .withMessage('Ticketmaster ID must be a non-empty string'),
+  body('wishlistId')
+    .optional()
+    .isInt()
+    .withMessage('Wishlist ID must be an integer'),
   async (req, res) => {
     try {
       const errors = validationResult(req);
@@ -139,21 +227,26 @@ router.post(
       }
 
       if (band) {
-        return res.status(409).json({ error: "Band already exists." });
+        return res.status(409).json({ error: 'Band already exists.' });
       }
 
       let foundBand;
       try {
         if (ticketmasterId) {
           // Fetch band data by Ticketmaster ID
-          foundBand = await axios.get(`${ticketmasterURL}attractions/${ticketmasterId}.json`, {
-            params: {
-              apikey: process.env.TICKETMASTER_KEY,
+          foundBand = await axios.get(
+            `${ticketmasterURL}attractions/${ticketmasterId}.json`,
+            {
+              params: {
+                apikey: process.env.TICKETMASTER_KEY,
+              },
             },
-          });
+          );
 
           if (!foundBand.data) {
-            return res.status(404).json({ error: "Band not found with that Ticketmaster ID" });
+            return res
+              .status(404)
+              .json({ error: 'Band not found with that Ticketmaster ID' });
           }
 
           // For ID-based search, the response structure is different
@@ -168,17 +261,21 @@ router.post(
           });
 
           if (foundBand.data._embedded.attractions.length === 0) {
-            return res.status(404).json({ error: "No band found." });
+            return res.status(404).json({ error: 'No band found.' });
           }
         }
       } catch (error) {
         if (error.status === 404) {
-          return res.status(404).json({ error: "No events found for this band." });
+          return res
+            .status(404)
+            .json({ error: 'No events found for this band.' });
         } else if (error.response && error.response.status === 429) {
-          return res.status(429).json({ error: "Too many requests, please try again later." });
+          return res
+            .status(429)
+            .json({ error: 'Too many requests, please try again later.' });
         }
-        console.error("Error fetching events from Ticketmaster:", error);
-        return res.status(500).json({ error: "Internal server error" });
+        console.error('Error fetching events from Ticketmaster:', error);
+        return res.status(500).json({ error: 'Internal server error' });
       }
 
       const bandData = foundBand.data._embedded.attractions[0];
@@ -210,21 +307,27 @@ router.post(
           params: eventParams,
         });
       } catch (error) {
-        const payload = handleError("events", error.status || 500);
+        const payload = handleError('events', error.status || 500);
         return res.status(error.status || 500).json(payload);
       }
 
       if (events.status !== 200) {
-        const payload = handleError("events", events.status);
+        const payload = handleError('events', events.status);
         return res.status(events.status).json(payload);
       }
 
-      if (!events.data._embedded || !events.data._embedded.events || events.data._embedded.events.length === 0) {
-        const payload = handleError("events", 404);
+      if (
+        !events.data._embedded ||
+        !events.data._embedded.events ||
+        events.data._embedded.events.length === 0
+      ) {
+        const payload = handleError('events', 404);
         return res.status(404).json(payload);
       }
 
-      const uniqueEvents = await removeDuplicateEvents(events.data._embedded.events);
+      const uniqueEvents = await removeDuplicateEvents(
+        events.data._embedded.events,
+      );
 
       for (const event of uniqueEvents) {
         const existingConcert = await findConcert({ event });
@@ -255,15 +358,15 @@ router.post(
         concerts: uniqueEvents.map((event) => ({
           name: event.name,
           concert_date: event.concert_date
-            ? new Date(event.concert_date).toLocaleString("en-GB", {
-              year: "numeric",
-              month: "2-digit",
-              day: "2-digit",
-              hour: "2-digit",
-              minute: "2-digit",
-              timeZone: "Europe/Stockholm",
-            })
-            : "",
+            ? new Date(event.concert_date).toLocaleString('en-GB', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                timeZone: 'Europe/Stockholm',
+              })
+            : '',
           venue: event.venue,
           city: event.city,
           country: event.country,
@@ -273,15 +376,15 @@ router.post(
         })),
       });
     } catch (error) {
-      console.error("Error fetching Ticketmaster data:", error);
-      const payload = handleError("events", 500);
+      console.error('Error fetching Ticketmaster data:', error);
+      const payload = handleError('events', 500);
       return res.status(500).json(payload);
     }
-  }
+  },
 );
 
 // Search bands on Ticketmaster to get their IDs (helpful for disambiguation)
-router.get("/bands/ticketmaster-search", async (req, res) => {
+router.get('/bands/ticketmaster-search', async (req, res) => {
   try {
     const { q, limit = 10 } = req.query;
 
@@ -309,15 +412,18 @@ router.get("/bands/ticketmaster-search", async (req, res) => {
         name: attraction.name,
         url: attraction.url || null,
         // Include image if available
-        image: attraction.images && attraction.images.length > 0 ? attraction.images[0].url : null,
+        image:
+          attraction.images && attraction.images.length > 0
+            ? attraction.images[0].url
+            : null,
         // Include genre if available
         classifications: attraction.classifications
           ? attraction.classifications
-            .map((c) => ({
-              genre: c.genre?.name || null,
-              subGenre: c.subGenre?.name || null,
-            }))
-            .filter((c) => c.genre || c.subGenre)
+              .map((c) => ({
+                genre: c.genre?.name || null,
+                subGenre: c.subGenre?.name || null,
+              }))
+              .filter((c) => c.genre || c.subGenre)
           : [],
       }));
 
@@ -326,16 +432,16 @@ router.get("/bands/ticketmaster-search", async (req, res) => {
       if (error.response?.status === 404) {
         return res.json([]);
       } else if (error.response?.status === 429) {
-        const payload = handleError("wishlist", 429);
+        const payload = handleError('wishlist', 429);
         return res.status(429).json(payload);
       }
-      console.error("Error searching Ticketmaster:", error);
-      const payload = handleError("wishlist", 500);
+      console.error('Error searching Ticketmaster:', error);
+      const payload = handleError('wishlist', 500);
       return res.status(500).json(payload);
     }
   } catch (error) {
-    console.error("Error in Ticketmaster search:", error);
-    const payload = handleError("wishlist", 500);
+    console.error('Error in Ticketmaster search:', error);
+    const payload = handleError('wishlist', 500);
     return res.status(500).json(payload);
   }
 });
