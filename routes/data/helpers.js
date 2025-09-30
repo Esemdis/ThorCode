@@ -1,4 +1,4 @@
-const prisma = require("../../prisma/client");
+const prisma = require('../../prisma/client');
 module.exports = {
   addConcert,
   findConcert,
@@ -7,20 +7,37 @@ module.exports = {
   handleError,
 };
 async function addConcert({ band, event }) {
+  let concert;
+  try {
+    concert = await prisma.concert.create({
+      data: {
+        ...event,
+      },
+    });
+  } catch (e) {
+    // Handle race condition / duplicate creation gracefully
+    if (e.code === 'P2002' && e.meta?.target?.includes('event_id')) {
+      concert = await prisma.concert.findUnique({
+        where: { event_id: event.event_id },
+      });
+      if (!concert) throw e; // If still not found, rethrow
+    } else {
+      throw e;
+    }
+  }
 
-  const concert = await prisma.concert.create({
-    data: {
-      ...event
-    },
+  // Create the band-concert relationship if not already existing
+  const existingRel = await prisma.concertBandReference.findFirst({
+    where: { concert: concert.id, band: band.id },
   });
-
-  // Create the band-concert relationship
-  await prisma.concertBandReference.create({
-    data: {
-      concert: concert.id,
-      band: band.id,
-    },
-  });
+  if (!existingRel) {
+    await prisma.concertBandReference.create({
+      data: {
+        concert: concert.id,
+        band: band.id,
+      },
+    });
+  }
 
   return concert;
 }
@@ -30,12 +47,14 @@ async function findConcert({ event }) {
     where: {
       OR: [
         {
-          event_id: event.id,
+          event_id: event.event_id, // Correct property from transformed event object
         },
         {
           AND: [
             {
-              concert_date: event.concert_date ? new Date(event.concert_date) : null,
+              concert_date: event.concert_date
+                ? new Date(event.concert_date)
+                : null,
             },
             {
               venue: event.venue,
@@ -45,7 +64,7 @@ async function findConcert({ event }) {
       ],
     },
   });
-  return concert
+  return concert;
 }
 
 async function addToExistingConcert({ concert, band, event }) {
@@ -55,7 +74,7 @@ async function addToExistingConcert({ concert, band, event }) {
     },
   });
 
-  if (existingBands.some(b => b.band === band.id)) {
+  if (existingBands.some((b) => b.band === band.id)) {
     return;
   }
 
@@ -71,10 +90,11 @@ async function removeDuplicateEvents(events) {
   const uniqueEvents = [];
   const seenVenueDates = new Map();
 
-  events.forEach(event => {
+  events.forEach((event) => {
     const venue = event._embedded?.venues?.[0]?.name || 'unknown';
     const location = event._embedded?.venues?.[0];
-    const performingBands = event._embedded?.attractions?.map(a => a.name) || [];
+    const performingBands =
+      event._embedded?.attractions?.map((a) => a.name) || [];
     const eventDate = event.dates?.start?.dateTime
       ? new Date(event.dates.start.dateTime).toISOString().split('T')[0]
       : 'unknown';
@@ -94,11 +114,15 @@ async function removeDuplicateEvents(events) {
         name: event.name,
         festival: performingBands.length > 6,
         ticket_sale_start: new Date(event.sales?.public?.startDateTime),
-        concert_date: dates.start.dateTime ? new Date(dates.start.dateTime) : null,
+        concert_date: dates.start.dateTime
+          ? new Date(dates.start.dateTime)
+          : null,
         on_sale: dates.status.code === 'onsale',
         created_at: new Date(),
         url: event.url,
-        metadata: `${performingBands.join(", ")} performing in ${location.city.name}`
+        metadata: `${performingBands.join(', ')} performing in ${
+          location.city.name
+        }`,
       });
     }
   });
@@ -107,18 +131,18 @@ async function removeDuplicateEvents(events) {
 }
 const errorMessages = {
   events: {
-    404: { error: "No events found for this band." },
-    429: { error: "Too many requests, please try again later." },
-    500: { error: "Internal server error" },
+    404: { error: 'No events found for this band.' },
+    429: { error: 'Too many requests, please try again later.' },
+    500: { error: 'Internal server error' },
   },
   band: {
-    404: { error: "Band not found with that Ticketmaster ID" },
-    409: { error: "Band already exists." },
-    500: { error: "Internal server error" },
+    404: { error: 'Band not found with that Ticketmaster ID' },
+    409: { error: 'Band already exists.' },
+    500: { error: 'Internal server error' },
   },
   wishlist: {
-    404: { error: "Wishlist not found." },
-    500: { error: "Internal server error" },
+    404: { error: 'Wishlist not found.' },
+    500: { error: 'Internal server error' },
   },
 };
 
@@ -127,5 +151,5 @@ function handleError(module, status) {
   if (moduleErrors && moduleErrors[status]) {
     return moduleErrors[status];
   }
-  return { error: "An unknown error occurred." };
+  return { error: 'An unknown error occurred.' };
 }
