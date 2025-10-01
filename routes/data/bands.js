@@ -196,6 +196,10 @@ router.post(
           });
         }
       }
+      const countries = uniqueEvents
+        .map((e) => e.country)
+        .filter((v, i, a) => v && a.indexOf(v) === i); // unique & non-empty
+      const startDate = uniqueEvents.map((e) => e.concert_date).sort()[0];
 
       res.status(200).json({
         message:
@@ -203,6 +207,8 @@ router.post(
           (newConcerts ? ` (${newConcerts} new)` : ''),
         newConcerts,
         band: { id: band.id, name: band.name },
+        countries,
+        startDate,
       });
     } catch (error) {
       if (error.response?.status === 404) {
