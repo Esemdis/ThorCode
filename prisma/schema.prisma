@@ -72,7 +72,7 @@ model Band {
   id              Int                     @id @default(autoincrement())
   name            String                  @unique
   ticketmaster_id String                  @unique
-  created_at      DateTime
+  created_at      DateTime?
   concerts        ConcertBandReference[]  @relation("BandConcerts")
   wishlists       WishlistBandReference[] @relation("BandWishlists")
 }

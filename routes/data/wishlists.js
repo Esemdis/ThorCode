@@ -431,6 +431,7 @@ router.post(
             data: {
               name: bandData.name,
               ticketmaster_id: bandData.id,
+              created_at: new Date(),
             },
           });
 

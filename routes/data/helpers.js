@@ -5,6 +5,9 @@ module.exports = {
   removeDuplicateEvents,
   addToExistingConcert,
   handleError,
+  checkDuplicateConcert,
+  stringSimilarity,
+  deduplicateEventsByName,
 };
 async function addConcert({ band, event }) {
   let concert;
@@ -85,6 +88,71 @@ async function addToExistingConcert({ concert, band, event }) {
     },
   });
 }
+
+async function checkDuplicateConcert({ concert, bandIds, tx }) {
+  /**
+   * Check for duplicate concerts based on festival status:
+   * - For festivals: deduplicate by concert_date + venue + city
+   * - For non-festivals: deduplicate by concert_date + venue + band combination
+   * 
+   * If duplicate found, merge additional bands into existing concert
+   * 
+   * Returns: { isDuplicate: boolean, existingConcert: concert object or null }
+   */
+  let existingConcert = null;
+
+  if (concert.festival) {
+    // For festivals, check by date + venue + city (looser matching)
+    existingConcert = await tx.concert.findFirst({
+      where: {
+        concert_date: concert.concert_date
+          ? new Date(concert.concert_date)
+          : null,
+        venue: concert.venue,
+        city: concert.city,
+        festival: true,
+      },
+      include: { bands: true },
+    });
+  } else {
+    // For non-festivals, use concert_date + venue + band combination
+    if (concert.concert_date && bandIds.length > 0) {
+      for (const bandId of bandIds) {
+        existingConcert = await tx.concert.findFirst({
+          where: {
+            concert_date: concert.concert_date
+              ? new Date(concert.concert_date)
+              : null,
+            venue: concert.venue,
+            bands: { some: { band: bandId } },
+          },
+          include: { bands: true },
+        });
+        if (existingConcert) break;
+      }
+    }
+  }
+
+  // If duplicate found, merge any new bands into existing concert
+  if (existingConcert) {
+    for (const bandId of bandIds) {
+      const existingRef = await tx.concertBandReference.findFirst({
+        where: { concert: existingConcert.id, band: bandId },
+      });
+      if (!existingRef) {
+        await tx.concertBandReference.create({
+          data: { concert: existingConcert.id, band: bandId },
+        });
+      }
+    }
+  }
+
+  return {
+    isDuplicate: !!existingConcert,
+    existingConcert,
+  };
+}
+
 async function removeDuplicateEvents(events) {
   // Deduplicate events by venue and date
   const uniqueEvents = [];
@@ -152,4 +220,90 @@ function handleError(module, status) {
     return moduleErrors[status];
   }
   return { error: 'An unknown error occurred.' };
+}
+
+function stringSimilarity(s1, s2) {
+  /**
+   * Calculate similarity between two strings using character overlap.
+   * Returns 0-1 where 1 is identical.
+   */
+  if (!s1 || !s2) return 0.0;
+  
+  const s1Lower = s1.toLowerCase();
+  const s2Lower = s2.toLowerCase();
+  
+  // Count matching characters at same positions
+  let matches = 0;
+  for (let i = 0; i < Math.min(s1Lower.length, s2Lower.length); i++) {
+    if (s1Lower[i] === s2Lower[i]) matches++;
+  }
+  
+  // Normalize by longer string length
+  const maxLen = Math.max(s1Lower.length, s2Lower.length);
+  return maxLen > 0 ? matches / maxLen : 0.0;
+}
+
+function deduplicateEventsByName(concerts, similarityThreshold = 0.28, daysThreshold = 5) {
+  /**
+   * Remove duplicate concerts based on name similarity AND date proximity.
+   * Prefers to keep concerts with "weekend" in the name.
+   * 
+   * @param {Array} concerts - Array of concert objects to deduplicate
+   * @param {Number} similarityThreshold - Name similarity threshold (0-1)
+   * @param {Number} daysThreshold - Days threshold for date proximity
+   * @returns {Array} Deduplicated concerts
+   */
+  if (!concerts || concerts.length === 0) return [];
+  
+  const getEventDate = (concert) => {
+    if (concert.concert_date) {
+      return new Date(concert.concert_date);
+    }
+    return null;
+  };
+  
+  const seenIndices = new Set();
+  const result = [];
+  
+  for (let i = 0; i < concerts.length; i++) {
+    if (seenIndices.has(i)) continue;
+    
+    const name1 = (concerts[i].name || '').toLowerCase();
+    const isWeekend1 = name1.includes('weekend');
+    const date1 = getEventDate(concerts[i]);
+    
+    for (let j = i + 1; j < concerts.length; j++) {
+      if (seenIndices.has(j)) continue;
+      
+      const name2 = (concerts[j].name || '').toLowerCase();
+      const similarity = stringSimilarity(name1, name2);
+      
+      if (similarity > similarityThreshold) {
+        const date2 = getEventDate(concerts[j]);
+        
+        // Check date proximity
+        if (date1 && date2) {
+          const daysDiff = Math.abs(Math.floor((date1 - date2) / (1000 * 60 * 60 * 24)));
+          if (daysDiff > daysThreshold) continue;
+        } else if (!date1 || !date2) {
+          continue; // Can't determine if duplicates without dates
+        }
+        
+        // Prefer weekend events
+        const isWeekend2 = name2.includes('weekend');
+        if (isWeekend2 && !isWeekend1) {
+          seenIndices.add(i);
+          break;
+        } else {
+          seenIndices.add(j);
+        }
+      }
+    }
+    
+    if (!seenIndices.has(i)) {
+      result.push(concerts[i]);
+    }
+  }
+  
+  return result;
 }

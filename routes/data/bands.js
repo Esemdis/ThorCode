@@ -8,6 +8,7 @@ const {
   addToExistingConcert,
   removeDuplicateEvents,
   handleError,
+  checkDuplicateConcert,
 } = require('./helpers');
 
 const auth = require('../../auth/verifyJWT');
@@ -35,6 +36,290 @@ const countries = [
   { name: 'Poland', iso: 'PL' },
   { name: 'United Kingdom', iso: 'GB' },
 ];
+
+// Helper function to get ticketmaster_id for a band
+// First checks DB, then falls back to API search if needed
+async function getTicketmasterId(bandIdentifier) {
+  // If identifier looks like a Ticketmaster ID (numeric), check DB first
+  if (bandIdentifier && /^\d+$/.test(bandIdentifier)) {
+    const band = await prisma.band.findUnique({
+      where: { ticketmaster_id: bandIdentifier },
+      select: { ticketmaster_id: true },
+    });
+    if (band) return band.ticketmaster_id;
+    
+    // If not in DB but looks like valid TM ID, return it (it's probably valid)
+    return bandIdentifier;
+  }
+  
+  // Try finding by name in DB
+  const band = await prisma.band.findUnique({
+    where: { name: bandIdentifier },
+    select: { ticketmaster_id: true },
+  });
+  if (band?.ticketmaster_id) return band.ticketmaster_id;
+  
+  // Fall back to API search to get the Ticketmaster ID
+  try {
+    const response = await axios.get(`${ticketmasterURL}attractions.json`, {
+      params: {
+        apikey: process.env.TICKETMASTER_KEY,
+        keyword: bandIdentifier,
+        size: 1,
+      },
+    });
+
+    if (response.data._embedded?.attractions?.[0]?.id) {
+      return response.data._embedded.attractions[0].id;
+    }
+    
+    throw new Error('Band not found on Ticketmaster');
+  } catch (error) {
+    if (error.response?.status === 429) {
+      throw new Error('Rate limited by Ticketmaster API');
+    }
+    throw new Error(`Could not find Ticketmaster ID for band "${bandIdentifier}"`);
+  }
+}
+
+// Bulk insert concerts with deduplication
+router.post(
+  '/bulk',
+  auth,
+  roleCheck(['ADMIN', 'SYSTEM']),
+  body('concerts')
+    .isArray({ min: 1 })
+    .withMessage('concerts must be a non-empty array'),
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const { concerts } = req.body;
+
+      const result = await prisma.$transaction(async (tx) => {
+        const insertedConcerts = [];
+        const duplicateConcerts = [];
+        const errors = [];
+
+        for (let i = 0; i < concerts.length; i++) {
+          const concert = concerts[i];
+
+          // Validate required fields
+          if (!concert.country || !concert.venue || !concert.city) {
+            errors.push({
+              index: i,
+              message:
+                'Concert must have country, venue, and city fields',
+            });
+            continue;
+          }
+
+          if (!concert.bands || !Array.isArray(concert.bands) || concert.bands.length === 0) {
+            errors.push({
+              index: i,
+              message: 'Concert must have at least one band',
+            });
+            continue;
+          }
+
+          try {
+            // Check for duplicates by event_id if provided
+            if (concert.event_id) {
+              const existingByEventId = await tx.concert.findUnique({
+                where: { event_id: concert.event_id },
+              });
+
+              if (existingByEventId) {
+                // For festival events, add the new bands to the existing concert
+                if (concert.festival && existingByEventId.festival) {
+                  const bandIds = [];
+                  for (const band of concert.bands) {
+                    if (!band.name || !band.ticketmaster_id) {
+                      throw new Error(`Invalid band data at index ${i}: name and ticketmaster_id required`);
+                    }
+
+                    let dbBand = await tx.band.findFirst({
+                      where: {
+                        ticketmaster_id: band.ticketmaster_id,
+                      },
+                    });
+
+                    if (!dbBand) {
+                      dbBand = await tx.band.create({
+                        data: {
+                          name: band.name,
+                          ticketmaster_id: band.ticketmaster_id,
+                          created_at: new Date(),
+                        },
+                      });
+                    }
+
+                    // Link band to existing concert (if not already linked)
+                    const existingRef = await tx.concertBandReference.findFirst({
+                      where: {
+                        concert: existingByEventId.id,
+                        band: dbBand.id,
+                      },
+                    });
+
+                    if (!existingRef) {
+                      await tx.concertBandReference.create({
+                        data: {
+                          concert: existingByEventId.id,
+                          band: dbBand.id,
+                        },
+                      });
+                      bandIds.push(dbBand.id);
+                    }
+                  }
+
+                  duplicateConcerts.push({
+                    index: i,
+                    reason: 'festival - added bands to existing concert',
+                    concertId: existingByEventId.id,
+                    bandsAdded: bandIds.length,
+                  });
+                  continue;
+                } else {
+                  // Non-festival duplicate, skip it
+                  duplicateConcerts.push({
+                    index: i,
+                    reason: 'event_id already exists',
+                    concertId: existingByEventId.id,
+                  });
+                  continue;
+                }
+              }
+            }
+
+            // Process and validate bands
+            const bandIds = [];
+            for (const band of concert.bands) {
+              if (!band.name || !band.ticketmaster_id) {
+                throw new Error(`Invalid band data at index ${i}: name and ticketmaster_id required`);
+              }
+
+              let dbBand = await tx.band.findFirst({
+                where: {
+                  ticketmaster_id: band.ticketmaster_id,
+                },
+              });
+
+              if (!dbBand) {
+                // Create new band
+                dbBand = await tx.band.create({
+                  data: {
+                    name: band.name,
+                    ticketmaster_id: band.ticketmaster_id,
+                    created_at: new Date(),
+                  },
+                });
+              }
+
+              bandIds.push(dbBand.id);
+            }
+
+            // Check for duplicates using helper
+            const { isDuplicate, existingConcert } = await checkDuplicateConcert({
+              concert,
+              bandIds,
+              tx,
+            });
+
+            if (isDuplicate) {
+              duplicateConcerts.push({
+                index: i,
+                reason: concert.festival
+                  ? 'festival duplicate (merged bands)'
+                  : 'duplicate concert_date + venue + band combination',
+                concertId: existingConcert.id,
+              });
+              continue;
+            }
+
+            // Create concert
+            const newConcert = await tx.concert.create({
+              data: {
+                country: concert.country,
+                venue: concert.venue,
+                city: concert.city,
+                concert_date: concert.concert_date
+                  ? new Date(concert.concert_date)
+                  : null,
+                on_sale: concert.on_sale !== undefined ? concert.on_sale : false,
+                event_id: concert.event_id || null,
+                latitude: concert.latitude || null,
+                longitude: concert.longitude || null,
+                metadata: concert.metadata || null,
+                name: concert.name || null,
+                ticket_sale_start: concert.ticket_sale_start
+                  ? new Date(concert.ticket_sale_start)
+                  : null,
+                url: concert.url || null,
+                festival: concert.festival || false,
+                created_at: new Date(),
+              },
+            });
+
+            // Link bands to concert
+            for (const bandId of bandIds) {
+              // Check if reference already exists
+              const existingRef = await tx.concertBandReference.findFirst({
+                where: {
+                  concert: newConcert.id,
+                  band: bandId,
+                },
+              });
+
+              if (!existingRef) {
+                await tx.concertBandReference.create({
+                  data: {
+                    concert: newConcert.id,
+                    band: bandId,
+                  },
+                });
+              }
+            }
+
+            insertedConcerts.push({
+              index: i,
+              concertId: newConcert.id,
+              name: newConcert.name,
+              venue: newConcert.venue,
+              city: newConcert.city,
+              date: newConcert.concert_date,
+              bandCount: bandIds.length,
+            });
+          } catch (error) {
+            errors.push({
+              index: i,
+              message: error.message,
+            });
+          }
+        }
+
+        return {
+          inserted: insertedConcerts.length,
+          duplicates: duplicateConcerts.length,
+          errors: errors.length,
+          details: {
+            insertedConcerts,
+            duplicateConcerts,
+            errors,
+          },
+        };
+      });
+
+      res.status(200).json(result);
+    } catch (error) {
+      console.error('Error bulk inserting concerts:', error);
+      res.status(500).json({ error: 'Internal server error', details: error.message });
+    }
+  },
+);
 
 // Search bands by name for autocomplete
 router.get('/bands/search', async (req, res) => {
@@ -164,77 +449,49 @@ router.post(
       // Fetch the band from the database
       const band = await prisma.band.findUnique({
         where: { id: parseInt(bandId) },
+        select: { id: true, name: true, ticketmaster_id: true },
       });
 
       if (!band) {
         return res.status(404).json({ error: 'Band not found' });
       }
-      let newConcerts = 0;
 
-      // Fetch concerts from Ticketmaster API using the correct endpoint
-      const eventParams = {
-        countryCode: countries.map((country) => country.iso),
-        apikey: process.env.TICKETMASTER_KEY,
-        attractionId: band.ticketmaster_id,
-      };
-
-      const response = await axios.get(`${ticketmasterURL}events.json`, {
-        params: eventParams,
-      });
-
-      if (
-        !response.data._embedded ||
-        !response.data._embedded.events ||
-        response.data._embedded.events.length === 0
-      ) {
-        return res
-          .status(200)
-          .json({ error: 'No events found for this band.' });
-      }
-
-      const events = response.data._embedded.events;
-
-      const uniqueEvents = await removeDuplicateEvents(events);
-
-      for (const event of uniqueEvents) {
-        const existingConcert = await findConcert({ event });
-        if (!existingConcert) {
-          await addConcert({ band, event });
-          newConcerts++;
-        } else {
-          await addToExistingConcert({
-            concert: existingConcert,
-            band,
-            event,
+      // Ensure we have a ticketmaster_id
+      let ticketmasterId = band.ticketmaster_id;
+      if (!ticketmasterId) {
+        // Try to get it from the API using the band name
+        ticketmasterId = await getTicketmasterId(band.name);
+        
+        // Update the band record with the ticketmaster_id if we found it
+        if (ticketmasterId) {
+          await prisma.band.update({
+            where: { id: band.id },
+            data: { ticketmaster_id: ticketmasterId },
           });
         }
       }
-      const countries = uniqueEvents
-        .map((e) => e.country)
-        .filter((v, i, a) => v && a.indexOf(v) === i); // unique & non-empty
-      const startDate = uniqueEvents.map((e) => e.concert_date).sort()[0];
+
+      // Call the Python service to sync concerts for this band
+      const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
+      const syncResponse = await axios.post(
+        `${pythonServiceUrl}/sync/${ticketmasterId}`,
+      );
 
       res.status(200).json({
-        message:
-          `Concerts for ${band.name} synced successfully` +
-          (newConcerts ? ` (${newConcerts} new)` : ''),
-        newConcerts,
-        band: { id: band.id, name: band.name },
-        countries,
-        startDate,
+        status: 'success',
+        message: 'Band concerts synced successfully',
+        bandId: band.id,
+        ticketmasterId,
+        syncDetails: syncResponse.data,
       });
     } catch (error) {
       if (error.response?.status === 404) {
-        return res
-          .status(404)
-          .json({ error: 'No events found for this band.' });
+        return res.status(404).json({ error: 'Band or sync endpoint not found' });
       } else if (error.response?.status === 429) {
-        return res
-          .status(429)
-          .json({ error: 'Too many requests, please try again later.' });
+        return res.status(429).json({ error: 'Too many requests, please try again later.' });
       }
-      console.error('Error syncing concerts:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      console.error('Error syncing concerts:', error.message);
+      res.status(500).json({ error: error.message || 'Internal server error' });
     }
   },
 );
@@ -278,29 +535,29 @@ router.post(
       const ticketmasterId = ticketmaster_id ? ticketmaster_id.trim() : null;
 
       // Check if band already exists in the database
-      let band = null;
+      let existingBand = null;
 
       if (ticketmasterId) {
-        band = await prisma.band.findUnique({
+        existingBand = await prisma.band.findUnique({
           where: { ticketmaster_id: ticketmasterId },
-          select: { name: true },
         });
       } else if (bandName) {
-        band = await prisma.band.findUnique({
+        existingBand = await prisma.band.findUnique({
           where: { name: bandName },
-          select: { name: true },
         });
       }
 
-      if (band) {
+      if (existingBand) {
         return res.status(409).json({ error: 'Band already exists.' });
       }
 
-      let foundBand;
+      // Fetch band data from Ticketmaster API
+      let bandData;
+      let resolvedTicketmasterId;
       try {
         if (ticketmasterId) {
           // Fetch band data by Ticketmaster ID
-          foundBand = await axios.get(
+          const response = await axios.get(
             `${ticketmasterURL}attractions/${ticketmasterId}.json`,
             {
               params: {
@@ -309,105 +566,53 @@ router.post(
             },
           );
 
-          if (!foundBand.data) {
+          if (!response.data) {
             return res
               .status(404)
               .json({ error: 'Band not found with that Ticketmaster ID' });
           }
 
-          // For ID-based search, the response structure is different
-          foundBand.data._embedded = { attractions: [foundBand.data] };
+          bandData = response.data;
+          resolvedTicketmasterId = response.data.id;
         } else {
           // Fetch band data from Ticketmaster API by name
-          foundBand = await axios.get(`${ticketmasterURL}attractions.json`, {
+          const response = await axios.get(`${ticketmasterURL}attractions.json`, {
             params: {
               apikey: process.env.TICKETMASTER_KEY,
               keyword: bandName,
+              size: 1,
             },
           });
 
-          if (foundBand.data._embedded.attractions.length === 0) {
+          if (!response.data._embedded?.attractions?.[0]) {
             return res.status(404).json({ error: 'No band found.' });
           }
+
+          bandData = response.data._embedded.attractions[0];
+          resolvedTicketmasterId = bandData.id;
         }
       } catch (error) {
-        if (error.status === 404) {
-          return res
-            .status(404)
-            .json({ error: 'No events found for this band.' });
-        } else if (error.response && error.response.status === 429) {
+        if (error.response?.status === 404) {
+          return res.status(404).json({ error: 'Band not found on Ticketmaster.' });
+        } else if (error.response?.status === 429) {
           return res
             .status(429)
             .json({ error: 'Too many requests, please try again later.' });
         }
-        console.error('Error fetching events from Ticketmaster:', error);
+        console.error('Error fetching band from Ticketmaster:', error);
         return res.status(500).json({ error: 'Internal server error' });
       }
 
-      const bandData = foundBand.data._embedded.attractions[0];
-
-      // Save band to the database
+      // Create band in database
       const newBand = await prisma.band.create({
         data: {
           name: bandData.name,
-          ticketmaster_id: bandData.id,
+          ticketmaster_id: resolvedTicketmasterId,
+          created_at: new Date(),
         },
       });
 
-      let events;
-      // Fetch events from Ticketmaster API
-      try {
-        const eventParams = {
-          countryCode: countries.map((country) => country.iso),
-          apikey: process.env.TICKETMASTER_KEY,
-        };
-
-        // Use attractionId if we have a ticketmaster_id, otherwise use keyword
-        if (ticketmasterId) {
-          eventParams.attractionId = bandData.id;
-        } else {
-          eventParams.keyword = bandData.name;
-        }
-
-        events = await axios.get(`${ticketmasterURL}events.json`, {
-          params: eventParams,
-        });
-      } catch (error) {
-        const payload = handleError('events', error.status || 500);
-        return res.status(error.status || 500).json(payload);
-      }
-
-      if (events.status !== 200) {
-        const payload = handleError('events', events.status);
-        return res.status(events.status).json(payload);
-      }
-
-      if (
-        !events.data._embedded ||
-        !events.data._embedded.events ||
-        events.data._embedded.events.length === 0
-      ) {
-        const payload = handleError('events', 404);
-        return res.status(404).json(payload);
-      }
-
-      const uniqueEvents = await removeDuplicateEvents(
-        events.data._embedded.events,
-      );
-
-      for (const event of uniqueEvents) {
-        const existingConcert = await findConcert({ event });
-        if (!existingConcert) {
-          await addConcert({ band: newBand, event });
-        } else {
-          await addToExistingConcert({
-            concert: existingConcert,
-            band: newBand,
-            event,
-          });
-        }
-      }
-
+      // Add to wishlist if provided
       if (wishlistId) {
         await prisma.wishlistBandReference.create({
           data: {
@@ -417,34 +622,36 @@ router.post(
         });
       }
 
-      res.json({
-        id: newBand.id,
-        name: newBand.name,
-        ticketmaster_id: newBand.ticketmaster_id,
-        concerts: uniqueEvents.map((event) => ({
-          name: event.name,
-          concert_date: event.concert_date
-            ? new Date(event.concert_date).toLocaleString('en-GB', {
-                year: 'numeric',
-                month: '2-digit',
-                day: '2-digit',
-                hour: '2-digit',
-                minute: '2-digit',
-                timeZone: 'Europe/Stockholm',
-              })
-            : '',
-          venue: event.venue,
-          city: event.city,
-          country: event.country,
-          url: event.url,
-          on_sale: event.on_sale,
-          id: event.id,
-        })),
+      // Call Python service to sync concerts for this band
+      let syncResult = null;
+      try {
+        const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
+        const syncResponse = await axios.post(
+          `${pythonServiceUrl}/sync/${resolvedTicketmasterId}`,
+        );
+        syncResult = syncResponse.data;
+      } catch (syncError) {
+        console.error('Error syncing concerts with Python service:', syncError.message);
+        // Don't fail the band creation if sync fails, just log it
+        syncResult = {
+          status: 'error',
+          message: 'Concert sync failed, but band was created',
+          error: syncError.message,
+        };
+      }
+
+      res.status(201).json({
+        status: 'success',
+        band: {
+          id: newBand.id,
+          name: newBand.name,
+          ticketmaster_id: newBand.ticketmaster_id,
+        },
+        sync: syncResult,
       });
     } catch (error) {
-      console.error('Error fetching Ticketmaster data:', error);
-      const payload = handleError('events', 500);
-      return res.status(500).json(payload);
+      console.error('Error creating band:', error);
+      res.status(500).json({ error: 'Internal server error' });
     }
   },
 );
