@@ -88,7 +88,7 @@ router.get('/bands/search', async (req, res) => {
 });
 
 // List all bands with concert counts (number of ConcertBandReferences)
-router.get('/bands', async (req, res) => {
+router.get('/upcoming/bands', async (req, res) => {
   try {
     const bands = await prisma.band.findMany({
       select: {
@@ -134,6 +134,19 @@ router.get('/bands', async (req, res) => {
     );
 
     res.json(mapped);
+  } catch (error) {
+    console.error('Error fetching bands:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/bands', async (req, res) => {
+  try {
+    const bands = await prisma.band.findMany({
+      select: { ticketmaster_id: true, name: true },
+      orderBy: { created_at: 'asc' },
+    });
+    res.json(bands);
   } catch (error) {
     console.error('Error fetching bands:', error);
     res.status(500).json({ error: 'Internal server error' });
