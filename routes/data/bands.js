@@ -764,4 +764,15 @@ router.get('/bands/ticketmaster-search', async (req, res) => {
   }
 });
 
+router.post('/bands/sync-all', auth, roleCheck(['ADMIN']), async (_req, res) => {
+  try {
+    const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
+    const syncResponse = await axios.post(`${pythonServiceUrl}/trigger`);
+    res.status(200).json({ status: 'success', ...syncResponse.data });
+  } catch (error) {
+    console.error('Error triggering full sync:', error.message);
+    res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+});
+
 module.exports = router;
