@@ -230,6 +230,7 @@ router.post(
     auth,
     roleCheck(["ADMIN"]),
     body("name").trim().isLength({ min: 1, max: 100 }).withMessage("Wishlist name must be between 1 and 100 characters"),
+    body("discord_webhook").optional({ nullable: true }).isURL().withMessage("Discord webhook must be a valid URL"),
   ],
   rateLimit,
   async (req, res) => {
@@ -242,13 +243,14 @@ router.post(
         });
       }
 
-      const { name } = req.body;
+      const { name, discord_webhook } = req.body;
 
       // Create the new wishlist
       const newWishlist = await prisma.wishlist.create({
         data: {
           name: name.trim(),
           user_id: req.user.id,
+          discord_webhook: discord_webhook || null,
         },
         include: {
           bands: true,
@@ -272,6 +274,7 @@ router.put(
     roleCheck(["ADMIN"]),
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
     body("name").trim().isLength({ min: 1, max: 100 }).withMessage("Wishlist name must be between 1 and 100 characters"),
+    body("discord_webhook").optional({ nullable: true }).isURL().withMessage("Discord webhook must be a valid URL"),
   ],
   rateLimit,
   async (req, res) => {
@@ -285,7 +288,7 @@ router.put(
       }
 
       const wishlistId = parseInt(req.params.id, 10);
-      const { name } = req.body;
+      const { name, discord_webhook } = req.body;
 
       // Check if wishlist exists and belongs to the user
       const existingWishlist = await prisma.wishlist.findUnique({
@@ -302,10 +305,13 @@ router.put(
         return res.status(403).json(payload);
       }
 
+      const updateData = { name: name.trim() };
+      if (discord_webhook !== undefined) updateData.discord_webhook = discord_webhook || null;
+
       // Update the wishlist
       const updatedWishlist = await prisma.wishlist.update({
         where: { id: wishlistId },
-        data: { name: name.trim() },
+        data: updateData,
         include: {
           bands: true,
         },
@@ -627,5 +633,88 @@ router.delete(
     }
   }
 );
+
+router.post(
+  "/wishlists/notify",
+  [auth, roleCheck(["ADMIN", "SYSTEM"]), body("bands").isArray({ min: 1 }).withMessage("bands must be a non-empty array")],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
+
+      const { bands } = req.body;
+      // bands: [{ ticketmaster_id, name, concerts: [...] }]
+
+      // Find all wishlists that contain any of these bands and have a webhook set
+      const wishlists = await prisma.wishlist.findMany({
+        where: { discord_webhook: { not: null } },
+        include: {
+          bands: {
+            include: { band_rel: { select: { id: true, name: true, ticketmaster_id: true } } },
+          },
+        },
+      });
+
+      // Group new concert data by wishlist
+      const notifications = wishlists
+        .map((wishlist) => {
+          const matchedBands = bands.filter((b) =>
+            wishlist.bands.some((ref) => ref.band_rel.ticketmaster_id === b.ticketmaster_id),
+          );
+          return { wishlist, matchedBands };
+        })
+        .filter(({ matchedBands }) => matchedBands.length > 0);
+
+      // Fire Discord webhooks
+      await Promise.all(
+        notifications.map(async ({ wishlist, matchedBands }) => {
+          const embeds = buildDiscordEmbeds(wishlist.name, matchedBands);
+          for (const embed of embeds) {
+            await axios.post(wishlist.discord_webhook, { embeds: [embed] });
+          }
+        }),
+      );
+
+      res.json({ notified: notifications.length });
+    } catch (error) {
+      console.error("Error sending Discord notifications:", error);
+      res.status(500).json({ error: "Failed to send notifications" });
+    }
+  },
+);
+
+function buildDiscordEmbeds(wishlistName, bands) {
+  const fields = [];
+
+  for (const band of bands) {
+    for (const concert of band.concerts) {
+      const date = concert.concert_date
+        ? new Date(concert.concert_date).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
+        : "TBA";
+      const location = [concert.city, concert.country].filter(Boolean).join(", ");
+      const venue = concert.venue || "Unknown venue";
+      const label = `${band.name} — ${date}, ${location}`;
+      const value = concert.url ? `[${venue}](${concert.url})` : venue;
+
+      let lineup = [];
+      try { lineup = JSON.parse(concert.metadata || "[]"); } catch {}
+      const lineupStr = lineup.length ? `\n${lineup.join(", ")}` : "";
+
+      fields.push({ name: label, value: value + lineupStr, inline: false });
+    }
+  }
+
+  // Chunk into groups of 25 (Discord embed field limit)
+  const embeds = [];
+  for (let i = 0; i < Math.max(fields.length, 1); i += 25) {
+    embeds.push({
+      title: `New concerts on wishlist: ${wishlistName}`,
+      color: 0x5865f2,
+      fields: fields.slice(i, i + 25),
+      footer: { text: `${fields.length} new concert${fields.length !== 1 ? "s" : ""}` },
+    });
+  }
+  return embeds;
+}
 
 module.exports = router;

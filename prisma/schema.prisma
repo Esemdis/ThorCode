@@ -113,11 +113,12 @@ model ConcertBandReference {
 }
 
 model Wishlist {
-  id       Int                     @id @default(autoincrement())
-  name     String                  @unique
-  user_id  String
-  user_rel User                    @relation("UserWishlists", fields: [user_id], references: [id])
-  bands    WishlistBandReference[] @relation("WishlistBands")
+  id              Int                     @id @default(autoincrement())
+  name            String                  @unique
+  user_id         String
+  discord_webhook String?
+  user_rel        User                    @relation("UserWishlists", fields: [user_id], references: [id])
+  bands           WishlistBandReference[] @relation("WishlistBands")
 }
 
 model WishlistBandReference {
