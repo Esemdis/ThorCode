@@ -243,7 +243,7 @@ function stringSimilarity(s1, s2) {
   return maxLen > 0 ? matches / maxLen : 0.0;
 }
 
-function deduplicateEventsByName(concerts, similarityThreshold = 0.28, daysThreshold = 5) {
+function deduplicateEventsByName(concerts, similarityThreshold = 0.25, daysThreshold = 5) {
   /**
    * Remove duplicate concerts based on name similarity AND date proximity.
    * Prefers to keep concerts with "weekend" in the name.
@@ -269,7 +269,7 @@ function deduplicateEventsByName(concerts, similarityThreshold = 0.28, daysThres
     if (seenIndices.has(i)) continue;
     
     const name1 = (concerts[i].name || '').toLowerCase();
-    const isWeekend1 = name1.includes('weekend');
+    const isWeekend1 = name1.includes('weekend') || name1.includes('combi');
     const date1 = getEventDate(concerts[i]);
     
     for (let j = i + 1; j < concerts.length; j++) {
@@ -290,7 +290,7 @@ function deduplicateEventsByName(concerts, similarityThreshold = 0.28, daysThres
         }
         
         // Prefer weekend events
-        const isWeekend2 = name2.includes('weekend');
+        const isWeekend2 = name2.includes('weekend') || name2.includes('combi');
         if (isWeekend2 && !isWeekend1) {
           seenIndices.add(i);
           break;

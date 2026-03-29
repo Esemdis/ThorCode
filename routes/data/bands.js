@@ -98,7 +98,6 @@ router.post(
       }
 
       const { concerts } = req.body;
-
       const result = await prisma.$transaction(async (tx) => {
         const insertedConcerts = [];
         const duplicateConcerts = [];
@@ -137,26 +136,14 @@ router.post(
                 if (concert.festival && existingByEventId.festival) {
                   const bandIds = [];
                   for (const band of concert.bands) {
-                    if (!band.name || !band.ticketmaster_id) {
+                    if (!band.ticketmaster_id) {
                       throw new Error(`Invalid band data at index ${i}: name and ticketmaster_id required`);
                     }
-
                     let dbBand = await tx.band.findFirst({
                       where: {
                         ticketmaster_id: band.ticketmaster_id,
                       },
                     });
-
-                    if (!dbBand) {
-                      dbBand = await tx.band.create({
-                        data: {
-                          name: band.name,
-                          ticketmaster_id: band.ticketmaster_id,
-                          created_at: new Date(),
-                        },
-                      });
-                    }
-
                     // Link band to existing concert (if not already linked)
                     const existingRef = await tx.concertBandReference.findFirst({
                       where: {
@@ -164,7 +151,6 @@ router.post(
                         band: dbBand.id,
                       },
                     });
-
                     if (!existingRef) {
                       await tx.concertBandReference.create({
                         data: {
@@ -198,8 +184,8 @@ router.post(
             // Process and validate bands
             const bandIds = [];
             for (const band of concert.bands) {
-              if (!band.name || !band.ticketmaster_id) {
-                throw new Error(`Invalid band data at index ${i}: name and ticketmaster_id required`);
+              if (!band.ticketmaster_id) {
+                throw new Error(`Invalid band data at index ${i}: ticketmaster_id required`);
               }
 
               let dbBand = await tx.band.findFirst({
@@ -207,17 +193,6 @@ router.post(
                   ticketmaster_id: band.ticketmaster_id,
                 },
               });
-
-              if (!dbBand) {
-                // Create new band
-                dbBand = await tx.band.create({
-                  data: {
-                    name: band.name,
-                    ticketmaster_id: band.ticketmaster_id,
-                    created_at: new Date(),
-                  },
-                });
-              }
 
               bandIds.push(dbBand.id);
             }
