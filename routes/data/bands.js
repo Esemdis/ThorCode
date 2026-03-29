@@ -132,52 +132,31 @@ router.post(
               });
 
               if (existingByEventId) {
-                // For festival events, add the new bands to the existing concert
-                if (concert.festival && existingByEventId.festival) {
-                  const bandIds = [];
-                  for (const band of concert.bands) {
-                    if (!band.ticketmaster_id) {
-                      throw new Error(`Invalid band data at index ${i}: name and ticketmaster_id required`);
-                    }
-                    let dbBand = await tx.band.findFirst({
-                      where: {
-                        ticketmaster_id: band.ticketmaster_id,
-                      },
+                // Always try to link incoming bands to the existing concert
+                const bandsAdded = [];
+                for (const band of concert.bands) {
+                  if (!band.ticketmaster_id) continue;
+                  const dbBand = await tx.band.findFirst({
+                    where: { ticketmaster_id: band.ticketmaster_id },
+                  });
+                  if (!dbBand) continue;
+                  const existingRef = await tx.concertBandReference.findFirst({
+                    where: { concert: existingByEventId.id, band: dbBand.id },
+                  });
+                  if (!existingRef) {
+                    await tx.concertBandReference.create({
+                      data: { concert: existingByEventId.id, band: dbBand.id },
                     });
-                    // Link band to existing concert (if not already linked)
-                    const existingRef = await tx.concertBandReference.findFirst({
-                      where: {
-                        concert: existingByEventId.id,
-                        band: dbBand.id,
-                      },
-                    });
-                    if (!existingRef) {
-                      await tx.concertBandReference.create({
-                        data: {
-                          concert: existingByEventId.id,
-                          band: dbBand.id,
-                        },
-                      });
-                      bandIds.push(dbBand.id);
-                    }
+                    bandsAdded.push(dbBand.id);
                   }
-
-                  duplicateConcerts.push({
-                    index: i,
-                    reason: 'festival - added bands to existing concert',
-                    concertId: existingByEventId.id,
-                    bandsAdded: bandIds.length,
-                  });
-                  continue;
-                } else {
-                  // Non-festival duplicate, skip it
-                  duplicateConcerts.push({
-                    index: i,
-                    reason: 'event_id already exists',
-                    concertId: existingByEventId.id,
-                  });
-                  continue;
                 }
+                duplicateConcerts.push({
+                  index: i,
+                  reason: 'event_id already exists',
+                  concertId: existingByEventId.id,
+                  bandsAdded: bandsAdded.length,
+                });
+                continue;
               }
             }
 
