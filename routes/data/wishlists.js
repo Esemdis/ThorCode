@@ -362,17 +362,37 @@ router.post(
 
 
       // If band doesn't exist, create it via the POST /data/bands route
+      let band;
         try {
+          const bandPayload = {};
+          if (ticketmasterId) bandPayload.ticketmaster_id = ticketmasterId;
+          if (bandName) bandPayload.name = bandName;
           const createResponse = await axios.post(
             `http://${process.env.API_BASE_URL}/data/concerts/bands`,
-            { ticketmaster_id: ticketmasterId },
+            bandPayload,
             { headers: { Authorization: req.headers.authorization } },
           );
           band = createResponse.data.band;
+          if (!band) {
+            console.error('Band creation response missing band object:', createResponse.data);
+            return res.status(500).json({ error: 'Band creation failed: no band returned' });
+          }
         } catch (error) {
-          const status = error.response?.status || 500;
-          const payload = handleError('band', status);
-          return res.status(status).json(payload);
+          if (error.response?.status === 409) {
+            // Band already exists — look it up directly
+            band = ticketmasterId
+              ? await prisma.band.findUnique({ where: { ticketmaster_id: ticketmasterId } })
+              : await prisma.band.findUnique({ where: { name: bandName } });
+            if (!band) {
+              console.error('Band reported as existing but not found in DB');
+              return res.status(500).json({ error: 'Band lookup failed after conflict' });
+            }
+          } else {
+            console.error('Error creating band:', error.response?.data ?? error.message);
+            const status = error.response?.status || 500;
+            const payload = handleError('band', status);
+            return res.status(status).json(payload);
+          }
         }
 
       // Check if band is already in the wishlist

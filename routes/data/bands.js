@@ -276,7 +276,7 @@ router.get('/upcoming/bands', async (req, res) => {
             b.nextConcertCountry = null;
           }
         } catch (e) {
-          // On error, fail gracefully for that band only
+          console.error(`Error fetching next concert for band ${b.id} (${b.name}):`, e);
           b.nextConcertDate = null;
           b.nextConcertCountry = null;
         }
