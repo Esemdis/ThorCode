@@ -73,6 +73,7 @@ model Band {
   name            String                  @unique
   ticketmaster_id String                  @unique
   created_at      DateTime?
+  MBID            String?                 @unique
   concerts        ConcertBandReference[]  @relation("BandConcerts")
   wishlists       WishlistBandReference[] @relation("BandWishlists")
 }
