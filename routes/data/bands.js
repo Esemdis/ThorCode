@@ -3,10 +3,7 @@ const router = express.Router();
 const { validationResult, body, query } = require('express-validator');
 const axios = require('axios');
 const {
-  addConcert,
-  findConcert,
-  addToExistingConcert,
-  removeDuplicateEvents,
+  getTicketmasterId,
   handleError,
   checkDuplicateConcert,
 } = require('./helpers');
@@ -22,65 +19,6 @@ const rateLimit = rateLimiter({
   message:
     'Too many requests to the Ticketmaster data route, please try again later.',
 });
-const countries = [
-  { name: 'Germany', iso: 'DE' },
-  { name: 'Austria', iso: 'AT' },
-  { name: 'Netherlands', iso: 'NL' },
-  { name: 'Denmark', iso: 'DK' },
-  { name: 'Belgium', iso: 'BE' },
-  { name: 'Norway', iso: 'NO' },
-  { name: 'Switzerland', iso: 'CH' },
-  { name: 'Spain', iso: 'ES' },
-  { name: 'Sweden', iso: 'SE' },
-  { name: 'Finland', iso: 'FI' },
-  { name: 'Poland', iso: 'PL' },
-  { name: 'United Kingdom', iso: 'GB' },
-];
-
-// Helper function to get ticketmaster_id for a band
-// First checks DB, then falls back to API search if needed
-async function getTicketmasterId(bandIdentifier) {
-  // If identifier looks like a Ticketmaster ID (numeric), check DB first
-  if (bandIdentifier && /^\d+$/.test(bandIdentifier)) {
-    const band = await prisma.band.findUnique({
-      where: { ticketmaster_id: bandIdentifier },
-      select: { ticketmaster_id: true },
-    });
-    if (band) return band.ticketmaster_id;
-    
-    // If not in DB but looks like valid TM ID, return it (it's probably valid)
-    return bandIdentifier;
-  }
-  
-  // Try finding by name in DB
-  const band = await prisma.band.findUnique({
-    where: { name: bandIdentifier },
-    select: { ticketmaster_id: true },
-  });
-  if (band?.ticketmaster_id) return band.ticketmaster_id;
-  
-  // Fall back to API search to get the Ticketmaster ID
-  try {
-    const response = await axios.get(`${ticketmasterURL}attractions.json`, {
-      params: {
-        apikey: process.env.TICKETMASTER_KEY,
-        keyword: bandIdentifier,
-        size: 1,
-      },
-    });
-
-    if (response.data._embedded?.attractions?.[0]?.id) {
-      return response.data._embedded.attractions[0].id;
-    }
-    
-    throw new Error('Band not found on Ticketmaster');
-  } catch (error) {
-    if (error.response?.status === 429) {
-      throw new Error('Rate limited by Ticketmaster API');
-    }
-    throw new Error(`Could not find Ticketmaster ID for band "${bandIdentifier}"`);
-  }
-}
 
 // Bulk insert concerts with deduplication
 router.post(
@@ -471,6 +409,7 @@ router.post(
     .withMessage('Wishlist ID must be an integer'),
   async (req, res) => {
     try {
+
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
         return res.status(400).json({ errors: errors.array() });
@@ -519,7 +458,6 @@ router.post(
               },
             },
           );
-
           if (!response.data) {
             return res
               .status(404)
@@ -557,12 +495,29 @@ router.post(
         return res.status(500).json({ error: 'Internal server error' });
       }
 
+      // Fetch MBID from MusicBrainz
+      let mbid = null;
+      try {
+        const mbResponse = await axios.get(
+          'https://musicbrainz.org/ws/2/artist/',
+          {
+            params: { query: `artist:"${bandData.name}"`, limit: 1, fmt: 'json' },
+            headers: {
+              'User-Agent': `${process.env.APP_NAME}/${process.env.APP_VERSION} (${process.env.APP_CONTACT})`,
+            },
+          },
+        );
+        mbid = mbResponse.data?.artists?.[0]?.id ?? null;
+      } catch (mbError) {
+        console.error('Error fetching MBID from MusicBrainz:', mbError.message);
+      }
       // Create band in database
       const newBand = await prisma.band.create({
         data: {
           name: bandData.name,
           ticketmaster_id: resolvedTicketmasterId,
           created_at: new Date(),
+          MBID: mbid,
         },
       });
 
@@ -600,6 +555,7 @@ router.post(
           id: newBand.id,
           name: newBand.name,
           ticketmaster_id: newBand.ticketmaster_id,
+          mbid: newBand.MBID,
         },
         sync: syncResult,
       });

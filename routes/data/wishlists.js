@@ -2,32 +2,16 @@ const express = require("express");
 const router = express.Router();
 const { validationResult, param, body } = require("express-validator");
 const axios = require("axios");
-const { addConcert, findConcert, addToExistingConcert, removeDuplicateEvents, handleError } = require("./helpers");
+const { handleError } = require("./helpers");
 
 const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const { rateLimiter } = require("../../utils/rateLimiter");
 const prisma = require("../../prisma/client");
 
-// Defaults to 5 requests per 15 minutes per IP
-const ticketmasterURL = "https://app.ticketmaster.com/discovery/v2/";
 const rateLimit = rateLimiter({
   message: "Too many requests to the Ticketmaster data route, please try again later.",
 });
-const countries = [
-  { name: "Germany", iso: "DE" },
-  { name: "Austria", iso: "AT" },
-  { name: "Netherlands", iso: "NL" },
-  { name: "Denmark", iso: "DK" },
-  { name: "Belgium", iso: "BE" },
-  { name: "Norway", iso: "NO" },
-  { name: "Switzerland", iso: "CH" },
-  { name: "Spain", iso: "ES" },
-  { name: "Sweden", iso: "SE" },
-  { name: "Finland", iso: "FI" },
-  { name: "Poland", iso: "PL" },
-  { name: "United Kingdom", iso: "GB" },
-];
 
 router.get(
   "/wishlists",
@@ -376,117 +360,20 @@ router.post(
         return res.status(403).json(payload);
       }
 
-      // Check if band already exists in the database
-      let band = null;
 
-      if (ticketmasterId) {
-        // Search by Ticketmaster ID first if provided
-        band = await prisma.band.findUnique({
-          where: { ticketmaster_id: ticketmasterId },
-          select: { id: true, name: true, ticketmaster_id: true },
-        });
-      } else if (bandName) {
-        // Search by name if no Ticketmaster ID provided
-        band = await prisma.band.findUnique({
-          where: { name: bandName },
-          select: { id: true, name: true, ticketmaster_id: true },
-        });
-      }
-
-      let newBandCreated = false;
-
-      // If band doesn't exist, create it
-      if (!band) {
+      // If band doesn't exist, create it via the POST /data/bands route
         try {
-          let foundBand;
-
-          if (ticketmasterId) {
-            // Fetch band data by Ticketmaster ID
-            foundBand = await axios.get(`${ticketmasterURL}attractions/${ticketmasterId}.json`, {
-              params: {
-                apikey: process.env.TICKETMASTER_KEY,
-              },
-            });
-
-            if (!foundBand.data) {
-              const payload = handleError("band", 404);
-              return res.status(404).json(payload);
-            }
-
-            // For ID-based search, the response structure is different
-            foundBand.data._embedded = { attractions: [foundBand.data] };
-          } else {
-            // Fetch band data by name (existing logic)
-            foundBand = await axios.get(`${ticketmasterURL}attractions.json`, {
-              params: {
-                apikey: process.env.TICKETMASTER_KEY,
-                keyword: bandName,
-              },
-            });
-
-            if (!foundBand.data._embedded || !foundBand.data._embedded.attractions || foundBand.data._embedded.attractions.length === 0) {
-              const payload = handleError("band", 404);
-              return res.status(404).json(payload);
-            }
-          }
-
-          const bandData = foundBand.data._embedded.attractions[0];
-
-          // Create band in database
-          band = await prisma.band.create({
-            data: {
-              name: bandData.name,
-              ticketmaster_id: bandData.id,
-              created_at: new Date(),
-            },
-          });
-
-          newBandCreated = true;
-
-          // Fetch and add concerts for the new band
-          try {
-            const eventParams = {
-              countryCode: countries.map((country) => country.iso),
-              apikey: process.env.TICKETMASTER_KEY,
-            };
-
-            // Use attractionId if we have a ticketmaster_id, otherwise use keyword
-            if (ticketmasterId) {
-              eventParams.attractionId = bandData.id;
-            } else {
-              eventParams.keyword = bandData.name;
-            }
-
-            const events = await axios.get(`${ticketmasterURL}events.json`, {
-              params: eventParams,
-            });
-
-            if (events.data._embedded && events.data._embedded.events && events.data._embedded.events.length > 0) {
-              const uniqueEvents = await removeDuplicateEvents(events.data._embedded.events);
-
-              for (const event of uniqueEvents) {
-                const existingConcert = await findConcert({ event });
-                if (!existingConcert) {
-                  await addConcert({ band, event });
-                } else {
-                  await addToExistingConcert({
-                    concert: existingConcert,
-                    band,
-                    event,
-                  });
-                }
-              }
-            }
-          } catch (eventError) {
-            console.warn("Could not fetch events for band, but band was created:", eventError.message);
-            // Continue anyway - band was created successfully
-          }
+          const createResponse = await axios.post(
+            `http://${process.env.API_BASE_URL}/data/concerts/bands`,
+            { ticketmaster_id: ticketmasterId },
+            { headers: { Authorization: req.headers.authorization } },
+          );
+          band = createResponse.data.band;
         } catch (error) {
-          console.error("Error fetching band from Ticketmaster:", error);
-          const payload = handleError("band", (error.response && error.response.status) || 500);
-          return res.status((error.response && error.response.status) || 500).json(payload);
+          const status = error.response?.status || 500;
+          const payload = handleError('band', status);
+          return res.status(status).json(payload);
         }
-      }
 
       // Check if band is already in the wishlist
       const existingReference = await prisma.wishlistBandReference.findFirst({
@@ -511,13 +398,12 @@ router.post(
 
       // Return success response
       res.status(201).json({
-        message: newBandCreated ? "Band created and added to wishlist successfully" : "Band added to wishlist successfully",
+        message: "Band added to wishlist successfully",
         band: {
           id: band.id,
           name: band.name,
           ticketmaster_id: band.ticketmaster_id,
         },
-        newBandCreated,
       });
     } catch (error) {
       console.error("Error adding band to wishlist:", error);
