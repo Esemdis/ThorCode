@@ -119,7 +119,7 @@ router.post(
             const bandIds = dbBands.filter(Boolean).map((b) => b.id);
 
             const { isDuplicate, existingConcert } = await checkDuplicateConcert({ concert, bandIds, tx });
-            console.log(isDuplicate)
+
             if (isDuplicate) {
               duplicateConcerts.push({
                 index: i,
@@ -129,7 +129,6 @@ router.post(
               continue;
             }
 
-            console.log(concert)
             const newConcert = await tx.concert.create({
               data: {
                 country: concert.country,
