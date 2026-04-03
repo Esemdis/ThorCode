@@ -34,31 +34,42 @@ router.post(
       if (!errors.isEmpty()) {
         return res.status(400).json({ errors: errors.array() });
       }
-
+      
       const { concerts } = req.body;
+
+      // Pre-deduplicate payload by coordinates: keep the entry with the most bands per location.
+      const coordKey = (c) =>
+        c.latitude != null && c.longitude != null
+          ? `${Math.round(c.latitude / 0.001)}:${Math.round(c.longitude / 0.001)}`
+          : null;
+
+      const { coordMap, noCoord } = concerts.reduce(
+        (acc, concert) => {
+          const key = coordKey(concert);
+          if (!key) { acc.noCoord.push(concert); return acc; }
+          const existing = acc.coordMap.get(key);
+          if (!existing || (concert.bands?.length ?? 0) > (existing.bands?.length ?? 0)) {
+            acc.coordMap.set(key, concert);
+          }
+          return acc;
+        },
+        { coordMap: new Map(), noCoord: [] },
+      );
+      const deduplicatedConcerts = [...coordMap.values(), ...noCoord];
+
       const result = await prisma.$transaction(async (tx) => {
         const insertedConcerts = [];
         const duplicateConcerts = [];
         const errors = [];
 
-        for (let i = 0; i < concerts.length; i++) {
-          const concert = concerts[i];
-
-          // Validate required fields
+        // Must be sequential — each insert affects subsequent duplicate checks within the tx
+        for (const [i, concert] of deduplicatedConcerts.entries()) {
           if (!concert.country || !concert.venue || !concert.city) {
-            errors.push({
-              index: i,
-              message:
-                'Concert must have country, venue, and city fields',
-            });
+            errors.push({ index: i, message: 'Concert must have country, venue, and city fields' });
             continue;
           }
-
-          if (!concert.bands || !Array.isArray(concert.bands) || concert.bands.length === 0) {
-            errors.push({
-              index: i,
-              message: 'Concert must have at least one band',
-            });
+          if (!Array.isArray(concert.bands) || concert.bands.length === 0) {
+            errors.push({ index: i, message: 'Concert must have at least one band' });
             continue;
           }
 
@@ -70,111 +81,77 @@ router.post(
               });
 
               if (existingByEventId) {
-                // Always try to link incoming bands to the existing concert
-                const bandsAdded = [];
-                for (const band of concert.bands) {
-                  if (!band.ticketmaster_id) continue;
-                  const dbBand = await tx.band.findFirst({
-                    where: { ticketmaster_id: band.ticketmaster_id },
+                // Resolve all bands in parallel, then batch-link the new ones
+                const dbBands = await Promise.all(
+                  concert.bands
+                    .filter((b) => b.ticketmaster_id)
+                    .map((b) => tx.band.findFirst({ where: { ticketmaster_id: b.ticketmaster_id } })),
+                );
+                const validIds = dbBands.filter(Boolean).map((b) => b.id);
+                const existingRefs = await tx.concertBandReference.findMany({
+                  where: { concert: existingByEventId.id, band: { in: validIds } },
+                  select: { band: true },
+                });
+                const linked = new Set(existingRefs.map((r) => r.band));
+                const toLink = validIds.filter((id) => !linked.has(id));
+                if (toLink.length > 0) {
+                  await tx.concertBandReference.createMany({
+                    data: toLink.map((band) => ({ concert: existingByEventId.id, band })),
                   });
-                  if (!dbBand) continue;
-                  const existingRef = await tx.concertBandReference.findFirst({
-                    where: { concert: existingByEventId.id, band: dbBand.id },
-                  });
-                  if (!existingRef) {
-                    await tx.concertBandReference.create({
-                      data: { concert: existingByEventId.id, band: dbBand.id },
-                    });
-                    bandsAdded.push(dbBand.id);
-                  }
                 }
                 duplicateConcerts.push({
                   index: i,
                   reason: 'event_id already exists',
                   concertId: existingByEventId.id,
-                  bandsAdded: bandsAdded.length,
+                  bandsAdded: toLink.length,
                 });
                 continue;
               }
             }
 
-            // Process and validate bands
-            const bandIds = [];
-            for (const band of concert.bands) {
-              if (!band.ticketmaster_id) {
-                throw new Error(`Invalid band data at index ${i}: ticketmaster_id required`);
-              }
-
-              let dbBand = await tx.band.findFirst({
-                where: {
-                  ticketmaster_id: band.ticketmaster_id,
-                },
-              });
-
-              bandIds.push(dbBand.id);
+            // Resolve all bands in parallel
+            if (concert.bands.some((b) => !b.ticketmaster_id)) {
+              throw new Error(`Invalid band data at index ${i}: ticketmaster_id required`);
             }
+            const dbBands = await Promise.all(
+              concert.bands.map((b) => tx.band.findFirst({ where: { ticketmaster_id: b.ticketmaster_id } })),
+            );
+            const bandIds = dbBands.filter(Boolean).map((b) => b.id);
 
-            // Check for duplicates using helper
-            const { isDuplicate, existingConcert } = await checkDuplicateConcert({
-              concert,
-              bandIds,
-              tx,
-            });
-
+            const { isDuplicate, existingConcert } = await checkDuplicateConcert({ concert, bandIds, tx });
+            console.log(isDuplicate)
             if (isDuplicate) {
               duplicateConcerts.push({
                 index: i,
-                reason: concert.festival
-                  ? 'festival duplicate (merged bands)'
-                  : 'duplicate concert_date + venue + band combination',
+                reason: concert.festival ? 'festival duplicate (merged bands)' : 'duplicate concert_date + venue + band combination',
                 concertId: existingConcert.id,
               });
               continue;
             }
 
-            // Create concert
+            console.log(concert)
             const newConcert = await tx.concert.create({
               data: {
                 country: concert.country,
                 venue: concert.venue,
                 city: concert.city,
-                concert_date: concert.concert_date
-                  ? new Date(concert.concert_date)
-                  : null,
-                on_sale: concert.on_sale !== undefined ? concert.on_sale : false,
+                concert_date: concert.concert_date ? new Date(concert.concert_date) : null,
+                on_sale: concert.on_sale ?? false,
                 event_id: concert.event_id || null,
                 latitude: concert.latitude || null,
                 longitude: concert.longitude || null,
                 metadata: concert.metadata || null,
                 name: concert.name || null,
-                ticket_sale_start: concert.ticket_sale_start
-                  ? new Date(concert.ticket_sale_start)
-                  : null,
+                ticket_sale_start: concert.ticket_sale_start ? new Date(concert.ticket_sale_start) : null,
                 url: concert.url || null,
                 festival: concert.festival || false,
                 created_at: new Date(),
               },
             });
 
-            // Link bands to concert
-            for (const bandId of bandIds) {
-              // Check if reference already exists
-              const existingRef = await tx.concertBandReference.findFirst({
-                where: {
-                  concert: newConcert.id,
-                  band: bandId,
-                },
-              });
-
-              if (!existingRef) {
-                await tx.concertBandReference.create({
-                  data: {
-                    concert: newConcert.id,
-                    band: bandId,
-                  },
-                });
-              }
-            }
+            await tx.concertBandReference.createMany({
+              data: bandIds.map((band) => ({ concert: newConcert.id, band })),
+            });
 
             insertedConcerts.push({
               index: i,
@@ -186,10 +163,7 @@ router.post(
               bandCount: bandIds.length,
             });
           } catch (error) {
-            errors.push({
-              index: i,
-              message: error.message,
-            });
+            errors.push({ index: i, message: error.message });
           }
         }
 
@@ -320,7 +294,7 @@ router.get('/upcoming/bands', async (req, res) => {
 router.get('/bands', async (req, res) => {
   try {
     const bands = await prisma.band.findMany({
-      select: { ticketmaster_id: true, name: true },
+      select: { ticketmaster_id: true, name: true, MBID: true },
       orderBy: { created_at: 'asc' },
     });
     res.json(bands);
