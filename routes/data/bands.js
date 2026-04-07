@@ -547,6 +547,82 @@ router.post(
   },
 );
 
+// Get all upcoming concerts for a specific band
+router.get('/bands/:bandId/upcoming', async (req, res) => {
+  try {
+    const bandId = parseInt(req.params.bandId, 10);
+    if (Number.isNaN(bandId)) {
+      return res.status(400).json({ error: 'Invalid band id' });
+    }
+
+    const band = await prisma.band.findUnique({
+      where: { id: bandId },
+      select: { id: true, name: true },
+    });
+
+    if (!band) {
+      return res.status(404).json({ error: 'Band not found' });
+    }
+
+    const now = new Date();
+    const concerts = await prisma.concert.findMany({
+      where: {
+        concert_date: { gte: now },
+        bands: { some: { band: bandId } },
+      },
+      select: {
+        id: true,
+        name: true,
+        venue: true,
+        city: true,
+        country: true,
+        concert_date: true,
+        on_sale: true,
+        ticket_sale_start: true,
+        url: true,
+        festival: true,
+        latitude: true,
+        longitude: true,
+        event_id: true,
+        metadata: true,
+        bands: {
+          select: {
+            band_rel: { select: { id: true, name: true } },
+          },
+        },
+      },
+      orderBy: { concert_date: 'asc' },
+    });
+
+    const formatted = concerts.map((c) => {
+      // All bands tracked in DB for this concert
+      const trackedBands = c.bands.map((b) => b.band_rel);
+      const trackedNames = new Set(trackedBands.map((b) => b.name.toLowerCase()));
+
+      // Full lineup from metadata (JSON array of name strings)
+      let metadataNames = [];
+      try { metadataNames = JSON.parse(c.metadata || '[]'); } catch {}
+
+      // Merge: tracked bands keep their id; metadata-only names get id: null
+      const metadataOnly = metadataNames
+        .filter((n) => !trackedNames.has(n.toLowerCase()))
+        .map((n) => ({ id: null, name: n }));
+
+      return {
+        ...c,
+        other_bands: [...trackedBands, ...metadataOnly],
+        bands: undefined,
+        metadata: undefined,
+      };
+    });
+
+    res.json({ band, upcoming: formatted });
+  } catch (error) {
+    console.error('Error fetching upcoming concerts for band:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Delete a band and all related references; remove orphan concerts
 router.delete(
   '/bands/:bandId',
