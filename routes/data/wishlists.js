@@ -83,6 +83,8 @@ router.get(
                   longitude: true,
                   latitude: true,
                   concert_date: true,
+                  on_sale: true,
+                  ticket_sale_start: true,
                   festival: true,
                   url: true,
                   bands: {
@@ -149,6 +151,8 @@ router.get(
               longitude: concert.longitude,
               latitude: concert.latitude,
               concert_date: concert.concert_date,
+              on_sale: concert.on_sale,
+              ticket_sale_start: concert.ticket_sale_start,
               festival: concert.festival,
               url: concert.url,
               participating_bands: wishlistBands,
