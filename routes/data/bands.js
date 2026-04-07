@@ -59,6 +59,7 @@ router.post(
 
       const result = await prisma.$transaction(async (tx) => {
         const insertedConcerts = [];
+        const updatedConcerts = [];
         const duplicateConcerts = [];
         const errors = [];
 
@@ -98,13 +99,18 @@ router.post(
                   await tx.concertBandReference.createMany({
                     data: toLink.map((band) => ({ concert: existingByEventId.id, band })),
                   });
+                  updatedConcerts.push({
+                    index: i,
+                    concertId: existingByEventId.id,
+                    bandsAdded: toLink.length,
+                  });
+                } else {
+                  duplicateConcerts.push({
+                    index: i,
+                    reason: 'event_id already exists',
+                    concertId: existingByEventId.id,
+                  });
                 }
-                duplicateConcerts.push({
-                  index: i,
-                  reason: 'event_id already exists',
-                  concertId: existingByEventId.id,
-                  bandsAdded: toLink.length,
-                });
                 continue;
               }
             }
@@ -168,10 +174,12 @@ router.post(
 
         return {
           inserted: insertedConcerts.length,
+          updated: updatedConcerts.length,
           duplicates: duplicateConcerts.length,
           errors: errors.length,
           details: {
             insertedConcerts,
+            updatedConcerts,
             duplicateConcerts,
             errors,
           },
