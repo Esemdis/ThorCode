@@ -40,27 +40,34 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
   let existingConcert = null;
   const lat = parseFloat(concert.latitude);
   const lng = parseFloat(concert.longitude);
-  if (!isNaN(lat) && !isNaN(lng) && concert.concert_date && concert.festival === true) {
+  if (!isNaN(lat) && !isNaN(lng) && concert.concert_date) {
     const concertDate = new Date(concert.concert_date);
     const threeDaysMs = 3 * 24 * 60 * 60 * 1000;
     const coordTolerance = 0.001;
-    existingConcert = await tx.concert.findFirst({
+    // Fetch candidates by date range only — lat/lng are stored as strings so
+    // DB range queries are unreliable for negative values (e.g. UK longitudes).
+    // Filter by coordinates in JS instead.
+    const candidates = await tx.concert.findMany({
       where: {
         concert_date: {
           gte: new Date(concertDate.getTime() - threeDaysMs),
           lte: new Date(concertDate.getTime() + threeDaysMs),
         },
-        latitude: {
-          gte: String(lat - coordTolerance),
-          lte: String(lat + coordTolerance),
-        },
-        longitude: {
-          gte: String(lng - coordTolerance),
-          lte: String(lng + coordTolerance),
-        },
+        latitude: { not: null },
+        longitude: { not: null },
       },
       include: { bands: true },
     });
+    existingConcert = candidates.find((c) => {
+      const cLat = parseFloat(c.latitude);
+      const cLng = parseFloat(c.longitude);
+      return (
+        !isNaN(cLat) &&
+        !isNaN(cLng) &&
+        Math.abs(cLat - lat) <= coordTolerance &&
+        Math.abs(cLng - lng) <= coordTolerance
+      );
+    }) ?? null;
   }
   
   if (!existingConcert) {
@@ -77,16 +84,17 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
         },
         include: { bands: true },
       });
-    } 
-  } else if (concert.concert_date && bandIds.length > 0){
-    existingConcert = await tx.concert.findFirst({
-      where: {
-        concert_date: new Date(concert.concert_date),
-        venue: concert.venue,
-        bands: { some: { band: { in: bandIds } } },
-      },
-      include: { bands: true },
-    });
+    } else if (concert.concert_date && bandIds.length > 0) {
+      // For non-festivals, check by date + venue + band combination
+      existingConcert = await tx.concert.findFirst({
+        where: {
+          concert_date: new Date(concert.concert_date),
+          venue: concert.venue,
+          bands: { some: { band: { in: bandIds } } },
+        },
+        include: { bands: true },
+      });
+    }
   }
 
   

@@ -594,6 +594,11 @@ router.post(
 );
 
 function buildDiscordEmbeds(wishlistName, bands) {
+  const EMBED_CHAR_LIMIT = 5800;
+  const FIELD_VALUE_LIMIT = 1024;
+  const FIELD_NAME_LIMIT = 256;
+  const MAX_FIELDS = 25;
+
   const fields = [];
 
   for (const band of bands) {
@@ -603,27 +608,43 @@ function buildDiscordEmbeds(wishlistName, bands) {
         : "TBA";
       const location = [concert.city, concert.country].filter(Boolean).join(", ");
       const venue = concert.venue || "Unknown venue";
-      const label = `${band.name} — ${date}, ${location}`;
-      const value = concert.url ? `[${venue}](${concert.url})` : venue;
+      const rawLabel = `${band.name} — ${date}, ${location}`;
+      const label = rawLabel.length > FIELD_NAME_LIMIT ? rawLabel.slice(0, FIELD_NAME_LIMIT - 1) + "…" : rawLabel;
+      const venueStr = concert.url ? `[${venue}](${concert.url})` : venue;
 
       let lineup = [];
       try { lineup = JSON.parse(concert.metadata || "[]"); } catch {}
-      const lineupStr = lineup.length ? `\n${lineup.join(", ")}` : "";
+      const fullLineup = lineup.length ? `\n${lineup.join(", ")}` : "";
+      const maxLineup = FIELD_VALUE_LIMIT - venueStr.length - 1;
+      const lineupStr = fullLineup.length > maxLineup ? fullLineup.slice(0, maxLineup) + "…" : fullLineup;
 
-      fields.push({ name: label, value: value + lineupStr, inline: false });
+      fields.push({ name: label, value: venueStr + lineupStr, inline: false });
     }
   }
 
-  // Chunk into groups of 25 (Discord embed field limit)
+  const title = `New concerts on wishlist: ${wishlistName}`;
+  const footer = `${fields.length} new concert${fields.length !== 1 ? "s" : ""}`;
+  const baseChars = title.length + footer.length;
+
   const embeds = [];
-  for (let i = 0; i < Math.max(fields.length, 1); i += 25) {
-    embeds.push({
-      title: `New concerts on wishlist: ${wishlistName}`,
-      color: 0x5865f2,
-      fields: fields.slice(i, i + 25),
-      footer: { text: `${fields.length} new concert${fields.length !== 1 ? "s" : ""}` },
-    });
+  let current = [];
+  let currentChars = baseChars;
+
+  for (const field of fields) {
+    const fieldChars = field.name.length + field.value.length;
+    if (current.length > 0 && (currentChars + fieldChars > EMBED_CHAR_LIMIT || current.length >= MAX_FIELDS)) {
+      embeds.push({ title, color: 0x5865f2, fields: current, footer: { text: footer } });
+      current = [];
+      currentChars = baseChars;
+    }
+    current.push(field);
+    currentChars += fieldChars;
   }
+
+  if (current.length > 0 || embeds.length === 0) {
+    embeds.push({ title, color: 0x5865f2, fields: current, footer: { text: footer } });
+  }
+
   return embeds;
 }
 

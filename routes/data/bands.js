@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { validationResult, body, query } = require('express-validator');
+const { validationResult, body } = require('express-validator');
 const axios = require('axios');
 const {
   getTicketmasterId,
