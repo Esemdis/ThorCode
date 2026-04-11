@@ -28,69 +28,40 @@ module.exports = {
 
 async function checkDuplicateConcert({ concert, bandIds, tx }) {
   /**
-   * Check for duplicate concerts using the following priority:
-   * 1. Coordinate-based: same coordinates (±0.001°) + within 3 days + >4 bands = festival duplicate
-   * 2. For festivals: deduplicate by concert_date + venue + city
-   * 3. For non-festivals: deduplicate by concert_date + venue + band combination
+   * A concert is a duplicate if ANY of the following are true (date = same day ±12h):
+   * 1. Same venue + same day
+   * 2. Same city + same day
    *
-   * If duplicate found, merge additional bands into existing concert
-   *
+   * If duplicate found, merge additional bands into existing concert.
    * Returns: { isDuplicate: boolean, existingConcert: concert object or null }
    */
   let existingConcert = null;
-  const lat = parseFloat(concert.latitude);
-  const lng = parseFloat(concert.longitude);
-  if (!isNaN(lat) && !isNaN(lng) && concert.concert_date) {
+
+  if (concert.concert_date) {
     const concertDate = new Date(concert.concert_date);
-    const threeDaysMs = 3 * 24 * 60 * 60 * 1000;
-    const coordTolerance = 0.001;
-    // Fetch candidates by date range only — lat/lng are stored as strings so
-    // DB range queries are unreliable for negative values (e.g. UK longitudes).
-    // Filter by coordinates in JS instead.
-    const candidates = await tx.concert.findMany({
-      where: {
-        concert_date: {
-          gte: new Date(concertDate.getTime() - threeDaysMs),
-          lte: new Date(concertDate.getTime() + threeDaysMs),
-        },
-        latitude: { not: null },
-        longitude: { not: null },
-      },
-      include: { bands: true },
-    });
-    existingConcert = candidates.find((c) => {
-      const cLat = parseFloat(c.latitude);
-      const cLng = parseFloat(c.longitude);
-      return (
-        !isNaN(cLat) &&
-        !isNaN(cLng) &&
-        Math.abs(cLat - lat) <= coordTolerance &&
-        Math.abs(cLng - lng) <= coordTolerance
-      );
-    }) ?? null;
-  }
-  
-  if (!existingConcert) {
-    if (concert.festival) {
-      // For festivals, check by date + venue + city (looser matching)
+    const halfDayMs = 12 * 60 * 60 * 1000;
+    const dateRange = {
+      gte: new Date(concertDate.getTime() - halfDayMs),
+      lte: new Date(concertDate.getTime() + halfDayMs),
+    };
+
+    // 1. Same venue + same day
+    if (concert.venue) {
       existingConcert = await tx.concert.findFirst({
         where: {
-          concert_date: concert.concert_date
-            ? new Date(concert.concert_date)
-            : null,
-          venue: concert.venue,
-          city: concert.city,
-          festival: true,
+          concert_date: dateRange,
+          venue: { equals: concert.venue, mode: 'insensitive' },
         },
         include: { bands: true },
       });
-    } else if (concert.concert_date && bandIds.length > 0) {
-      // For non-festivals, check by date + venue + band combination
+    }
+
+    // 2. Same city + same day
+    if (!existingConcert && concert.city) {
       existingConcert = await tx.concert.findFirst({
         where: {
-          concert_date: new Date(concert.concert_date),
-          venue: concert.venue,
-          bands: { some: { band: { in: bandIds } } },
+          concert_date: dateRange,
+          city: { equals: concert.city, mode: 'insensitive' },
         },
         include: { bands: true },
       });

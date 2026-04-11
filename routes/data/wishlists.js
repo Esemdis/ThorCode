@@ -86,6 +86,7 @@ router.get(
                   on_sale: true,
                   ticket_sale_start: true,
                   festival: true,
+                  source: true,
                   url: true,
                   bands: {
                     include: {
@@ -155,6 +156,7 @@ router.get(
               on_sale: concert.on_sale,
               ticket_sale_start: concert.ticket_sale_start,
               festival: concert.festival,
+              source: concert.source,
               url: concert.url,
               participating_bands: wishlistBands,
               wishlist_band_count: wishlistBands.length,

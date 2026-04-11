@@ -12,6 +12,32 @@ const roleCheck = require('../../middlewares/roleCheck');
 const { rateLimiter } = require('../../utils/rateLimiter');
 const prisma = require('../../prisma/client');
 
+async function findSourceUrl(bandName, source) {
+  const patterns = {
+    songkick:    { query: `${bandName} songkick`,    regex: /https:\/\/www\.songkick\.com\/artists\/[^"&\s<>]+/ },
+    bandsintown: { query: `${bandName} bandsintown`, regex: /https:\/\/www\.bandsintown\.com\/a\/[^"&\s<>]+/ },
+  };
+  const { query, regex } = patterns[source] || {};
+  if (!query) return null;
+
+  try {
+    const res = await axios.get('https://search.brave.com/search', {
+      params: { q: query },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      timeout: 10000,
+    });
+    const match = res.data.match(regex);
+    return match ? match[0].split('?')[0].replace(/\/$/, '') : null;
+  } catch (e) {
+    console.error(`[findSourceUrl] ${source} search failed for "${bandName}":`, e.message);
+    return null;
+  }
+}
+
 // Defaults to 5 requests per 15 minutes per IP
 const ticketmasterURL = 'https://app.ticketmaster.com/discovery/v2/';
 const rateLimit = rateLimiter({
@@ -170,7 +196,7 @@ router.post(
                 ticket_sale_start: concert.ticket_sale_start ? new Date(concert.ticket_sale_start) : null,
                 url: concert.url || null,
                 festival: concert.festival || false,
-                songkick: concert.songkick ?? null,
+                source: concert.source ?? null,
                 created_at: new Date(),
               },
             });
@@ -348,7 +374,7 @@ router.get('/upcoming/bands', async (req, res) => {
 router.get('/bands', async (req, res) => {
   try {
     const bands = await prisma.band.findMany({
-      select: { id: true, ticketmaster_id: true, name: true, MBID: true, songkick_url: true },
+      select: { id: true, ticketmaster_id: true, name: true, MBID: true, songkick_url: true, bandsintown_url: true },
       orderBy: { created_at: 'asc' },
     });
     res.json(bands);
@@ -369,22 +395,22 @@ router.post(
       // Fetch the band from the database
       const band = await prisma.band.findUnique({
         where: { id: parseInt(bandId) },
-        select: { id: true, name: true, ticketmaster_id: true, songkick_url: true },
+        select: { id: true, name: true, ticketmaster_id: true, songkick_url: true, bandsintown_url: true },
       });
 
       if (!band) {
         return res.status(404).json({ error: 'Band not found' });
       }
 
-      if (!band.songkick_url) {
-        return res.status(400).json({ error: 'No Songkick URL set for this band' });
+      if (!band.songkick_url && !band.bandsintown_url) {
+        return res.status(400).json({ error: 'No Songkick or Bandsintown URL set for this band' });
       }
 
-      // Call the Python service to sync concerts for this band via Songkick
+      // Call the Python service to sync concerts for this band
       const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
       const syncResponse = await axios.post(
         `${pythonServiceUrl}/sync/${band.id}`,
-        { songkick_url: band.songkick_url ?? null, ticketmaster_id: band.ticketmaster_id ?? null, band_name: band.name },
+        { songkick_url: band.songkick_url ?? null, bandsintown_url: band.bandsintown_url ?? null, ticketmaster_id: band.ticketmaster_id ?? null, band_name: band.name },
       );
 
       res.status(200).json({
@@ -538,6 +564,22 @@ router.post(
         },
       });
 
+      // Auto-discover Songkick + Bandsintown URLs in parallel
+      const [songkickUrl, bandsintownUrl] = await Promise.all([
+        findSourceUrl(newBand.name, 'songkick'),
+        findSourceUrl(newBand.name, 'bandsintown'),
+      ]);
+      console.log(`[findSourceUrl] ${newBand.name} → songkick: ${songkickUrl}, bandsintown: ${bandsintownUrl}`);
+      if (songkickUrl || bandsintownUrl) {
+        await prisma.band.update({
+          where: { id: newBand.id },
+          data: {
+            ...(songkickUrl    && { songkick_url:    songkickUrl }),
+            ...(bandsintownUrl && { bandsintown_url: bandsintownUrl }),
+          },
+        });
+      }
+
       // Add to wishlist if provided
       if (wishlistId) {
         await prisma.wishlistBandReference.create({
@@ -553,7 +595,8 @@ router.post(
       try {
         const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
         const syncResponse = await axios.post(
-          `${pythonServiceUrl}/sync/${resolvedTicketmasterId}`,
+          `${pythonServiceUrl}/sync/${newBand.id}`,
+          { songkick_url: songkickUrl ?? null, bandsintown_url: bandsintownUrl ?? null, ticketmaster_id: resolvedTicketmasterId, band_name: newBand.name },
         );
         syncResult = syncResponse.data;
       } catch (syncError) {
@@ -573,6 +616,8 @@ router.post(
           name: newBand.name,
           ticketmaster_id: newBand.ticketmaster_id,
           mbid: newBand.MBID,
+          songkick_url: songkickUrl ?? null,
+          bandsintown_url: bandsintownUrl ?? null,
         },
         sync: syncResult,
       });
@@ -593,7 +638,7 @@ router.get('/bands/:bandId/upcoming', async (req, res) => {
 
     const band = await prisma.band.findUnique({
       where: { id: bandId },
-      select: { id: true, name: true, songkick_url: true },
+      select: { id: true, name: true, songkick_url: true, bandsintown_url: true },
     });
 
     if (!band) {
@@ -659,6 +704,36 @@ router.get('/bands/:bandId/upcoming', async (req, res) => {
   }
 });
 
+router.post(
+  '/bands/:bandId/refresh-urls',
+  auth,
+  roleCheck(['ADMIN']),
+  async (req, res) => {
+    const bandId = parseInt(req.params.bandId, 10);
+    if (Number.isNaN(bandId)) return res.status(400).json({ error: 'Invalid band id' });
+
+    const band = await prisma.band.findUnique({ where: { id: bandId }, select: { name: true } });
+    if (!band) return res.status(404).json({ error: 'Band not found' });
+
+    const [songkickUrl, bandsintownUrl] = await Promise.all([
+      findSourceUrl(band.name, 'songkick'),
+      findSourceUrl(band.name, 'bandsintown'),
+    ]);
+    console.log(`[refresh-urls] ${band.name} → songkick: ${songkickUrl}, bandsintown: ${bandsintownUrl}`);
+
+    const updated = await prisma.band.update({
+      where: { id: bandId },
+      data: {
+        songkick_url:    songkickUrl    ?? undefined,
+        bandsintown_url: bandsintownUrl ?? undefined,
+      },
+      select: { id: true, name: true, songkick_url: true, bandsintown_url: true },
+    });
+
+    res.json({ songkick_url: updated.songkick_url, bandsintown_url: updated.bandsintown_url });
+  },
+);
+
 router.patch(
   '/bands/:bandId',
   auth,
@@ -667,6 +742,10 @@ router.patch(
     .optional({ nullable: true })
     .isString()
     .withMessage('songkick_url must be a string'),
+  body('bandsintown_url')
+    .optional({ nullable: true })
+    .isString()
+    .withMessage('bandsintown_url must be a string'),
   async (req, res) => {
     try {
       const errors = validationResult(req);
@@ -677,11 +756,14 @@ router.patch(
       if (Number.isNaN(bandId)) {
         return res.status(400).json({ error: 'Invalid band id' });
       }
-      const { songkick_url } = req.body;
+      const { songkick_url, bandsintown_url } = req.body;
+      const data = {};
+      if (songkick_url !== undefined)    data.songkick_url    = songkick_url    ? songkick_url.split('?')[0]    || null : null;
+      if (bandsintown_url !== undefined) data.bandsintown_url = bandsintown_url ? bandsintown_url.split('?')[0] || null : null;
       const updated = await prisma.band.update({
         where: { id: bandId },
-        data: { songkick_url: songkick_url.split('?')[0] || null },
-        select: { id: true, name: true, songkick_url: true },
+        data,
+        select: { id: true, name: true, songkick_url: true, bandsintown_url: true },
       });
       res.json(updated);
     } catch (error) {
