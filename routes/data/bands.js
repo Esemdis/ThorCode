@@ -3,7 +3,6 @@ const router = express.Router();
 const { validationResult, body } = require('express-validator');
 const axios = require('axios');
 const {
-  getTicketmasterId,
   handleError,
   checkDuplicateConcert,
 } = require('./helpers');
@@ -82,13 +81,31 @@ router.post(
               });
 
               if (existingByEventId) {
-                // Resolve all bands in parallel, then batch-link the new ones
+                // Resolve bands by band_id or ticketmaster_id
                 const dbBands = await Promise.all(
-                  concert.bands
-                    .filter((b) => b.ticketmaster_id)
-                    .map((b) => tx.band.findFirst({ where: { ticketmaster_id: b.ticketmaster_id } })),
+                  concert.bands.map((b) => {
+                    if (b.band_id) return tx.band.findUnique({ where: { id: b.band_id } });
+                    if (b.ticketmaster_id) return tx.band.findFirst({ where: { ticketmaster_id: b.ticketmaster_id } });
+                    return null;
+                  }),
                 );
-                const validIds = dbBands.filter(Boolean).map((b) => b.id);
+                let validIds = dbBands.filter(Boolean).map((b) => b.id);
+
+                // Also auto-link any bands from the metadata lineup
+                if (concert.metadata) {
+                  try {
+                    const lineupNames = JSON.parse(concert.metadata);
+                    if (Array.isArray(lineupNames) && lineupNames.length > 0) {
+                      const lineupBands = await tx.band.findMany({
+                        where: { OR: lineupNames.map((n) => ({ name: { equals: n, mode: 'insensitive' } })) },
+                        select: { id: true },
+                      });
+                      const validSet = new Set(validIds);
+                      lineupBands.forEach((b) => { if (!validSet.has(b.id)) validIds.push(b.id); });
+                    }
+                  } catch (_) {}
+                }
+
                 const existingRefs = await tx.concertBandReference.findMany({
                   where: { concert: existingByEventId.id, band: { in: validIds } },
                   select: { band: true },
@@ -116,11 +133,14 @@ router.post(
             }
 
             // Resolve all bands in parallel
-            if (concert.bands.some((b) => !b.ticketmaster_id)) {
-              throw new Error(`Invalid band data at index ${i}: ticketmaster_id required`);
+            if (concert.bands.some((b) => !b.ticketmaster_id && !b.band_id)) {
+              throw new Error(`Invalid band data at index ${i}: ticketmaster_id or band_id required`);
             }
             const dbBands = await Promise.all(
-              concert.bands.map((b) => tx.band.findFirst({ where: { ticketmaster_id: b.ticketmaster_id } })),
+              concert.bands.map((b) => {
+                if (b.band_id) return tx.band.findUnique({ where: { id: b.band_id } });
+                return tx.band.findFirst({ where: { ticketmaster_id: b.ticketmaster_id } });
+              }),
             );
             const bandIds = dbBands.filter(Boolean).map((b) => b.id);
 
@@ -150,6 +170,7 @@ router.post(
                 ticket_sale_start: concert.ticket_sale_start ? new Date(concert.ticket_sale_start) : null,
                 url: concert.url || null,
                 festival: concert.festival || false,
+                songkick: concert.songkick ?? null,
                 created_at: new Date(),
               },
             });
@@ -157,6 +178,30 @@ router.post(
             await tx.concertBandReference.createMany({
               data: bandIds.map((band) => ({ concert: newConcert.id, band })),
             });
+
+            // Auto-link any other bands in the lineup (metadata) that exist in the DB
+            if (concert.metadata) {
+              try {
+                const lineupNames = JSON.parse(concert.metadata);
+                if (Array.isArray(lineupNames) && lineupNames.length > 0) {
+                  const lineupBands = await tx.band.findMany({
+                    where: {
+                      OR: lineupNames.map((n) => ({ name: { equals: n, mode: 'insensitive' } })),
+                    },
+                    select: { id: true },
+                  });
+                  const linkedSet = new Set(bandIds);
+                  const extraIds = lineupBands.map((b) => b.id).filter((id) => !linkedSet.has(id));
+                  if (extraIds.length > 0) {
+                    await tx.concertBandReference.createMany({
+                      data: extraIds.map((band) => ({ concert: newConcert.id, band })),
+                    });
+                  }
+                }
+              } catch (_) {
+                // malformed metadata — skip silently
+              }
+            }
 
             insertedConcerts.push({
               index: i,
@@ -252,6 +297,7 @@ router.get('/upcoming/bands', async (req, res) => {
       select: {
         id: true,
         name: true,
+        songkick_url: true,
         _count: { select: { concerts: true } }, // concerts relation name in Band model
       },
       orderBy: { name: 'asc' },
@@ -260,6 +306,7 @@ router.get('/upcoming/bands', async (req, res) => {
     const mapped = bands.map((b) => ({
       id: b.id,
       name: b.name,
+      songkick_url: b.songkick_url,
       concertCount: b._count.concerts,
     }));
 
@@ -301,7 +348,7 @@ router.get('/upcoming/bands', async (req, res) => {
 router.get('/bands', async (req, res) => {
   try {
     const bands = await prisma.band.findMany({
-      select: { ticketmaster_id: true, name: true, MBID: true },
+      select: { id: true, ticketmaster_id: true, name: true, MBID: true, songkick_url: true },
       orderBy: { created_at: 'asc' },
     });
     res.json(bands);
@@ -322,39 +369,28 @@ router.post(
       // Fetch the band from the database
       const band = await prisma.band.findUnique({
         where: { id: parseInt(bandId) },
-        select: { id: true, name: true, ticketmaster_id: true },
+        select: { id: true, name: true, ticketmaster_id: true, songkick_url: true },
       });
 
       if (!band) {
         return res.status(404).json({ error: 'Band not found' });
       }
 
-      // Ensure we have a ticketmaster_id
-      let ticketmasterId = band.ticketmaster_id;
-      if (!ticketmasterId) {
-        // Try to get it from the API using the band name
-        ticketmasterId = await getTicketmasterId(band.name);
-        
-        // Update the band record with the ticketmaster_id if we found it
-        if (ticketmasterId) {
-          await prisma.band.update({
-            where: { id: band.id },
-            data: { ticketmaster_id: ticketmasterId },
-          });
-        }
+      if (!band.songkick_url) {
+        return res.status(400).json({ error: 'No Songkick URL set for this band' });
       }
 
-      // Call the Python service to sync concerts for this band
+      // Call the Python service to sync concerts for this band via Songkick
       const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
       const syncResponse = await axios.post(
-        `${pythonServiceUrl}/sync/${ticketmasterId}`,
+        `${pythonServiceUrl}/sync/${band.id}`,
+        { songkick_url: band.songkick_url ?? null, ticketmaster_id: band.ticketmaster_id ?? null, band_name: band.name },
       );
 
       res.status(200).json({
         status: 'success',
         message: 'Band concerts synced successfully',
         bandId: band.id,
-        ticketmasterId,
         syncDetails: syncResponse.data,
       });
     } catch (error) {
@@ -557,7 +593,7 @@ router.get('/bands/:bandId/upcoming', async (req, res) => {
 
     const band = await prisma.band.findUnique({
       where: { id: bandId },
-      select: { id: true, name: true },
+      select: { id: true, name: true, songkick_url: true },
     });
 
     if (!band) {
@@ -622,6 +658,41 @@ router.get('/bands/:bandId/upcoming', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+router.patch(
+  '/bands/:bandId',
+  auth,
+  roleCheck(['ADMIN']),
+  body('songkick_url')
+    .optional({ nullable: true })
+    .isString()
+    .withMessage('songkick_url must be a string'),
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+      const bandId = parseInt(req.params.bandId, 10);
+      if (Number.isNaN(bandId)) {
+        return res.status(400).json({ error: 'Invalid band id' });
+      }
+      const { songkick_url } = req.body;
+      const updated = await prisma.band.update({
+        where: { id: bandId },
+        data: { songkick_url: songkick_url.split('?')[0] || null },
+        select: { id: true, name: true, songkick_url: true },
+      });
+      res.json(updated);
+    } catch (error) {
+      if (error.code === 'P2025') {
+        return res.status(404).json({ error: 'Band not found' });
+      }
+      console.error('Error updating band:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+);
 
 // Delete a band and all related references; remove orphan concerts
 router.delete(

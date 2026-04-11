@@ -74,6 +74,7 @@ model Band {
   ticketmaster_id String                  @unique
   created_at      DateTime?
   MBID            String?                 @unique
+  songkick_url    String?
   concerts        ConcertBandReference[]  @relation("BandConcerts")
   wishlists       WishlistBandReference[] @relation("BandWishlists")
 }
@@ -94,6 +95,7 @@ model Concert {
   ticket_sale_start DateTime?              @db.Timestamp(6)
   url               String?
   festival          Boolean?               @default(false)
+  songkick          Boolean?
   bands             ConcertBandReference[] @relation("ConcertBands")
 }
 

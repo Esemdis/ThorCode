@@ -118,6 +118,7 @@ router.get(
             const concertDate = new Date(concert.concert_date);
             const startDate = new Date(start_date);
             const endDate = new Date(end_date);
+            endDate.setHours(23, 59, 59, 999);
 
             // Skip if concert is outside the date range
             if (concertDate < startDate || concertDate > endDate) {
