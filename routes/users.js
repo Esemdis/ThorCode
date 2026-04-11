@@ -54,6 +54,10 @@ router.post(
         select: { id: true, email: true },
       });
 
+      await prisma.wishlist.create({
+        data: { name: 'My Wishlist', user_id: user.id },
+      });
+
       res.status(201).json({ message: 'User registered successfully', user });
     } catch (error) {
       console.error('Error during registration:', error);

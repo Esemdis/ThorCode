@@ -50,88 +50,111 @@ function stringSimilarity(a, b) {
 
 async function checkDuplicateConcert({ concert, bandIds, tx }) {
   /**
-   * A concert is a duplicate if ANY of the following are true (same UTC calendar day):
-   * 1. Venue similarity ≥ 70%
-   * 2. Same city (exact, case-insensitive)
+   * Duplicate detection rules:
+   * 1. Venue similarity ≥ 70% within date window
+   * 2. City similarity ≥ 70% within date window
+   * 3. Any incoming band already linked to a concert in the same city on the same day
    *
-   * When multiple venue candidates match, prefer the one with the most bands.
-   * If duplicate found, merge additional bands into existing concert.
-   * Returns: { isDuplicate: boolean, existingConcert: concert object or null }
+   * Date window:
+   * - Always fetch 7 days around the incoming date.
+   * - A candidate is eligible if EITHER the incoming or the existing event has 3+ bands
+   *   (festival/multi-band), OR both are within ±1.5 days of each other.
+   *
+   * When merging, the concert with more bands wins: its date, metadata, and URL become
+   * the canonical record. The loser's bands are merged in.
    */
   let existingConcert = null;
 
   if (concert.concert_date) {
     const dayStart = toUtcDay(concert.concert_date);
     const oneDayMs = 24 * 60 * 60 * 1000;
+    const incomingIsMultiBand = concert.festival || bandIds.length >= 3;
 
-    // Fetch all concerts on the same UTC calendar day (±12h padding for timezone edge cases)
+    // Always fetch 7 days — we filter per-candidate below
     const candidates = await tx.concert.findMany({
       where: {
         concert_date: {
-          gte: new Date(dayStart.getTime() - 12 * 60 * 60 * 1000),
-          lte: new Date(dayStart.getTime() + oneDayMs + 12 * 60 * 60 * 1000),
+          gte: new Date(dayStart.getTime() - 7 * oneDayMs),
+          lte: new Date(dayStart.getTime() + 7 * oneDayMs),
         },
       },
       include: { bands: true },
     });
 
-    // 1. Venue fuzzy match (≥70% similarity) — prefer highest band count, then highest similarity
+    const diffDays = (c) => Math.abs(toUtcDay(c.concert_date).getTime() - dayStart.getTime()) / oneDayMs;
+    const isMultiBand = (c) => c.festival || c.bands.length >= 3;
+    const sharesABand = (c) => c.bands.some((ref) => bandIds.includes(ref.band));
+
+    // 1. Venue fuzzy match — within 1.5 days always; within 7 days if multi-band or shares a band
     if (concert.venue) {
       const venueMatches = candidates
         .filter((c) => c.venue)
         .map((c) => ({ c, sim: stringSimilarity(concert.venue, c.venue) }))
-        .filter(({ sim }) => sim >= 0.7)
+        .filter(({ c, sim }) => {
+          if (sim < 0.7) return false;
+          const d = diffDays(c);
+          return d <= 1.5 || incomingIsMultiBand || isMultiBand(c) || sharesABand(c);
+        })
+        .filter(({ c }) => diffDays(c) <= 7)
         .sort((a, b) => b.c.bands.length - a.c.bands.length || b.sim - a.sim);
       existingConcert = venueMatches[0]?.c ?? null;
     }
 
-    // 2. City fuzzy match (≥70% similarity) — handles "Sölvesborg" vs "Sölvesborgs kommun" etc.
+    // 2. City fuzzy match fallback — only within 1.5 days or multi-band window
     if (!existingConcert && concert.city) {
       const cityMatches = candidates
+        .filter((c) => {
+          const d = diffDays(c);
+          return d <= (incomingIsMultiBand || isMultiBand(c) ? 7 : 1.5);
+        })
         .filter((c) => c.city)
         .map((c) => ({ c, sim: stringSimilarity(concert.city, c.city) }))
         .filter(({ sim }) => sim >= 0.7)
         .sort((a, b) => b.c.bands.length - a.c.bands.length || b.sim - a.sim);
       existingConcert = cityMatches[0]?.c ?? null;
     }
+
+    // 3. Band-schedule conflict — a band can't play two events in the same city on the same day.
+    //    Use ±1.5 day window regardless of multi-band status.
+    if (!existingConcert && concert.city && bandIds.length > 0) {
+      const cityNorm = concert.city.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+      for (const c of candidates) {
+        if (diffDays(c) > 1.5 || !c.city) continue;
+        const cNorm = c.city.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+        if (stringSimilarity(cityNorm, cNorm) < 0.7) continue;
+        if (sharesABand(c)) { existingConcert = c; break; }
+      }
+    }
   }
 
-  
-
-  // If duplicate found, merge any new bands into existing concert
   if (existingConcert) {
-    // Prefer a proper name over "BAND @ VENUE" format
+    // The concert with more bands wins — its date/metadata become canonical
+    const incomingWins = bandIds.length > existingConcert.bands.length;
+
     const existingIsAtFormat = (existingConcert.name || '').includes(' @ ');
     const incomingIsAtFormat = (concert.name || '').includes(' @ ');
     const bestName = (concert.name && existingIsAtFormat && !incomingIsAtFormat)
       ? concert.name
       : concert.name || existingConcert.name;
-
     const hasBetterName = bestName !== existingConcert.name;
-    const hasMoreBands = bandIds.length > existingConcert.bands.length;
 
-    if (hasMoreBands || hasBetterName) {
+    if (incomingWins || hasBetterName) {
       await tx.concert.update({
         where: { id: existingConcert.id },
         data: {
           name: bestName,
-          ...(hasMoreBands && {
+          ...(incomingWins && {
+            concert_date: concert.concert_date ? new Date(concert.concert_date) : existingConcert.concert_date,
             url: concert.url || existingConcert.url,
             metadata: concert.metadata || existingConcert.metadata,
-            concert_date: concert.concert_date
-              ? new Date(concert.concert_date)
-              : existingConcert.concert_date,
             on_sale: concert.on_sale !== undefined ? concert.on_sale : existingConcert.on_sale,
-            ticket_sale_start: concert.ticket_sale_start
-              ? new Date(concert.ticket_sale_start)
-              : existingConcert.ticket_sale_start,
+            ticket_sale_start: concert.ticket_sale_start ? new Date(concert.ticket_sale_start) : existingConcert.ticket_sale_start,
             festival: concert.festival || existingConcert.festival,
           }),
         },
       });
     }
 
-    // Fetch all existing refs in one query, then batch create missing ones
     const existingRefs = await tx.concertBandReference.findMany({
       where: { concert: existingConcert.id, band: { in: bandIds } },
       select: { band: true },
@@ -145,10 +168,7 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
     }
   }
 
-  return {
-    isDuplicate: !!existingConcert,
-    existingConcert,
-  };
+  return { isDuplicate: !!existingConcert, existingConcert };
 }
 
 function handleError(module, status) {

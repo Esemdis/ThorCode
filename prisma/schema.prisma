@@ -117,18 +117,23 @@ model ConcertBandReference {
 }
 
 model Wishlist {
-  id              Int                     @id @default(autoincrement())
-  name            String                  @unique
-  user_id         String
-  discord_webhook String?
-  user_rel        User                    @relation("UserWishlists", fields: [user_id], references: [id])
-  bands           WishlistBandReference[] @relation("WishlistBands")
+  id                   Int                     @id @default(autoincrement())
+  name                 String
+  user_id              String                  @unique
+  discord_webhook      String?
+  concert_scores       String?
+  city_rankings        String?
+  scores_computed_at   DateTime?
+  user_rel             User                    @relation("UserWishlists", fields: [user_id], references: [id])
+  bands                WishlistBandReference[] @relation("WishlistBands")
 }
 
 model WishlistBandReference {
   id           Int      @id @default(autoincrement())
   band_id      Int
   wishlist_id  Int
+  tier         BandTier @default(FOLLOW)
+  times_seen   Int      @default(0)
   band_rel     Band     @relation("BandWishlists", fields: [band_id], references: [id])
   wishlist_rel Wishlist @relation("WishlistBands", fields: [wishlist_id], references: [id])
 
@@ -139,4 +144,10 @@ enum Role {
   USER
   ADMIN
   SYSTEM
+}
+
+enum BandTier {
+  LOVE
+  LIKE
+  FOLLOW
 }

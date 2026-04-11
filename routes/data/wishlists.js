@@ -13,6 +13,21 @@ const rateLimit = rateLimiter({
   message: "Too many requests to the Ticketmaster data route, please try again later.",
 });
 
+const VALID_TIERS = ["LOVE", "LIKE", "FOLLOW"];
+
+// Helper: trigger Python service to recompute scores for a wishlist
+async function triggerScoreRecompute(wishlistId) {
+  const pythonUrl = process.env.PYTHON_SERVICE_URL;
+  if (!pythonUrl) return;
+  try {
+    await axios.post(`${pythonUrl}/recompute/${wishlistId}`, {}, { timeout: 5000 });
+  } catch (e) {
+    // Non-blocking — scoring will recompute on next full sync if this fails
+    console.warn(`[Scoring] Failed to trigger recompute for wishlist ${wishlistId}:`, e.message);
+  }
+}
+
+// GET /wishlists — list the user's single wishlist
 router.get(
   "/wishlists",
   [auth, roleCheck(["ADMIN"])],
@@ -32,17 +47,90 @@ router.get(
   }
 );
 
+// GET /wishlists/raw — returns all wishlists with raw band+concert data (SYSTEM only, for Python scoring)
+router.get(
+  "/wishlists/raw",
+  [auth, roleCheck(["SYSTEM"])],
+  async (_req, res) => {
+    try {
+      const wishlists = await prisma.wishlist.findMany({
+        include: {
+          bands: {
+            select: {
+              band_id: true,
+              tier: true,
+              times_seen: true,
+            },
+          },
+        },
+      });
+
+      const result = await Promise.all(
+        wishlists.map(async (wishlist) => {
+          const bandIds = wishlist.bands.map((b) => b.band_id);
+
+          // Get all concerts for all bands in this wishlist
+          const concertRefs = await prisma.concertBandReference.findMany({
+            where: { band: { in: bandIds } },
+            include: {
+              concert_rel: {
+                select: {
+                  id: true,
+                  city: true,
+                  country: true,
+                  concert_date: true,
+                  latitude: true,
+                  longitude: true,
+                  bands: {
+                    select: { band: true },
+                  },
+                },
+              },
+            },
+          });
+
+          // Deduplicate concerts and collect band_ids per concert
+          const concertMap = new Map();
+          for (const ref of concertRefs) {
+            const c = ref.concert_rel;
+            if (!concertMap.has(c.id)) {
+              concertMap.set(c.id, {
+                id: c.id,
+                city: c.city,
+                country: c.country,
+                concert_date: c.concert_date,
+                latitude: c.latitude,
+                longitude: c.longitude,
+                band_ids: c.bands.map((b) => b.band),
+              });
+            }
+          }
+
+          return {
+            id: wishlist.id,
+            bands: wishlist.bands,
+            concerts: Array.from(concertMap.values()),
+          };
+        })
+      );
+
+      res.json(result);
+    } catch (error) {
+      console.error("Error fetching raw wishlists:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// GET /wishlists/:id — wishlist with concerts, bands (with tiers), and precomputed scores
 router.get(
   "/wishlists/:id",
   [auth, roleCheck(["ADMIN"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
   async (req, res) => {
     try {
       const wishlistId = parseInt(req.params.id, 10);
-
-      // Get date range filter parameters
       const { start_date, end_date, countries } = req.query;
 
-      // Get the wishlist with band references
       const wishlist = await prisma.wishlist.findUnique({
         where: { id: wishlistId },
         include: {
@@ -59,14 +147,11 @@ router.get(
         return res.status(404).json(payload);
       }
 
-      // Get band IDs from the wishlist
       const bandIds = wishlist.bands.map((ref) => ref.band_id);
+      const bandTierMap = new Map(wishlist.bands.map((ref) => [ref.band_id, ref.tier]));
 
-      // Get bands with all their concerts and details
       const bandsWithConcerts = await prisma.band.findMany({
-        where: {
-          id: { in: bandIds },
-        },
+        where: { id: { in: bandIds } },
         select: {
           id: true,
           name: true,
@@ -91,10 +176,7 @@ router.get(
                   bands: {
                     include: {
                       band_rel: {
-                        select: {
-                          name: true,
-                          id: true,
-                        },
+                        select: { name: true, id: true },
                       },
                     },
                   },
@@ -105,34 +187,33 @@ router.get(
         },
       });
 
-      // Format the response with detailed concert information
+      // Parse precomputed concert scores from stored JSON
+      let concertScoreMap = new Map();
+      if (wishlist.concert_scores) {
+        try {
+          const stored = JSON.parse(wishlist.concert_scores);
+          concertScoreMap = new Map(Object.entries(stored).map(([k, v]) => [parseInt(k, 10), v]));
+        } catch (_) {}
+      }
+
       const formattedBands = bandsWithConcerts.map((band) => {
-        // First, create a map to store unique concerts by ID
         const concertsMap = new Map();
 
         band.concerts.forEach((concertRef) => {
           const concert = concertRef.concert_rel;
           const eventId = concert.id;
 
-          // Apply date range filtering
           if (start_date && end_date) {
             const concertDate = new Date(concert.concert_date);
             const startDate = new Date(start_date);
             const endDate = new Date(end_date);
             endDate.setHours(23, 59, 59, 999);
-
-            // Skip if concert is outside the date range
-            if (concertDate < startDate || concertDate > endDate) {
-              return;
-            }
+            if (concertDate < startDate || concertDate > endDate) return;
           }
 
-          // Apply country filtering if provided
           if (countries) {
             const countryList = countries.split(",");
-            if (!countryList.includes(concert.country)) {
-              return;
-            }
+            if (!countryList.includes(concert.country)) return;
           }
 
           if (!concertsMap.has(eventId)) {
@@ -140,8 +221,9 @@ router.get(
               .map((b) => ({
                 id: b.band_rel.id,
                 name: b.band_rel.name,
+                tier: bandTierMap.get(b.band_rel.id) ?? null,
               }))
-              .filter((band) => bandIds.includes(band.id)); // Only include bands that are in the wishlist
+              .filter((b) => bandIds.includes(b.id));
 
             concertsMap.set(eventId, {
               id: concert.id,
@@ -160,51 +242,58 @@ router.get(
               url: concert.url,
               participating_bands: wishlistBands,
               wishlist_band_count: wishlistBands.length,
+              concert_score: concertScoreMap.get(concert.id) ?? 0,
             });
           }
         });
 
-        // Convert map values to array
         const concertsList = Array.from(concertsMap.values());
-
-        return {
-          id: band.id,
-          name: band.name,
-          concerts: concertsList,
-          concertCount: concertsList.length,
-        };
+        return { id: band.id, name: band.name, concerts: concertsList, concertCount: concertsList.length };
       });
 
-      // Create a simplified bands array with minimal info
-      const simplifiedBands = formattedBands.map((band) => ({
-        id: band.id,
-        name: band.name,
-        concertCount: band.concerts.length,
+      // Simplified bands array with tier and seen count
+      const simplifiedBands = wishlist.bands.map((ref) => ({
+        id: ref.band_rel.id,
+        name: ref.band_rel.name,
+        concertCount: formattedBands.find((b) => b.id === ref.band_id)?.concertCount ?? 0,
+        tier: ref.tier,
+        times_seen: ref.times_seen,
+        songkick_url: ref.band_rel.songkick_url ?? null,
+        bandsintown_url: ref.band_rel.bandsintown_url ?? null,
       }));
 
-      // Create a consolidated concerts array with all unique concerts
+      // Deduplicated concerts across all bands
       const allConcerts = new Map();
-
-      // Populate with all concerts from all bands
       formattedBands.forEach((band) => {
         band.concerts.forEach((concert) => {
-          if (!allConcerts.has(concert.id)) {
-            // Store the complete concert object, not just the ID
-            allConcerts.set(concert.id, concert);
-          }
+          if (!allConcerts.has(concert.id)) allConcerts.set(concert.id, concert);
         });
       });
-
-      // Convert to array
       const concertsArray = Array.from(allConcerts.values());
 
-      // Return the restructured data
+      // Parse precomputed city rankings
+      let cityRankings = [];
+      if (wishlist.city_rankings) {
+        try {
+          cityRankings = JSON.parse(wishlist.city_rankings);
+          // Apply date range filter to city rankings if provided
+          if ((start_date || end_date) && concertsArray.length > 0) {
+            // Re-filter city rankings based on which concerts are visible in this date range
+              const visibleCities = new Set(concertsArray.map((c) => `${c.city}|||${c.country}`));
+            cityRankings = cityRankings.filter((r) => visibleCities.has(`${r.city}|||${r.country}`));
+          }
+        } catch (_) {}
+      }
+
       res.json({
         id: wishlist.id,
         name: wishlist.name,
         user_id: wishlist.user_id,
+        discord_webhook: wishlist.discord_webhook,
         bands: simplifiedBands,
         concerts: concertsArray,
+        city_rankings: cityRankings,
+        scores_computed_at: wishlist.scores_computed_at,
       });
     } catch (error) {
       console.error("Error fetching wishlist:", error);
@@ -214,7 +303,85 @@ router.get(
   }
 );
 
-// Create a new wishlist
+// PATCH /wishlists/:id/scores — store precomputed scores from Python (SYSTEM only)
+router.patch(
+  "/wishlists/:id/scores",
+  [auth, roleCheck(["SYSTEM"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
+  async (req, res) => {
+    try {
+      const wishlistId = parseInt(req.params.id, 10);
+      const { concert_scores, city_rankings } = req.body;
+
+      await prisma.wishlist.update({
+        where: { id: wishlistId },
+        data: {
+          concert_scores: JSON.stringify(concert_scores),
+          city_rankings: JSON.stringify(city_rankings),
+          scores_computed_at: new Date(),
+        },
+      });
+
+      res.json({ ok: true });
+    } catch (error) {
+      console.error("Error storing computed scores:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// PATCH /wishlists/:id/bands/:bandId — update tier and/or times_seen for a band
+router.patch(
+  "/wishlists/:id/bands/:bandId",
+  [
+    auth,
+    roleCheck(["ADMIN"]),
+    param("id").isInt().withMessage("Wishlist ID must be an integer"),
+    param("bandId").isInt().withMessage("Band ID must be an integer"),
+    body("tier").optional().isIn(VALID_TIERS).withMessage("tier must be LOVE, LIKE, or FOLLOW"),
+    body("times_seen").optional().isInt({ min: 0 }).withMessage("times_seen must be a non-negative integer"),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ error: "Validation failed", details: errors.array() });
+      }
+
+      const wishlistId = parseInt(req.params.id, 10);
+      const bandId = parseInt(req.params.bandId, 10);
+      const { tier, times_seen } = req.body;
+
+      if (tier === undefined && times_seen === undefined) {
+        return res.status(400).json({ error: "Provide at least one of: tier, times_seen" });
+      }
+
+      // Verify ownership
+      const wishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
+      if (!wishlist) return res.status(404).json(handleError("wishlist", 404));
+      if (wishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
+
+      const updateData = {};
+      if (tier !== undefined) updateData.tier = tier;
+      if (times_seen !== undefined) updateData.times_seen = times_seen;
+
+      const updated = await prisma.wishlistBandReference.update({
+        where: { band_wishlist: { band_id: bandId, wishlist_id: wishlistId } },
+        data: updateData,
+      });
+
+      // Trigger async score recompute — non-blocking
+      triggerScoreRecompute(wishlistId);
+
+      res.json(updated);
+    } catch (error) {
+      console.error("Error updating band in wishlist:", error);
+      const payload = handleError("wishlist", 500);
+      return res.status(500).json(payload);
+    }
+  }
+);
+
+// POST /wishlists — create wishlist (returns existing one if user already has one)
 router.post(
   "/wishlists",
   [
@@ -228,24 +395,22 @@ router.post(
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
-        return res.status(400).json({
-          error: "Validation failed",
-          details: errors.array(),
-        });
+        return res.status(400).json({ error: "Validation failed", details: errors.array() });
       }
+
+      // Return existing wishlist if user already has one
+      const existing = await prisma.wishlist.findUnique({ where: { user_id: req.user.id }, include: { bands: true } });
+      if (existing) return res.status(200).json(existing);
 
       const { name, discord_webhook } = req.body;
 
-      // Create the new wishlist
       const newWishlist = await prisma.wishlist.create({
         data: {
           name: name.trim(),
           user_id: req.user.id,
           discord_webhook: discord_webhook || null,
         },
-        include: {
-          bands: true,
-        },
+        include: { bands: true },
       });
 
       res.status(201).json(newWishlist);
@@ -257,7 +422,7 @@ router.post(
   }
 );
 
-// Update a wishlist name
+// PUT /wishlists/:id — update wishlist name/webhook
 router.put(
   "/wishlists/:id",
   [
@@ -272,40 +437,23 @@ router.put(
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
-        return res.status(400).json({
-          error: "Validation failed",
-          details: errors.array(),
-        });
+        return res.status(400).json({ error: "Validation failed", details: errors.array() });
       }
 
       const wishlistId = parseInt(req.params.id, 10);
       const { name, discord_webhook } = req.body;
 
-      // Check if wishlist exists and belongs to the user
-      const existingWishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
-      });
-
-      if (!existingWishlist) {
-        const payload = handleError("wishlist", 404);
-        return res.status(404).json(payload);
-      }
-
-      if (existingWishlist.user_id !== req.user.id) {
-        const payload = handleError("wishlist", 403);
-        return res.status(403).json(payload);
-      }
+      const existingWishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
+      if (!existingWishlist) return res.status(404).json(handleError("wishlist", 404));
+      if (existingWishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
 
       const updateData = { name: name.trim() };
       if (discord_webhook !== undefined) updateData.discord_webhook = discord_webhook || null;
 
-      // Update the wishlist
       const updatedWishlist = await prisma.wishlist.update({
         where: { id: wishlistId },
         data: updateData,
-        include: {
-          bands: true,
-        },
+        include: { bands: true },
       });
 
       res.json(updatedWishlist);
@@ -317,7 +465,7 @@ router.put(
   }
 );
 
-// Add a band to a wishlist (create band if it doesn't exist)
+// POST /wishlists/:id/bands — add a band to the wishlist (with tier)
 router.post(
   "/wishlists/:id/bands",
   [
@@ -326,111 +474,77 @@ router.post(
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
     body("name").optional().isString().notEmpty().withMessage("Band name must be a non-empty string"),
     body("ticketmaster_id").optional().isString().notEmpty().withMessage("Ticketmaster ID must be a non-empty string"),
+    body("tier").optional().isIn(VALID_TIERS).withMessage("tier must be LOVE, LIKE, or FOLLOW"),
   ],
   rateLimit,
   async (req, res) => {
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
-        return res.status(400).json({
-          error: "Validation failed",
-          details: errors.array(),
-        });
+        return res.status(400).json({ error: "Validation failed", details: errors.array() });
       }
 
       const wishlistId = parseInt(req.params.id, 10);
-      const { name, ticketmaster_id } = req.body;
+      const { name, ticketmaster_id, tier = "FOLLOW" } = req.body;
 
-      // Validate that either name or ticketmaster_id is provided
       if (!name && !ticketmaster_id) {
-        return res.status(400).json({
-          error: "Either 'name' or 'ticketmaster_id' must be provided",
-        });
+        return res.status(400).json({ error: "Either 'name' or 'ticketmaster_id' must be provided" });
       }
 
-      // Sanitize inputs
       const bandName = name ? name.trim() : null;
       const ticketmasterId = ticketmaster_id ? ticketmaster_id.trim() : null;
 
-      // Check if wishlist exists and belongs to the user
-      const existingWishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
-      });
+      const existingWishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
+      if (!existingWishlist) return res.status(404).json(handleError("wishlist", 404));
+      if (existingWishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
 
-      if (!existingWishlist) {
-        const payload = handleError("wishlist", 404);
-        return res.status(404).json(payload);
-      }
-
-      if (existingWishlist.user_id !== req.user.id) {
-        const payload = handleError("wishlist", 403);
-        return res.status(403).json(payload);
-      }
-
-
-      // If band doesn't exist, create it via the POST /data/bands route
       let band;
-        try {
-          const bandPayload = {};
-          if (ticketmasterId) bandPayload.ticketmaster_id = ticketmasterId;
-          if (bandName) bandPayload.name = bandName;
-          const createResponse = await axios.post(
-            `http://${process.env.API_BASE_URL}/data/concerts/bands`,
-            bandPayload,
-            { headers: { Authorization: req.headers.authorization } },
-          );
-          band = createResponse.data.band;
-          if (!band) {
-            console.error('Band creation response missing band object:', createResponse.data);
-            return res.status(500).json({ error: 'Band creation failed: no band returned' });
-          }
-        } catch (error) {
-          if (error.response?.status === 409) {
-            // Band already exists — look it up directly
-            band = ticketmasterId
-              ? await prisma.band.findUnique({ where: { ticketmaster_id: ticketmasterId } })
-              : await prisma.band.findUnique({ where: { name: bandName } });
-            if (!band) {
-              console.error('Band reported as existing but not found in DB');
-              return res.status(500).json({ error: 'Band lookup failed after conflict' });
-            }
-          } else {
-            console.error('Error creating band:', error.response?.data ?? error.message);
-            const status = error.response?.status || 500;
-            const payload = handleError('band', status);
-            return res.status(status).json(payload);
-          }
+      try {
+        const bandPayload = {};
+        if (ticketmasterId) bandPayload.ticketmaster_id = ticketmasterId;
+        if (bandName) bandPayload.name = bandName;
+        const createResponse = await axios.post(
+          `http://${process.env.API_BASE_URL}/data/concerts/bands`,
+          bandPayload,
+          { headers: { Authorization: req.headers.authorization } },
+        );
+        band = createResponse.data.band;
+        if (!band) {
+          console.error("Band creation response missing band object:", createResponse.data);
+          return res.status(500).json({ error: "Band creation failed: no band returned" });
         }
-
-      // Check if band is already in the wishlist
-      const existingReference = await prisma.wishlistBandReference.findFirst({
-        where: {
-          wishlist_id: wishlistId,
-          band_id: band.id,
-        },
-      });
-
-      if (existingReference) {
-        const payload = handleError("wishlist", 409);
-        return res.status(409).json(payload);
+      } catch (error) {
+        if (error.response?.status === 409) {
+          band = ticketmasterId
+            ? await prisma.band.findUnique({ where: { ticketmaster_id: ticketmasterId } })
+            : await prisma.band.findUnique({ where: { name: bandName } });
+          if (!band) {
+            console.error("Band reported as existing but not found in DB");
+            return res.status(500).json({ error: "Band lookup failed after conflict" });
+          }
+        } else {
+          console.error("Error creating band:", error.response?.data ?? error.message);
+          const status = error.response?.status || 500;
+          return res.status(status).json(handleError("band", status));
+        }
       }
 
-      // Add band to wishlist
-      await prisma.wishlistBandReference.create({
-        data: {
-          wishlist_id: wishlistId,
-          band_id: band.id,
-        },
+      const existingReference = await prisma.wishlistBandReference.findFirst({
+        where: { wishlist_id: wishlistId, band_id: band.id },
       });
 
-      // Return success response
+      if (existingReference) return res.status(409).json(handleError("wishlist", 409));
+
+      await prisma.wishlistBandReference.create({
+        data: { wishlist_id: wishlistId, band_id: band.id, tier },
+      });
+
+      // Trigger score recompute after adding a new band
+      triggerScoreRecompute(wishlistId);
+
       res.status(201).json({
         message: "Band added to wishlist successfully",
-        band: {
-          id: band.id,
-          name: band.name,
-          ticketmaster_id: band.ticketmaster_id,
-        },
+        band: { id: band.id, name: band.name, ticketmaster_id: band.ticketmaster_id },
       });
     } catch (error) {
       console.error("Error adding band to wishlist:", error);
@@ -440,7 +554,7 @@ router.post(
   }
 );
 
-// Remove a band from a wishlist
+// DELETE /wishlists/:id/bands/:bandId — remove a band from the wishlist
 router.delete(
   "/wishlists/:id/bands/:bandId",
   [
@@ -454,49 +568,26 @@ router.delete(
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
-        return res.status(400).json({
-          error: "Validation failed",
-          details: errors.array(),
-        });
+        return res.status(400).json({ error: "Validation failed", details: errors.array() });
       }
 
       const wishlistId = parseInt(req.params.id, 10);
       const bandId = parseInt(req.params.bandId, 10);
 
-      // Check if wishlist exists and belongs to the user
-      const existingWishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
-      });
+      const existingWishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
+      if (!existingWishlist) return res.status(404).json(handleError("wishlist", 404));
+      if (existingWishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
 
-      if (!existingWishlist) {
-        const payload = handleError("wishlist", 404);
-        return res.status(404).json(payload);
-      }
-
-      if (existingWishlist.user_id !== req.user.id) {
-        const payload = handleError("wishlist", 403);
-        return res.status(403).json(payload);
-      }
-
-      // Check if the band is in the wishlist
       const existingReference = await prisma.wishlistBandReference.findFirst({
-        where: {
-          wishlist_id: wishlistId,
-          band_id: bandId,
-        },
+        where: { wishlist_id: wishlistId, band_id: bandId },
       });
 
-      if (!existingReference) {
-        const payload = handleError("wishlist", 404);
-        return res.status(404).json(payload);
-      }
+      if (!existingReference) return res.status(404).json(handleError("wishlist", 404));
 
-      // Remove the band from the wishlist
-      await prisma.wishlistBandReference.delete({
-        where: {
-          id: existingReference.id,
-        },
-      });
+      await prisma.wishlistBandReference.delete({ where: { id: existingReference.id } });
+
+      // Trigger score recompute after removing a band
+      triggerScoreRecompute(wishlistId);
 
       res.json({ message: "Band removed from wishlist successfully" });
     } catch (error) {
@@ -507,6 +598,7 @@ router.delete(
   }
 );
 
+// DELETE /wishlists/:id
 router.delete(
   "/wishlists/:id",
   [auth, roleCheck(["ADMIN"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
@@ -514,29 +606,12 @@ router.delete(
   async (req, res) => {
     try {
       const wishlistId = parseInt(req.params.id, 10);
-      const existingWishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
-      });
+      const existingWishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
+      if (!existingWishlist) return res.status(404).json(handleError("wishlist", 404));
+      if (existingWishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
 
-      if (!existingWishlist) {
-        const payload = handleError("wishlist", 404);
-        return res.status(404).json(payload);
-      }
-
-      if (existingWishlist.user_id !== req.user.id) {
-        const payload = handleError("wishlist", 403);
-        return res.status(403).json(payload);
-      }
-
-      // Delete related wishlist_band_references first
-      await prisma.wishlistBandReference.deleteMany({
-        where: { wishlist_id: wishlistId },
-      });
-
-      // Then delete the wishlist
-      await prisma.wishlist.delete({
-        where: { id: wishlistId },
-      });
+      await prisma.wishlistBandReference.deleteMany({ where: { wishlist_id: wishlistId } });
+      await prisma.wishlist.delete({ where: { id: wishlistId } });
 
       res.json({ message: "Wishlist deleted successfully." });
     } catch (error) {
@@ -547,6 +622,7 @@ router.delete(
   }
 );
 
+// POST /wishlists/notify — Discord notifications for new concerts (SYSTEM/ADMIN)
 router.post(
   "/wishlists/notify",
   [auth, roleCheck(["ADMIN", "SYSTEM"]), body("bands").isArray({ min: 1 }).withMessage("bands must be a non-empty array")],
@@ -556,9 +632,7 @@ router.post(
       if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
 
       const { bands } = req.body;
-      // bands: [{ ticketmaster_id, name, concerts: [...] }]
 
-      // Find all wishlists that contain any of these bands and have a webhook set
       const wishlists = await prisma.wishlist.findMany({
         where: { discord_webhook: { not: null } },
         include: {
@@ -568,7 +642,6 @@ router.post(
         },
       });
 
-      // Group new concert data by wishlist
       const notifications = wishlists
         .map((wishlist) => {
           const matchedBands = bands.filter((b) =>
@@ -578,7 +651,6 @@ router.post(
         })
         .filter(({ matchedBands }) => matchedBands.length > 0);
 
-      // Fire Discord webhooks
       await Promise.all(
         notifications.map(async ({ wishlist, matchedBands }) => {
           const embeds = buildDiscordEmbeds(wishlist.name, matchedBands);
