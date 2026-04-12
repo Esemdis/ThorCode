@@ -32,6 +32,24 @@ function toUtcDay(date) {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
+// Haversine distance in km between two lat/lng points
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Returns true if both concerts have coordinates and are within 20km of each other
+function sameArea(incoming, existing) {
+  const iLat = parseFloat(incoming.latitude), iLng = parseFloat(incoming.longitude);
+  const eLat = parseFloat(existing.latitude), eLng = parseFloat(existing.longitude);
+  if (!iLat || !iLng || !eLat || !eLng) return false;
+  return haversineKm(iLat, iLng, eLat, eLng) <= 20;
+}
+
 // Bigram Dice coefficient — returns 0.0–1.0. Unicode-safe: keeps all letters/numbers.
 function stringSimilarity(a, b) {
   const norm = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
@@ -85,8 +103,21 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
     const isMultiBand = (c) => c.festival || c.bands.length >= 3;
     const sharesABand = (c) => c.bands.some((ref) => bandIds.includes(ref.band));
 
+    // 0. Band-schedule conflict — highest confidence rule, checked first.
+    //    A band cannot play in the same city area on the same calendar day.
+    //    Uses coordinates when available (language-agnostic), falls back to city name similarity.
+    if (bandIds.length > 0) {
+      const sameDayCandidates = candidates.filter((c) => diffDays(c) === 0);
+      for (const c of sameDayCandidates) {
+        if (!sharesABand(c)) continue;
+        const inSameArea = sameArea(concert, c) ||
+          (concert.city && c.city && stringSimilarity(concert.city, c.city) >= 0.7);
+        if (inSameArea) { existingConcert = c; break; }
+      }
+    }
+
     // 1. Venue fuzzy match — within 1.5 days always; within 7 days if multi-band or shares a band
-    if (concert.venue) {
+    if (!existingConcert && concert.venue) {
       const venueMatches = candidates
         .filter((c) => c.venue)
         .map((c) => ({ c, sim: stringSimilarity(concert.venue, c.venue) }))
@@ -100,31 +131,18 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
       existingConcert = venueMatches[0]?.c ?? null;
     }
 
-    // 2. City fuzzy match fallback — only within 1.5 days or multi-band window
+    // 2. City fuzzy match fallback — name similarity only (coordinates alone are too broad)
     if (!existingConcert && concert.city) {
       const cityMatches = candidates
         .filter((c) => {
           const d = diffDays(c);
           return d <= (incomingIsMultiBand || isMultiBand(c) ? 7 : 1.5);
         })
-        .filter((c) => c.city)
-        .map((c) => ({ c, sim: stringSimilarity(concert.city, c.city) }))
-        .filter(({ sim }) => sim >= 0.7)
-        .sort((a, b) => b.c.bands.length - a.c.bands.length || b.sim - a.sim);
-      existingConcert = cityMatches[0]?.c ?? null;
+        .filter((c) => c.city && stringSimilarity(concert.city, c.city) >= 0.7)
+        .sort((a, b) => b.bands.length - a.bands.length);
+      existingConcert = cityMatches[0] ?? null;
     }
 
-    // 3. Band-schedule conflict — a band can't play two events in the same city on the same day.
-    //    Use ±1.5 day window regardless of multi-band status.
-    if (!existingConcert && concert.city && bandIds.length > 0) {
-      const cityNorm = concert.city.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
-      for (const c of candidates) {
-        if (diffDays(c) > 1.5 || !c.city) continue;
-        const cNorm = c.city.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
-        if (stringSimilarity(cityNorm, cNorm) < 0.7) continue;
-        if (sharesABand(c)) { existingConcert = c; break; }
-      }
-    }
   }
 
   if (existingConcert) {
