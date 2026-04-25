@@ -645,7 +645,7 @@ router.post(
       const notifications = wishlists
         .map((wishlist) => {
           const matchedBands = bands.filter((b) =>
-            wishlist.bands.some((ref) => ref.band_rel.ticketmaster_id === b.ticketmaster_id),
+            wishlist.bands.some((ref) => ref.band_rel.id === b.band_id),
           );
           return { wishlist, matchedBands };
         })
