@@ -653,9 +653,11 @@ router.post(
 
       await Promise.all(
         notifications.map(async ({ wishlist, matchedBands }) => {
-          const embeds = buildDiscordEmbeds(wishlist.name, matchedBands);
-          for (const embed of embeds) {
-            await axios.post(wishlist.discord_webhook, { embeds: [embed] });
+          for (const band of matchedBands) {
+            const embeds = buildDiscordEmbeds(band);
+            for (const embed of embeds) {
+              await axios.post(wishlist.discord_webhook, { embeds: [embed] });
+            }
           }
         }),
       );
@@ -668,7 +670,7 @@ router.post(
   },
 );
 
-function buildDiscordEmbeds(wishlistName, bands) {
+function buildDiscordEmbeds(band) {
   const EMBED_CHAR_LIMIT = 5800;
   const FIELD_VALUE_LIMIT = 1024;
   const FIELD_NAME_LIMIT = 256;
@@ -676,28 +678,26 @@ function buildDiscordEmbeds(wishlistName, bands) {
 
   const fields = [];
 
-  for (const band of bands) {
-    for (const concert of band.concerts) {
-      const date = concert.concert_date
-        ? new Date(concert.concert_date).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
-        : "TBA";
-      const location = [concert.city, concert.country].filter(Boolean).join(", ");
-      const venue = concert.venue || "Unknown venue";
-      const rawLabel = `${band.name} — ${date}, ${location}`;
-      const label = rawLabel.length > FIELD_NAME_LIMIT ? rawLabel.slice(0, FIELD_NAME_LIMIT - 1) + "…" : rawLabel;
-      const venueStr = concert.url ? `[${venue}](${concert.url})` : venue;
+  for (const concert of band.concerts) {
+    const date = concert.concert_date
+      ? new Date(concert.concert_date).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
+      : "TBA";
+    const location = [concert.city, concert.country].filter(Boolean).join(", ");
+    const venue = concert.venue || "Unknown venue";
+    const rawLabel = `${date} — ${location}`;
+    const label = rawLabel.length > FIELD_NAME_LIMIT ? rawLabel.slice(0, FIELD_NAME_LIMIT - 1) + "…" : rawLabel;
+    const venueStr = concert.url ? `[${venue}](${concert.url})` : venue;
 
-      let lineup = [];
-      try { lineup = JSON.parse(concert.metadata || "[]"); } catch {}
-      const fullLineup = lineup.length ? `\n${lineup.join(", ")}` : "";
-      const maxLineup = FIELD_VALUE_LIMIT - venueStr.length - 1;
-      const lineupStr = fullLineup.length > maxLineup ? fullLineup.slice(0, maxLineup) + "…" : fullLineup;
+    let lineup = [];
+    try { lineup = JSON.parse(concert.metadata || "[]"); } catch {}
+    const fullLineup = lineup.length ? `\n${lineup.join(", ")}` : "";
+    const maxLineup = FIELD_VALUE_LIMIT - venueStr.length - 1;
+    const lineupStr = fullLineup.length > maxLineup ? fullLineup.slice(0, maxLineup) + "…" : fullLineup;
 
-      fields.push({ name: label, value: venueStr + lineupStr, inline: false });
-    }
+    fields.push({ name: label, value: venueStr + lineupStr, inline: false });
   }
 
-  const title = `New concerts on wishlist: ${wishlistName}`;
+  const title = `New concerts: ${band.name}`;
   const footer = `${fields.length} new concert${fields.length !== 1 ? "s" : ""}`;
   const baseChars = title.length + footer.length;
 
