@@ -122,6 +122,83 @@ router.get(
   }
 );
 
+// GET /wishlists/:id/new — concerts added since the user's last visit (cross-device)
+router.get(
+  "/wishlists/:id/new",
+  [auth, roleCheck(["ADMIN"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
+  async (req, res) => {
+    try {
+      const wishlistId = parseInt(req.params.id, 10);
+
+      const wishlist = await prisma.wishlist.findUnique({
+        where: { id: wishlistId },
+        include: { bands: true },
+      });
+
+      if (!wishlist) return res.status(404).json({ error: "Not found" });
+      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+
+      const sinceDate = wishlist.last_active_at ?? new Date(0);
+
+      // Update last_active_at before returning so any device hitting this endpoint moves the cursor
+      await prisma.wishlist.update({
+        where: { id: wishlistId },
+        data: { last_active_at: new Date() },
+      });
+
+      const bandIds = wishlist.bands.map((b) => b.band_id);
+
+      const refs = await prisma.concertBandReference.findMany({
+        where: {
+          band: { in: bandIds },
+          concert_rel: { created_at: { gt: sinceDate } },
+        },
+        include: {
+          concert_rel: {
+            select: {
+              id: true,
+              name: true,
+              city: true,
+              country: true,
+              venue: true,
+              latitude: true,
+              longitude: true,
+              concert_date: true,
+              on_sale: true,
+              ticket_sale_start: true,
+              url: true,
+              festival: true,
+              bands: {
+                include: { band_rel: { select: { name: true, id: true } } },
+              },
+            },
+          },
+        },
+      });
+
+      const concertMap = new Map();
+      for (const ref of refs) {
+        const c = ref.concert_rel;
+        if (!concertMap.has(c.id)) {
+          concertMap.set(c.id, {
+            ...c,
+            participating_bands: c.bands.map((b) => b.band_rel),
+          });
+        }
+      }
+
+      const concerts = Array.from(concertMap.values()).sort(
+        (a, b) => new Date(a.concert_date || 0) - new Date(b.concert_date || 0),
+      );
+
+      res.json({ concerts });
+    } catch (error) {
+      console.error("Error fetching new concerts:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
 // GET /wishlists/:id — wishlist with concerts, bands (with tiers), and precomputed scores
 router.get(
   "/wishlists/:id",

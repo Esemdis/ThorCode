@@ -50,6 +50,21 @@ function sameArea(incoming, existing) {
   return haversineKm(iLat, iLng, eLat, eLng) <= 20;
 }
 
+// Normalize a venue string for substring containment checks (strips accents, punctuation, case)
+function normalizeVenueFlat(s) {
+  return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// Returns true if one venue name is substantially contained within the other.
+// Catches cases like "Zenith De Nancy - Amphitheatre Plein Air" containing "Amphitheatre Plein Air".
+// Requires the shorter fragment to be at least 10 chars to avoid trivial matches.
+function venueContains(a, b) {
+  const na = normalizeVenueFlat(a), nb = normalizeVenueFlat(b);
+  const shorter = na.length <= nb.length ? na : nb;
+  const longer  = na.length <= nb.length ? nb : na;
+  return shorter.length >= 10 && longer.includes(shorter);
+}
+
 // Bigram Dice coefficient — returns 0.0–1.0. Unicode-safe: keeps all letters/numbers.
 function stringSimilarity(a, b) {
   const norm = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
@@ -116,25 +131,30 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
       }
     }
 
-    // 1. Venue fuzzy match — within 1.5 days always; within 7 days if multi-band or shares a band
+    // 1. Venue fuzzy match — same venue only merges if the concerts share a band.
+    //    Two independent shows can be at the same arena on the same day; venue alone is not enough.
     if (!existingConcert && concert.venue) {
       const venueMatches = candidates
         .filter((c) => c.venue)
         .map((c) => ({ c, sim: stringSimilarity(concert.venue, c.venue) }))
         .filter(({ c, sim }) => {
-          if (sim < 0.7) return false;
+          const venueMatch = sim >= 0.7 || venueContains(concert.venue, c.venue);
+          if (!venueMatch) return false;
+          if (bandIds.length > 0 && !sharesABand(c)) return false;
           const d = diffDays(c);
-          return d <= 1.5 || incomingIsMultiBand || isMultiBand(c) || sharesABand(c);
+          return d <= 1.5 || incomingIsMultiBand || isMultiBand(c);
         })
         .filter(({ c }) => diffDays(c) <= 7)
         .sort((a, b) => b.c.bands.length - a.c.bands.length || b.sim - a.sim);
       existingConcert = venueMatches[0]?.c ?? null;
     }
 
-    // 2. City fuzzy match fallback — name similarity only (coordinates alone are too broad)
+    // 2. City fuzzy match fallback — same restriction: must share a band.
+    //    Same city on the same day is far too broad without a band overlap.
     if (!existingConcert && concert.city) {
       const cityMatches = candidates
         .filter((c) => {
+          if (bandIds.length > 0 && !sharesABand(c)) return false;
           const d = diffDays(c);
           return d <= (incomingIsMultiBand || isMultiBand(c) ? 7 : 1.5);
         })

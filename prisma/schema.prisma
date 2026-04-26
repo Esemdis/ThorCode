@@ -124,6 +124,7 @@ model Wishlist {
   concert_scores       String?
   city_rankings        String?
   scores_computed_at   DateTime?
+  last_active_at       DateTime?
   user_rel             User                    @relation("UserWishlists", fields: [user_id], references: [id])
   bands                WishlistBandReference[] @relation("WishlistBands")
 }
