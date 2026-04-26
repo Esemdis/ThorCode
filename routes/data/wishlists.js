@@ -125,7 +125,7 @@ router.get(
 // GET /wishlists/:id/new — concerts added since the user's last visit (cross-device)
 router.get(
   "/wishlists/:id/new",
-  [auth, roleCheck(["ADMIN"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
+  [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
   async (req, res) => {
     try {
       const wishlistId = parseInt(req.params.id, 10);
@@ -154,6 +154,7 @@ router.get(
           concert_rel: { created_at: { gt: sinceDate } },
         },
         include: {
+          band_rel: { select: { name: true } },
           concert_rel: {
             select: {
               id: true,
@@ -187,6 +188,37 @@ router.get(
         }
       }
 
+      // Write NEW_CONCERTS activity log entry when there's something to report
+      if (concertMap.size > 0) {
+        const bandConcertMap = new Map();
+        for (const ref of refs) {
+          const name = ref.band_rel?.name || "Unknown";
+          if (!bandConcertMap.has(name)) bandConcertMap.set(name, { ids: new Set(), countries: new Set() });
+          bandConcertMap.get(name).ids.add(ref.concert_rel.id);
+          if (ref.concert_rel.country) bandConcertMap.get(name).countries.add(ref.concert_rel.country);
+        }
+        const byBand = [...bandConcertMap.entries()]
+          .map(([name, { ids, countries }]) => ({ name, count: ids.size, countries: [...countries] }))
+          .sort((a, b) => b.count - a.count);
+
+        await prisma.activityLog.create({
+          data: {
+            wishlist_id: wishlistId,
+            type: "NEW_CONCERTS",
+            data: JSON.stringify({ total: concertMap.size, by_band: byBand }),
+          },
+        });
+        const old = await prisma.activityLog.findMany({
+          where: { wishlist_id: wishlistId },
+          orderBy: { created_at: "desc" },
+          skip: 15,
+          select: { id: true },
+        });
+        if (old.length > 0) {
+          await prisma.activityLog.deleteMany({ where: { id: { in: old.map((e) => e.id) } } });
+        }
+      }
+
       const concerts = Array.from(concertMap.values()).sort(
         (a, b) => new Date(a.concert_date || 0) - new Date(b.concert_date || 0),
       );
@@ -194,6 +226,33 @@ router.get(
       res.json({ concerts });
     } catch (error) {
       console.error("Error fetching new concerts:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// GET /wishlists/:id/activity — last 15 activity log entries for this wishlist
+router.get(
+  "/wishlists/:id/activity",
+  [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
+  async (req, res) => {
+    try {
+      const wishlistId = parseInt(req.params.id, 10);
+      const wishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
+      if (!wishlist) return res.status(404).json({ error: "Not found" });
+      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+
+      const logs = await prisma.activityLog.findMany({
+        where: { wishlist_id: wishlistId },
+        orderBy: { created_at: "desc" },
+        take: 15,
+      });
+
+      res.json({
+        activity: logs.map((log) => ({ ...log, data: JSON.parse(log.data) })),
+      });
+    } catch (error) {
+      console.error("Error fetching activity log:", error);
       return res.status(500).json({ error: "Internal server error" });
     }
   }
@@ -710,8 +769,8 @@ router.post(
 
       const { bands } = req.body;
 
-      const wishlists = await prisma.wishlist.findMany({
-        where: { discord_webhook: { not: null } },
+      // All wishlists — needed for activity logs regardless of webhook
+      const allWishlists = await prisma.wishlist.findMany({
         include: {
           bands: {
             include: { band_rel: { select: { id: true, name: true, ticketmaster_id: true } } },
@@ -719,7 +778,9 @@ router.post(
         },
       });
 
-      const notifications = wishlists
+      // Discord notifications — only wishlists with a webhook
+      const notifications = allWishlists
+        .filter((w) => w.discord_webhook)
         .map((wishlist) => {
           const matchedBands = bands.filter((b) =>
             wishlist.bands.some((ref) => ref.band_rel.id === b.band_id),
@@ -738,6 +799,32 @@ router.post(
           }
         }),
       );
+
+      // Activity logs — all wishlists that have the band, only when concerts were inserted
+      for (const wishlist of allWishlists) {
+        const matchedBands = bands.filter(
+          (b) => b.inserted > 0 && wishlist.bands.some((ref) => ref.band_rel.id === b.band_id),
+        );
+        for (const band of matchedBands) {
+          const countries = [...new Set((band.concerts || []).map((c) => c.country).filter(Boolean))];
+          await prisma.activityLog.create({
+            data: {
+              wishlist_id: wishlist.id,
+              type: "BAND_ADDED",
+              data: JSON.stringify({ band_name: band.name, band_id: band.band_id, inserted: band.inserted, countries }),
+            },
+          });
+          const old = await prisma.activityLog.findMany({
+            where: { wishlist_id: wishlist.id },
+            orderBy: { created_at: "desc" },
+            skip: 15,
+            select: { id: true },
+          });
+          if (old.length > 0) {
+            await prisma.activityLog.deleteMany({ where: { id: { in: old.map((e) => e.id) } } });
+          }
+        }
+      }
 
       res.json({ notified: notifications.length });
     } catch (error) {

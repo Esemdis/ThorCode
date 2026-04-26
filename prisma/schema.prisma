@@ -127,6 +127,16 @@ model Wishlist {
   last_active_at       DateTime?
   user_rel             User                    @relation("UserWishlists", fields: [user_id], references: [id])
   bands                WishlistBandReference[] @relation("WishlistBands")
+  activity_logs        ActivityLog[]           @relation("WishlistActivityLogs")
+}
+
+model ActivityLog {
+  id           Int      @id @default(autoincrement())
+  wishlist_id  Int
+  type         String   // 'BAND_ADDED' | 'NEW_CONCERTS'
+  data         String   // JSON
+  created_at   DateTime @default(now())
+  wishlist_rel Wishlist @relation("WishlistActivityLogs", fields: [wishlist_id], references: [id])
 }
 
 model WishlistBandReference {
