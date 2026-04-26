@@ -23,7 +23,8 @@ const errorMessages = {
 module.exports = {
   handleError,
   checkDuplicateConcert,
-  getTicketmasterId
+  getTicketmasterId,
+  stringSimilarity,
 };
 
 // Normalize a date to midnight UTC on its calendar day

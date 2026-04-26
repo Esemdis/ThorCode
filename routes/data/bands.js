@@ -5,6 +5,7 @@ const axios = require('axios');
 const {
   handleError,
   checkDuplicateConcert,
+  stringSimilarity,
 } = require('./helpers');
 
 const auth = require('../../auth/verifyJWT');
@@ -262,6 +263,8 @@ router.post(
             insertedConcerts.push({
               index: i,
               concertId: newConcert.id,
+              event_id: newConcert.event_id,
+              source: newConcert.source,
               name: newConcert.name,
               venue: newConcert.venue,
               city: newConcert.city,
@@ -596,20 +599,6 @@ router.post(
         },
       });
 
-      // Auto-discover Songkick + Bandsintown URLs in the background — don't block the response
-      findSourceUrls(newBand.name, mbid).then(([songkickUrl, bandsintownUrl]) => {
-        console.log(`[findSourceUrl] ${newBand.name} → songkick: ${songkickUrl}, bandsintown: ${bandsintownUrl}`);
-        if (songkickUrl || bandsintownUrl) {
-          prisma.band.update({
-            where: { id: newBand.id },
-            data: {
-              ...(songkickUrl    && { songkick_url:    songkickUrl }),
-              ...(bandsintownUrl && { bandsintown_url: bandsintownUrl }),
-            },
-          }).catch((e) => console.error(`[findSourceUrl] DB update failed for ${newBand.name}:`, e.message));
-        }
-      }).catch(() => {});
-
       // Add to wishlist if provided
       if (wishlistId) {
         await prisma.wishlistBandReference.create({
@@ -620,25 +609,7 @@ router.post(
         });
       }
 
-      // Call Python service to sync concerts for this band
-      let syncResult = null;
-      try {
-        const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
-        const syncResponse = await axios.post(
-          `${pythonServiceUrl}/sync/${newBand.id}`,
-          { songkick_url: null, bandsintown_url: null, ticketmaster_id: resolvedTicketmasterId, band_name: newBand.name },
-        );
-        syncResult = syncResponse.data;
-      } catch (syncError) {
-        console.error('Error syncing concerts with Python service:', syncError.message);
-        // Don't fail the band creation if sync fails, just log it
-        syncResult = {
-          status: 'error',
-          message: 'Concert sync failed, but band was created',
-          error: syncError.message,
-        };
-      }
-
+      // Respond immediately — sync happens in the background after URL discovery
       res.status(201).json({
         status: 'success',
         band: {
@@ -647,8 +618,30 @@ router.post(
           ticketmaster_id: newBand.ticketmaster_id,
           mbid: newBand.MBID,
         },
-        sync: syncResult,
+        sync: { status: 'queued' },
       });
+
+      // Discover Songkick + Bandsintown URLs, save them, THEN trigger sync so all
+      // three sources are available in one pass — avoids the race where sync fires
+      // before URLs are known.
+      findSourceUrls(newBand.name, mbid).then(async ([songkickUrl, bandsintownUrl]) => {
+        console.log(`[findSourceUrl] ${newBand.name} → songkick: ${songkickUrl}, bandsintown: ${bandsintownUrl}`);
+        if (songkickUrl || bandsintownUrl) {
+          await prisma.band.update({
+            where: { id: newBand.id },
+            data: {
+              ...(songkickUrl    && { songkick_url:    songkickUrl }),
+              ...(bandsintownUrl && { bandsintown_url: bandsintownUrl }),
+            },
+          }).catch((e) => console.error(`[findSourceUrl] DB update failed for ${newBand.name}:`, e.message));
+        }
+        const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
+        await axios.post(
+          `${pythonServiceUrl}/sync/${newBand.id}`,
+          { songkick_url: songkickUrl || null, bandsintown_url: bandsintownUrl || null, ticketmaster_id: resolvedTicketmasterId, band_name: newBand.name },
+        );
+        console.log(`[findSourceUrl] Sync queued for ${newBand.name}`);
+      }).catch((e) => console.error(`[findSourceUrl] Background sync failed for ${newBand.name}:`, e.message));
     } catch (error) {
       console.error('Error creating band:', error);
       res.status(500).json({ error: 'Internal server error' });
@@ -958,6 +951,84 @@ router.post('/bands/sync-all', auth, roleCheck(['ADMIN']), async (_req, res) => 
   } catch (error) {
     console.error('Error triggering full sync:', error.message);
     res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+});
+
+// GET /bandsintown/enrich-pending — future BIT concerts with numeric event IDs that can be enriched
+router.get('/bandsintown/enrich-pending', auth, roleCheck(['ADMIN', 'SYSTEM']), async (_req, res) => {
+  try {
+    const concerts = await prisma.concert.findMany({
+      where: {
+        source: 'bandsintown',
+        concert_date: { gte: new Date() },
+        event_id: { startsWith: 'bit_' },
+      },
+      select: { id: true, event_id: true },
+    });
+    // Only numeric IDs — hashed JSON-LD IDs can't be used to reconstruct the event URL
+    const pending = concerts.filter((c) => /^bit_\d+$/.test(c.event_id));
+    res.json(pending);
+  } catch (error) {
+    console.error('[enrich-pending] Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /:concertId/enrich-lineup — match scraped artist names to known bands, link missing ones
+router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), async (req, res) => {
+  const concertId = parseInt(req.params.concertId, 10);
+  const { band_names } = req.body;
+
+  if (!Array.isArray(band_names) || band_names.length === 0) {
+    return res.json({ linked: 0, matches: [] });
+  }
+
+  try {
+    const [allBands, existing] = await Promise.all([
+      prisma.band.findMany({ select: { id: true, name: true } }),
+      prisma.concertBandReference.findMany({
+        where: { concert: concertId },
+        select: { band: true },
+      }),
+    ]);
+
+    const existingIds = new Set(existing.map((r) => r.band));
+    const toLink = [];
+    const matches = [];
+
+    for (const name of band_names) {
+      if (!name || !name.trim()) continue;
+      const needle = name.trim().toLowerCase();
+
+      let bestBand = null;
+      let bestScore = 0;
+      for (const band of allBands) {
+        const score = stringSimilarity(needle, (band.name || '').toLowerCase());
+        if (score > bestScore) { bestScore = score; bestBand = band; }
+      }
+
+      if (bestScore >= 0.75 && bestBand && !existingIds.has(bestBand.id)) {
+        toLink.push(bestBand.id);
+        existingIds.add(bestBand.id);
+        matches.push({ input_name: name, band_name: bestBand.name, band_id: bestBand.id, score: Math.round(bestScore * 100) });
+      }
+    }
+
+    await Promise.all([
+      toLink.length > 0 && prisma.concertBandReference.createMany({
+        data: toLink.map((bandId) => ({ concert: concertId, band: bandId })),
+        skipDuplicates: true,
+      }),
+      prisma.concert.update({
+        where: { id: concertId },
+        data: { metadata: JSON.stringify(band_names.filter(Boolean)) },
+      }),
+    ].filter(Boolean));
+
+    res.json({ linked: toLink.length, matches });
+  } catch (error) {
+    console.error(`[enrich-lineup] Error for concert ${concertId}:`, error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
