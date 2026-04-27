@@ -165,7 +165,8 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
           // High-confidence match: near-identical venue on the same calendar day —
           // band overlap not required (syncs for different bands in the same lineup
           // arrive separately, so the existing record may not yet have the incoming band).
-          const highConfidence = sim >= 0.95 && d === 0;
+          // Also covers "myticket Jahrhunderthalle" vs "Jahrhunderthalle" style sponsorship prefixes.
+          const highConfidence = d === 0 && (sim >= 0.95 || venueContains(concert.venue, c.venue));
           if (bandIds.length > 0 && !sharesABand(c) && !eitherIsMultiBand && !highConfidence) return false;
           return d <= 1.5 || eitherIsMultiBand || highConfidence;
         })
