@@ -132,8 +132,10 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
       }
     }
 
-    // 1. Venue fuzzy match — same venue only merges if the concerts share a band.
-    //    Two independent shows can be at the same arena on the same day; venue alone is not enough.
+    // 1. Venue fuzzy match — same venue only merges if the concerts share a band,
+    //    UNLESS either side is a festival/multi-band event (different headliners
+    //    can appear at the same festival without sharing a band reference).
+    //    Two independent single-band shows at the same arena still require band overlap.
     if (!existingConcert && concert.venue) {
       const venueMatches = candidates
         .filter((c) => c.venue)
@@ -141,23 +143,29 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
         .filter(({ c, sim }) => {
           const venueMatch = sim >= 0.7 || venueContains(concert.venue, c.venue);
           if (!venueMatch) return false;
-          if (bandIds.length > 0 && !sharesABand(c)) return false;
+          const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
           const d = diffDays(c);
-          return d <= 1.5 || incomingIsMultiBand || isMultiBand(c);
+          // High-confidence match: near-identical venue on the same calendar day —
+          // band overlap not required (syncs for different bands in the same lineup
+          // arrive separately, so the existing record may not yet have the incoming band).
+          const highConfidence = sim >= 0.95 && d === 0;
+          if (bandIds.length > 0 && !sharesABand(c) && !eitherIsMultiBand && !highConfidence) return false;
+          return d <= 1.5 || eitherIsMultiBand || highConfidence;
         })
         .filter(({ c }) => diffDays(c) <= 7)
         .sort((a, b) => b.c.bands.length - a.c.bands.length || b.sim - a.sim);
       existingConcert = venueMatches[0]?.c ?? null;
     }
 
-    // 2. City fuzzy match fallback — same restriction: must share a band.
-    //    Same city on the same day is far too broad without a band overlap.
+    // 2. City fuzzy match fallback — same restriction: must share a band unless
+    //    either side is a festival/multi-band event.
     if (!existingConcert && concert.city) {
       const cityMatches = candidates
         .filter((c) => {
-          if (bandIds.length > 0 && !sharesABand(c)) return false;
+          const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
+          if (bandIds.length > 0 && !sharesABand(c) && !eitherIsMultiBand) return false;
           const d = diffDays(c);
-          return d <= (incomingIsMultiBand || isMultiBand(c) ? 7 : 1.5);
+          return d <= (eitherIsMultiBand ? 7 : 1.5);
         })
         .filter((c) => c.city && stringSimilarity(concert.city, c.city) >= 0.7)
         .sort((a, b) => b.bands.length - a.bands.length);
