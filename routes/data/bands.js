@@ -135,6 +135,7 @@ router.post(
             if (concert.event_id) {
               const existingByEventId = await tx.concert.findUnique({
                 where: { event_id: concert.event_id },
+                include: { _count: { select: { bands: true } } },
               });
 
               if (existingByEventId) {
@@ -169,20 +170,40 @@ router.post(
                 });
                 const linked = new Set(existingRefs.map((r) => r.band));
                 const toLink = validIds.filter((id) => !linked.has(id));
-                if (toLink.length > 0) {
-                  await tx.concertBandReference.createMany({
-                    data: toLink.map((band) => ({ concert: existingByEventId.id, band })),
-                  });
+
+                // Upgrade name if incoming has a better one (existing is "Band @ Venue" fallback)
+                const isAtFormat = (s) => s.includes(' @ ') || / at /i.test(s);
+                const existingIsAtFormat = isAtFormat(existingByEventId.name || '');
+                const incomingIsAtFormat = isAtFormat(concert.name || '');
+                const betterName = concert.name && existingIsAtFormat && !incomingIsAtFormat
+                  ? concert.name : null;
+
+                if (toLink.length > 0 || betterName) {
+                  await Promise.all([
+                    toLink.length > 0 && tx.concertBandReference.createMany({
+                      data: toLink.map((band) => ({ concert: existingByEventId.id, band })),
+                    }),
+                    betterName && tx.concert.update({
+                      where: { id: existingByEventId.id },
+                      data: { name: betterName },
+                    }),
+                  ].filter(Boolean));
                   updatedConcerts.push({
                     index: i,
                     concertId: existingByEventId.id,
+                    event_id: concert.event_id,
                     bandsAdded: toLink.length,
+                    name: betterName || existingByEventId.name,
+                    bandCount: existingByEventId._count.bands + toLink.length,
                   });
                 } else {
                   duplicateConcerts.push({
                     index: i,
                     reason: 'event_id already exists',
                     concertId: existingByEventId.id,
+                    event_id: concert.event_id,
+                    name: existingByEventId.name,
+                    bandCount: existingByEventId._count.bands,
                   });
                 }
                 continue;
@@ -208,6 +229,9 @@ router.post(
                 index: i,
                 reason: concert.festival ? 'festival duplicate (merged bands)' : 'duplicate concert_date + venue + band combination',
                 concertId: existingConcert.id,
+                event_id: existingConcert.event_id || '',
+                name: existingConcert.name,
+                bandCount: existingConcert.bands.length,
               });
               continue;
             }
@@ -977,9 +1001,9 @@ router.get('/bandsintown/enrich-pending', auth, roleCheck(['ADMIN', 'SYSTEM']), 
 // POST /:concertId/enrich-lineup — match scraped artist names to known bands, link missing ones
 router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), async (req, res) => {
   const concertId = parseInt(req.params.concertId, 10);
-  const { band_names } = req.body;
+  const { band_names, event_name } = req.body;
 
-  if (!Array.isArray(band_names) || band_names.length === 0) {
+  if ((!Array.isArray(band_names) || band_names.length === 0) && !event_name) {
     return res.json({ linked: 0, matches: [] });
   }
 
@@ -1014,6 +1038,18 @@ router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), a
       }
     }
 
+    // Resolve the best name to store: prefer a real event name from the enricher;
+    // only overwrite the existing name if we have something better.
+    const concertUpdate = { metadata: JSON.stringify((band_names || []).filter(Boolean)) };
+    if (event_name) {
+      const existing = await prisma.concert.findUnique({ where: { id: concertId }, select: { name: true } });
+      const currentName = existing?.name || '';
+      // Apply the scraped name if the concert has no name or only a "Band @ Venue" fallback
+      if (!currentName || currentName.includes(' @ ') || currentName.includes(' at ')) {
+        concertUpdate.name = event_name;
+      }
+    }
+
     await Promise.all([
       toLink.length > 0 && prisma.concertBandReference.createMany({
         data: toLink.map((bandId) => ({ concert: concertId, band: bandId })),
@@ -1021,7 +1057,7 @@ router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), a
       }),
       prisma.concert.update({
         where: { id: concertId },
-        data: { metadata: JSON.stringify(band_names.filter(Boolean)) },
+        data: concertUpdate,
       }),
     ].filter(Boolean));
 

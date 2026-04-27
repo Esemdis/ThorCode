@@ -132,6 +132,23 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
       }
     }
 
+    // 0.5. Named event match — tour and festival names are a strong cross-source signal.
+    //      If both concerts have a real event name (not "Band @ Venue") and those names
+    //      are highly similar, same area, and within 3 days, treat as the same stop.
+    //      No band overlap required — syncs for different lineup members arrive separately.
+    if (!existingConcert && concert.name) {
+      const nameCandidates = candidates
+        .filter((c) => {
+          if (!c.name) return false;
+          if (diffDays(c) > 3) return false;
+          if (stringSimilarity(concert.name, c.name) < 0.8) return false;
+          return sameArea(concert, c) ||
+            (concert.city && c.city && stringSimilarity(concert.city, c.city) >= 0.7);
+        })
+        .sort((a, b) => b.bands.length - a.bands.length);
+      existingConcert = nameCandidates[0] ?? null;
+    }
+
     // 1. Venue fuzzy match — same venue only merges if the concerts share a band,
     //    UNLESS either side is a festival/multi-band event (different headliners
     //    can appear at the same festival without sharing a band reference).
@@ -178,11 +195,16 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
     // The concert with more bands wins — its date/metadata become canonical
     const incomingWins = bandIds.length > existingConcert.bands.length;
 
-    const existingIsAtFormat = (existingConcert.name || '').includes(' @ ');
-    const incomingIsAtFormat = (concert.name || '').includes(' @ ');
-    const bestName = (concert.name && existingIsAtFormat && !incomingIsAtFormat)
-      ? concert.name
-      : concert.name || existingConcert.name;
+    const isAtFormat = (s) => s.includes(' @ ') || / at /i.test(s);
+    const existingIsAtFormat = isAtFormat(existingConcert.name || '');
+    const incomingIsAtFormat = isAtFormat(concert.name || '');
+    // Never overwrite a proper name with an @ format name.
+    // Upgrade @ → proper when possible, otherwise keep the better of the two.
+    const bestName = (!existingIsAtFormat && incomingIsAtFormat)
+      ? existingConcert.name                          // keep existing proper name
+      : (existingIsAtFormat && !incomingIsAtFormat && concert.name)
+        ? concert.name                                // upgrade @ → proper
+        : concert.name || existingConcert.name;       // both same format, prefer incoming
     const hasBetterName = bestName !== existingConcert.name;
 
     if (incomingWins || hasBetterName) {
