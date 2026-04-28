@@ -794,7 +794,11 @@ router.post(
           for (const band of matchedBands) {
             const embeds = buildDiscordEmbeds(band);
             for (const embed of embeds) {
-              await axios.post(wishlist.discord_webhook, { embeds: [embed] });
+              try {
+                await axios.post(wishlist.discord_webhook, { embeds: [embed] }, { timeout: 10000 });
+              } catch (e) {
+                console.error(`[Discord] Failed to notify wishlist ${wishlist.id} for band "${band.name}":`, e.response?.status ?? e.message);
+              }
             }
           }
         }),
@@ -842,7 +846,7 @@ function buildDiscordEmbeds(band) {
 
   const fields = [];
 
-  for (const concert of band.concerts) {
+  for (const concert of band.concerts ?? []) {
     const date = concert.concert_date
       ? new Date(concert.concert_date).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
       : "TBA";

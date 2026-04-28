@@ -185,7 +185,11 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
           const d = diffDays(c);
           return d <= (eitherIsMultiBand ? 7 : 1.5);
         })
-        .filter((c) => c.city && stringSimilarity(concert.city, c.city) >= 0.7)
+        .filter((c) => {
+          const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
+          return (eitherIsMultiBand && sameArea(concert, c)) ||
+            (c.city && stringSimilarity(concert.city, c.city) >= 0.7);
+        })
         .sort((a, b) => b.bands.length - a.bands.length);
       existingConcert = cityMatches[0] ?? null;
     }
@@ -201,11 +205,14 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
     const incomingIsAtFormat = isAtFormat(concert.name || '');
     // Never overwrite a proper name with an @ format name.
     // Upgrade @ → proper when possible, otherwise keep the better of the two.
+    // When both are proper names, prefer the shorter one (avoids "GRASPOP 2026 COMBI TICKET" over "GRASPOP 2026").
     const bestName = (!existingIsAtFormat && incomingIsAtFormat)
       ? existingConcert.name                          // keep existing proper name
       : (existingIsAtFormat && !incomingIsAtFormat && concert.name)
         ? concert.name                                // upgrade @ → proper
-        : concert.name || existingConcert.name;       // both same format, prefer incoming
+        : (concert.name && existingConcert.name && !incomingIsAtFormat && !existingIsAtFormat)
+          ? (concert.name.length <= existingConcert.name.length ? concert.name : existingConcert.name)  // both proper — pick shorter
+          : concert.name || existingConcert.name;     // fallback
     const hasBetterName = bestName !== existingConcert.name;
 
     if (incomingWins || hasBetterName) {
