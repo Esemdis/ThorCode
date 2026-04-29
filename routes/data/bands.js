@@ -12,6 +12,7 @@ const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
 const { rateLimiter } = require('../../utils/rateLimiter');
 const prisma = require('../../prisma/client');
+const { Prisma } = require('@prisma/client');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -978,6 +979,18 @@ router.post('/bands/sync-all', auth, roleCheck(['ADMIN']), async (_req, res) => 
   }
 });
 
+// POST /sync-weather — proxy to Python weather sync (ADMIN only)
+router.post('/sync-weather', auth, roleCheck(['ADMIN']), async (_req, res) => {
+  try {
+    const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
+    await axios.post(`${pythonServiceUrl}/sync-weather`, {}, { timeout: 300000 });
+    res.status(200).json({ status: 'success' });
+  } catch (error) {
+    console.error('Error triggering weather sync:', error.message);
+    res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+});
+
 // GET /bandsintown/enrich-pending — future BIT concerts with numeric event IDs that can be enriched
 router.get('/bandsintown/enrich-pending', auth, roleCheck(['ADMIN', 'SYSTEM']), async (_req, res) => {
   try {
@@ -994,6 +1007,29 @@ router.get('/bandsintown/enrich-pending', auth, roleCheck(['ADMIN', 'SYSTEM']), 
     res.json(pending);
   } catch (error) {
     console.error('[enrich-pending] Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /weather-pending — future concerts with coordinates but no weather data yet (SYSTEM only)
+router.get('/weather-pending', auth, roleCheck(['SYSTEM']), async (_req, res) => {
+  try {
+    const in16Days = new Date(Date.now() + 16 * 24 * 60 * 60 * 1000);
+    const concerts = await prisma.concert.findMany({
+      where: {
+        concert_date: { gte: new Date() },
+        latitude: { not: null },
+        longitude: { not: null },
+        OR: [
+          { weather: { equals: Prisma.DbNull } },
+          { concert_date: { lte: in16Days } },
+        ],
+      },
+      select: { id: true, latitude: true, longitude: true, concert_date: true },
+    });
+    res.json(concerts);
+  } catch (error) {
+    console.error('[weather-pending] Error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

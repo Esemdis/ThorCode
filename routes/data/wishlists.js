@@ -309,6 +309,7 @@ router.get(
                   festival: true,
                   source: true,
                   url: true,
+                  weather: true,
                   bands: {
                     include: {
                       band_rel: {
@@ -376,6 +377,7 @@ router.get(
               festival: concert.festival,
               source: concert.source,
               url: concert.url,
+              weather: concert.weather,
               participating_bands: wishlistBands,
               wishlist_band_count: wishlistBands.length,
               concert_score: concertScoreMap.get(concert.id) ?? 0,
@@ -460,6 +462,34 @@ router.patch(
       res.json({ ok: true });
     } catch (error) {
       console.error("Error storing computed scores:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// PATCH /weather/bulk — store precomputed weather blobs from Python (SYSTEM only)
+router.patch(
+  "/weather/bulk",
+  [auth, roleCheck(["SYSTEM"])],
+  async (req, res) => {
+    try {
+      const updates = req.body; // [{ id, weather }]
+      if (!Array.isArray(updates) || updates.length === 0) {
+        return res.status(400).json({ error: "Expected non-empty array of { id, weather }" });
+      }
+
+      await Promise.all(
+        updates.map(({ id, weather }) =>
+          prisma.concert.update({
+            where: { id },
+            data: { weather },
+          })
+        )
+      );
+
+      res.json({ ok: true, updated: updates.length });
+    } catch (error) {
+      console.error("Error storing concert weather:", error);
       return res.status(500).json({ error: "Internal server error" });
     }
   }

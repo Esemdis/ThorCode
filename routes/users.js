@@ -119,6 +119,25 @@ router.post(
   },
 );
 
+router.patch('/me/settings', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { settings } = req.body;
+    if (settings === undefined || typeof settings !== 'object' || Array.isArray(settings)) {
+      return res.status(400).json({ error: 'settings must be a JSON object' });
+    }
+    const user = await prisma.user.update({
+      where: { id: userId },
+      data: { settings },
+      select: { id: true, settings: true },
+    });
+    res.json({ settings: user.settings });
+  } catch (error) {
+    console.error('Error updating settings:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 router.get('/me', auth, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -129,6 +148,7 @@ router.get('/me', auth, async (req, res) => {
         email: true,
         role: true,
         created_at: true,
+        settings: true,
         gameTimes: {
           select: {
             play_time: true,

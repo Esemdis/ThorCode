@@ -14,6 +14,7 @@ model User {
   role          Role          @default(USER)
   created_at    DateTime      @default(now())
   steam_id      Int?          @unique
+  settings      Json?
   game_times    GameTime[]    @relation("UserGameTimes")
   movie_reviews MovieReview[] @relation("UserMovieReviews")
   oauth         OAuth[]       @relation("UserOauth")
@@ -97,6 +98,7 @@ model Concert {
   url               String?
   festival          Boolean?               @default(false)
   source            String?
+  weather           Json?
   bands             ConcertBandReference[] @relation("ConcertBands")
 }
 
