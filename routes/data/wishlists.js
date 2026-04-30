@@ -821,6 +821,14 @@ router.post(
         })
         .filter(({ matchedBands }) => matchedBands.length > 0);
 
+      // Log wishlists that matched bands but have no webhook configured
+      const noWebhookCount = allWishlists.filter((w) => !w.discord_webhook && bands.some((b) =>
+        w.bands.some((ref) => ref.band_rel.id === b.band_id)
+      )).length;
+      if (noWebhookCount > 0) {
+        console.log(`[Discord] ${noWebhookCount} wishlist(s) matched but have no webhook configured — skipping`);
+      }
+
       await Promise.all(
         notifications.map(async ({ wishlist, matchedBands }) => {
           for (const band of matchedBands) {
