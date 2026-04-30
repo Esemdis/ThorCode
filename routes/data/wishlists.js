@@ -3,6 +3,7 @@ const router = express.Router();
 const { validationResult, param, body } = require("express-validator");
 const axios = require("axios");
 const { handleError } = require("./helpers");
+const { deduplicateConcerts } = require("../../utils/concertDedup");
 
 const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
@@ -408,26 +409,7 @@ router.get(
         });
       });
 
-      // Second pass: remove same-event duplicates stored as separate records
-      // (same name + same venue, both non-empty, within 4 days of each other)
-      const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-      const kept = [];
-      for (const concert of allConcerts.values()) {
-        const name = concert.name?.trim().toLowerCase();
-        const venue = concert.venue?.trim().toLowerCase();
-        const time = concert.concert_date ? new Date(concert.concert_date).getTime() : null;
-        if (!name || !venue || !time) { kept.push(concert); continue; }
-        const isDup = kept.some((k) => {
-          if (!k.name || !k.venue) return false;
-          const kName = k.name.trim().toLowerCase();
-          if (kName !== name && !kName.includes(name) && !name.includes(kName)) return false;
-          if (k.venue.trim().toLowerCase() !== venue) return false;
-          const kt = k.concert_date ? new Date(k.concert_date).getTime() : null;
-          return kt && Math.abs(kt - time) <= SEVEN_DAYS_MS;
-        });
-        if (!isDup) kept.push(concert);
-      }
-      const concertsArray = kept;
+      const concertsArray = deduplicateConcerts([...allConcerts.values()]);
 
       // Parse precomputed city rankings
       let cityRankings = [];

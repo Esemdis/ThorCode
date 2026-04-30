@@ -1,5 +1,6 @@
 const prisma = require('../../prisma/client');
 const axios = require('axios');
+const { checkDuplicateConcert, stringSimilarity } = require('../../utils/concertDedup');
 
 const ticketmasterURL = 'https://app.ticketmaster.com/discovery/v2/';
 
@@ -27,227 +28,6 @@ module.exports = {
   stringSimilarity,
 };
 
-// Normalize a date to midnight UTC on its calendar day
-function toUtcDay(date) {
-  const d = new Date(date);
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-}
-
-// Haversine distance in km between two lat/lng points
-function haversineKm(lat1, lng1, lat2, lng2) {
-  const R = 6371;
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLng = (lng2 - lng1) * Math.PI / 180;
-  const a = Math.sin(dLat / 2) ** 2 +
-    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-// Returns true if both concerts have coordinates and are within 20km of each other
-function sameArea(incoming, existing) {
-  const iLat = parseFloat(incoming.latitude), iLng = parseFloat(incoming.longitude);
-  const eLat = parseFloat(existing.latitude), eLng = parseFloat(existing.longitude);
-  if (!iLat || !iLng || !eLat || !eLng) return false;
-  return haversineKm(iLat, iLng, eLat, eLng) <= 20;
-}
-
-// Normalize a venue string for substring containment checks (strips accents, punctuation, case)
-function normalizeVenueFlat(s) {
-  return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-// Returns true if one venue name is substantially contained within the other.
-// Catches cases like "Zenith De Nancy - Amphitheatre Plein Air" containing "Amphitheatre Plein Air".
-// Requires the shorter fragment to be at least 10 chars to avoid trivial matches.
-function venueContains(a, b) {
-  const na = normalizeVenueFlat(a), nb = normalizeVenueFlat(b);
-  const shorter = na.length <= nb.length ? na : nb;
-  const longer  = na.length <= nb.length ? nb : na;
-  return shorter.length >= 10 && longer.includes(shorter);
-}
-
-// Bigram Dice coefficient — returns 0.0–1.0. Unicode-safe: keeps all letters/numbers.
-function stringSimilarity(a, b) {
-  const norm = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
-  const na = norm(a), nb = norm(b);
-  if (na === nb) return 1;
-  if (!na || !nb) return 0;
-  const bigrams = (s) => Array.from({ length: Math.max(s.length - 1, 0) }, (_, i) => s.slice(i, i + 2));
-  const ba = bigrams(na), bb = bigrams(nb);
-  if (!ba.length || !bb.length) return 0;
-  const bbCount = new Map();
-  for (const g of bb) bbCount.set(g, (bbCount.get(g) || 0) + 1);
-  let matches = 0;
-  for (const g of ba) if (bbCount.get(g) > 0) { matches++; bbCount.set(g, bbCount.get(g) - 1); }
-  return (2 * matches) / (ba.length + bb.length);
-}
-
-async function checkDuplicateConcert({ concert, bandIds, tx }) {
-  /**
-   * Duplicate detection rules:
-   * 1. Venue similarity ≥ 70% within date window
-   * 2. City similarity ≥ 70% within date window
-   * 3. Any incoming band already linked to a concert in the same city on the same day
-   *
-   * Date window:
-   * - Always fetch 7 days around the incoming date.
-   * - A candidate is eligible if EITHER the incoming or the existing event has 3+ bands
-   *   (festival/multi-band), OR both are within ±1.5 days of each other.
-   *
-   * When merging, the concert with more bands wins: its date, metadata, and URL become
-   * the canonical record. The loser's bands are merged in.
-   */
-  let existingConcert = null;
-
-  if (concert.concert_date) {
-    const dayStart = toUtcDay(concert.concert_date);
-    const oneDayMs = 24 * 60 * 60 * 1000;
-    const incomingIsMultiBand = concert.festival || bandIds.length >= 3;
-
-    // Always fetch 7 days — we filter per-candidate below
-    const candidates = await tx.concert.findMany({
-      where: {
-        concert_date: {
-          gte: new Date(dayStart.getTime() - 7 * oneDayMs),
-          lte: new Date(dayStart.getTime() + 7 * oneDayMs),
-        },
-      },
-      include: { bands: true },
-    });
-
-    const diffDays = (c) => Math.abs(toUtcDay(c.concert_date).getTime() - dayStart.getTime()) / oneDayMs;
-    const isMultiBand = (c) => c.festival || c.bands.length >= 3;
-    const sharesABand = (c) => c.bands.some((ref) => bandIds.includes(ref.band));
-
-    // 0. Band-schedule conflict — highest confidence rule, checked first.
-    //    A band cannot play in the same city area on the same calendar day.
-    //    Uses coordinates when available (language-agnostic), falls back to city name similarity.
-    if (bandIds.length > 0) {
-      const sameDayCandidates = candidates.filter((c) => diffDays(c) === 0);
-      for (const c of sameDayCandidates) {
-        if (!sharesABand(c)) continue;
-        const inSameArea = sameArea(concert, c) ||
-          (concert.city && c.city && stringSimilarity(concert.city, c.city) >= 0.7);
-        if (inSameArea) { existingConcert = c; break; }
-      }
-    }
-
-    // 0.5. Named event match — tour and festival names are a strong cross-source signal.
-    //      If both concerts have a real event name (not "Band @ Venue") and those names
-    //      are highly similar, same area, and within 3 days, treat as the same stop.
-    //      No band overlap required — syncs for different lineup members arrive separately.
-    if (!existingConcert && concert.name) {
-      const nameCandidates = candidates
-        .filter((c) => {
-          if (!c.name) return false;
-          if (diffDays(c) > 3) return false;
-          if (stringSimilarity(concert.name, c.name) < 0.8) return false;
-          return sameArea(concert, c) ||
-            (concert.city && c.city && stringSimilarity(concert.city, c.city) >= 0.7);
-        })
-        .sort((a, b) => b.bands.length - a.bands.length);
-      existingConcert = nameCandidates[0] ?? null;
-    }
-
-    // 1. Venue fuzzy match — same venue only merges if the concerts share a band,
-    //    UNLESS either side is a festival/multi-band event (different headliners
-    //    can appear at the same festival without sharing a band reference).
-    //    Two independent single-band shows at the same arena still require band overlap.
-    if (!existingConcert && concert.venue) {
-      const venueMatches = candidates
-        .filter((c) => c.venue)
-        .map((c) => ({ c, sim: stringSimilarity(concert.venue, c.venue) }))
-        .filter(({ c, sim }) => {
-          const venueMatch = sim >= 0.7 || venueContains(concert.venue, c.venue);
-          if (!venueMatch) return false;
-          const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
-          const d = diffDays(c);
-          // High-confidence match: near-identical venue on the same calendar day —
-          // band overlap not required (syncs for different bands in the same lineup
-          // arrive separately, so the existing record may not yet have the incoming band).
-          // Also covers "myticket Jahrhunderthalle" vs "Jahrhunderthalle" style sponsorship prefixes.
-          const highConfidence = d === 0 && (sim >= 0.95 || venueContains(concert.venue, c.venue));
-          if (bandIds.length > 0 && !sharesABand(c) && !eitherIsMultiBand && !highConfidence) return false;
-          return d <= 1.5 || eitherIsMultiBand || highConfidence;
-        })
-        .filter(({ c }) => diffDays(c) <= 7)
-        .sort((a, b) => b.c.bands.length - a.c.bands.length || b.sim - a.sim);
-      existingConcert = venueMatches[0]?.c ?? null;
-    }
-
-    // 2. City fuzzy match fallback — same restriction: must share a band unless
-    //    either side is a festival/multi-band event.
-    if (!existingConcert && concert.city) {
-      const cityMatches = candidates
-        .filter((c) => {
-          const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
-          if (bandIds.length > 0 && !sharesABand(c) && !eitherIsMultiBand) return false;
-          const d = diffDays(c);
-          return d <= (eitherIsMultiBand ? 7 : 1.5);
-        })
-        .filter((c) => {
-          const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
-          return (eitherIsMultiBand && sameArea(concert, c)) ||
-            (c.city && stringSimilarity(concert.city, c.city) >= 0.7);
-        })
-        .sort((a, b) => b.bands.length - a.bands.length);
-      existingConcert = cityMatches[0] ?? null;
-    }
-
-  }
-
-  if (existingConcert) {
-    // The concert with more bands wins — its date/metadata become canonical
-    const incomingWins = bandIds.length > existingConcert.bands.length;
-
-    const isAtFormat = (s) => s.includes(' @ ') || / at /i.test(s);
-    const existingIsAtFormat = isAtFormat(existingConcert.name || '');
-    const incomingIsAtFormat = isAtFormat(concert.name || '');
-    // Never overwrite a proper name with an @ format name.
-    // Upgrade @ → proper when possible, otherwise keep the better of the two.
-    // When both are proper names, prefer the shorter one (avoids "GRASPOP 2026 COMBI TICKET" over "GRASPOP 2026").
-    const bestName = (!existingIsAtFormat && incomingIsAtFormat)
-      ? existingConcert.name                          // keep existing proper name
-      : (existingIsAtFormat && !incomingIsAtFormat && concert.name)
-        ? concert.name                                // upgrade @ → proper
-        : (concert.name && existingConcert.name && !incomingIsAtFormat && !existingIsAtFormat)
-          ? (concert.name.length <= existingConcert.name.length ? concert.name : existingConcert.name)  // both proper — pick shorter
-          : concert.name || existingConcert.name;     // fallback
-    const hasBetterName = bestName !== existingConcert.name;
-
-    if (incomingWins || hasBetterName) {
-      await tx.concert.update({
-        where: { id: existingConcert.id },
-        data: {
-          name: bestName,
-          ...(incomingWins && {
-            concert_date: concert.concert_date ? new Date(concert.concert_date) : existingConcert.concert_date,
-            url: concert.url || existingConcert.url,
-            metadata: concert.metadata || existingConcert.metadata,
-            on_sale: concert.on_sale !== undefined ? concert.on_sale : existingConcert.on_sale,
-            ticket_sale_start: concert.ticket_sale_start ? new Date(concert.ticket_sale_start) : existingConcert.ticket_sale_start,
-            festival: concert.festival || existingConcert.festival,
-          }),
-        },
-      });
-    }
-
-    const existingRefs = await tx.concertBandReference.findMany({
-      where: { concert: existingConcert.id, band: { in: bandIds } },
-      select: { band: true },
-    });
-    const linkedBandIds = new Set(existingRefs.map((r) => r.band));
-    const toLink = bandIds.filter((id) => !linkedBandIds.has(id));
-    if (toLink.length > 0) {
-      await tx.concertBandReference.createMany({
-        data: toLink.map((band) => ({ concert: existingConcert.id, band })),
-      });
-    }
-  }
-
-  return { isDuplicate: !!existingConcert, existingConcert };
-}
-
 function handleError(module, status) {
   const moduleErrors = errorMessages[module];
   if (moduleErrors && moduleErrors[status]) {
@@ -264,18 +44,18 @@ async function getTicketmasterId(bandIdentifier) {
       select: { ticketmaster_id: true },
     });
     if (band) return band.ticketmaster_id;
-    
+
     // If not in DB but looks like valid TM ID, return it (it's probably valid)
     return bandIdentifier;
   }
-  
+
   // Try finding by name in DB
   const band = await prisma.band.findUnique({
     where: { name: bandIdentifier },
     select: { ticketmaster_id: true },
   });
   if (band?.ticketmaster_id) return band.ticketmaster_id;
-  
+
   // Fall back to API search to get the Ticketmaster ID
   try {
     const response = await axios.get(`${ticketmasterURL}attractions.json`, {
@@ -289,7 +69,7 @@ async function getTicketmasterId(bandIdentifier) {
     if (response.data._embedded?.attractions?.[0]?.id) {
       return response.data._embedded.attractions[0].id;
     }
-    
+
     throw new Error('Band not found on Ticketmaster');
   } catch (error) {
     if (error.response?.status === 429) {
@@ -298,4 +78,3 @@ async function getTicketmasterId(bandIdentifier) {
     throw new Error(`Could not find Ticketmaster ID for band "${bandIdentifier}"`);
   }
 }
-

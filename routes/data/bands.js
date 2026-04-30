@@ -2,11 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
 const axios = require('axios');
-const {
-  handleError,
-  checkDuplicateConcert,
-  stringSimilarity,
-} = require('./helpers');
+const { handleError, checkDuplicateConcert } = require('./helpers');
+const { stringSimilarity, deduplicateByCoords } = require('../../utils/concertDedup');
 
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
@@ -94,25 +91,7 @@ router.post(
       
       const { concerts } = req.body;
 
-      // Pre-deduplicate payload by coordinates: keep the entry with the most bands per location.
-      const coordKey = (c) =>
-        c.latitude != null && c.longitude != null
-          ? `${Math.round(c.latitude / 0.001)}:${Math.round(c.longitude / 0.001)}`
-          : null;
-
-      const { coordMap, noCoord } = concerts.reduce(
-        (acc, concert) => {
-          const key = coordKey(concert);
-          if (!key) { acc.noCoord.push(concert); return acc; }
-          const existing = acc.coordMap.get(key);
-          if (!existing || (concert.bands?.length ?? 0) > (existing.bands?.length ?? 0)) {
-            acc.coordMap.set(key, concert);
-          }
-          return acc;
-        },
-        { coordMap: new Map(), noCoord: [] },
-      );
-      const deduplicatedConcerts = [...coordMap.values(), ...noCoord];
+      const deduplicatedConcerts = deduplicateByCoords(concerts);
 
       const result = await prisma.$transaction(async (tx) => {
         const insertedConcerts = [];
