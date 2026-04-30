@@ -10,7 +10,7 @@ async function findUserById({ userId }) {
       email: true,
       role: true,
       created_at: true,
-      gameTimes: {
+      game_times: {
         select: {
           play_time: true,
           updated_at: true,
@@ -23,7 +23,7 @@ async function findUserById({ userId }) {
           },
         },
       },
-      movieReviews: {
+      movie_reviews: {
         select: {
           id: true,
           rating: true,
@@ -39,12 +39,12 @@ async function findUserById({ userId }) {
   });
 
   if (!user) throw new Error("User not found");
-  // Limit to top 3 gameTimes and movieReviews in JS
-  user.gameTimes = (user.gameTimes || [])
+  // Limit to top 3 game_times and movie_reviews in JS
+  user.game_times = (user.game_times || [])
     .sort((a, b) => b.play_time - a.play_time)
     .slice(0, 3);
 
-  user.movieReviews = (user.movieReviews || []).slice(0, 3);
+  user.movie_reviews = (user.movie_reviews || []).slice(0, 3);
 
   return user;
 }

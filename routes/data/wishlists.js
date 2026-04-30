@@ -314,7 +314,7 @@ router.get(
                   bands: {
                     include: {
                       band_rel: {
-                        select: { name: true, id: true },
+                        select: { name: true, id: true, setlist: true },
                       },
                     },
                   },
@@ -360,6 +360,7 @@ router.get(
                 id: b.band_rel.id,
                 name: b.band_rel.name,
                 tier: bandTierMap.get(b.band_rel.id) ?? null,
+                setlist: b.band_rel.setlist ?? null,
               }))
               .filter((b) => bandIds.includes(b.id));
 

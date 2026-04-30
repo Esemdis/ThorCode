@@ -149,7 +149,7 @@ router.get('/me', auth, async (req, res) => {
         role: true,
         created_at: true,
         settings: true,
-        gameTimes: {
+        game_times: {
           select: {
             play_time: true,
             updated_at: true,
@@ -162,7 +162,7 @@ router.get('/me', auth, async (req, res) => {
             },
           },
         },
-        movieReviews: {
+        movie_reviews: {
           select: {
             id: true,
             rating: true,
@@ -181,12 +181,12 @@ router.get('/me', auth, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Limit to top 3 gameTimes and movieReviews in JS
-    user.gameTimes = (user.gameTimes || [])
+    // Limit to top 3 game_times and movie_reviews in JS
+    user.game_times = (user.game_times || [])
       .sort((a, b) => b.play_time - a.play_time)
       .slice(0, 3);
 
-    user.movieReviews = (user.movieReviews || []).slice(0, 3);
+    user.movie_reviews = (user.movie_reviews || []).slice(0, 3);
 
     res.json({ user });
   } catch (error) {
@@ -264,7 +264,7 @@ router.get(
           email: true,
           role: true,
           created_at: true,
-          gameTimes: {
+          game_times: {
             select: {
               play_time: true,
               updated_at: true,
@@ -277,7 +277,7 @@ router.get(
               },
             },
           },
-          movieReviews: {
+          movie_reviews: {
             select: {
               id: true,
               rating: true,
@@ -296,12 +296,12 @@ router.get(
         return res.status(404).json({ error: 'User not found' });
       }
 
-      // Limit to top 3 gameTimes and movieReviews in JS
-      user.gameTimes = (user.gameTimes || [])
+      // Limit to top 3 game_times and movie_reviews in JS
+      user.game_times = (user.game_times || [])
         .sort((a, b) => b.play_time - a.play_time)
         .slice(0, 3);
 
-      user.movieReviews = (user.movieReviews || []).slice(0, 3);
+      user.movie_reviews = (user.movie_reviews || []).slice(0, 3);
 
       res.json({ user });
     } catch (error) {

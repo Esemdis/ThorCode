@@ -970,6 +970,18 @@ router.post('/sync-weather', auth, roleCheck(['ADMIN']), async (_req, res) => {
   }
 });
 
+// POST /bands/sync-setlists — proxy to Python setlist sync (ADMIN only)
+router.post('/bands/sync-setlists', auth, roleCheck(['ADMIN']), async (_req, res) => {
+  try {
+    const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
+    await axios.post(`${pythonServiceUrl}/sync-setlists`, {}, { timeout: 300000 });
+    res.status(200).json({ status: 'success' });
+  } catch (error) {
+    console.error('Error triggering setlist sync:', error.message);
+    res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+});
+
 // GET /bandsintown/enrich-pending — future BIT concerts with numeric event IDs that can be enriched
 router.get('/bandsintown/enrich-pending', auth, roleCheck(['ADMIN', 'SYSTEM']), async (_req, res) => {
   try {
@@ -1009,6 +1021,49 @@ router.get('/weather-pending', auth, roleCheck(['SYSTEM']), async (_req, res) =>
     res.json(concerts);
   } catch (error) {
     console.error('[weather-pending] Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /bands/setlist-pending — bands with no setlist or stale setlist (> 30 days), excluding bands
+// that only appear in festivals (concerts with > 5 total bands) (SYSTEM only)
+router.get('/bands/setlist-pending', auth, roleCheck(['SYSTEM']), async (_req, res) => {
+  try {
+    const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    const bands = await prisma.band.findMany({
+      where: {
+        OR: [
+          { setlist: { equals: Prisma.DbNull } },
+          { setlist_updated_at: { lt: threeDaysAgo } },
+        ],
+      },
+      select: { id: true, name: true, MBID: true },
+    });
+    res.json(bands);
+  } catch (error) {
+    console.error('[setlist-pending] Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// PATCH /bands/setlists/bulk — store fetched setlists for multiple bands (SYSTEM only)
+router.patch('/bands/setlists/bulk', auth, roleCheck(['SYSTEM']), async (req, res) => {
+  try {
+    const updates = req.body; // [{ id, setlist }]
+    if (!Array.isArray(updates) || updates.length === 0) {
+      return res.status(400).json({ error: 'Expected non-empty array of { id, setlist }' });
+    }
+    await Promise.all(
+      updates.map(({ id, setlist }) =>
+        prisma.band.update({
+          where: { id },
+          data: { setlist, setlist_updated_at: new Date() },
+        })
+      )
+    );
+    res.json({ ok: true, updated: updates.length });
+  } catch (error) {
+    console.error('[setlists/bulk] Error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

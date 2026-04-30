@@ -77,6 +77,8 @@ model Band {
   MBID            String?                 @unique
   songkick_url      String?
   bandsintown_url   String?
+  setlist            Json?
+  setlist_updated_at DateTime?
   concerts        ConcertBandReference[]  @relation("BandConcerts")
   wishlists       WishlistBandReference[] @relation("BandWishlists")
 }
