@@ -1025,18 +1025,20 @@ router.get('/weather-pending', auth, roleCheck(['SYSTEM']), async (_req, res) =>
   }
 });
 
-// GET /bands/setlist-pending — bands with no setlist or stale setlist (> 30 days), excluding bands
-// that only appear in festivals (concerts with > 5 total bands) (SYSTEM only)
-router.get('/bands/setlist-pending', auth, roleCheck(['SYSTEM']), async (_req, res) => {
+// GET /bands/setlist-pending — bands with no setlist or stale setlist (> 3 days)
+// ?force=true returns all bands regardless of when they were last updated (SYSTEM only)
+router.get('/bands/setlist-pending', auth, roleCheck(['SYSTEM']), async (req, res) => {
   try {
+    const force = req.query.force === 'true';
     const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    const where = force ? {} : {
+      OR: [
+        { setlist: { equals: Prisma.DbNull } },
+        { setlist_updated_at: { lt: threeDaysAgo } },
+      ],
+    };
     const bands = await prisma.band.findMany({
-      where: {
-        OR: [
-          { setlist: { equals: Prisma.DbNull } },
-          { setlist_updated_at: { lt: threeDaysAgo } },
-        ],
-      },
+      where,
       select: { id: true, name: true, MBID: true },
     });
     res.json(bands);

@@ -14,7 +14,7 @@ async function findUserById({ userId }) {
         select: {
           play_time: true,
           updated_at: true,
-          game: {
+          game_rel: {
             select: {
               id: true,
               name: true,
@@ -27,7 +27,7 @@ async function findUserById({ userId }) {
         select: {
           id: true,
           rating: true,
-          movie: {
+          movie_rel: {
             select: {
               id: true,
               name: true,
