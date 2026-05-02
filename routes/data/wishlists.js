@@ -232,6 +232,64 @@ router.get(
   }
 );
 
+// GET /wishlists/:id/recent-concerts — 30 most recently inserted future concerts for this wishlist
+router.get(
+  "/wishlists/:id/recent-concerts",
+  [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
+  async (req, res) => {
+    try {
+      const wishlistId = parseInt(req.params.id, 10);
+      const wishlist = await prisma.wishlist.findUnique({
+        where: { id: wishlistId },
+        include: { bands: { select: { band_id: true, tier: true } } },
+      });
+      if (!wishlist) return res.status(404).json({ error: "Not found" });
+      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+
+      const wishlistBandMap = new Map(wishlist.bands.map((b) => [b.band_id, b.tier]));
+      const bandIds = [...wishlistBandMap.keys()];
+
+      const concerts = await prisma.concert.findMany({
+        where: {
+          concert_date: { gte: new Date() },
+          bands: { some: { band: { in: bandIds } } },
+        },
+        orderBy: { created_at: "desc" },
+        take: 30,
+        select: {
+          id: true,
+          name: true,
+          city: true,
+          country: true,
+          venue: true,
+          concert_date: true,
+          url: true,
+          festival: true,
+          created_at: true,
+          bands: {
+            where: { band: { in: bandIds } },
+            select: { band_rel: { select: { id: true, name: true } } },
+          },
+        },
+      });
+
+      const result = concerts.map((c) => ({
+        ...c,
+        participating_bands: c.bands.map((b) => ({
+          id: b.band_rel.id,
+          name: b.band_rel.name,
+          tier: wishlistBandMap.get(b.band_rel.id),
+        })),
+      }));
+
+      res.json({ concerts: result });
+    } catch (error) {
+      console.error("Error fetching recent concerts:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
 // GET /wishlists/:id/activity — last 15 activity log entries for this wishlist
 router.get(
   "/wishlists/:id/activity",
