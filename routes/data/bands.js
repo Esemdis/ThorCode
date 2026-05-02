@@ -97,6 +97,7 @@ router.post(
         const insertedConcerts = [];
         const updatedConcerts = [];
         const duplicateConcerts = [];
+        const newlySoldOut = [];
         const errors = [];
 
         // Must be sequential — each insert affects subsequent duplicate checks within the tx
@@ -158,14 +159,25 @@ router.post(
                 const betterName = concert.name && existingIsAtFormat && !incomingIsAtFormat
                   ? concert.name : null;
 
-                if (toLink.length > 0 || betterName) {
+                const concertFieldUpdate = {};
+                if (betterName) concertFieldUpdate.name = betterName;
+                if (concert.on_sale !== undefined) concertFieldUpdate.on_sale = concert.on_sale;
+                if (concert.ticket_sale_start !== undefined) concertFieldUpdate.ticket_sale_start = concert.ticket_sale_start ? new Date(concert.ticket_sale_start) : null;
+                if (concert.price_min !== undefined) concertFieldUpdate.price_min = concert.price_min ?? null;
+                if (concert.price_max !== undefined) concertFieldUpdate.price_max = concert.price_max ?? null;
+                if (concert.price_currency !== undefined) concertFieldUpdate.price_currency = concert.price_currency ?? null;
+                if (concert.sold_out !== undefined) concertFieldUpdate.sold_out = concert.sold_out ?? false;
+
+                const becameSoldOut = concert.sold_out === true && !existingByEventId.sold_out;
+
+                if (toLink.length > 0 || Object.keys(concertFieldUpdate).length > 0) {
                   await Promise.all([
                     toLink.length > 0 && tx.concertBandReference.createMany({
                       data: toLink.map((band) => ({ concert: existingByEventId.id, band })),
                     }),
-                    betterName && tx.concert.update({
+                    Object.keys(concertFieldUpdate).length > 0 && tx.concert.update({
                       where: { id: existingByEventId.id },
-                      data: { name: betterName },
+                      data: concertFieldUpdate,
                     }),
                   ].filter(Boolean));
                   updatedConcerts.push({
@@ -176,6 +188,15 @@ router.post(
                     name: betterName || existingByEventId.name,
                     bandCount: existingByEventId._count.bands + toLink.length,
                   });
+                  if (becameSoldOut) {
+                    newlySoldOut.push({
+                      concertId: existingByEventId.id,
+                      name: betterName || existingByEventId.name,
+                      city: existingByEventId.city,
+                      country: existingByEventId.country,
+                      concert_date: existingByEventId.concert_date,
+                    });
+                  }
                 } else {
                   duplicateConcerts.push({
                     index: i,
@@ -232,6 +253,10 @@ router.post(
                 url: concert.url || null,
                 festival: concert.festival || false,
                 source: concert.source ?? null,
+                price_min: concert.price_min ?? null,
+                price_max: concert.price_max ?? null,
+                price_currency: concert.price_currency ?? null,
+                sold_out: concert.sold_out ?? false,
                 created_at: new Date(),
               },
             });
@@ -285,6 +310,7 @@ router.post(
           updated: updatedConcerts.length,
           duplicates: duplicateConcerts.length,
           errors: errors.length,
+          newlySoldOut,
           details: {
             insertedConcerts,
             updatedConcerts,
@@ -293,6 +319,51 @@ router.post(
           },
         };
       }, { timeout: 60000 });
+
+      // Create SOLD_OUT activity logs for every wishlist that has a band at a newly sold-out concert
+      if (result.newlySoldOut.length > 0) {
+        for (const soldOut of result.newlySoldOut) {
+          try {
+            const refs = await prisma.concertBandReference.findMany({
+              where: { concert: soldOut.concertId },
+              select: {
+                band_rel: {
+                  select: {
+                    name: true,
+                    wishlists: { select: { wishlist_id: true } },
+                  },
+                },
+              },
+            });
+
+            const wishlistMap = new Map(); // wishlist_id -> Set of band names
+            for (const ref of refs) {
+              for (const wl of ref.band_rel.wishlists) {
+                if (!wishlistMap.has(wl.wishlist_id)) wishlistMap.set(wl.wishlist_id, new Set());
+                wishlistMap.get(wl.wishlist_id).add(ref.band_rel.name);
+              }
+            }
+
+            await Promise.all([...wishlistMap.entries()].map(([wishlistId, bandNames]) =>
+              prisma.activityLog.create({
+                data: {
+                  wishlist_id: wishlistId,
+                  type: 'SOLD_OUT',
+                  data: JSON.stringify({
+                    concert_name: soldOut.name,
+                    city: soldOut.city,
+                    country: soldOut.country,
+                    concert_date: soldOut.concert_date,
+                    band_names: [...bandNames],
+                  }),
+                },
+              })
+            ));
+          } catch (e) {
+            console.error('[SoldOut] Failed to create activity log:', e.message);
+          }
+        }
+      }
 
       res.status(200).json(result);
     } catch (error) {
