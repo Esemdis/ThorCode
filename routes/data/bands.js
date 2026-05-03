@@ -163,9 +163,9 @@ router.post(
                 if (betterName) concertFieldUpdate.name = betterName;
                 if (concert.on_sale !== undefined) concertFieldUpdate.on_sale = concert.on_sale;
                 if (concert.ticket_sale_start !== undefined) concertFieldUpdate.ticket_sale_start = concert.ticket_sale_start ? new Date(concert.ticket_sale_start) : null;
-                if (concert.price_min !== undefined) concertFieldUpdate.price_min = concert.price_min ?? null;
-                if (concert.price_max !== undefined) concertFieldUpdate.price_max = concert.price_max ?? null;
-                if (concert.price_currency !== undefined) concertFieldUpdate.price_currency = concert.price_currency ?? null;
+                if (concert.price_min != null) concertFieldUpdate.price_min = concert.price_min;
+                if (concert.price_max != null) concertFieldUpdate.price_max = concert.price_max;
+                if (concert.price_currency != null) concertFieldUpdate.price_currency = concert.price_currency;
                 if (concert.sold_out !== undefined) concertFieldUpdate.sold_out = concert.sold_out ?? false;
 
                 const becameSoldOut = concert.sold_out === true && !existingByEventId.sold_out;
@@ -724,6 +724,52 @@ router.post(
   },
 );
 
+// POST /bands/quick-add
+// Minimal band creation from known name + MBID (e.g. from Setlist.fm).
+// Does not do Ticketmaster lookup — adds straight to DB and optionally to a wishlist.
+router.post('/bands/quick-add', auth, async (req, res) => {
+  try {
+    const { name, mbid, wishlistId, tier } = req.body;
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+
+    const validTiers = ['LOVE', 'LIKE', 'FOLLOW'];
+    const resolvedTier = validTiers.includes(tier) ? tier : 'FOLLOW';
+
+    // Check for existing band by MBID or name
+    const existing = await prisma.band.findFirst({
+      where: mbid ? { MBID: mbid } : { name: name.trim() },
+      select: { id: true, name: true },
+    });
+
+    let band = existing;
+    if (!band) {
+      band = await prisma.band.create({
+        data: { name: name.trim(), MBID: mbid ?? null, created_at: new Date() },
+        select: { id: true, name: true },
+      });
+    }
+
+    // Add to wishlist if provided (skip if already there)
+    if (wishlistId) {
+      const wid = parseInt(wishlistId, 10);
+      if (!Number.isNaN(wid)) {
+        await prisma.wishlistBandReference.upsert({
+          where: { band_wishlist: { band_id: band.id, wishlist_id: wid } },
+          create: { band_id: band.id, wishlist_id: wid, tier: resolvedTier },
+          update: {},
+        });
+      }
+    }
+
+    return res.status(201).json({ band });
+  } catch (error) {
+    console.error('[bands/quick-add] Error:', error.message);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get all upcoming concerts for a specific band
 router.get('/bands/:bandId/upcoming', async (req, res) => {
   try {
@@ -1208,6 +1254,126 @@ router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), a
   } catch (error) {
     console.error(`[enrich-lineup] Error for concert ${concertId}:`, error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/bands/:bandId/setlist-history', auth, async (req, res) => {
+  try {
+    const bandId = parseInt(req.params.bandId, 10);
+    if (Number.isNaN(bandId)) return res.status(400).json({ error: 'Invalid band id' });
+
+    const page = parseInt(req.query.page, 10) || 1;
+
+    const band = await prisma.band.findUnique({
+      where: { id: bandId },
+      select: { MBID: true },
+    });
+
+    if (!band) return res.status(404).json({ error: 'Band not found' });
+    if (!band.MBID) return res.status(404).json({ error: 'Band has no MBID' });
+
+    const sfmRes = await axios.get(
+      `https://api.setlist.fm/rest/1.0/artist/${band.MBID}/setlists`,
+      {
+        headers: { 'x-api-key': process.env.SETLIST_API_KEY, Accept: 'application/json' },
+        params: { p: page },
+        timeout: 15000,
+      },
+    );
+
+    const raw = sfmRes.data;
+    const setlists = (raw.setlist || []).map((s) => {
+      const venue = s.venue || {};
+      const city = venue.city || {};
+      const sets = (s.sets?.set || []);
+      const songs = sets.flatMap((set) =>
+        (set.song || []).map((song) => ({
+          name: song.name || '',
+          cover: song.cover?.name ?? null,
+          tape: song.tape ?? false,
+        })),
+      );
+      return {
+        setlistfm_id: s.id,
+        date: s.eventDate,
+        venue: venue.name ?? null,
+        city: city.name ?? null,
+        country: city.country?.code ?? null,
+        tour: s.tour?.name ?? null,
+        songs,
+        url: s.url ?? null,
+      };
+    });
+
+    return res.json({
+      setlists,
+      total: raw.total ?? setlists.length,
+      page: raw.page ?? page,
+      itemsPerPage: raw.itemsPerPage ?? 20,
+    });
+  } catch (error) {
+    console.error('[setlist-history] Error:', error.message);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /data/concerts/setlist-lookup?id=:setlistfm_id
+// Fetch a specific setlist by Setlist.fm ID and return preview data + DB band match
+router.get('/setlist-lookup', auth, async (req, res) => {
+  try {
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ error: 'Missing id parameter' });
+
+    const sfmRes = await axios.get(
+      `https://api.setlist.fm/rest/1.0/setlist/${id}`,
+      {
+        headers: { 'x-api-key': process.env.SETLIST_API_KEY, Accept: 'application/json' },
+        timeout: 15000,
+      },
+    );
+
+    const s = sfmRes.data;
+    const venue = s.venue || {};
+    const city = venue.city || {};
+    const sets = (s.sets?.set || []);
+    const songs = sets.flatMap((set) =>
+      (set.song || []).map((song) => ({
+        name: song.name || '',
+        cover: song.cover?.name ?? null,
+        tape: song.tape ?? false,
+      })),
+    );
+
+    const artistMbid = s.artist?.mbid ?? null;
+    const artistName = s.artist?.name ?? null;
+
+    // Match artist MBID to a band in the DB
+    let band = null;
+    if (artistMbid) {
+      band = await prisma.band.findFirst({
+        where: { MBID: artistMbid },
+        select: { id: true, name: true },
+      });
+    }
+
+    return res.json({
+      setlistfm_id: s.id,
+      date: s.eventDate,
+      venue: venue.name ?? null,
+      city: city.name ?? null,
+      country: city.country?.code ?? null,
+      tour: s.tour?.name ?? null,
+      songs,
+      url: s.url ?? null,
+      artist: { name: artistName, mbid: artistMbid },
+      band: band ?? null,
+    });
+  } catch (error) {
+    if (error.response?.status === 404) {
+      return res.status(404).json({ error: 'Setlist not found' });
+    }
+    console.error('[setlist-lookup] Error:', error.message);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 

@@ -276,12 +276,16 @@ function mergeByDayAndBands(concerts) {
     if (dateKey && bandIds.size > 0) {
       for (const idx of (dayBuckets.get(dateKey) || [])) {
         const ex = result[idx];
+        const sameCity = concert.city && ex.city
+          ? stringSimilarity(concert.city, ex.city) >= 0.7
+          : false;
+        if (!sameCity) continue;
         const exIds = new Set((ex.participating_bands || []).map((b) => b.id));
         if ([...bandIds].some((id) => exIds.has(id))) { mergedIdx = idx; break; }
       }
     }
 
-    if (mergedIdx !== null) {
+    if (mergedIdx !== null && !concert.festival && !result[mergedIdx].festival) {
       const base = result[mergedIdx];
       const baseIds = new Set((base.participating_bands || []).map((b) => b.id));
       base.participating_bands = [

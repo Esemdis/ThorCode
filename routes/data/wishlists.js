@@ -16,6 +16,25 @@ const rateLimit = rateLimiter({
 
 const VALID_TIERS = ["LOVE", "LIKE", "FOLLOW"];
 
+// Helper: recount past attended concerts for a band and SET times_seen accurately.
+// Always use this instead of increment/decrement to avoid drift from manual edits.
+async function recountTimesSeen(wishlistId, bandId) {
+  const count = await prisma.concertAttendance.count({
+    where: {
+      wishlist_id: wishlistId,
+      concert_rel: {
+        concert_date: { lt: new Date() },
+        bands: { some: { band: bandId } },
+      },
+    },
+  });
+  await prisma.wishlistBandReference.update({
+    where: { band_wishlist: { band_id: bandId, wishlist_id: wishlistId } },
+    data: { times_seen: count },
+  });
+  return count;
+}
+
 // Helper: trigger Python service to recompute scores for a wishlist
 async function triggerScoreRecompute(wishlistId) {
   const pythonUrl = process.env.PYTHON_SERVICE_URL;
@@ -442,6 +461,10 @@ router.get(
               concert_date: concert.concert_date,
               on_sale: concert.on_sale,
               ticket_sale_start: concert.ticket_sale_start,
+              price_min: concert.price_min,
+              price_max: concert.price_max,
+              price_currency: concert.price_currency,
+              sold_out: concert.sold_out,
               festival: concert.festival,
               source: concert.source,
               url: concert.url,
@@ -945,6 +968,326 @@ router.post(
   },
 );
 
+// GET /wishlists/:id/attendance — all attended/going concerts for this wishlist
+router.get(
+  "/wishlists/:id/attendance",
+  [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
+  async (req, res) => {
+    try {
+      const wishlistId = parseInt(req.params.id, 10);
+      const wishlist = await prisma.wishlist.findUnique({
+        where: { id: wishlistId },
+        include: { bands: { select: { band_id: true, tier: true } } },
+      });
+      if (!wishlist) return res.status(404).json({ error: "Not found" });
+      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+
+      const bandTierMap = new Map(wishlist.bands.map((b) => [b.band_id, b.tier]));
+      const bandIds = [...bandTierMap.keys()];
+
+      const filterBandId = req.query.band_id ? parseInt(req.query.band_id, 10) : null;
+
+      const records = await prisma.concertAttendance.findMany({
+        where: {
+          wishlist_id: wishlistId,
+          ...(filterBandId ? { concert_rel: { bands: { some: { band: filterBandId } } } } : {}),
+        },
+        orderBy: { concert_rel: { concert_date: "desc" } },
+        include: {
+          concert_rel: {
+            select: {
+              id: true,
+              event_id: true,
+              name: true,
+              venue: true,
+              city: true,
+              country: true,
+              concert_date: true,
+              url: true,
+              festival: true,
+              latitude: true,
+              longitude: true,
+              on_sale: true,
+              sold_out: true,
+              price_min: true,
+              price_max: true,
+              price_currency: true,
+              weather: true,
+              bands: {
+                where: { band: { in: bandIds } },
+                select: { setlist: true, band_rel: { select: { id: true, name: true } } },
+              },
+            },
+          },
+        },
+      });
+
+      const result = records.map((r) => ({
+        attendance_id: r.id,
+        created_at: r.created_at,
+        concert: {
+          ...r.concert_rel,
+          participating_bands: r.concert_rel.bands.map((b) => ({
+            id: b.band_rel.id,
+            name: b.band_rel.name,
+            tier: bandTierMap.get(b.band_rel.id) ?? null,
+            setlist: b.setlist ?? null,
+          })),
+        },
+      }));
+
+      res.json({ attendance: result });
+    } catch (error) {
+      console.error("Error fetching attendance:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// POST /wishlists/:id/attendance — mark a concert as going/attended
+router.post(
+  "/wishlists/:id/attendance",
+  [
+    auth,
+    roleCheck(["ADMIN", "USER"]),
+    param("id").isInt().withMessage("Wishlist ID must be an integer"),
+    body("concert_id").isInt().withMessage("concert_id must be an integer"),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
+
+      const wishlistId = parseInt(req.params.id, 10);
+      const concertId = parseInt(req.body.concert_id, 10);
+
+      const wishlist = await prisma.wishlist.findUnique({
+        where: { id: wishlistId },
+        include: { bands: { select: { band_id: true } } },
+      });
+      if (!wishlist) return res.status(404).json({ error: "Not found" });
+      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+
+      const concert = await prisma.concert.findUnique({
+        where: { id: concertId },
+        select: { id: true, concert_date: true, bands: { select: { band: true } } },
+      });
+      if (!concert) return res.status(404).json({ error: "Concert not found" });
+
+      const attendance = await prisma.concertAttendance.upsert({
+        where: { wishlist_id_concert_id: { wishlist_id: wishlistId, concert_id: concertId } },
+        create: { wishlist_id: wishlistId, concert_id: concertId },
+        update: {},
+      });
+
+      // Recount times_seen for past concerts
+      const timesSeenUpdated = [];
+      const isPast = concert.concert_date && new Date(concert.concert_date) < new Date();
+      if (isPast) {
+        const concertBandIds = new Set(concert.bands.map((b) => b.band));
+        const wishlistBandIds = wishlist.bands.map((b) => b.band_id).filter((id) => concertBandIds.has(id));
+        for (const bandId of wishlistBandIds) {
+          const newCount = await recountTimesSeen(wishlistId, bandId);
+          timesSeenUpdated.push({ band_id: bandId, new_times_seen: newCount });
+        }
+      }
+
+      triggerScoreRecompute(wishlistId);
+      res.json({ attendance_id: attendance.id, times_seen_updated: timesSeenUpdated });
+    } catch (error) {
+      console.error("Error adding attendance:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// DELETE /wishlists/:id/attendance/:concertId — unmark a concert
+router.delete(
+  "/wishlists/:id/attendance/:concertId",
+  [
+    auth,
+    roleCheck(["ADMIN", "USER"]),
+    param("id").isInt().withMessage("Wishlist ID must be an integer"),
+    param("concertId").isInt().withMessage("Concert ID must be an integer"),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
+
+      const wishlistId = parseInt(req.params.id, 10);
+      const concertId = parseInt(req.params.concertId, 10);
+
+      const wishlist = await prisma.wishlist.findUnique({
+        where: { id: wishlistId },
+        include: { bands: { select: { band_id: true } } },
+      });
+      if (!wishlist) return res.status(404).json({ error: "Not found" });
+      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+
+      const attendance = await prisma.concertAttendance.findUnique({
+        where: { wishlist_id_concert_id: { wishlist_id: wishlistId, concert_id: concertId } },
+      });
+      if (!attendance) return res.status(404).json({ error: "Attendance record not found" });
+
+      await prisma.concertAttendance.delete({ where: { id: attendance.id } });
+
+      // Recount times_seen for past concerts
+      const concert = await prisma.concert.findUnique({
+        where: { id: concertId },
+        select: { concert_date: true, bands: { select: { band: true } } },
+      });
+      if (concert?.concert_date && new Date(concert.concert_date) < new Date()) {
+        const concertBandIds = new Set(concert.bands.map((b) => b.band));
+        const wishlistBandIds = wishlist.bands.map((b) => b.band_id).filter((id) => concertBandIds.has(id));
+        for (const bandId of wishlistBandIds) {
+          await recountTimesSeen(wishlistId, bandId);
+        }
+      }
+
+      triggerScoreRecompute(wishlistId);
+      res.json({ deleted: true });
+    } catch (error) {
+      console.error("Error removing attendance:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// POST /wishlists/:id/attendance/from-setlist — add a past concert from Setlist.fm history
+router.post(
+  "/wishlists/:id/attendance/from-setlist",
+  [
+    auth,
+    roleCheck(["ADMIN", "USER"]),
+    param("id").isInt().withMessage("Wishlist ID must be an integer"),
+    body("setlistfm_id").isString().notEmpty(),
+    body("date").isString().notEmpty(),
+    body("venue").isString().notEmpty(),
+    body("city").isString().notEmpty(),
+    body("country").isString().notEmpty(),
+    body("band_id").isInt().withMessage("band_id must be an integer"),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
+
+      const wishlistId = parseInt(req.params.id, 10);
+      const { setlistfm_id, date, venue, city, country, band_id, url, songs } = req.body;
+      const bandId = parseInt(band_id, 10);
+
+      const wishlist = await prisma.wishlist.findUnique({
+        where: { id: wishlistId },
+        include: { bands: { select: { band_id: true } } },
+      });
+      if (!wishlist) return res.status(404).json({ error: "Not found" });
+      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+
+      // Parse "DD-MM-YYYY" from Setlist.fm to ISO date
+      let concertDate = null;
+      try {
+        const [dd, mm, yyyy] = date.split("-");
+        concertDate = new Date(`${yyyy}-${mm}-${dd}T12:00:00Z`);
+      } catch {}
+
+      const eventId = `sfm_${setlistfm_id}`;
+
+      const concert = await prisma.concert.upsert({
+        where: { event_id: eventId },
+        create: {
+          event_id: eventId,
+          venue,
+          city,
+          country,
+          concert_date: concertDate,
+          on_sale: false,
+          created_at: new Date(),
+          url: url ?? null,
+          source: "setlistfm",
+        },
+        update: {},
+        select: { id: true },
+      });
+
+      // Link band to concert, storing the specific setlist if provided
+      const setlistData = Array.isArray(songs) && songs.length > 0 ? { songs } : undefined;
+      await prisma.concertBandReference.upsert({
+        where: { concert_band: { concert: concert.id, band: bandId } },
+        create: { concert: concert.id, band: bandId, setlist: setlistData },
+        update: { ...(setlistData ? { setlist: setlistData } : {}) },
+      });
+
+      const attendance = await prisma.concertAttendance.upsert({
+        where: { wishlist_id_concert_id: { wishlist_id: wishlistId, concert_id: concert.id } },
+        create: { wishlist_id: wishlistId, concert_id: concert.id },
+        update: {},
+      });
+
+      // Recount times_seen from attendance — all Setlist.fm history is past
+      const isBandInWishlist = wishlist.bands.some((b) => b.band_id === bandId);
+      if (isBandInWishlist) {
+        await recountTimesSeen(wishlistId, bandId);
+      }
+
+      triggerScoreRecompute(wishlistId);
+      res.json({ concert_id: concert.id, attendance_id: attendance.id });
+
+      // Background: find other bands at the same show via Setlist.fm and link any that exist in the DB
+      enrichConcertBands(concert.id, date, venue, city).catch(() => {});
+    } catch (error) {
+      console.error("Error adding from-setlist attendance:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+async function enrichConcertBands(concertId, date, venue, city) {
+  if (!process.env.SETLIST_API_KEY) return;
+  try {
+    const res = await axios.get("https://api.setlist.fm/rest/1.0/search/setlists", {
+      headers: { "x-api-key": process.env.SETLIST_API_KEY, Accept: "application/json" },
+      params: { date, venueName: venue, cityName: city, p: 1 },
+      timeout: 15000,
+    });
+    const setlists = res.data?.setlist ?? [];
+    const mbids = [...new Set(setlists.map((s) => s.artist?.mbid).filter(Boolean))];
+    if (!mbids.length) return;
+
+    const bands = await prisma.band.findMany({
+      where: { MBID: { in: mbids } },
+      select: { id: true, MBID: true },
+    });
+
+    // Build mbid -> songs map from search results
+    const mbidSongs = new Map();
+    for (const s of setlists) {
+      const mbid = s.artist?.mbid;
+      if (!mbid || mbidSongs.has(mbid)) continue;
+      const songs = (s.sets?.set ?? []).flatMap((set) =>
+        (set.song ?? []).map((song) => ({
+          name: song.name || '',
+          cover: song.cover?.name ?? null,
+          tape: song.tape ?? false,
+        })),
+      );
+      if (songs.length) mbidSongs.set(mbid, songs);
+    }
+
+    for (const band of bands) {
+      const songs = mbidSongs.get(band.MBID);
+      const setlistData = songs ? { songs } : undefined;
+      await prisma.concertBandReference.upsert({
+        where: { concert_band: { concert: concertId, band: band.id } },
+        create: { concert: concertId, band: band.id, setlist: setlistData },
+        update: { ...(setlistData ? { setlist: setlistData } : {}) },
+      });
+    }
+  } catch (e) {
+    console.error("[enrichConcertBands] Error:", e.message);
+  }
+}
+
 function buildDiscordEmbeds(band) {
   const EMBED_CHAR_LIMIT = 5800;
   const FIELD_VALUE_LIMIT = 1024;
@@ -997,5 +1340,35 @@ function buildDiscordEmbeds(band) {
 
   return embeds;
 }
+
+// POST /wishlists/:id/recalculate-times-seen
+// Resets times_seen for every band in the wishlist to the real count of past attended concerts.
+router.post(
+  "/wishlists/:id/recalculate-times-seen",
+  [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt()],
+  async (req, res) => {
+    try {
+      const wishlistId = parseInt(req.params.id, 10);
+      const wishlist = await prisma.wishlist.findUnique({
+        where: { id: wishlistId },
+        include: { bands: { select: { band_id: true } } },
+      });
+      if (!wishlist) return res.status(404).json({ error: "Not found" });
+      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+
+      const results = [];
+      for (const { band_id } of wishlist.bands) {
+        const count = await recountTimesSeen(wishlistId, band_id);
+        results.push({ band_id, times_seen: count });
+      }
+
+      triggerScoreRecompute(wishlistId);
+      res.json({ updated: results.length, results });
+    } catch (error) {
+      console.error("Error recalculating times_seen:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
 
 module.exports = router;

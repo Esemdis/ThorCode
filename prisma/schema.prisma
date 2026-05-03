@@ -106,6 +106,7 @@ model Concert {
   price_currency    String?
   sold_out          Boolean?               @default(false)
   bands             ConcertBandReference[] @relation("ConcertBands")
+  attendances       ConcertAttendance[]    @relation("ConcertAttendances")
 }
 
 model Country {
@@ -118,6 +119,7 @@ model ConcertBandReference {
   id          Int     @id @default(autoincrement())
   concert     Int
   band        Int
+  setlist     Json?
   band_rel    Band    @relation("BandConcerts", fields: [band], references: [id])
   concert_rel Concert @relation("ConcertBands", fields: [concert], references: [id])
 
@@ -136,6 +138,7 @@ model Wishlist {
   user_rel             User                    @relation("UserWishlists", fields: [user_id], references: [id])
   bands                WishlistBandReference[] @relation("WishlistBands")
   activity_logs        ActivityLog[]           @relation("WishlistActivityLogs")
+  attendance           ConcertAttendance[]     @relation("WishlistAttendance")
 }
 
 model ActivityLog {
@@ -157,6 +160,17 @@ model WishlistBandReference {
   wishlist_rel Wishlist @relation("WishlistBands", fields: [wishlist_id], references: [id])
 
   @@unique([band_id, wishlist_id], name: "band_wishlist")
+}
+
+model ConcertAttendance {
+  id           Int      @id @default(autoincrement())
+  wishlist_id  Int
+  concert_id   Int
+  created_at   DateTime @default(now())
+  wishlist_rel Wishlist @relation("WishlistAttendance", fields: [wishlist_id], references: [id])
+  concert_rel  Concert  @relation("ConcertAttendances", fields: [concert_id], references: [id])
+
+  @@unique([wishlist_id, concert_id])
 }
 
 enum Role {
