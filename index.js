@@ -5,8 +5,8 @@ const app = express();
 const port = 4000;
 
 app.use(cors());
-app.use(express.json()); // Add this line to parse JSON payloads
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use("/users", require("./routes/users"));
 app.use("/data/steam", require("./routes/data/steam"));
 app.use("/data/concerts", require("./routes/data/ticketmaster"))

@@ -427,13 +427,14 @@ router.get('/bands/search', async (req, res) => {
 // List all bands with concert counts (number of ConcertBandReferences)
 router.get('/upcoming/bands', async (req, res) => {
   try {
+    const now = new Date();
     const bands = await prisma.band.findMany({
       select: {
         id: true,
         name: true,
         songkick_url: true,
         bandsintown_url: true,
-        _count: { select: { concerts: true } }, // concerts relation name in Band model
+        _count: { select: { concerts: { where: { concert_rel: { concert_date: { gte: now } } } } } },
       },
       orderBy: { name: 'asc' },
     });
@@ -447,7 +448,6 @@ router.get('/upcoming/bands', async (req, res) => {
     }));
 
     // Enrich with next upcoming concert (date & country)
-    const now = new Date();
     await Promise.all(
       mapped.map(async (b) => {
         try {
@@ -780,7 +780,7 @@ router.get('/bands/:bandId/upcoming', async (req, res) => {
 
     const band = await prisma.band.findUnique({
       where: { id: bandId },
-      select: { id: true, name: true, songkick_url: true, bandsintown_url: true },
+      select: { id: true, name: true, songkick_url: true, bandsintown_url: true, setlist: true, MBID: true },
     });
 
     if (!band) {

@@ -155,7 +155,6 @@ model WishlistBandReference {
   band_id      Int
   wishlist_id  Int
   tier         BandTier @default(FOLLOW)
-  times_seen   Int      @default(0)
   band_rel     Band     @relation("BandWishlists", fields: [band_id], references: [id])
   wishlist_rel Wishlist @relation("WishlistBands", fields: [wishlist_id], references: [id])
 

@@ -16,23 +16,51 @@ const rateLimit = rateLimiter({
 
 const VALID_TIERS = ["LOVE", "LIKE", "FOLLOW"];
 
-// Helper: recount past attended concerts for a band and SET times_seen accurately.
-// Always use this instead of increment/decrement to avoid drift from manual edits.
-async function recountTimesSeen(wishlistId, bandId) {
-  const count = await prisma.concertAttendance.count({
+// Helper: compute per-band seen counts from past attendance.
+// Deduplicates by date+venue+city (same logic as the Attended tab display),
+// preferring sfm_ records so a TM + sfm_ pair for the same show counts as 1.
+async function computeSeenCounts(wishlistId) {
+  const attendances = await prisma.concertAttendance.findMany({
     where: {
       wishlist_id: wishlistId,
+      concert_rel: { concert_date: { lt: new Date() } },
+    },
+    select: {
+      concert_id: true,
       concert_rel: {
-        concert_date: { lt: new Date() },
-        bands: { some: { band: bandId } },
+        select: {
+          event_id: true,
+          concert_date: true,
+          venue: true,
+          city: true,
+          bands: { select: { band: true } },
+        },
       },
     },
   });
-  await prisma.wishlistBandReference.update({
-    where: { band_wishlist: { band_id: bandId, wishlist_id: wishlistId } },
-    data: { times_seen: count },
+
+  // Sort sfm_ first so they win deduplication
+  attendances.sort((a, b) => {
+    const aS = a.concert_rel.event_id?.startsWith('sfm_') ? 0 : 1;
+    const bS = b.concert_rel.event_id?.startsWith('sfm_') ? 0 : 1;
+    return aS - bS;
   });
-  return count;
+
+  const deduped = new Map(); // "date|venue|city" -> attendance
+  for (const a of attendances) {
+    const c = a.concert_rel;
+    const day = c.concert_date ? new Date(c.concert_date).toISOString().slice(0, 10) : 'unknown';
+    const key = `${day}|${c.venue ?? ''}|${c.city ?? ''}`;
+    if (!deduped.has(key)) deduped.set(key, a);
+  }
+
+  const seenCountMap = new Map();
+  for (const a of deduped.values()) {
+    for (const b of a.concert_rel.bands) {
+      seenCountMap.set(b.band, (seenCountMap.get(b.band) || 0) + 1);
+    }
+  }
+  return seenCountMap;
 }
 
 // Helper: trigger Python service to recompute scores for a wishlist
@@ -79,7 +107,6 @@ router.get(
             select: {
               band_id: true,
               tier: true,
-              times_seen: true,
             },
           },
         },
@@ -126,9 +153,11 @@ router.get(
             }
           }
 
+          const seenCountMap = await computeSeenCounts(wishlist.id);
+
           return {
             id: wishlist.id,
-            bands: wishlist.bands,
+            bands: wishlist.bands.map((b) => ({ ...b, times_seen: seenCountMap.get(b.band_id) ?? 0 })),
             concerts: Array.from(concertMap.values()),
           };
         })
@@ -480,13 +509,15 @@ router.get(
         return { id: band.id, name: band.name, concerts: concertsList, concertCount: concertsList.length };
       });
 
+      const seenCountMap = await computeSeenCounts(wishlistId);
+
       // Simplified bands array with tier and seen count
       const simplifiedBands = wishlist.bands.map((ref) => ({
         id: ref.band_rel.id,
         name: ref.band_rel.name,
         concertCount: formattedBands.find((b) => b.id === ref.band_id)?.concertCount ?? 0,
         tier: ref.tier,
-        times_seen: ref.times_seen,
+        times_seen: seenCountMap.get(ref.band_id) ?? 0,
         songkick_url: ref.band_rel.songkick_url ?? null,
         bandsintown_url: ref.band_rel.bandsintown_url ?? null,
       }));
@@ -587,7 +618,7 @@ router.patch(
   }
 );
 
-// PATCH /wishlists/:id/bands/:bandId — update tier and/or times_seen for a band
+// PATCH /wishlists/:id/bands/:bandId — update tier for a band
 router.patch(
   "/wishlists/:id/bands/:bandId",
   [
@@ -596,7 +627,6 @@ router.patch(
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
     param("bandId").isInt().withMessage("Band ID must be an integer"),
     body("tier").optional().isIn(VALID_TIERS).withMessage("tier must be LOVE, LIKE, or FOLLOW"),
-    body("times_seen").optional().isInt({ min: 0 }).withMessage("times_seen must be a non-negative integer"),
   ],
   async (req, res) => {
     try {
@@ -607,10 +637,10 @@ router.patch(
 
       const wishlistId = parseInt(req.params.id, 10);
       const bandId = parseInt(req.params.bandId, 10);
-      const { tier, times_seen } = req.body;
+      const { tier } = req.body;
 
-      if (tier === undefined && times_seen === undefined) {
-        return res.status(400).json({ error: "Provide at least one of: tier, times_seen" });
+      if (tier === undefined) {
+        return res.status(400).json({ error: "Provide tier" });
       }
 
       // Verify ownership
@@ -618,13 +648,9 @@ router.patch(
       if (!wishlist) return res.status(404).json(handleError("wishlist", 404));
       if (wishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
 
-      const updateData = {};
-      if (tier !== undefined) updateData.tier = tier;
-      if (times_seen !== undefined) updateData.times_seen = times_seen;
-
       const updated = await prisma.wishlistBandReference.update({
         where: { band_wishlist: { band_id: bandId, wishlist_id: wishlistId } },
-        data: updateData,
+        data: { tier },
       });
 
       // Trigger async score recompute — non-blocking
@@ -1080,20 +1106,8 @@ router.post(
         update: {},
       });
 
-      // Recount times_seen for past concerts
-      const timesSeenUpdated = [];
-      const isPast = concert.concert_date && new Date(concert.concert_date) < new Date();
-      if (isPast) {
-        const concertBandIds = new Set(concert.bands.map((b) => b.band));
-        const wishlistBandIds = wishlist.bands.map((b) => b.band_id).filter((id) => concertBandIds.has(id));
-        for (const bandId of wishlistBandIds) {
-          const newCount = await recountTimesSeen(wishlistId, bandId);
-          timesSeenUpdated.push({ band_id: bandId, new_times_seen: newCount });
-        }
-      }
-
       triggerScoreRecompute(wishlistId);
-      res.json({ attendance_id: attendance.id, times_seen_updated: timesSeenUpdated });
+      res.json({ attendance_id: attendance.id });
     } catch (error) {
       console.error("Error adding attendance:", error);
       return res.status(500).json({ error: "Internal server error" });
@@ -1131,19 +1145,6 @@ router.delete(
       if (!attendance) return res.status(404).json({ error: "Attendance record not found" });
 
       await prisma.concertAttendance.delete({ where: { id: attendance.id } });
-
-      // Recount times_seen for past concerts
-      const concert = await prisma.concert.findUnique({
-        where: { id: concertId },
-        select: { concert_date: true, bands: { select: { band: true } } },
-      });
-      if (concert?.concert_date && new Date(concert.concert_date) < new Date()) {
-        const concertBandIds = new Set(concert.bands.map((b) => b.band));
-        const wishlistBandIds = wishlist.bands.map((b) => b.band_id).filter((id) => concertBandIds.has(id));
-        for (const bandId of wishlistBandIds) {
-          await recountTimesSeen(wishlistId, bandId);
-        }
-      }
 
       triggerScoreRecompute(wishlistId);
       res.json({ deleted: true });
@@ -1223,12 +1224,6 @@ router.post(
         create: { wishlist_id: wishlistId, concert_id: concert.id },
         update: {},
       });
-
-      // Recount times_seen from attendance — all Setlist.fm history is past
-      const isBandInWishlist = wishlist.bands.some((b) => b.band_id === bandId);
-      if (isBandInWishlist) {
-        await recountTimesSeen(wishlistId, bandId);
-      }
 
       triggerScoreRecompute(wishlistId);
       res.json({ concert_id: concert.id, attendance_id: attendance.id });
@@ -1340,35 +1335,5 @@ function buildDiscordEmbeds(band) {
 
   return embeds;
 }
-
-// POST /wishlists/:id/recalculate-times-seen
-// Resets times_seen for every band in the wishlist to the real count of past attended concerts.
-router.post(
-  "/wishlists/:id/recalculate-times-seen",
-  [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt()],
-  async (req, res) => {
-    try {
-      const wishlistId = parseInt(req.params.id, 10);
-      const wishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
-        include: { bands: { select: { band_id: true } } },
-      });
-      if (!wishlist) return res.status(404).json({ error: "Not found" });
-      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
-
-      const results = [];
-      for (const { band_id } of wishlist.bands) {
-        const count = await recountTimesSeen(wishlistId, band_id);
-        results.push({ band_id, times_seen: count });
-      }
-
-      triggerScoreRecompute(wishlistId);
-      res.json({ updated: results.length, results });
-    } catch (error) {
-      console.error("Error recalculating times_seen:", error);
-      return res.status(500).json({ error: "Internal server error" });
-    }
-  }
-);
 
 module.exports = router;
