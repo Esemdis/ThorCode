@@ -318,6 +318,8 @@ router.get(
           url: true,
           festival: true,
           created_at: true,
+          latitude: true,
+          longitude: true,
           bands: {
             where: { band: { in: bandIds } },
             select: { band_rel: { select: { id: true, name: true } } },
