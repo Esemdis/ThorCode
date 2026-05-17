@@ -107,6 +107,9 @@ model Concert {
   sold_out          Boolean?               @default(false)
   bands             ConcertBandReference[] @relation("ConcertBands")
   attendances       ConcertAttendance[]    @relation("ConcertAttendances")
+
+  @@index([concert_date])
+  @@index([concert_date, latitude, longitude])
 }
 
 model Country {
