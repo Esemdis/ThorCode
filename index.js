@@ -10,6 +10,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use("/users", require("./routes/users"));
 app.use("/data/steam", require("./routes/data/steam"));
 app.use("/data/concerts", require("./routes/data/ticketmaster"))
+app.use("/data/cities", require("./routes/data/cities"))
 app.use("/data/tmdb", require("./routes/data/tmdb"));
 app.use("/oauth/tmdb", require("./routes/oauth/tmdb"));
 app.use((err, req, res, _next) => {

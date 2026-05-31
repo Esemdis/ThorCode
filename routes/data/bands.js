@@ -237,6 +237,28 @@ router.post(
               continue;
             }
 
+            // Find or create city record
+            let cityId = null;
+            if (concert.city && concert.country) {
+              const cityRecord = await tx.city.upsert({
+                where: { name_country: { name: concert.city, country: concert.country } },
+                create: {
+                  name: concert.city,
+                  country: concert.country,
+                  latitude:  concert.latitude  ? parseFloat(concert.latitude)  : null,
+                  longitude: concert.longitude ? parseFloat(concert.longitude) : null,
+                  reachable: concert.reachable ?? null,
+                },
+                update: {
+                  // Only backfill missing coordinate data; never overwrite manually set flight_price
+                  ...(concert.latitude  && { latitude:  parseFloat(concert.latitude)  }),
+                  ...(concert.longitude && { longitude: parseFloat(concert.longitude) }),
+                  ...(concert.reachable && { reachable: concert.reachable }),
+                },
+              });
+              cityId = cityRecord.id;
+            }
+
             const newConcert = await tx.concert.create({
               data: {
                 country: concert.country,
@@ -257,6 +279,8 @@ router.post(
                 price_max: concert.price_max ?? null,
                 price_currency: concert.price_currency ?? null,
                 sold_out: concert.sold_out ?? false,
+                reachable: concert.reachable ?? null,
+                city_id: cityId,
                 created_at: new Date(),
               },
             });

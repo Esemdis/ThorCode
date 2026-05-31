@@ -105,11 +105,30 @@ model Concert {
   price_max         Float?
   price_currency    String?
   sold_out          Boolean?               @default(false)
+  reachable         String?
+  city_id           Int?
+  city_rel          City?                  @relation(fields: [city_id], references: [id])
   bands             ConcertBandReference[] @relation("ConcertBands")
   attendances       ConcertAttendance[]    @relation("ConcertAttendances")
 
   @@index([concert_date])
   @@index([concert_date, latitude, longitude])
+}
+
+model City {
+  id                 Int       @id @default(autoincrement())
+  name               String
+  country            String
+  latitude           Float?
+  longitude          Float?
+  reachable          String?
+  airport_iata       String?
+  weather_monthly    Json?
+  weather_updated_at DateTime?
+  created_at         DateTime  @default(now())
+  concerts           Concert[]
+
+  @@unique([name, country])
 }
 
 model Country {

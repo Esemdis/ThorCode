@@ -427,6 +427,15 @@ router.get(
                   source: true,
                   url: true,
                   weather: true,
+                  reachable: true,
+                  city_rel: {
+                    select: {
+                      id: true,
+                      reachable: true,
+                      airport_iata: true,
+                      weather_monthly: true,
+                    },
+                  },
                   bands: {
                     include: {
                       band_rel: {
@@ -500,6 +509,8 @@ router.get(
               source: concert.source,
               url: concert.url,
               weather: concert.weather,
+              reachable: concert.reachable ?? null,
+              city_rel: concert.city_rel ?? null,
               participating_bands: wishlistBands,
               wishlist_band_count: wishlistBands.length,
               concert_score: concertScoreMap.get(concert.id) ?? 0,
