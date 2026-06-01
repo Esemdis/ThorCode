@@ -528,6 +528,7 @@ router.get(
       const simplifiedBands = wishlist.bands.map((ref) => ({
         id: ref.band_rel.id,
         name: ref.band_rel.name,
+        mbid: ref.band_rel.MBID ?? null,
         concertCount: formattedBands.find((b) => b.id === ref.band_id)?.concertCount ?? 0,
         tier: ref.tier,
         times_seen: seenCountMap.get(ref.band_id) ?? 0,

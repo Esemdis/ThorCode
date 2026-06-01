@@ -72,7 +72,7 @@ model OAuth {
 model Band {
   id              Int                     @id @default(autoincrement())
   name            String                  @unique
-  ticketmaster_id String                  @unique
+  ticketmaster_id String?                 @unique
   created_at      DateTime?
   MBID            String?                 @unique
   songkick_url      String?

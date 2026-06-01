@@ -870,6 +870,57 @@ router.get('/bands/:bandId/upcoming', async (req, res) => {
   }
 });
 
+// GET /bands/:bandId/related — similar artists from Last.fm
+// Uses MBID for accuracy when available, falls back to artist name.
+router.get('/bands/:bandId/related', auth, async (req, res) => {
+  const bandId = parseInt(req.params.bandId, 10);
+  if (Number.isNaN(bandId)) return res.status(400).json({ error: 'Invalid band id' });
+
+  const apiKey = process.env.LASTFM_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'Last.fm API key not configured' });
+
+  try {
+    const band = await prisma.band.findUnique({
+      where: { id: bandId },
+      select: { id: true, name: true, MBID: true },
+    });
+    if (!band) return res.status(404).json({ error: 'Band not found' });
+
+    const params = {
+      method: 'artist.getSimilar',
+      api_key: apiKey,
+      format: 'json',
+      limit: 12,
+      autocorrect: 1,
+    };
+    if (band.MBID) params.mbid = band.MBID;
+    else params.artist = band.name;
+
+    const lfmRes = await axios.get('https://ws.audioscrobbler.com/2.0/', {
+      params,
+      timeout: 8000,
+    });
+
+    // Last.fm returns { error, message } on failure
+    if (lfmRes.data?.error) {
+      return res.status(404).json({ error: lfmRes.data.message || 'Artist not found on Last.fm' });
+    }
+
+    const raw = lfmRes.data?.similarartists?.artist ?? [];
+    const related = raw.map((a) => ({
+      name: a.name,
+      match: Math.round(parseFloat(a.match) * 100), // 0–100
+      mbid: a.mbid || null,
+      url: a.url || null,
+    }));
+
+    return res.json({ band: { id: band.id, name: band.name }, related });
+  } catch (e) {
+    console.error('[related-artists]', e.message);
+    return res.status(500).json({ error: 'Failed to fetch related artists' });
+  }
+});
+
 router.post(
   '/bands/:bandId/refresh-urls',
   auth,
