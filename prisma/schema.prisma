@@ -238,6 +238,7 @@ model TripItem {
   url           String?       @db.VarChar(500)
   sort_order    Int           @default(0)
   gear_item_id  Int?
+  worn          Boolean       @default(false)
   created_at    DateTime      @default(now())
   updated_at    DateTime      @updatedAt
   trip_rel      Trip          @relation(fields: [trip_id], references: [id], onDelete: Cascade)
@@ -249,7 +250,7 @@ model ExpenseEstimate {
   trip_id    Int
   category   String   @db.VarChar(100)
   amount     Decimal  @db.Decimal(10, 2)
-  currency   String   @default("EUR") @db.VarChar(3)
+  currency   String   @default("SEK") @db.VarChar(3)
   note       String?  @db.Text
   sort_order Int      @default(0)
   created_at DateTime @default(now())
@@ -291,6 +292,7 @@ model GearItem {
   tags       String[]
   sort_order Int      @default(0)
   parent_id  Int?
+  worn       Boolean  @default(false)
   notes      String?    @db.Text
   url        String?    @db.VarChar(500)
   created_at DateTime   @default(now())
@@ -312,7 +314,8 @@ model TravelWishlistItem {
   url        String?  @db.VarChar(500)
   notes      String?  @db.Text
   price      Float?
-  currency   String   @default("EUR") @db.VarChar(3)
+  currency   String   @default("SEK") @db.VarChar(3)
+  dimensions Json?
   bought     Boolean  @default(false)
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt

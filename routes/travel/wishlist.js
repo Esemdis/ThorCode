@@ -27,7 +27,7 @@ router.post("/", [body("name").notEmpty().trim()], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-  const { name, brand, model, category, url, notes, price, currency } = req.body;
+  const { name, brand, model, category, url, notes, price, currency, dimensions } = req.body;
   try {
     const item = await prisma.travelWishlistItem.create({
       data: {
@@ -39,7 +39,8 @@ router.post("/", [body("name").notEmpty().trim()], async (req, res) => {
         url: url?.trim() || null,
         notes: notes?.trim() || null,
         price: price != null ? parseFloat(price) : null,
-        currency: currency?.trim() || "EUR",
+        currency: currency?.trim() || "SEK",
+        dimensions: dimensions || null,
       },
     });
     res.status(201).json({ data: item });
@@ -53,7 +54,7 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-  const { name, brand, model, category, url, notes, price, currency, bought } = req.body;
+  const { name, brand, model, category, url, notes, price, currency, dimensions, bought } = req.body;
   const data = {};
   if (name !== undefined) data.name = name.trim();
   if (brand !== undefined) data.brand = brand?.trim() || null;
@@ -62,7 +63,8 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   if (url !== undefined) data.url = url?.trim() || null;
   if (notes !== undefined) data.notes = notes?.trim() || null;
   if (price !== undefined) data.price = price != null ? parseFloat(price) : null;
-  if (currency !== undefined) data.currency = currency?.trim() || "EUR";
+  if (currency !== undefined) data.currency = currency?.trim() || "SEK";
+  if (dimensions !== undefined) data.dimensions = dimensions || null;
   if (bought !== undefined) data.bought = Boolean(bought);
 
   try {

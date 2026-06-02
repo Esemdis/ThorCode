@@ -16,8 +16,6 @@ app.use("/oauth/tmdb", require("./routes/oauth/tmdb"));
 app.use("/travel/trips", require("./routes/travel/trips"));
 app.use("/travel/trips/:tripId/items", require("./routes/travel/tripItems"));
 app.use("/travel/trips/:tripId/estimates", require("./routes/travel/estimates"));
-app.use("/travel/templates", require("./routes/travel/templates"));
-app.use("/travel/templates/:templateId/items", require("./routes/travel/templateItems"));
 app.use("/travel/gear", require("./routes/travel/gear"));
 app.use("/travel/wishlist", require("./routes/travel/wishlist"));
 app.use("/travel/loadouts", require("./routes/travel/loadouts"));

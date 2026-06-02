@@ -55,7 +55,7 @@ router.post(
           trip_id: tripId,
           category: category.trim(),
           amount: parseFloat(amount),
-          currency: currency?.toUpperCase() || "EUR",
+          currency: currency?.toUpperCase() || "SEK",
           note: note?.trim() || null,
           sort_order: sort_order ?? 0,
         },

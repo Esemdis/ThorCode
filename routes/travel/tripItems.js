@@ -47,15 +47,17 @@ router.post(
     const tripId = parseInt(req.params.tripId);
     if (!(await ownsTrip(req.user.id, tripId))) return res.status(404).json({ error: "Trip not found" });
 
-    const { name, category, status, note, url, sort_order, gear_item_id } = req.body;
+    const { name, category, status, note, url, sort_order, gear_item_id, worn } = req.body;
     if (status && !VALID_STATUSES.includes(status)) {
       return res.status(400).json({ error: "Invalid status" });
     }
 
-    // If linking to a gear item, verify ownership
+    // If linking to a gear item, verify ownership and inherit worn flag
+    let resolvedWorn = worn !== undefined ? Boolean(worn) : false;
     if (gear_item_id) {
       const gear = await prisma.gearItem.findFirst({ where: { id: parseInt(gear_item_id), user_id: req.user.id } });
       if (!gear) return res.status(404).json({ error: "Gear item not found" });
+      if (worn === undefined) resolvedWorn = gear.worn;
     }
 
     try {
@@ -69,6 +71,7 @@ router.post(
           url: url?.trim() || null,
           sort_order: sort_order ?? 0,
           gear_item_id: gear_item_id ? parseInt(gear_item_id) : null,
+          worn: resolvedWorn,
         },
         include: { gear_item_rel: true },
       });
@@ -117,7 +120,7 @@ router.patch(
     const itemId = parseInt(req.params.itemId);
     if (!(await ownsTrip(req.user.id, tripId))) return res.status(404).json({ error: "Trip not found" });
 
-    const { name, category, status, note, url, sort_order, gear_item_id } = req.body;
+    const { name, category, status, note, url, sort_order, gear_item_id, worn } = req.body;
     if (status && !VALID_STATUSES.includes(status)) {
       return res.status(400).json({ error: "Invalid status" });
     }
@@ -130,6 +133,7 @@ router.patch(
     if (url !== undefined) data.url = url?.trim() || null;
     if (sort_order !== undefined) data.sort_order = sort_order;
     if (gear_item_id !== undefined) data.gear_item_id = gear_item_id ? parseInt(gear_item_id) : null;
+    if (worn !== undefined) data.worn = Boolean(worn);
 
     try {
       const existing = await prisma.tripItem.findFirst({ where: { id: itemId, trip_id: tripId } });

@@ -205,6 +205,7 @@ router.post(
             category: gearItem.category || null,
             gear_item_id: gearItem.id,
             status: "PACKED",
+            worn: gearItem.worn || false,
           });
         }
       }
