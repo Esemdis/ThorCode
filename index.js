@@ -13,6 +13,12 @@ app.use("/data/concerts", require("./routes/data/ticketmaster"))
 app.use("/data/cities", require("./routes/data/cities"))
 app.use("/data/tmdb", require("./routes/data/tmdb"));
 app.use("/oauth/tmdb", require("./routes/oauth/tmdb"));
+app.use("/travel/trips", require("./routes/travel/trips"));
+app.use("/travel/trips/:tripId/items", require("./routes/travel/tripItems"));
+app.use("/travel/trips/:tripId/estimates", require("./routes/travel/estimates"));
+app.use("/travel/templates", require("./routes/travel/templates"));
+app.use("/travel/templates/:templateId/items", require("./routes/travel/templateItems"));
+app.use("/travel/gear", require("./routes/travel/gear"));
 app.use((err, req, res, _next) => {
   console.error(`[${new Date().toISOString()}] ${req.method} ${req.path}`, err);
   res.status(err.status ?? 500).json({ error: err.message || 'Internal server error' });
