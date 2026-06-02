@@ -149,7 +149,7 @@ router.post(
         note: item.note,
         url: item.url,
         sort_order: item.sort_order,
-        status: "NEED_TO_BUY",
+        status: "PACKED",
       }));
 
       const created = await prisma.$transaction(

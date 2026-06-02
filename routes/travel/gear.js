@@ -31,7 +31,7 @@ router.post(
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-    const { name, model, brand, category, dimensions, tags, amount, notes, url } = req.body;
+    const { name, model, brand, category, dimensions, tags, parent_id, notes, url } = req.body;
     try {
       const item = await prisma.gearItem.create({
         data: {
@@ -42,7 +42,7 @@ router.post(
           category: category?.trim() || null,
           dimensions: dimensions ?? null,
           tags: Array.isArray(tags) ? tags.map((t) => t.trim()).filter(Boolean) : [],
-          amount: amount != null ? parseInt(amount, 10) : null,
+          parent_id: parent_id != null ? parseInt(parent_id, 10) : null,
           notes: notes?.trim() || null,
           url: url?.trim() || null,
         },
@@ -81,7 +81,7 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-  const { name, model, brand, category, dimensions, tags, notes, url, amount } = req.body;
+  const { name, model, brand, category, dimensions, tags, notes, url, parent_id } = req.body;
   const data = {};
   if (name !== undefined) data.name = name.trim();
   if (model !== undefined) data.model = model?.trim() || null;
@@ -91,7 +91,8 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   if (tags !== undefined) data.tags = Array.isArray(tags) ? tags.map((t) => t.trim()).filter(Boolean) : [];
   if (notes !== undefined) data.notes = notes?.trim() || null;
   if (url !== undefined) data.url = url?.trim() || null;
-  if (amount !== undefined) data.amount = amount != null ? parseInt(amount, 10) : null;
+  if (parent_id !== undefined) data.parent_id = parent_id != null ? parseInt(parent_id, 10) : null;
+  if (req.body.sort_order !== undefined) data.sort_order = parseInt(req.body.sort_order, 10);
 
   try {
     const existing = await prisma.gearItem.findFirst({

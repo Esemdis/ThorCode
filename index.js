@@ -19,6 +19,8 @@ app.use("/travel/trips/:tripId/estimates", require("./routes/travel/estimates"))
 app.use("/travel/templates", require("./routes/travel/templates"));
 app.use("/travel/templates/:templateId/items", require("./routes/travel/templateItems"));
 app.use("/travel/gear", require("./routes/travel/gear"));
+app.use("/travel/wishlist", require("./routes/travel/wishlist"));
+app.use("/travel/loadouts", require("./routes/travel/loadouts"));
 app.use((err, req, res, _next) => {
   console.error(`[${new Date().toISOString()}] ${req.method} ${req.path}`, err);
   res.status(err.status ?? 500).json({ error: err.message || 'Internal server error' });

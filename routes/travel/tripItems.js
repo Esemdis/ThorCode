@@ -64,7 +64,7 @@ router.post(
           trip_id: tripId,
           name: name.trim(),
           category: category?.trim() || null,
-          status: status || "NEED_TO_BUY",
+          status: status || "PACKED",
           note: note?.trim() || null,
           url: url?.trim() || null,
           sort_order: sort_order ?? 0,

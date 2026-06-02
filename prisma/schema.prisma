@@ -21,7 +21,9 @@ model User {
   wishlists     Wishlist[]    @relation("UserWishlists")
   trips         Trip[]        @relation("UserTrips")
   templates     Template[]    @relation("UserTemplates")
-  gear_items    GearItem[]    @relation("UserGearItems")
+  gear_items       GearItem[]             @relation("UserGearItems")
+  travel_wishlist  TravelWishlistItem[]   @relation("UserTravelWishlist")
+  loadouts         Loadout[]              @relation("UserLoadouts")
 }
 
 model Game {
@@ -287,13 +289,56 @@ model GearItem {
   category   String?    @db.VarChar(100)
   dimensions Json?
   tags       String[]
-  amount     Int?
+  sort_order Int      @default(0)
+  parent_id  Int?
   notes      String?    @db.Text
   url        String?    @db.VarChar(500)
   created_at DateTime   @default(now())
   updated_at DateTime   @updatedAt
   user_rel   User       @relation("UserGearItems", fields: [user_id], references: [id])
-  trip_items TripItem[] @relation("GearItemTripItems")
+  parent_rel GearItem?  @relation("GearItemChildren", fields: [parent_id], references: [id], onDelete: SetNull)
+  children   GearItem[] @relation("GearItemChildren")
+  trip_items      TripItem[]      @relation("GearItemTripItems")
+  loadout_entries LoadoutEntry[]  @relation("GearItemLoadoutEntries")
+}
+
+model TravelWishlistItem {
+  id         Int      @id @default(autoincrement())
+  user_id    String
+  name       String   @db.VarChar(200)
+  brand      String?  @db.VarChar(100)
+  model      String?  @db.VarChar(200)
+  category   String?  @db.VarChar(100)
+  url        String?  @db.VarChar(500)
+  notes      String?  @db.Text
+  price      Float?
+  currency   String   @default("EUR") @db.VarChar(3)
+  bought     Boolean  @default(false)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+  user_rel   User     @relation("UserTravelWishlist", fields: [user_id], references: [id])
+}
+
+model Loadout {
+  id          Int            @id @default(autoincrement())
+  user_id     String
+  name        String         @db.VarChar(200)
+  description String?        @db.Text
+  created_at  DateTime       @default(now())
+  updated_at  DateTime       @updatedAt
+  user_rel    User           @relation("UserLoadouts", fields: [user_id], references: [id])
+  entries     LoadoutEntry[]
+}
+
+model LoadoutEntry {
+  id            Int       @id @default(autoincrement())
+  loadout_id    Int
+  gear_item_id  Int
+  created_at    DateTime  @default(now())
+  loadout_rel   Loadout   @relation(fields: [loadout_id], references: [id], onDelete: Cascade)
+  gear_item_rel GearItem  @relation("GearItemLoadoutEntries", fields: [gear_item_id], references: [id], onDelete: Cascade)
+
+  @@unique([loadout_id, gear_item_id])
 }
 
 enum PackingStatus {
