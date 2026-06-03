@@ -214,18 +214,19 @@ enum BandTier {
 // ── TRAVEL BAG ────────────────────────────────────────────────────────────────
 
 model Trip {
-  id           Int               @id @default(autoincrement())
-  user_id      String
-  name         String            @db.VarChar(200)
-  destination  String?           @db.VarChar(200)
-  start_date   DateTime?         @db.Date
-  end_date     DateTime?         @db.Date
-  notes        String?           @db.Text
-  created_at   DateTime          @default(now())
-  updated_at   DateTime          @updatedAt
-  user_rel     User              @relation("UserTrips", fields: [user_id], references: [id])
-  items        TripItem[]
-  estimates    ExpenseEstimate[]
+  id             Int               @id @default(autoincrement())
+  user_id        String
+  name           String            @db.VarChar(200)
+  destination    String?           @db.VarChar(200)
+  start_date     DateTime?         @db.Date
+  end_date       DateTime?         @db.Date
+  notes          String?           @db.Text
+  weight_budget  Int?
+  created_at     DateTime          @default(now())
+  updated_at     DateTime          @updatedAt
+  user_rel       User              @relation("UserTrips", fields: [user_id], references: [id])
+  items          TripItem[]
+  estimates      ExpenseEstimate[]
 }
 
 model TripItem {
@@ -323,14 +324,15 @@ model TravelWishlistItem {
 }
 
 model Loadout {
-  id          Int            @id @default(autoincrement())
-  user_id     String
-  name        String         @db.VarChar(200)
-  description String?        @db.Text
-  created_at  DateTime       @default(now())
-  updated_at  DateTime       @updatedAt
-  user_rel    User           @relation("UserLoadouts", fields: [user_id], references: [id])
-  entries     LoadoutEntry[]
+  id             Int            @id @default(autoincrement())
+  user_id        String
+  name           String         @db.VarChar(200)
+  description    String?        @db.Text
+  weight_budget  Int?
+  created_at     DateTime       @default(now())
+  updated_at     DateTime       @updatedAt
+  user_rel       User           @relation("UserLoadouts", fields: [user_id], references: [id])
+  entries        LoadoutEntry[]
 }
 
 model LoadoutEntry {

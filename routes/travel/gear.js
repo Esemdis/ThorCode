@@ -9,6 +9,49 @@ const prisma = require("../../prisma/client");
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
 
+// GET /travel/gear/usage-stats — trip usage summary for all gear items
+router.get("/usage-stats", async (req, res) => {
+  try {
+    const tripItems = await prisma.tripItem.findMany({
+      where: {
+        gear_item_id: { not: null },
+        gear_item_rel: { user_id: req.user.id },
+      },
+      select: {
+        gear_item_id: true,
+        trip_rel: { select: { id: true, name: true, destination: true, start_date: true } },
+      },
+      orderBy: { created_at: "asc" },
+    });
+
+    // Build per-gear map: gear_item_id → { trips (deduped by trip id), last_trip }
+    const map = new Map();
+    for (const ti of tripItems) {
+      const gid = ti.gear_item_id;
+      if (!map.has(gid)) map.set(gid, { trips: new Map() });
+      const entry = map.get(gid);
+      const t = ti.trip_rel;
+      if (!entry.trips.has(t.id)) entry.trips.set(t.id, t);
+    }
+
+    const stats = {};
+    for (const [gid, { trips }] of map.entries()) {
+      const tripList = [...trips.values()].sort(
+        (a, b) => new Date(b.start_date || 0) - new Date(a.start_date || 0)
+      );
+      stats[gid] = {
+        trip_count: tripList.length,
+        last_trip: tripList[0] || null,
+        trips: tripList,
+      };
+    }
+
+    res.json({ data: stats });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /travel/gear — list all gear items with trip count
 router.get("/", async (req, res) => {
   try {

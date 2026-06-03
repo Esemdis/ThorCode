@@ -15,6 +15,11 @@ router.get("/", async (req, res) => {
     const trips = await prisma.trip.findMany({
       where: { user_id: req.user.id },
       orderBy: [{ start_date: "asc" }, { created_at: "desc" }],
+      include: {
+        items: {
+          include: { gear_item_rel: { select: { dimensions: true } } },
+        },
+      },
     });
     res.json({ data: trips });
   } catch (err) {
@@ -30,7 +35,7 @@ router.post(
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-    const { name, destination, start_date, end_date, notes } = req.body;
+    const { name, destination, start_date, end_date, notes, weight_budget } = req.body;
     try {
       const trip = await prisma.trip.create({
         data: {
@@ -40,6 +45,7 @@ router.post(
           start_date: start_date ? new Date(start_date) : null,
           end_date: end_date ? new Date(end_date) : null,
           notes: notes?.trim() || null,
+          weight_budget: weight_budget != null ? parseInt(weight_budget, 10) : null,
         },
       });
       res.status(201).json({ data: trip });
@@ -77,13 +83,14 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-  const { name, destination, start_date, end_date, notes } = req.body;
+  const { name, destination, start_date, end_date, notes, weight_budget } = req.body;
   const data = {};
   if (name !== undefined) data.name = name.trim();
   if (destination !== undefined) data.destination = destination?.trim() || null;
   if (start_date !== undefined) data.start_date = start_date ? new Date(start_date) : null;
   if (end_date !== undefined) data.end_date = end_date ? new Date(end_date) : null;
   if (notes !== undefined) data.notes = notes?.trim() || null;
+  if (weight_budget !== undefined) data.weight_budget = weight_budget != null ? parseInt(weight_budget, 10) : null;
 
   try {
     const existing = await prisma.trip.findFirst({
@@ -119,48 +126,52 @@ router.delete("/:id", param("id").isInt(), async (req, res) => {
   }
 });
 
-// POST /travel/trips/:id/apply-template — copy template items into trip
-router.post(
-  "/:id/apply-template",
-  [param("id").isInt(), body("template_id").isInt()],
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid parameters" });
+// POST /travel/trips/:id/duplicate — clone trip with all items
+router.post("/:id/duplicate", param("id").isInt(), async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-    const tripId = parseInt(req.params.id);
-    const templateId = parseInt(req.body.template_id);
+  const sourceId = parseInt(req.params.id);
+  try {
+    const source = await prisma.trip.findFirst({
+      where: { id: sourceId, user_id: req.user.id },
+      include: { items: { orderBy: [{ sort_order: "asc" }, { created_at: "asc" }] } },
+    });
+    if (!source) return res.status(404).json({ error: "Trip not found" });
 
-    try {
-      const [trip, template] = await Promise.all([
-        prisma.trip.findFirst({ where: { id: tripId, user_id: req.user.id } }),
-        prisma.template.findFirst({
-          where: { id: templateId, user_id: req.user.id },
-          include: { items: { orderBy: { sort_order: "asc" } } },
-        }),
-      ]);
+    const newTrip = await prisma.trip.create({
+      data: {
+        user_id: req.user.id,
+        name: `Copy of ${source.name}`,
+        destination: source.destination,
+        notes: source.notes,
+      },
+    });
 
-      if (!trip) return res.status(404).json({ error: "Trip not found" });
-      if (!template) return res.status(404).json({ error: "Template not found" });
-
-      const newItems = template.items.map((item) => ({
-        trip_id: tripId,
-        name: item.name,
-        category: item.category,
-        note: item.note,
-        url: item.url,
-        sort_order: item.sort_order,
-        status: "PACKED",
-      }));
-
-      const created = await prisma.$transaction(
-        newItems.map((item) => prisma.tripItem.create({ data: item }))
+    if (source.items.length > 0) {
+      await prisma.$transaction(
+        source.items.map((item) =>
+          prisma.tripItem.create({
+            data: {
+              trip_id: newTrip.id,
+              name: item.name,
+              category: item.category,
+              status: item.status,
+              note: item.note,
+              url: item.url,
+              sort_order: item.sort_order,
+              gear_item_id: item.gear_item_id,
+              worn: item.worn,
+            },
+          })
+        )
       );
-
-      res.json({ data: { added: created.length, items: created } });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
     }
+
+    res.status(201).json({ data: newTrip });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-);
+});
 
 module.exports = router;

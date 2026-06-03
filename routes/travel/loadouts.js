@@ -51,10 +51,15 @@ router.post("/", [body("name").notEmpty().trim()], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-  const { name, description } = req.body;
+  const { name, description, weight_budget } = req.body;
   try {
     const loadout = await prisma.loadout.create({
-      data: { user_id: req.user.id, name: name.trim(), description: description?.trim() || null },
+      data: {
+        user_id: req.user.id,
+        name: name.trim(),
+        description: description?.trim() || null,
+        weight_budget: weight_budget != null ? parseInt(weight_budget, 10) : null,
+      },
       include: { entries: true },
     });
     res.status(201).json({ data: loadout });
@@ -68,10 +73,11 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-  const { name, description } = req.body;
+  const { name, description, weight_budget } = req.body;
   const data = {};
   if (name !== undefined) data.name = name.trim();
   if (description !== undefined) data.description = description?.trim() || null;
+  if (weight_budget !== undefined) data.weight_budget = weight_budget != null ? parseInt(weight_budget, 10) : null;
 
   try {
     const existing = await prisma.loadout.findFirst({
@@ -220,5 +226,46 @@ router.post(
     }
   }
 );
+
+// POST /travel/loadouts/:id/duplicate — clone a loadout with all its entries
+router.post("/:id/duplicate", param("id").isInt(), async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
+
+  const id = parseInt(req.params.id);
+  try {
+    const source = await prisma.loadout.findFirst({
+      where: { id, user_id: req.user.id },
+      include: { entries: true },
+    });
+    if (!source) return res.status(404).json({ error: "Loadout not found" });
+
+    const copy = await prisma.loadout.create({
+      data: {
+        user_id: req.user.id,
+        name: `${source.name} (copy)`,
+        description: source.description,
+        weight_budget: source.weight_budget,
+        entries: {
+          create: source.entries.map((e) => ({ gear_item_id: e.gear_item_id })),
+        },
+      },
+      include: {
+        entries: {
+          include: {
+            gear_item_rel: {
+              select: { id: true, name: true, brand: true, model: true, category: true, parent_id: true },
+            },
+          },
+          orderBy: { created_at: "asc" },
+        },
+      },
+    });
+
+    res.status(201).json({ data: copy });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 module.exports = router;
