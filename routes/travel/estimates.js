@@ -48,7 +48,7 @@ router.post(
     const tripId = parseInt(req.params.tripId);
     if (!(await ownsTrip(req.user.id, tripId))) return res.status(404).json({ error: "Trip not found" });
 
-    const { category, amount, currency, note, sort_order } = req.body;
+    const { category, amount, currency, note, sort_order, date, end_date } = req.body;
     try {
       const estimate = await prisma.expenseEstimate.create({
         data: {
@@ -56,6 +56,8 @@ router.post(
           category: category.trim(),
           amount: parseFloat(amount),
           currency: currency?.toUpperCase() || "SEK",
+          date: date ? new Date(date) : null,
+          end_date: end_date ? new Date(end_date) : null,
           note: note?.trim() || null,
           sort_order: sort_order ?? 0,
         },
@@ -79,11 +81,13 @@ router.patch(
     const estimateId = parseInt(req.params.estimateId);
     if (!(await ownsTrip(req.user.id, tripId))) return res.status(404).json({ error: "Trip not found" });
 
-    const { category, amount, currency, note, sort_order } = req.body;
+    const { category, amount, currency, note, sort_order, date, end_date } = req.body;
     const data = {};
     if (category !== undefined) data.category = category.trim();
     if (amount !== undefined) data.amount = parseFloat(amount);
     if (currency !== undefined) data.currency = currency.toUpperCase();
+    if (date !== undefined) data.date = date ? new Date(date) : null;
+    if (end_date !== undefined) data.end_date = end_date ? new Date(end_date) : null;
     if (note !== undefined) data.note = note?.trim() || null;
     if (sort_order !== undefined) data.sort_order = sort_order;
 

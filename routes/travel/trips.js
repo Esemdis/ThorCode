@@ -19,6 +19,7 @@ router.get("/", async (req, res) => {
         items: {
           include: { gear_item_rel: { select: { dimensions: true } } },
         },
+        estimates: { select: { amount: true, currency: true, category: true } },
       },
     });
     res.json({ data: trips });
@@ -35,7 +36,8 @@ router.post(
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-    const { name, destination, start_date, end_date, notes, weight_budget } = req.body;
+    const { name, destination, start_date, end_date, notes, weight_budget, money_budget, currency,
+            budget_flights, budget_hotel, budget_entertainment, budget_food } = req.body;
     try {
       const trip = await prisma.trip.create({
         data: {
@@ -46,6 +48,12 @@ router.post(
           end_date: end_date ? new Date(end_date) : null,
           notes: notes?.trim() || null,
           weight_budget: weight_budget != null ? parseInt(weight_budget, 10) : null,
+          money_budget: money_budget != null ? parseFloat(money_budget) : null,
+          currency: currency?.toUpperCase() || 'SEK',
+          budget_flights: budget_flights != null ? parseFloat(budget_flights) : null,
+          budget_hotel: budget_hotel != null ? parseFloat(budget_hotel) : null,
+          budget_entertainment: budget_entertainment != null ? parseFloat(budget_entertainment) : null,
+          budget_food: budget_food != null ? parseFloat(budget_food) : null,
         },
       });
       res.status(201).json({ data: trip });
@@ -83,7 +91,8 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-  const { name, destination, start_date, end_date, notes, weight_budget } = req.body;
+  const { name, destination, start_date, end_date, notes, weight_budget, money_budget, currency,
+          budget_flights, budget_hotel, budget_entertainment, budget_food } = req.body;
   const data = {};
   if (name !== undefined) data.name = name.trim();
   if (destination !== undefined) data.destination = destination?.trim() || null;
@@ -91,6 +100,12 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   if (end_date !== undefined) data.end_date = end_date ? new Date(end_date) : null;
   if (notes !== undefined) data.notes = notes?.trim() || null;
   if (weight_budget !== undefined) data.weight_budget = weight_budget != null ? parseInt(weight_budget, 10) : null;
+  if (money_budget !== undefined) data.money_budget = money_budget != null ? parseFloat(money_budget) : null;
+  if (currency !== undefined) data.currency = currency.toUpperCase();
+  if (budget_flights !== undefined) data.budget_flights = budget_flights != null ? parseFloat(budget_flights) : null;
+  if (budget_hotel !== undefined) data.budget_hotel = budget_hotel != null ? parseFloat(budget_hotel) : null;
+  if (budget_entertainment !== undefined) data.budget_entertainment = budget_entertainment != null ? parseFloat(budget_entertainment) : null;
+  if (budget_food !== undefined) data.budget_food = budget_food != null ? parseFloat(budget_food) : null;
 
   try {
     const existing = await prisma.trip.findFirst({

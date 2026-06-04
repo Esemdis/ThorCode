@@ -9,20 +9,6 @@ const prisma = require("../../prisma/client");
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
 
-function flattenSubtree(gearItemId, allItems) {
-  const result = [];
-  const queue = [gearItemId];
-  while (queue.length) {
-    const id = queue.shift();
-    const item = allItems.find((g) => g.id === id);
-    if (item) {
-      result.push(item);
-      allItems.filter((g) => g.parent_id === id).forEach((child) => queue.push(child.id));
-    }
-  }
-  return result;
-}
-
 // GET /travel/loadouts
 router.get("/", async (req, res) => {
   try {
@@ -33,7 +19,7 @@ router.get("/", async (req, res) => {
         entries: {
           include: {
             gear_item_rel: {
-              select: { id: true, name: true, brand: true, model: true, category: true, parent_id: true },
+              select: { id: true, name: true, brand: true, model: true, category: true, dimensions: true },
             },
           },
           orderBy: { created_at: "asc" },
@@ -129,17 +115,53 @@ router.post(
       if (!loadout) return res.status(404).json({ error: "Loadout not found" });
       if (!gearItem) return res.status(404).json({ error: "Gear item not found" });
 
+      const worn = req.body.worn === true || req.body.worn === 'true';
       const entry = await prisma.loadoutEntry.upsert({
         where: { loadout_id_gear_item_id: { loadout_id: loadoutId, gear_item_id: gearItemId } },
-        create: { loadout_id: loadoutId, gear_item_id: gearItemId },
-        update: {},
+        create: { loadout_id: loadoutId, gear_item_id: gearItemId, worn },
+        update: req.body.worn !== undefined ? { worn } : {},
         include: {
           gear_item_rel: {
-            select: { id: true, name: true, brand: true, model: true, category: true, parent_id: true },
+            select: { id: true, name: true, brand: true, model: true, category: true },
           },
         },
       });
       res.status(201).json({ data: entry });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// PATCH /travel/loadouts/:id/entries/:gearItemId — update entry (e.g. toggle worn)
+router.patch(
+  "/:id/entries/:gearItemId",
+  [param("id").isInt(), param("gearItemId").isInt()],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
+
+    const loadoutId  = parseInt(req.params.id);
+    const gearItemId = parseInt(req.params.gearItemId);
+
+    try {
+      const loadout = await prisma.loadout.findFirst({ where: { id: loadoutId, user_id: req.user.id } });
+      if (!loadout) return res.status(404).json({ error: "Loadout not found" });
+
+      const data = {};
+      if (req.body.worn !== undefined) data.worn = Boolean(req.body.worn);
+      if (req.body.bag_id !== undefined) data.bag_id = req.body.bag_id != null ? parseInt(req.body.bag_id, 10) : null;
+
+      const entry = await prisma.loadoutEntry.update({
+        where: { loadout_id_gear_item_id: { loadout_id: loadoutId, gear_item_id: gearItemId } },
+        data,
+        include: {
+          gear_item_rel: {
+            select: { id: true, name: true, brand: true, model: true, category: true },
+          },
+        },
+      });
+      res.json({ data: entry });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -185,36 +207,25 @@ router.post(
     const tripId = parseInt(req.params.tripId);
 
     try {
-      const [loadout, trip, allGear] = await Promise.all([
+      const [loadout, trip] = await Promise.all([
         prisma.loadout.findFirst({
           where: { id: loadoutId, user_id: req.user.id },
           include: { entries: { include: { gear_item_rel: true } } },
         }),
         prisma.trip.findFirst({ where: { id: tripId, user_id: req.user.id } }),
-        prisma.gearItem.findMany({ where: { user_id: req.user.id } }),
       ]);
 
       if (!loadout) return res.status(404).json({ error: "Loadout not found" });
       if (!trip) return res.status(404).json({ error: "Trip not found" });
 
-      // Expand each entry: if it's a container, include all descendants
-      const seen = new Set();
-      const toAdd = [];
-      for (const entry of loadout.entries) {
-        const subtree = flattenSubtree(entry.gear_item_id, allGear);
-        for (const gearItem of subtree) {
-          if (seen.has(gearItem.id)) continue;
-          seen.add(gearItem.id);
-          toAdd.push({
-            trip_id: tripId,
-            name: gearItem.name,
-            category: gearItem.category || null,
-            gear_item_id: gearItem.id,
-            status: "PACKED",
-            worn: gearItem.worn || false,
-          });
-        }
-      }
+      const toAdd = loadout.entries.map((entry) => ({
+        trip_id: tripId,
+        name: entry.gear_item_rel.name,
+        category: entry.gear_item_rel.category || null,
+        gear_item_id: entry.gear_item_id,
+        status: "PACKED",
+        worn: entry.worn || false,
+      }));
 
       const created = await prisma.$transaction(
         toAdd.map((item) => prisma.tripItem.create({ data: item }))
@@ -247,14 +258,14 @@ router.post("/:id/duplicate", param("id").isInt(), async (req, res) => {
         description: source.description,
         weight_budget: source.weight_budget,
         entries: {
-          create: source.entries.map((e) => ({ gear_item_id: e.gear_item_id })),
+          create: source.entries.map((e) => ({ gear_item_id: e.gear_item_id, worn: e.worn, bag_id: e.bag_id })),
         },
       },
       include: {
         entries: {
           include: {
             gear_item_rel: {
-              select: { id: true, name: true, brand: true, model: true, category: true, parent_id: true },
+              select: { id: true, name: true, brand: true, model: true, category: true, dimensions: true },
             },
           },
           orderBy: { created_at: "asc" },

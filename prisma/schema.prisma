@@ -222,7 +222,13 @@ model Trip {
   end_date       DateTime?         @db.Date
   notes          String?           @db.Text
   weight_budget  Int?
-  created_at     DateTime          @default(now())
+  money_budget           Decimal?  @db.Decimal(10, 2)
+  currency               String    @default("SEK") @db.VarChar(3)
+  budget_flights         Decimal?  @db.Decimal(10, 2)
+  budget_hotel           Decimal?  @db.Decimal(10, 2)
+  budget_entertainment   Decimal?  @db.Decimal(10, 2)
+  budget_food            Decimal?  @db.Decimal(10, 2)
+  created_at             DateTime  @default(now())
   updated_at     DateTime          @updatedAt
   user_rel       User              @relation("UserTrips", fields: [user_id], references: [id])
   items          TripItem[]
@@ -251,9 +257,11 @@ model ExpenseEstimate {
   trip_id    Int
   category   String   @db.VarChar(100)
   amount     Decimal  @db.Decimal(10, 2)
-  currency   String   @default("SEK") @db.VarChar(3)
-  note       String?  @db.Text
-  sort_order Int      @default(0)
+  currency   String    @default("SEK") @db.VarChar(3)
+  date       DateTime? @db.Date
+  end_date   DateTime? @db.Date
+  note       String?   @db.Text
+  sort_order Int       @default(0)
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
   trip_rel   Trip     @relation(fields: [trip_id], references: [id], onDelete: Cascade)
@@ -292,17 +300,15 @@ model GearItem {
   dimensions Json?
   tags       String[]
   sort_order Int      @default(0)
-  parent_id  Int?
   worn       Boolean  @default(false)
   notes      String?    @db.Text
   url        String?    @db.VarChar(500)
   created_at DateTime   @default(now())
   updated_at DateTime   @updatedAt
-  user_rel   User       @relation("UserGearItems", fields: [user_id], references: [id])
-  parent_rel GearItem?  @relation("GearItemChildren", fields: [parent_id], references: [id], onDelete: SetNull)
-  children   GearItem[] @relation("GearItemChildren")
-  trip_items      TripItem[]      @relation("GearItemTripItems")
-  loadout_entries LoadoutEntry[]  @relation("GearItemLoadoutEntries")
+  user_rel        User           @relation("UserGearItems", fields: [user_id], references: [id])
+  trip_items      TripItem[]     @relation("GearItemTripItems")
+  loadout_entries LoadoutEntry[] @relation("GearItemLoadoutEntries")
+  bag_entries     LoadoutEntry[] @relation("LoadoutEntryBag")
 }
 
 model TravelWishlistItem {
@@ -339,9 +345,12 @@ model LoadoutEntry {
   id            Int       @id @default(autoincrement())
   loadout_id    Int
   gear_item_id  Int
+  worn          Boolean   @default(false)
+  bag_id        Int?
   created_at    DateTime  @default(now())
   loadout_rel   Loadout   @relation(fields: [loadout_id], references: [id], onDelete: Cascade)
   gear_item_rel GearItem  @relation("GearItemLoadoutEntries", fields: [gear_item_id], references: [id], onDelete: Cascade)
+  bag_rel       GearItem? @relation("LoadoutEntryBag", fields: [bag_id], references: [id], onDelete: SetNull)
 
   @@unique([loadout_id, gear_item_id])
 }
@@ -350,6 +359,5 @@ enum PackingStatus {
   NEED_TO_BUY
   BOUGHT
   PACKED
-  BORROWED
-  NOT_BRINGING
+  NOT_PACKED
 }
