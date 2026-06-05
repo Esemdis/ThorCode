@@ -73,7 +73,10 @@ router.get("/:id", param("id").isInt(), async (req, res) => {
       where: { id: parseInt(req.params.id), user_id: req.user.id },
       include: {
         items: {
-          include: { gear_item_rel: true },
+          include: {
+            gear_item_rel: true,
+            bag_rel: { select: { id: true, name: true, brand: true } },
+          },
           orderBy: [{ sort_order: "asc" }, { created_at: "asc" }],
         },
         estimates: { orderBy: [{ sort_order: "asc" }, { created_at: "asc" }] },

@@ -248,8 +248,10 @@ model TripItem {
   worn          Boolean       @default(false)
   created_at    DateTime      @default(now())
   updated_at    DateTime      @updatedAt
+  bag_id        Int?
   trip_rel      Trip          @relation(fields: [trip_id], references: [id], onDelete: Cascade)
   gear_item_rel GearItem?     @relation("GearItemTripItems", fields: [gear_item_id], references: [id], onDelete: SetNull)
+  bag_rel       GearItem?     @relation("TripItemBag", fields: [bag_id], references: [id], onDelete: SetNull)
 }
 
 model ExpenseEstimate {
@@ -307,6 +309,7 @@ model GearItem {
   updated_at DateTime   @updatedAt
   user_rel        User           @relation("UserGearItems", fields: [user_id], references: [id])
   trip_items      TripItem[]     @relation("GearItemTripItems")
+  trip_bag_items  TripItem[]     @relation("TripItemBag")
   loadout_entries LoadoutEntry[] @relation("GearItemLoadoutEntries")
   bag_entries     LoadoutEntry[] @relation("LoadoutEntryBag")
 }

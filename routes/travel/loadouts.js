@@ -225,6 +225,7 @@ router.post(
         gear_item_id: entry.gear_item_id,
         status: "PACKED",
         worn: entry.worn || false,
+        bag_id: entry.bag_id || null,
       }));
 
       const created = await prisma.$transaction(
