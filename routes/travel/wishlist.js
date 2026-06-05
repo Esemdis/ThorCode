@@ -27,7 +27,7 @@ router.post("/", [body("name").notEmpty().trim()], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-  const { name, brand, model, category, url, notes, price, currency, dimensions } = req.body;
+  const { name, brand, model, category, url, notes, price, currency, dimensions, keywords } = req.body;
   try {
     const item = await prisma.travelWishlistItem.create({
       data: {
@@ -41,6 +41,7 @@ router.post("/", [body("name").notEmpty().trim()], async (req, res) => {
         price: price != null ? parseFloat(price) : null,
         currency: currency?.trim() || "SEK",
         dimensions: dimensions || null,
+        keywords: Array.isArray(keywords) ? keywords.map((k) => k.trim()).filter(Boolean) : [],
       },
     });
     res.status(201).json({ data: item });
@@ -54,7 +55,7 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-  const { name, brand, model, category, url, notes, price, currency, dimensions, bought } = req.body;
+  const { name, brand, model, category, url, notes, price, currency, dimensions, bought, keywords } = req.body;
   const data = {};
   if (name !== undefined) data.name = name.trim();
   if (brand !== undefined) data.brand = brand?.trim() || null;
@@ -66,6 +67,7 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   if (currency !== undefined) data.currency = currency?.trim() || "SEK";
   if (dimensions !== undefined) data.dimensions = dimensions || null;
   if (bought !== undefined) data.bought = Boolean(bought);
+  if (keywords !== undefined) data.keywords = Array.isArray(keywords) ? keywords.map((k) => k.trim()).filter(Boolean) : [];
 
   try {
     const existing = await prisma.travelWishlistItem.findFirst({
@@ -93,6 +95,20 @@ router.delete("/:id", param("id").isInt(), async (req, res) => {
 
     await prisma.travelWishlistItem.delete({ where: { id: parseInt(req.params.id) } });
     res.json({ message: "Item deleted" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /travel/wishlist/keywords — all unique keywords from non-bought items (for RSS watcher)
+router.get("/keywords", async (req, res) => {
+  try {
+    const items = await prisma.travelWishlistItem.findMany({
+      where: { user_id: req.user.id, bought: false },
+      select: { keywords: true },
+    });
+    const unique = [...new Set(items.flatMap((i) => i.keywords))].sort();
+    res.json({ data: unique });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

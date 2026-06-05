@@ -326,6 +326,7 @@ model TravelWishlistItem {
   price      Float?
   currency   String   @default("SEK") @db.VarChar(3)
   dimensions Json?
+  keywords   String[]
   bought     Boolean  @default(false)
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
