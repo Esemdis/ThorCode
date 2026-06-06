@@ -7,7 +7,7 @@ const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
 
 router.use(auth);
-router.use(roleCheck(["USER", "ADMIN"]));
+router.use(roleCheck(["USER", "ADMIN", "SYSTEM"]));
 
 // GET /travel/wishlist
 router.get("/", async (req, res) => {
