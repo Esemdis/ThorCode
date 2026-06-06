@@ -103,8 +103,11 @@ router.delete("/:id", param("id").isInt(), async (req, res) => {
 // GET /travel/wishlist/keywords — all unique keywords from non-bought items (for RSS watcher)
 router.get("/keywords", async (req, res) => {
   try {
+    const where = req.user.role === "SYSTEM"
+      ? { bought: false }
+      : { user_id: req.user.id, bought: false };
     const items = await prisma.travelWishlistItem.findMany({
-      where: { user_id: req.user.id, bought: false },
+      where,
       select: { keywords: true },
     });
     const unique = [...new Set(items.flatMap((i) => i.keywords))].sort();
