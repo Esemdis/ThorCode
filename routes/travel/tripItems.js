@@ -9,7 +9,7 @@ const prisma = require("../../prisma/client");
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
 
-const VALID_STATUSES = ["NEED_TO_BUY", "BOUGHT", "PACKED", "BORROWED", "NOT_BRINGING"];
+const VALID_STATUSES = ["NEED_TO_BUY", "BOUGHT", "PACKED", "NOT_PACKED"];
 
 async function ownsTrip(userId, tripId) {
   const trip = await prisma.trip.findFirst({ where: { id: tripId, user_id: userId } });

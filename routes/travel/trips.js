@@ -1,12 +1,77 @@
 const express = require("express");
 const router = express.Router();
 const { body, param, validationResult } = require("express-validator");
+const { Prisma } = require("@prisma/client");
+const axios = require("axios");
 
 const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
 
 router.use(auth);
+
+// GET /travel/trips/weather-pending — trips needing weather sync (SYSTEM only)
+router.get("/weather-pending", roleCheck(["SYSTEM"]), async (_req, res) => {
+  try {
+    const now = new Date();
+    const staleThreshold = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const trips = await prisma.trip.findMany({
+      where: {
+        destination: { not: null },
+        start_date: { not: null },
+        end_date: { not: null },
+        OR: [
+          { weather_data: { equals: Prisma.DbNull } },
+          {
+            end_date: { gte: now },
+            OR: [
+              { weather_updated_at: null },
+              { weather_updated_at: { lt: staleThreshold } },
+            ],
+          },
+        ],
+      },
+      select: { id: true, destination: true, start_date: true, end_date: true },
+    });
+    res.json(trips);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /travel/trips/sync-weather — proxy to Python trip weather sync (ADMIN only)
+router.post("/sync-weather", roleCheck(["ADMIN"]), async (_req, res) => {
+  try {
+    const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
+    await axios.post(`${pythonServiceUrl}/sync-trip-weather`, {}, { timeout: 300000 });
+    res.status(200).json({ status: "success" });
+  } catch (error) {
+    console.error("Error triggering trip weather sync:", error.message);
+    res.status(500).json({ error: error.message || "Internal server error" });
+  }
+});
+
+// PATCH /travel/trips/weather/bulk — store weather blobs from Python cron (SYSTEM only)
+router.patch("/weather/bulk", roleCheck(["SYSTEM"]), async (req, res) => {
+  try {
+    const updates = req.body; // [{ id, weather_data }]
+    if (!Array.isArray(updates) || updates.length === 0) {
+      return res.status(400).json({ error: "Expected non-empty array of { id, weather_data }" });
+    }
+    await Promise.all(
+      updates.map(({ id, weather_data }) =>
+        prisma.trip.update({
+          where: { id },
+          data: { weather_data, weather_updated_at: new Date() },
+        })
+      )
+    );
+    res.json({ ok: true, updated: updates.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.use(roleCheck(["USER", "ADMIN"]));
 
 // GET /travel/trips — list user's trips

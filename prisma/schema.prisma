@@ -228,6 +228,8 @@ model Trip {
   budget_hotel           Decimal?  @db.Decimal(10, 2)
   budget_entertainment   Decimal?  @db.Decimal(10, 2)
   budget_food            Decimal?  @db.Decimal(10, 2)
+  weather_data           Json?
+  weather_updated_at     DateTime?
   created_at             DateTime  @default(now())
   updated_at     DateTime          @updatedAt
   user_rel       User              @relation("UserTrips", fields: [user_id], references: [id])
