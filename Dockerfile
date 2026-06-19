@@ -16,4 +16,4 @@ COPY . .
 EXPOSE 4000
 
 # Apply any pending migrations, then start
-CMD ["sh", "-c", "npx prisma migrate deploy && node index.js"]
+CMD ["sh", "-c", "npx prisma db push && node index.js"]
