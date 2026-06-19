@@ -1,0 +1,8 @@
+node_modules
+.env
+.env.*
+.git
+.gitignore
+start.sh
+resetdb.md
+README.md
