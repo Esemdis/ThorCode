@@ -1,0 +1,1 @@
+ALTER TABLE "TravelWishlistItem" ADD COLUMN IF NOT EXISTS "keywords" TEXT[] NOT NULL DEFAULT '{}';
