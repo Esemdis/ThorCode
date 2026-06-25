@@ -10,6 +10,7 @@ const roleCheck = require('../../middlewares/roleCheck');
 const { rateLimiter } = require('../../utils/rateLimiter');
 const prisma = require('../../prisma/client');
 const { Prisma } = require('@prisma/client');
+const { setCache, getCache } = require('../../utils/cache');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -880,6 +881,10 @@ router.get('/bands/:bandId/related', auth, async (req, res) => {
   if (!apiKey) return res.status(503).json({ error: 'Last.fm API key not configured' });
 
   try {
+    const cacheKey = `lfm:related:${bandId}`;
+    const cached = await getCache(cacheKey);
+    if (cached) return res.json(cached);
+
     const band = await prisma.band.findUnique({
       where: { id: bandId },
       select: { id: true, name: true, MBID: true },
@@ -914,7 +919,9 @@ router.get('/bands/:bandId/related', auth, async (req, res) => {
       url: a.url || null,
     }));
 
-    return res.json({ band: { id: band.id, name: band.name }, related });
+    const payload = { band: { id: band.id, name: band.name }, related };
+    await setCache(cacheKey, payload, 86400); // 24h — similar artists are stable
+    return res.json(payload);
   } catch (e) {
     console.error('[related-artists]', e.message);
     return res.status(500).json({ error: 'Failed to fetch related artists' });
@@ -1339,6 +1346,10 @@ router.get('/bands/:bandId/setlist-history', auth, async (req, res) => {
 
     const page = parseInt(req.query.page, 10) || 1;
 
+    const cacheKey = `sfm:setlists:${bandId}:p${page}`;
+    const cached = await getCache(cacheKey);
+    if (cached) return res.json(cached);
+
     const band = await prisma.band.findUnique({
       where: { id: bandId },
       select: { MBID: true },
@@ -1380,12 +1391,14 @@ router.get('/bands/:bandId/setlist-history', auth, async (req, res) => {
       };
     });
 
-    return res.json({
+    const payload = {
       setlists,
       total: raw.total ?? setlists.length,
       page: raw.page ?? page,
       itemsPerPage: raw.itemsPerPage ?? 20,
-    });
+    };
+    await setCache(cacheKey, payload, 21600); // 6h
+    return res.json(payload);
   } catch (error) {
     console.error('[setlist-history] Error:', error.message);
     return res.status(500).json({ error: 'Internal server error' });

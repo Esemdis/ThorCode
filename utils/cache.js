@@ -53,9 +53,39 @@ async function clearCache({ prefix }) {
     await client.del(keys);
   }
 }
+
+// Deterministic key helpers for API response caching
+async function setCache(key, data, ttl = 3600) {
+  try {
+    await client.set(key, JSON.stringify(data), 'EX', ttl);
+  } catch (err) {
+    console.error('Redis setCache error:', err);
+  }
+}
+async function getCache(key) {
+  try {
+    const data = await client.get(key);
+    return data ? JSON.parse(data) : null;
+  } catch (err) {
+    console.error('Redis getCache error:', err);
+    return null;
+  }
+}
+async function invalidatePrefix(prefix) {
+  try {
+    const keys = await client.keys(`${prefix}:*`);
+    if (keys.length > 0) await client.del(keys);
+  } catch (err) {
+    console.error('Redis invalidatePrefix error:', err);
+  }
+}
+
 module.exports = {
   cacheData,
   getCachedData,
   deleteCachedData,
   clearCache,
+  setCache,
+  getCache,
+  invalidatePrefix,
 };

@@ -126,9 +126,14 @@ router.patch('/me/settings', auth, async (req, res) => {
     if (settings === undefined || typeof settings !== 'object' || Array.isArray(settings)) {
       return res.status(400).json({ error: 'settings must be a JSON object' });
     }
+    const existing = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { settings: true },
+    });
+    const merged = { ...(existing?.settings ?? {}), ...settings };
     const user = await prisma.user.update({
       where: { id: userId },
-      data: { settings },
+      data: { settings: merged },
       select: { id: true, settings: true },
     });
     res.json({ settings: user.settings });
