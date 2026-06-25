@@ -78,7 +78,7 @@ async function triggerScoreRecompute(wishlistId) {
 // GET /wishlists — list the user's single wishlist
 router.get(
   "/wishlists",
-  [auth, roleCheck(["ADMIN"])],
+  [auth, roleCheck(["ADMIN", "USER"])],
   rateLimit,
   async (req, res) => {
     try {
@@ -374,7 +374,7 @@ router.get(
 // GET /wishlists/:id — wishlist with concerts, bands (with tiers), and precomputed scores
 router.get(
   "/wishlists/:id",
-  [auth, roleCheck(["ADMIN"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
+  [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
   async (req, res) => {
     try {
       const wishlistId = parseInt(req.params.id, 10);
@@ -394,6 +394,10 @@ router.get(
       if (!wishlist) {
         const payload = handleError("wishlist", 404);
         return res.status(404).json(payload);
+      }
+
+      if (wishlist.user_id !== req.user.id && req.user.role !== 'ADMIN') {
+        return res.status(403).json(handleError("wishlist", 403));
       }
 
       const bandIds = wishlist.bands.map((ref) => ref.band_id);
@@ -637,7 +641,7 @@ router.patch(
   "/wishlists/:id/bands/:bandId",
   [
     auth,
-    roleCheck(["ADMIN"]),
+    roleCheck(["ADMIN", "USER"]),
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
     param("bandId").isInt().withMessage("Band ID must be an integer"),
     body("tier").optional().isIn(VALID_TIERS).withMessage("tier must be LOVE, LIKE, or FOLLOW"),
@@ -684,7 +688,7 @@ router.post(
   "/wishlists",
   [
     auth,
-    roleCheck(["ADMIN"]),
+    roleCheck(["ADMIN", "USER"]),
     body("name").trim().isLength({ min: 1, max: 100 }).withMessage("Wishlist name must be between 1 and 100 characters"),
     body("discord_webhook").optional({ nullable: true }).isURL().withMessage("Discord webhook must be a valid URL"),
   ],
@@ -768,7 +772,7 @@ router.post(
   "/wishlists/:id/bands",
   [
     auth,
-    roleCheck(["ADMIN"]),
+    roleCheck(["ADMIN", "USER"]),
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
     body("name").optional().isString().notEmpty().withMessage("Band name must be a non-empty string"),
     body("ticketmaster_id").optional().isString().notEmpty().withMessage("Ticketmaster ID must be a non-empty string"),
@@ -857,7 +861,7 @@ router.delete(
   "/wishlists/:id/bands/:bandId",
   [
     auth,
-    roleCheck(["ADMIN"]),
+    roleCheck(["ADMIN", "USER"]),
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
     param("bandId").isInt().withMessage("Band ID must be an integer"),
   ],

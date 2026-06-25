@@ -569,7 +569,7 @@ router.post(
   '/bands',
   rateLimit,
   auth,
-  roleCheck(['ADMIN']),
+  roleCheck(['ADMIN', 'USER']),
   body('name')
     .optional()
     .isString()
