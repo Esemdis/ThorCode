@@ -454,15 +454,6 @@ router.get(
         },
       });
 
-      // Parse precomputed concert scores from stored JSON
-      let concertScoreMap = new Map();
-      if (wishlist.concert_scores) {
-        try {
-          const stored = JSON.parse(wishlist.concert_scores);
-          concertScoreMap = new Map(Object.entries(stored).map(([k, v]) => [parseInt(k, 10), v]));
-        } catch (_) {}
-      }
-
       const formattedBands = bandsWithConcerts.map((band) => {
         const concertsMap = new Map();
 
@@ -517,7 +508,6 @@ router.get(
               city_rel: concert.city_rel ?? null,
               participating_bands: wishlistBands,
               wishlist_band_count: wishlistBands.length,
-              concert_score: concertScoreMap.get(concert.id) ?? 0,
             });
           }
         });
@@ -550,20 +540,6 @@ router.get(
 
       const concertsArray = deduplicateConcerts([...allConcerts.values()]);
 
-      // Parse precomputed city rankings
-      let cityRankings = [];
-      if (wishlist.city_rankings) {
-        try {
-          cityRankings = JSON.parse(wishlist.city_rankings);
-          // Apply date range filter to city rankings if provided
-          if ((start_date || end_date) && concertsArray.length > 0) {
-            // Re-filter city rankings based on which concerts are visible in this date range
-              const visibleCities = new Set(concertsArray.map((c) => `${c.city}|||${c.country}`));
-            cityRankings = cityRankings.filter((r) => visibleCities.has(`${r.city}|||${r.country}`));
-          }
-        } catch (_) {}
-      }
-
       res.json({
         id: wishlist.id,
         name: wishlist.name,
@@ -571,8 +547,6 @@ router.get(
         discord_webhook: wishlist.discord_webhook,
         bands: simplifiedBands,
         concerts: concertsArray,
-        city_rankings: cityRankings,
-        scores_computed_at: wishlist.scores_computed_at,
       });
     } catch (error) {
       console.error("Error fetching wishlist:", error);
@@ -582,31 +556,6 @@ router.get(
   }
 );
 
-// PATCH /wishlists/:id/scores — store precomputed scores from Python (SYSTEM only)
-router.patch(
-  "/wishlists/:id/scores",
-  [auth, roleCheck(["SYSTEM"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
-  async (req, res) => {
-    try {
-      const wishlistId = parseInt(req.params.id, 10);
-      const { concert_scores, city_rankings } = req.body;
-
-      await prisma.wishlist.update({
-        where: { id: wishlistId },
-        data: {
-          concert_scores: JSON.stringify(concert_scores),
-          city_rankings: JSON.stringify(city_rankings),
-          scores_computed_at: new Date(),
-        },
-      });
-
-      res.json({ ok: true });
-    } catch (error) {
-      console.error("Error storing computed scores:", error);
-      return res.status(500).json({ error: "Internal server error" });
-    }
-  }
-);
 
 // PATCH /weather/bulk — store precomputed weather blobs from Python (SYSTEM only)
 router.patch(
