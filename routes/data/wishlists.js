@@ -63,17 +63,6 @@ async function computeSeenCounts(wishlistId) {
   return seenCountMap;
 }
 
-// Helper: trigger Python service to recompute scores for a wishlist
-async function triggerScoreRecompute(wishlistId) {
-  const pythonUrl = process.env.PYTHON_SERVICE_URL;
-  if (!pythonUrl) return;
-  try {
-    await axios.post(`${pythonUrl}/recompute/${wishlistId}`, {}, { timeout: 5000 });
-  } catch (e) {
-    // Non-blocking — scoring will recompute on next full sync if this fails
-    console.warn(`[Scoring] Failed to trigger recompute for wishlist ${wishlistId}:`, e.message);
-  }
-}
 
 // GET /wishlists — list the user's single wishlist
 router.get(
@@ -620,8 +609,6 @@ router.patch(
         data: { tier },
       });
 
-      // Trigger async score recompute — non-blocking
-      triggerScoreRecompute(wishlistId);
 
       res.json(updated);
     } catch (error) {
@@ -790,8 +777,6 @@ router.post(
         data: { wishlist_id: wishlistId, band_id: band.id, tier },
       });
 
-      // Trigger score recompute after adding a new band
-      triggerScoreRecompute(wishlistId);
 
       res.status(201).json({
         message: "Band added to wishlist successfully",
@@ -837,8 +822,6 @@ router.delete(
 
       await prisma.wishlistBandReference.delete({ where: { id: existingReference.id } });
 
-      // Trigger score recompute after removing a band
-      triggerScoreRecompute(wishlistId);
 
       res.json({ message: "Band removed from wishlist successfully" });
     } catch (error) {

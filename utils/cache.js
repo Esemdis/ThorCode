@@ -24,7 +24,15 @@ client.on("ready", () => console.log("Redis ready"));
 client.on("close", () => console.log("Redis connection closed"));
 client.on("reconnecting", () => console.log("Redis reconnecting..."));
 client.on("error", (err) => {
-  console.error("Redis connection error:", err);
+  if (err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED') {
+    // Log once per unique hostname, not on every retry
+    if (!client._lastDnsError || client._lastDnsError !== err.hostname) {
+      client._lastDnsError = err.hostname;
+      console.warn(`Redis unavailable (${err.code}: ${err.hostname ?? err.address}). Cache disabled.`);
+    }
+  } else {
+    console.error('Redis connection error:', err);
+  }
 });
 
 function generateCacheKey(prefix) {
