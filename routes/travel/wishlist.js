@@ -76,6 +76,24 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
     if (!existing) return res.status(404).json({ error: "Item not found" });
 
     const item = await prisma.travelWishlistItem.update({ where: { id: parseInt(req.params.id) }, data });
+
+    if (Boolean(bought) && !existing.bought) {
+      await prisma.gearItem.create({
+        data: {
+          user_id: req.user.id,
+          name: item.name,
+          brand: item.brand || null,
+          model: item.model || null,
+          category: item.category || null,
+          url: item.url || null,
+          notes: item.notes || null,
+          dimensions: item.dimensions || null,
+          tags: item.keywords || [],
+          worn: false,
+        },
+      });
+    }
+
     res.json({ data: item });
   } catch (err) {
     res.status(500).json({ error: err.message });
