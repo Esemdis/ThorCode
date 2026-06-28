@@ -669,7 +669,9 @@ router.post(
         select: { id: true },
       });
       if (orphans.length > 0) {
-        await tx.concert.deleteMany({ where: { id: { in: orphans.map((c) => c.id) } } });
+        const orphanIds = orphans.map((c) => c.id);
+        await tx.concertAttendance.deleteMany({ where: { concert_id: { in: orphanIds } } });
+        await tx.concert.deleteMany({ where: { id: { in: orphanIds } } });
       }
     });
 
@@ -1179,9 +1181,8 @@ router.delete(
           });
           orphanConcertIds = orphans.map((c) => c.id);
           if (orphanConcertIds.length) {
-            await tx.concert.deleteMany({
-              where: { id: { in: orphanConcertIds } },
-            });
+            await tx.concertAttendance.deleteMany({ where: { concert_id: { in: orphanConcertIds } } });
+            await tx.concert.deleteMany({ where: { id: { in: orphanConcertIds } } });
           }
         }
 
@@ -1397,6 +1398,7 @@ router.delete('/concerts/:concertId', auth, roleCheck(['ADMIN']), async (req, re
 
   await prisma.$transaction([
     prisma.concertBandReference.deleteMany({ where: { concert: concertId } }),
+    prisma.concertAttendance.deleteMany({ where: { concert_id: concertId } }),
     prisma.concert.delete({ where: { id: concertId } }),
   ]);
 
