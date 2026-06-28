@@ -22,7 +22,7 @@ function haversineKm(lat1, lng1, lat2, lng2) {
 function sameArea(incoming, existing) {
   const iLat = parseFloat(incoming.latitude), iLng = parseFloat(incoming.longitude);
   const eLat = parseFloat(existing.latitude), eLng = parseFloat(existing.longitude);
-  if (!iLat || !iLng || !eLat || !eLng) return false;
+  if (isNaN(iLat) || isNaN(iLng) || isNaN(eLat) || isNaN(eLng)) return false;
   return haversineKm(iLat, iLng, eLat, eLng) <= 20;
 }
 
@@ -154,7 +154,7 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
           const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
           const d = diffDays(c);
           const highConfidence = d === 0 && (sim >= 0.95 || venueContains(concert.venue, c.venue));
-          if (bandIds.length > 0 && !sharesABand(c) && !eitherIsMultiBand && !highConfidence) return false;
+          if (bandIds.length > 0 && !sharesABand(c) && !highConfidence) return false;
           return d <= 1.5 || eitherIsMultiBand || highConfidence;
         })
         .filter(({ c }) => diffDays(c) <= 7)
@@ -172,6 +172,11 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
           return d <= (eitherIsMultiBand ? 7 : 1.5);
         })
         .filter((c) => {
+          // If both have venues that are clearly different, they're distinct events
+          if (concert.venue && c.venue) {
+            const vSim = stringSimilarity(concert.venue, c.venue);
+            if (vSim < 0.7 && !venueContains(concert.venue, c.venue)) return false;
+          }
           const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
           return (eitherIsMultiBand && sameArea(concert, c)) ||
             (c.city && stringSimilarity(concert.city, c.city) >= 0.7);
@@ -248,9 +253,9 @@ function deduplicateByNameVenue(concerts) {
       if (!k.name || !k.venue) return false;
       const kt = k.concert_date ? new Date(k.concert_date).getTime() : null;
       if (!kt || Math.abs(kt - time) > SEVEN_DAYS_MS) return false;
-      return stringSimilarity(venue, k.venue) >= 0.7 || venueContains(venue, k.venue)
-        ? stringSimilarity(name, k.name) >= 0.8
-        : false;
+      if (!(stringSimilarity(venue, k.venue) >= 0.7 || venueContains(venue, k.venue))) return false;
+      if (stringSimilarity(name, k.name) < 0.8) return false;
+      return sameArea(concert, k) || (concert.city && k.city && stringSimilarity(concert.city, k.city) >= 0.7);
     });
 
     if (!isDup) kept.push(concert);
