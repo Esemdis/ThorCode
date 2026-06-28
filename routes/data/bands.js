@@ -568,9 +568,11 @@ router.post(
 
 // POST /bands/:bandId/reconcile
 // Called after a single-band sync. Compares fresh scraped concerts (source of truth)
-// against future DB concerts for this band. Deletes any DB concert that has no match
-// in the fresh data (canceled or wrongly merged), and returns other participating bands
-// from those stale records so they can be re-synced.
+// against future DB concerts for this band. For any DB concert with no match in the
+// fresh data, unlinks this band from it (rather than deleting outright) and returns
+// the other participating bands for re-sync. Those bands' own reconcile pass decides
+// whether the concert is legitimate for them; if no bands remain it becomes an orphan
+// and is deleted.
 router.post(
   '/bands/:bandId/reconcile',
   auth,
@@ -624,19 +626,27 @@ router.post(
         if (!fresh.concert_date) return false;
         if (Math.abs(toUtcDay(fresh.concert_date) - dbDay) / ONE_DAY_MS > dayWindow) return false;
 
+        // When both sides have venue names, require venue similarity — area alone is not
+        // enough (e.g. two different venues in the same city would otherwise match).
+        // 5km fallback handles same venue with a localised name on one side.
         if (dbConcert.venue && fresh.venue) {
           if (stringSimilarity(dbConcert.venue, fresh.venue) >= 0.7 || venueContains(dbConcert.venue, fresh.venue)) return true;
+          const freshLat = parseFloat(fresh.latitude);
+          const freshLng = parseFloat(fresh.longitude);
+          if (!isNaN(dbLat) && !isNaN(dbLng) && !isNaN(freshLat) && !isNaN(freshLng)) {
+            if (haversineKm(dbLat, dbLng, freshLat, freshLng) <= 8) return true;
+          }
+          return false;
         }
 
+        // No venue on one side — fall back to coordinates or city name
         const freshLat = parseFloat(fresh.latitude);
         const freshLng = parseFloat(fresh.longitude);
         if (!isNaN(dbLat) && !isNaN(dbLng) && !isNaN(freshLat) && !isNaN(freshLng)) {
-          if (haversineKm(dbLat, dbLng, freshLat, freshLng) <= 20) return true;
+          if (haversineKm(dbLat, dbLng, freshLat, freshLng) <= 8) return true;
         }
 
-        if (dbConcert.city && fresh.city && stringSimilarity(dbConcert.city, fresh.city) >= 0.7) return true;
-
-        return false;
+        return dbConcert.city && fresh.city && stringSimilarity(dbConcert.city, fresh.city) >= 0.7;
       });
 
       if (!hasMatch) {
@@ -649,10 +659,19 @@ router.post(
 
     if (staleIds.length === 0) return res.json({ stale_removed: 0, resync_bands: [] });
 
-    await prisma.$transaction([
-      prisma.concertBandReference.deleteMany({ where: { concert: { in: staleIds } } }),
-      prisma.concert.deleteMany({ where: { id: { in: staleIds } } }),
-    ]);
+    // Unlink this band from stale concerts rather than deleting immediately.
+    // The participating bands' own reconcile pass will decide if the concert is
+    // valid for them; any concert left with no bands after unlinking is an orphan.
+    await prisma.$transaction(async (tx) => {
+      await tx.concertBandReference.deleteMany({ where: { concert: { in: staleIds }, band: bandId } });
+      const orphans = await tx.concert.findMany({
+        where: { id: { in: staleIds }, bands: { none: {} } },
+        select: { id: true },
+      });
+      if (orphans.length > 0) {
+        await tx.concert.deleteMany({ where: { id: { in: orphans.map((c) => c.id) } } });
+      }
+    });
 
     const resyncBands = [...resyncBandMap.values()].map((b) => ({
       id: b.id, name: b.name,
