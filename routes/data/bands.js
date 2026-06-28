@@ -3,7 +3,7 @@ const router = express.Router();
 const { validationResult, body } = require('express-validator');
 const axios = require('axios');
 const { handleError, checkDuplicateConcert } = require('./helpers');
-const { stringSimilarity, deduplicateByCoords } = require('../../utils/concertDedup');
+const { haversineKm, stringSimilarity, venueContains, deduplicateByCoords } = require('../../utils/concertDedup');
 
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
@@ -563,6 +563,105 @@ router.post(
       console.error('Error syncing concerts:', error.message);
       res.status(500).json({ error: error.message || 'Internal server error' });
     }
+  },
+);
+
+// POST /bands/:bandId/reconcile
+// Called after a single-band sync. Compares fresh scraped concerts (source of truth)
+// against future DB concerts for this band. Deletes any DB concert that has no match
+// in the fresh data (canceled or wrongly merged), and returns other participating bands
+// from those stale records so they can be re-synced.
+router.post(
+  '/bands/:bandId/reconcile',
+  auth,
+  roleCheck(['ADMIN', 'SYSTEM']),
+  async (req, res) => {
+    const bandId = parseInt(req.params.bandId, 10);
+    if (Number.isNaN(bandId)) return res.status(400).json({ error: 'Invalid band id' });
+
+    const { upcoming } = req.body;
+    if (!Array.isArray(upcoming)) return res.status(400).json({ error: 'upcoming must be an array' });
+
+    // If scraper returned nothing, skip — likely a scrape failure, not a genuinely empty schedule
+    if (upcoming.length === 0) {
+      return res.json({ stale_removed: 0, resync_bands: [], skipped: true, reason: 'empty_upcoming' });
+    }
+
+    const now = new Date();
+    const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+    const toUtcDay = (d) => { const x = new Date(d); return Date.UTC(x.getUTCFullYear(), x.getUTCMonth(), x.getUTCDate()); };
+
+    const freshByEventId = new Map(upcoming.filter((c) => c.event_id).map((c) => [c.event_id, c]));
+
+    const dbConcerts = await prisma.concert.findMany({
+      where: {
+        concert_date: { gt: now },
+        bands: { some: { band: bandId } },
+      },
+      include: {
+        bands: {
+          include: {
+            band_rel: {
+              select: { id: true, name: true, songkick_url: true, bandsintown_url: true, ticketmaster_id: true },
+            },
+          },
+        },
+      },
+    });
+
+    const staleIds = [];
+    const resyncBandMap = new Map();
+
+    for (const dbConcert of dbConcerts) {
+      if (dbConcert.event_id && freshByEventId.has(dbConcert.event_id)) continue;
+
+      const dbDay = toUtcDay(dbConcert.concert_date);
+      const dbLat = parseFloat(dbConcert.latitude);
+      const dbLng = parseFloat(dbConcert.longitude);
+      const dayWindow = dbConcert.festival ? 3 : 2;
+
+      const hasMatch = upcoming.some((fresh) => {
+        if (!fresh.concert_date) return false;
+        if (Math.abs(toUtcDay(fresh.concert_date) - dbDay) / ONE_DAY_MS > dayWindow) return false;
+
+        if (dbConcert.venue && fresh.venue) {
+          if (stringSimilarity(dbConcert.venue, fresh.venue) >= 0.7 || venueContains(dbConcert.venue, fresh.venue)) return true;
+        }
+
+        const freshLat = parseFloat(fresh.latitude);
+        const freshLng = parseFloat(fresh.longitude);
+        if (!isNaN(dbLat) && !isNaN(dbLng) && !isNaN(freshLat) && !isNaN(freshLng)) {
+          if (haversineKm(dbLat, dbLng, freshLat, freshLng) <= 20) return true;
+        }
+
+        if (dbConcert.city && fresh.city && stringSimilarity(dbConcert.city, fresh.city) >= 0.7) return true;
+
+        return false;
+      });
+
+      if (!hasMatch) {
+        staleIds.push(dbConcert.id);
+        for (const ref of dbConcert.bands) {
+          if (ref.band_rel.id !== bandId) resyncBandMap.set(ref.band_rel.id, ref.band_rel);
+        }
+      }
+    }
+
+    if (staleIds.length === 0) return res.json({ stale_removed: 0, resync_bands: [] });
+
+    await prisma.$transaction([
+      prisma.concertBandReference.deleteMany({ where: { concert: { in: staleIds } } }),
+      prisma.concert.deleteMany({ where: { id: { in: staleIds } } }),
+    ]);
+
+    const resyncBands = [...resyncBandMap.values()].map((b) => ({
+      id: b.id, name: b.name,
+      songkick_url: b.songkick_url, bandsintown_url: b.bandsintown_url, ticketmaster_id: b.ticketmaster_id,
+    }));
+
+    console.log(`[reconcile] Band ${bandId}: removed ${staleIds.length} stale concert(s), re-syncing: ${resyncBands.map((b) => b.name).join(', ') || 'none'}`);
+
+    return res.json({ stale_removed: staleIds.length, resync_bands: resyncBands });
   },
 );
 
