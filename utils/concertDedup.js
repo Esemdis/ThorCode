@@ -175,7 +175,12 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
           if (!venueMatch) return false;
           const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
           const d = diffDays(c);
-          const highConfidence = d === 0 && (sim >= 0.95 || venueContains(concert.venue, c.venue));
+          // Both flagged as festival + same venue = multi-day festival. Safe to merge
+          // across days without band sharing; two separate festivals rarely share a venue
+          // within the same 7-day window.
+          const bothFestivals = concert.festival && c.festival;
+          const venueIdentical = sim >= 0.95 || venueContains(concert.venue, c.venue);
+          const highConfidence = venueIdentical && (d === 0 || bothFestivals);
           if (bandIds.length > 0 && !sharesABand(c) && !highConfidence) return false;
           return d <= 1.5 || eitherIsMultiBand || highConfidence;
         })
