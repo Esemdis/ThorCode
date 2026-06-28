@@ -31,6 +31,17 @@ function normalizeVenueFlat(s) {
   return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
+// Strips year numbers and "Artist @ " prefix so festival name variants compare cleanly.
+// "Resurrection Fest 2026" and "Imminence @ Resurrection Fest" both reduce to "resurrectionfest".
+function normalizeEventName(s) {
+  return s
+    .replace(/^[^@]+@\s*/i, '')        // strip "Artist @ " prefix
+    .replace(/\b\d{4}\b/g, '')         // strip 4-digit years
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
 // Returns true if one venue name is substantially contained within the other.
 // Catches cases like "Zenith De Nancy - Amphitheatre Plein Air" containing "Amphitheatre Plein Air".
 // Requires the shorter fragment to be at least 10 chars to avoid trivial matches.
@@ -130,12 +141,23 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
     }
 
     // 0.5. Named event match
+    // Also checks normalized names (strips "Artist @ " prefix and year numbers) so that
+    // "Resurrection Fest 2026" and "Imminence @ Resurrection Fest" are treated as the same event.
     if (!existingConcert && concert.name) {
+      const normIncoming = normalizeEventName(concert.name);
       const nameCandidates = candidates
         .filter((c) => {
           if (!c.name) return false;
-          if (diffDays(c) > 3) return false;
-          if (stringSimilarity(concert.name, c.name) < 0.8) return false;
+          const rawSim = stringSimilarity(concert.name, c.name);
+          const normSim = normIncoming.length >= 6
+            ? stringSimilarity(normIncoming, normalizeEventName(c.name))
+            : 0;
+          const bestSim = Math.max(rawSim, normSim);
+          if (bestSim < 0.8) return false;
+          // When only the normalized form matches (different "Artist @ Festival" variants),
+          // extend the day window to 7 to cover multi-day festivals.
+          const maxDays = normSim >= 0.8 && rawSim < 0.8 ? 7 : 3;
+          if (diffDays(c) > maxDays) return false;
           return sameArea(concert, c) ||
             (concert.city && c.city && stringSimilarity(concert.city, c.city) >= 0.7);
         })
@@ -172,10 +194,21 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
           return d <= (eitherIsMultiBand ? 7 : 1.5);
         })
         .filter((c) => {
-          // If both have venues that are clearly different, they're distinct events
+          // If both have venues that clearly don't match, treat as distinct events.
+          // Exception: when BOTH are multi-band/festival, the same grounds can be named
+          // differently by different sources (e.g. "Wacken Open Air" vs "Wacken Festivalgelände").
+          // In that case allow a tight 8km coordinate fallback. A single-band concert must
+          // always match by venue name to prevent it being absorbed by a nearby festival.
           if (concert.venue && c.venue) {
             const vSim = stringSimilarity(concert.venue, c.venue);
-            if (vSim < 0.7 && !venueContains(concert.venue, c.venue)) return false;
+            if (vSim < 0.7 && !venueContains(concert.venue, c.venue)) {
+              const bothMultiBand = incomingIsMultiBand && isMultiBand(c);
+              if (!bothMultiBand) return false;
+              if (haversineKm(
+                parseFloat(concert.latitude), parseFloat(concert.longitude),
+                parseFloat(c.latitude),        parseFloat(c.longitude),
+              ) > 8) return false;
+            }
           }
           const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
           return (eitherIsMultiBand && sameArea(concert, c)) ||

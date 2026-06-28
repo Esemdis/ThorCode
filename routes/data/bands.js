@@ -1387,6 +1387,22 @@ router.patch('/bands/setlists/bulk', auth, roleCheck(['SYSTEM']), async (req, re
   }
 });
 
+// DELETE /concerts/:concertId — hard-delete a single concert and all its band references
+router.delete('/concerts/:concertId', auth, roleCheck(['ADMIN']), async (req, res) => {
+  const concertId = parseInt(req.params.concertId, 10);
+  if (Number.isNaN(concertId)) return res.status(400).json({ error: 'Invalid concert id' });
+
+  const concert = await prisma.concert.findUnique({ where: { id: concertId } });
+  if (!concert) return res.status(404).json({ error: 'Concert not found' });
+
+  await prisma.$transaction([
+    prisma.concertBandReference.deleteMany({ where: { concert: concertId } }),
+    prisma.concert.delete({ where: { id: concertId } }),
+  ]);
+
+  res.json({ deleted: concertId });
+});
+
 // POST /:concertId/enrich-lineup — match scraped artist names to known bands, link missing ones
 router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), async (req, res) => {
   const concertId = parseInt(req.params.concertId, 10);
