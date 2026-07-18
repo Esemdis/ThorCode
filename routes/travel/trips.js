@@ -82,9 +82,10 @@ router.get("/", async (req, res) => {
       orderBy: [{ start_date: "asc" }, { created_at: "desc" }],
       include: {
         items: {
-          include: { gear_item_rel: { select: { dimensions: true } } },
+          include: { gear_item_rel: { select: { dimensions: true, review_status: true } } },
         },
         estimates: { select: { amount: true, currency: true, category: true } },
+        reviews: { select: { trip_item_id: true } },
       },
     });
     res.json({ data: trips });
@@ -145,6 +146,7 @@ router.get("/:id", param("id").isInt(), async (req, res) => {
           orderBy: [{ sort_order: "asc" }, { created_at: "asc" }],
         },
         estimates: { orderBy: [{ sort_order: "asc" }, { created_at: "asc" }] },
+        reviews: { orderBy: { created_at: "asc" } },
       },
     });
     if (!trip) return res.status(404).json({ error: "Trip not found" });
@@ -160,8 +162,9 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
   const { name, destination, start_date, end_date, notes, weight_budget, money_budget, currency,
-          budget_flights, budget_hotel, budget_entertainment, budget_food } = req.body;
+          budget_flights, budget_hotel, budget_entertainment, budget_food, exchange_rates } = req.body;
   const data = {};
+  if (exchange_rates !== undefined) data.exchange_rates = exchange_rates ?? null;
   if (name !== undefined) data.name = name.trim();
   if (destination !== undefined) data.destination = destination?.trim() || null;
   if (start_date !== undefined) data.start_date = start_date ? new Date(start_date) : null;

@@ -24,6 +24,7 @@ model User {
   gear_items       GearItem[]             @relation("UserGearItems")
   travel_wishlist  TravelWishlistItem[]   @relation("UserTravelWishlist")
   loadouts         Loadout[]              @relation("UserLoadouts")
+  item_reviews     ItemReview[]           @relation("UserItemReviews")
 }
 
 model Game {
@@ -230,11 +231,13 @@ model Trip {
   budget_food            Decimal?  @db.Decimal(10, 2)
   weather_data           Json?
   weather_updated_at     DateTime?
+  exchange_rates         Json?
   created_at             DateTime  @default(now())
   updated_at     DateTime          @updatedAt
   user_rel       User              @relation("UserTrips", fields: [user_id], references: [id])
   items          TripItem[]
   estimates      ExpenseEstimate[]
+  reviews        ItemReview[]      @relation("TripItemReviews")
 }
 
 model TripItem {
@@ -254,6 +257,7 @@ model TripItem {
   trip_rel      Trip          @relation(fields: [trip_id], references: [id], onDelete: Cascade)
   gear_item_rel GearItem?     @relation("GearItemTripItems", fields: [gear_item_id], references: [id], onDelete: SetNull)
   bag_rel       GearItem?     @relation("TripItemBag", fields: [bag_id], references: [id], onDelete: SetNull)
+  reviews       ItemReview[]  @relation("TripItemReview")
 }
 
 model ExpenseEstimate {
@@ -309,11 +313,44 @@ model GearItem {
   url        String?    @db.VarChar(500)
   created_at DateTime   @default(now())
   updated_at DateTime   @updatedAt
+  review_status  ReviewStatus?
+  review_streak  Int           @default(0)
+  review_count   Int           @default(0)
+  last_review_at DateTime?
+  essential      Boolean       @default(false)
+  retired        Boolean       @default(false)
+  replaced_by_id Int?
   user_rel        User           @relation("UserGearItems", fields: [user_id], references: [id])
   trip_items      TripItem[]     @relation("GearItemTripItems")
   trip_bag_items  TripItem[]     @relation("TripItemBag")
   loadout_entries LoadoutEntry[] @relation("GearItemLoadoutEntries")
   bag_entries     LoadoutEntry[] @relation("LoadoutEntryBag")
+  reviews         ItemReview[]   @relation("GearItemReviews")
+  replaced_by_rel GearItem?      @relation("GearUpgrade", fields: [replaced_by_id], references: [id], onDelete: SetNull)
+  replaces        GearItem[]     @relation("GearUpgrade")
+}
+
+model ItemReview {
+  id           Int             @id @default(autoincrement())
+  user_id      String
+  trip_id      Int
+  trip_item_id Int?
+  gear_item_id Int?
+  item_name    String          @db.VarChar(200)
+  usage        ReviewUsage?
+  rating       Int?
+  verdict      ReviewVerdict
+  quantity     ReviewQuantity?
+  note         String?         @db.Text
+  created_at   DateTime        @default(now())
+  updated_at   DateTime        @updatedAt
+  user_rel      User      @relation("UserItemReviews", fields: [user_id], references: [id])
+  trip_rel      Trip      @relation("TripItemReviews", fields: [trip_id], references: [id], onDelete: Cascade)
+  trip_item_rel TripItem? @relation("TripItemReview", fields: [trip_item_id], references: [id], onDelete: SetNull)
+  gear_item_rel GearItem? @relation("GearItemReviews", fields: [gear_item_id], references: [id], onDelete: SetNull)
+
+  @@unique([trip_id, trip_item_id])
+  @@index([gear_item_id])
 }
 
 model TravelWishlistItem {
@@ -366,4 +403,27 @@ enum PackingStatus {
   BOUGHT
   PACKED
   NOT_PACKED
+}
+
+enum ReviewUsage {
+  NEVER
+  SOMETIMES
+  OFTEN
+}
+
+enum ReviewVerdict {
+  KEEP
+  REPLACE
+  DITCH
+}
+
+enum ReviewQuantity {
+  TOO_FEW
+  RIGHT
+  TOO_MANY
+}
+
+enum ReviewStatus {
+  LOCKED
+  FLAGGED
 }

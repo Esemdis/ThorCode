@@ -5,6 +5,7 @@ const { body, param, validationResult } = require("express-validator");
 const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
+const { recomputeGearReviewStatus } = require("../../utils/reviewStatus");
 
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
@@ -57,7 +58,10 @@ router.get("/", async (req, res) => {
   try {
     const gear = await prisma.gearItem.findMany({
       where: { user_id: req.user.id },
-      include: { _count: { select: { trip_items: true } } },
+      include: {
+        _count: { select: { trip_items: true } },
+        replaced_by_rel: { select: { id: true, name: true, brand: true, model: true } },
+      },
       orderBy: [{ category: "asc" }, { brand: "asc" }, { name: "asc" }],
     });
     res.json({ data: gear });
@@ -110,6 +114,10 @@ router.get("/:id", param("id").isInt(), async (req, res) => {
           include: { trip_rel: { select: { id: true, name: true, destination: true, start_date: true } } },
           orderBy: { created_at: "desc" },
         },
+        reviews: {
+          include: { trip_rel: { select: { id: true, name: true, destination: true, start_date: true } } },
+          orderBy: { created_at: "desc" },
+        },
       },
     });
     if (!item) return res.status(404).json({ error: "Gear item not found" });
@@ -124,8 +132,11 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-  const { name, model, brand, category, dimensions, tags, notes, url, worn } = req.body;
+  const { name, model, brand, category, dimensions, tags, notes, url, worn, essential, retired, replaced_by_id } = req.body;
   const data = {};
+  if (essential !== undefined) data.essential = Boolean(essential);
+  if (retired !== undefined) data.retired = Boolean(retired);
+  if (replaced_by_id !== undefined) data.replaced_by_id = replaced_by_id != null ? parseInt(replaced_by_id, 10) : null;
   if (name !== undefined) data.name = name.trim();
   if (model !== undefined) data.model = model?.trim() || null;
   if (brand !== undefined) data.brand = brand?.trim() || null;
@@ -143,7 +154,8 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
     });
     if (!existing) return res.status(404).json({ error: "Gear item not found" });
 
-    const item = await prisma.gearItem.update({ where: { id: parseInt(req.params.id) }, data });
+    let item = await prisma.gearItem.update({ where: { id: parseInt(req.params.id) }, data });
+    if (essential !== undefined) item = await recomputeGearReviewStatus(item.id);
     res.json({ data: item });
   } catch (err) {
     res.status(500).json({ error: err.message });
