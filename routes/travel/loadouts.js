@@ -19,7 +19,7 @@ router.get("/", async (req, res) => {
         entries: {
           include: {
             gear_item_rel: {
-              select: { id: true, name: true, brand: true, model: true, category: true, dimensions: true },
+              select: { id: true, name: true, brand: true, model: true, category: true, dimensions: true, photo: true },
             },
           },
           orderBy: { created_at: "asc" },
@@ -122,7 +122,7 @@ router.post(
         update: req.body.worn !== undefined ? { worn } : {},
         include: {
           gear_item_rel: {
-            select: { id: true, name: true, brand: true, model: true, category: true },
+            select: { id: true, name: true, brand: true, model: true, category: true, photo: true },
           },
         },
       });
@@ -157,7 +157,7 @@ router.patch(
         data,
         include: {
           gear_item_rel: {
-            select: { id: true, name: true, brand: true, model: true, category: true },
+            select: { id: true, name: true, brand: true, model: true, category: true, photo: true },
           },
         },
       });
@@ -266,7 +266,7 @@ router.post("/:id/duplicate", param("id").isInt(), async (req, res) => {
         entries: {
           include: {
             gear_item_rel: {
-              select: { id: true, name: true, brand: true, model: true, category: true, dimensions: true },
+              select: { id: true, name: true, brand: true, model: true, category: true, dimensions: true, photo: true },
             },
           },
           orderBy: { created_at: "asc" },

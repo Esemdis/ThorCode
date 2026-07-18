@@ -10,6 +10,15 @@ const { recomputeGearReviewStatus } = require("../../utils/reviewStatus");
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
 
+// Photos arrive as client-side-compressed data URLs; cap ~300KB of string
+const PHOTO_MAX_LENGTH = 300000;
+function invalidPhoto(photo) {
+  if (photo == null) return null;
+  if (typeof photo !== "string" || !photo.startsWith("data:image/")) return "Photo must be an image data URL";
+  if (photo.length > PHOTO_MAX_LENGTH) return "Photo too large — compress it below ~220KB";
+  return null;
+}
+
 // GET /travel/gear/usage-stats — trip usage summary for all gear items
 router.get("/usage-stats", async (req, res) => {
   try {
@@ -78,11 +87,14 @@ router.post(
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-    const { name, model, brand, category, dimensions, tags, notes, url, worn } = req.body;
+    const { name, model, brand, category, dimensions, tags, notes, url, worn, photo } = req.body;
+    const photoError = invalidPhoto(photo);
+    if (photoError) return res.status(400).json({ error: photoError });
     try {
       const item = await prisma.gearItem.create({
         data: {
           user_id: req.user.id,
+          photo: photo || null,
           name: name.trim(),
           model: model?.trim() || null,
           brand: brand?.trim() || null,
@@ -132,8 +144,13 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-  const { name, model, brand, category, dimensions, tags, notes, url, worn, essential, retired, replaced_by_id } = req.body;
+  const { name, model, brand, category, dimensions, tags, notes, url, worn, essential, retired, replaced_by_id, photo } = req.body;
   const data = {};
+  if (photo !== undefined) {
+    const photoError = invalidPhoto(photo);
+    if (photoError) return res.status(400).json({ error: photoError });
+    data.photo = photo || null;
+  }
   if (essential !== undefined) data.essential = Boolean(essential);
   if (retired !== undefined) data.retired = Boolean(retired);
   if (replaced_by_id !== undefined) data.replaced_by_id = replaced_by_id != null ? parseInt(replaced_by_id, 10) : null;

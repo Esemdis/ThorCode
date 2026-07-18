@@ -19,7 +19,7 @@ router.get("/", async (req, res) => {
           select: {
             id: true, name: true, brand: true, model: true, category: true, dimensions: true,
             review_status: true, review_streak: true, review_count: true, essential: true,
-            retired: true,
+            retired: true, photo: true,
             replaced_by_rel: { select: { id: true, name: true, brand: true } },
           },
         },

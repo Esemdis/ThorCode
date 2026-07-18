@@ -320,6 +320,7 @@ model GearItem {
   essential      Boolean       @default(false)
   retired        Boolean       @default(false)
   replaced_by_id Int?
+  photo          String?       @db.Text
   user_rel        User           @relation("UserGearItems", fields: [user_id], references: [id])
   trip_items      TripItem[]     @relation("GearItemTripItems")
   trip_bag_items  TripItem[]     @relation("TripItemBag")
