@@ -103,7 +103,7 @@ router.post(
     if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
     const { name, destination, start_date, end_date, notes, weight_budget, money_budget, currency,
-            budget_flights, budget_hotel, budget_entertainment, budget_food } = req.body;
+            budget_flights, budget_hotel, budget_entertainment, budget_food, tags } = req.body;
     try {
       const trip = await prisma.trip.create({
         data: {
@@ -120,6 +120,7 @@ router.post(
           budget_hotel: budget_hotel != null ? parseFloat(budget_hotel) : null,
           budget_entertainment: budget_entertainment != null ? parseFloat(budget_entertainment) : null,
           budget_food: budget_food != null ? parseFloat(budget_food) : null,
+          tags: Array.isArray(tags) ? tags.map((t) => t.trim()).filter(Boolean) : [],
         },
       });
       res.status(201).json({ data: trip });
@@ -162,8 +163,9 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
   const { name, destination, start_date, end_date, notes, weight_budget, money_budget, currency,
-          budget_flights, budget_hotel, budget_entertainment, budget_food, exchange_rates } = req.body;
+          budget_flights, budget_hotel, budget_entertainment, budget_food, exchange_rates, tags } = req.body;
   const data = {};
+  if (tags !== undefined) data.tags = Array.isArray(tags) ? tags.map((t) => t.trim()).filter(Boolean) : [];
   if (exchange_rates !== undefined) data.exchange_rates = exchange_rates ?? null;
   if (name !== undefined) data.name = name.trim();
   if (destination !== undefined) data.destination = destination?.trim() || null;
@@ -231,6 +233,7 @@ router.post("/:id/duplicate", param("id").isInt(), async (req, res) => {
         name: `Copy of ${source.name}`,
         destination: source.destination,
         notes: source.notes,
+        tags: source.tags,
       },
     });
 

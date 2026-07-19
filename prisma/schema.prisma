@@ -232,6 +232,7 @@ model Trip {
   weather_data           Json?
   weather_updated_at     DateTime?
   exchange_rates         Json?
+  tags                   String[]
   created_at             DateTime  @default(now())
   updated_at     DateTime          @updatedAt
   user_rel       User              @relation("UserTrips", fields: [user_id], references: [id])
@@ -321,6 +322,10 @@ model GearItem {
   retired        Boolean       @default(false)
   replaced_by_id Int?
   photo          String?       @db.Text
+  retail_price   Decimal?      @db.Decimal(10, 2)
+  bought_for     Decimal?      @db.Decimal(10, 2)
+  currency       String        @default("SEK") @db.VarChar(3)
+  fill_level     Int?
   user_rel        User           @relation("UserGearItems", fields: [user_id], references: [id])
   trip_items      TripItem[]     @relation("GearItemTripItems")
   trip_bag_items  TripItem[]     @relation("TripItemBag")

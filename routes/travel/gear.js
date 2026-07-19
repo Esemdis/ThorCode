@@ -68,7 +68,8 @@ router.get("/", async (req, res) => {
     const gear = await prisma.gearItem.findMany({
       where: { user_id: req.user.id },
       include: {
-        _count: { select: { trip_items: true } },
+        _count: { select: { trip_items: true, loadout_entries: true } },
+        loadout_entries: { select: { loadout_rel: { select: { id: true, name: true } } } },
         replaced_by_rel: { select: { id: true, name: true, brand: true, model: true } },
       },
       orderBy: [{ category: "asc" }, { brand: "asc" }, { name: "asc" }],
@@ -87,7 +88,7 @@ router.post(
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-    const { name, model, brand, category, dimensions, tags, notes, url, worn, photo } = req.body;
+    const { name, model, brand, category, dimensions, tags, notes, url, worn, photo, retail_price, bought_for, currency, fill_level } = req.body;
     const photoError = invalidPhoto(photo);
     if (photoError) return res.status(400).json({ error: photoError });
     try {
@@ -104,6 +105,10 @@ router.post(
           notes: notes?.trim() || null,
           url: url?.trim() || null,
           worn: Boolean(worn),
+          retail_price: retail_price != null && retail_price !== "" ? parseFloat(retail_price) : null,
+          bought_for: bought_for != null && bought_for !== "" ? parseFloat(bought_for) : null,
+          currency: currency?.trim().toUpperCase() || "SEK",
+          fill_level: fill_level != null && fill_level !== "" ? Math.max(0, Math.min(100, parseInt(fill_level, 10))) : null,
         },
       });
       res.status(201).json({ data: item });
@@ -144,7 +149,7 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-  const { name, model, brand, category, dimensions, tags, notes, url, worn, essential, retired, replaced_by_id, photo } = req.body;
+  const { name, model, brand, category, dimensions, tags, notes, url, worn, essential, retired, replaced_by_id, photo, retail_price, bought_for, currency, fill_level } = req.body;
   const data = {};
   if (photo !== undefined) {
     const photoError = invalidPhoto(photo);
@@ -164,6 +169,10 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   if (url !== undefined) data.url = url?.trim() || null;
   if (req.body.sort_order !== undefined) data.sort_order = parseInt(req.body.sort_order, 10);
   if (worn !== undefined) data.worn = Boolean(worn);
+  if (retail_price !== undefined) data.retail_price = retail_price != null && retail_price !== "" ? parseFloat(retail_price) : null;
+  if (bought_for !== undefined) data.bought_for = bought_for != null && bought_for !== "" ? parseFloat(bought_for) : null;
+  if (currency !== undefined) data.currency = currency?.trim().toUpperCase() || "SEK";
+  if (fill_level !== undefined) data.fill_level = fill_level != null && fill_level !== "" ? Math.max(0, Math.min(100, parseInt(fill_level, 10))) : null;
 
   try {
     const existing = await prisma.gearItem.findFirst({
