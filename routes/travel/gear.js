@@ -174,13 +174,33 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   if (currency !== undefined) data.currency = currency?.trim().toUpperCase() || "SEK";
   if (fill_level !== undefined) data.fill_level = fill_level != null && fill_level !== "" ? Math.max(0, Math.min(100, parseInt(fill_level, 10))) : null;
 
+  // Fields that describe "the same product" and should stay in sync across every
+  // identical copy (same name+brand+model) a user owns. Per-copy realities — fill
+  // level, worn, sort position, essential/retired/review status — are excluded.
+  const SYNCED_FIELDS = ["name", "model", "brand", "category", "dimensions", "tags", "notes", "url", "photo", "retail_price", "bought_for", "currency"];
+
   try {
     const existing = await prisma.gearItem.findFirst({
       where: { id: parseInt(req.params.id), user_id: req.user.id },
     });
     if (!existing) return res.status(404).json({ error: "Gear item not found" });
 
-    let item = await prisma.gearItem.update({ where: { id: parseInt(req.params.id) }, data });
+    const syncData = {};
+    for (const f of SYNCED_FIELDS) if (f in data) syncData[f] = data[f];
+
+    let item;
+    if (Object.keys(syncData).length > 0) {
+      const [updated] = await prisma.$transaction([
+        prisma.gearItem.update({ where: { id: existing.id }, data }),
+        prisma.gearItem.updateMany({
+          where: { user_id: req.user.id, id: { not: existing.id }, name: existing.name, brand: existing.brand, model: existing.model },
+          data: syncData,
+        }),
+      ]);
+      item = updated;
+    } else {
+      item = await prisma.gearItem.update({ where: { id: existing.id }, data });
+    }
     if (essential !== undefined) item = await recomputeGearReviewStatus(item.id);
     res.json({ data: item });
   } catch (err) {
