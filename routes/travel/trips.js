@@ -86,7 +86,13 @@ router.get("/", async (req, res) => {
         },
         estimates: { select: { amount: true, currency: true, category: true } },
         reviews: { select: { trip_item_id: true } },
-        trip_review: { select: { culture_rating: true, food_rating: true, fun_rating: true } },
+        trip_review: {
+          select: {
+            culture_rating: true, food_rating: true, fun_rating: true,
+            // Feeds the "forgotten gear" signal in the gear closet
+            missing_gear_item_ids: true, missing_note: true,
+          },
+        },
       },
     });
     res.json({ data: trips });
