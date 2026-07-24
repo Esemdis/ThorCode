@@ -59,7 +59,7 @@ router.get("/usage-stats", async (req, res) => {
     res.json({ data: stats });
   } catch (err) {
     res.status(500).json({ error: err.message });
-  }W
+  }
 });
 
 // GET /travel/gear — list all gear items with trip count
@@ -88,7 +88,7 @@ router.post(
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-    const { name, model, brand, category, dimensions, tags, notes, url, worn, photo, retail_price, bought_for, currency, fill_level } = req.body;
+    const { name, model, brand, category, dimensions, tags, notes, url, worn, photo, retail_price, bought_for, currency, fill_level, price_irrelevant } = req.body;
     const photoError = invalidPhoto(photo);
     if (photoError) return res.status(400).json({ error: photoError });
     try {
@@ -109,6 +109,7 @@ router.post(
           bought_for: bought_for != null && bought_for !== "" ? parseFloat(bought_for) : null,
           currency: currency?.trim().toUpperCase() || "SEK",
           fill_level: fill_level != null && fill_level !== "" ? Math.max(0, Math.min(100, parseInt(fill_level, 10))) : null,
+          price_irrelevant: Boolean(price_irrelevant),
         },
       });
       res.status(201).json({ data: item });
@@ -149,7 +150,7 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-  const { name, model, brand, category, dimensions, tags, notes, url, worn, essential, retired, replaced_by_id, photo, retail_price, bought_for, currency, fill_level } = req.body;
+  const { name, model, brand, category, dimensions, tags, notes, url, worn, essential, retired, replaced_by_id, photo, retail_price, bought_for, currency, fill_level, price_irrelevant } = req.body;
   const data = {};
   if (photo !== undefined) {
     const photoError = invalidPhoto(photo);
@@ -173,11 +174,12 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   if (bought_for !== undefined) data.bought_for = bought_for != null && bought_for !== "" ? parseFloat(bought_for) : null;
   if (currency !== undefined) data.currency = currency?.trim().toUpperCase() || "SEK";
   if (fill_level !== undefined) data.fill_level = fill_level != null && fill_level !== "" ? Math.max(0, Math.min(100, parseInt(fill_level, 10))) : null;
+  if (price_irrelevant !== undefined) data.price_irrelevant = Boolean(price_irrelevant);
 
   // Fields that describe "the same product" and should stay in sync across every
   // identical copy (same name+brand+model) a user owns. Per-copy realities — fill
   // level, worn, sort position, essential/retired/review status — are excluded.
-  const SYNCED_FIELDS = ["name", "model", "brand", "category", "dimensions", "tags", "notes", "url", "photo", "retail_price", "bought_for", "currency"];
+  const SYNCED_FIELDS = ["name", "model", "brand", "category", "dimensions", "tags", "notes", "url", "photo", "retail_price", "bought_for", "currency", "price_irrelevant"];
 
   try {
     const existing = await prisma.gearItem.findFirst({

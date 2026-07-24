@@ -354,6 +354,7 @@ model GearItem {
   bought_for     Decimal?      @db.Decimal(10, 2)
   currency       String        @default("SEK") @db.VarChar(3)
   fill_level     Int?
+  price_irrelevant Boolean     @default(false)
   user_rel        User           @relation("UserGearItems", fields: [user_id], references: [id])
   trip_items      TripItem[]     @relation("GearItemTripItems")
   trip_bag_items  TripItem[]     @relation("TripItemBag")
