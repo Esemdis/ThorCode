@@ -21,6 +21,7 @@ app.use("/travel/trips", require("./routes/travel/trips"));
 app.use("/travel/trips/:tripId/items", require("./routes/travel/tripItems"));
 app.use("/travel/trips/:tripId/estimates", require("./routes/travel/estimates"));
 app.use("/travel/trips/:tripId/reviews", require("./routes/travel/reviews"));
+app.use("/travel/trips/:tripId/trip-review", require("./routes/travel/tripReview"));
 app.use("/travel/reviews", require("./routes/travel/allReviews"));
 app.use("/travel/rates", require("./routes/travel/rates"));
 app.use("/travel/gear", require("./routes/travel/gear"));
