@@ -742,7 +742,7 @@ router.post(
         if (ticketmasterId) bandPayload.ticketmaster_id = ticketmasterId;
         if (bandName) bandPayload.name = bandName;
         const createResponse = await axios.post(
-          `https://${process.env.API_BASE_URL}/data/concerts/bands`,
+          `${process.env.CALLBACK_URL}/data/concerts/bands`,
           bandPayload,
           { headers: { Authorization: req.headers.authorization } },
         );
