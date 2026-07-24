@@ -59,7 +59,7 @@ router.get("/usage-stats", async (req, res) => {
     res.json({ data: stats });
   } catch (err) {
     res.status(500).json({ error: err.message });
-  }
+  }W
 });
 
 // GET /travel/gear — list all gear items with trip count
