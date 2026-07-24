@@ -148,6 +148,7 @@ router.get("/:id", param("id").isInt(), async (req, res) => {
         },
         estimates: { orderBy: [{ sort_order: "asc" }, { created_at: "asc" }] },
         reviews: { orderBy: { created_at: "asc" } },
+        trip_review: true,
       },
     });
     if (!trip) return res.status(404).json({ error: "Trip not found" });

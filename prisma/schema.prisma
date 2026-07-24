@@ -25,6 +25,7 @@ model User {
   travel_wishlist  TravelWishlistItem[]   @relation("UserTravelWishlist")
   loadouts         Loadout[]              @relation("UserLoadouts")
   item_reviews     ItemReview[]           @relation("UserItemReviews")
+  trip_reviews     TripReview[]           @relation("UserTripReviews")
   notification_subscriptions NotificationSubscription[] @relation("UserNotificationSubscriptions")
 }
 
@@ -265,6 +266,7 @@ model Trip {
   items          TripItem[]
   estimates      ExpenseEstimate[]
   reviews        ItemReview[]      @relation("TripItemReviews")
+  trip_review    TripReview?
 }
 
 model TripItem {
@@ -383,6 +385,25 @@ model ItemReview {
 
   @@unique([trip_id, trip_item_id])
   @@index([gear_item_id])
+}
+
+model TripReview {
+  id                    Int      @id @default(autoincrement())
+  user_id               String
+  trip_id               Int      @unique
+  culture_rating        Int?
+  culture_note          String?  @db.Text
+  food_rating           Int?
+  food_note             String?  @db.Text
+  fun_rating            Int?
+  fun_note              String?  @db.Text
+  missing_gear_item_ids Int[]
+  missing_note          String?  @db.Text
+  comment               String?  @db.Text
+  created_at            DateTime @default(now())
+  updated_at            DateTime @updatedAt
+  user_rel              User     @relation("UserTripReviews", fields: [user_id], references: [id])
+  trip_rel              Trip     @relation(fields: [trip_id], references: [id], onDelete: Cascade)
 }
 
 model TravelWishlistItem {
