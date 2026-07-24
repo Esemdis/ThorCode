@@ -28,7 +28,9 @@
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.0",
     "nanoid": "^5.1.5",
+    "node-cron": "^3.0.3",
     "prisma": "^6.9.0",
+    "resend": "^4.0.1",
     "uuid": "^11.1.0"
   },
   "devDependencies": {

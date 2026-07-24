@@ -25,6 +25,7 @@ model User {
   travel_wishlist  TravelWishlistItem[]   @relation("UserTravelWishlist")
   loadouts         Loadout[]              @relation("UserLoadouts")
   item_reviews     ItemReview[]           @relation("UserItemReviews")
+  notification_subscriptions NotificationSubscription[] @relation("UserNotificationSubscriptions")
 }
 
 model Game {
@@ -87,6 +88,7 @@ model Band {
   setlist_updated_at DateTime?
   concerts        ConcertBandReference[]  @relation("BandConcerts")
   wishlists       WishlistBandReference[] @relation("BandWishlists")
+  notification_subscriptions NotificationSubscription[] @relation("BandNotificationSubscriptions")
 }
 
 model Concert {
@@ -133,6 +135,7 @@ model City {
   weather_updated_at DateTime?
   created_at         DateTime  @default(now())
   concerts           Concert[]
+  notification_subscriptions NotificationSubscription[] @relation("CityNotificationSubscriptions")
 
   @@unique([name, country])
 }
@@ -198,6 +201,29 @@ model ConcertAttendance {
   concert_rel  Concert  @relation("ConcertAttendances", fields: [concert_id], references: [id])
 
   @@unique([wishlist_id, concert_id])
+}
+
+// A user's watch for new concerts: by band, by city, or a band-in-a-specific-city combo.
+// band_id null == any band. city_id null == any city. At least one is always set (enforced in the route).
+model NotificationSubscription {
+  id         Int      @id @default(autoincrement())
+  user_id    String
+  band_id    Int?
+  city_id    Int?
+  created_at DateTime @default(now())
+  user_rel   User     @relation("UserNotificationSubscriptions", fields: [user_id], references: [id], onDelete: Cascade)
+  band_rel   Band?    @relation("BandNotificationSubscriptions", fields: [band_id], references: [id], onDelete: Cascade)
+  city_rel   City?    @relation("CityNotificationSubscriptions", fields: [city_id], references: [id], onDelete: Cascade)
+
+  @@index([band_id])
+  @@index([city_id])
+}
+
+// Single-row cursor for the notification digest cron: tracks the last time it ran
+// so each pass only scans concerts created since then.
+model NotificationDigestRun {
+  id          Int      @id @default(autoincrement())
+  last_run_at DateTime @default(now())
 }
 
 enum Role {
