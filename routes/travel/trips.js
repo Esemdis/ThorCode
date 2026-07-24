@@ -86,6 +86,7 @@ router.get("/", async (req, res) => {
         },
         estimates: { select: { amount: true, currency: true, category: true } },
         reviews: { select: { trip_item_id: true } },
+        trip_review: { select: { culture_rating: true, food_rating: true, fun_rating: true } },
       },
     });
     res.json({ data: trips });
