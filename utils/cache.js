@@ -1,7 +1,14 @@
 const { v4: uuidv4 } = require("uuid");
 const { Redis } = require("ioredis");
-const client = new Redis(process.env.REDIS_URL, {
-  tls: {},
+
+// Managed instances are reached over rediss:// and need TLS. A self-hosted
+// Redis/Valkey on the LAN speaks plain redis:// and will fail the handshake if
+// we offer TLS anyway, so only turn it on when the URL asks for it.
+const REDIS_URL = process.env.REDIS_URL;
+const useTls = /^rediss:\/\//i.test(REDIS_URL || "");
+
+const client = new Redis(REDIS_URL, {
+  ...(useTls ? { tls: {} } : {}),
   retryDelayOnFailover: 300000, // 5 minutes
   maxRetriesPerRequest: 3,
   lazyConnect: true,
