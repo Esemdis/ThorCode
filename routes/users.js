@@ -15,6 +15,9 @@ const { rateLimiter } = require('../utils/rateLimiter');
 const prisma = require('../prisma/client');
 const signJWT = require('../auth/signJWT');
 const { sendEmailVerificationCode } = require('../utils/mail');
+const { validateEmail } = require('../utils/validation/email');
+const { emailRateLimiter } = require('../utils/emailRateLimiter');
+const response = require('../utils/apiResponse');
 
 // Defaults to 5 requests per 15 minutes per IP
 const rateLimit = rateLimiter({
@@ -317,26 +320,44 @@ router.get(
   },
 );
 
-router.post('/email/request-change', auth, upload.none(), async (req, res) => {
+/**
+ * POST /users/email/request-change
+ * Initiates email change by sending verification code to new email
+ * @body {string} newEmail - New email address
+ * @returns {object} { success: true, message: string }
+ * @throws {400} Invalid email format or email already in use
+ * @throws {401} Unauthorized
+ * @throws {409} Email already in use or pending verification
+ * @throws {500} Server error
+ */
+router.post('/email/request-change', auth, emailRateLimiter, upload.none(), async (req, res) => {
   try {
     const userId = req.user.id;
     const { newEmail } = req.body;
 
+    // Validate email input
     if (!newEmail || typeof newEmail !== 'string') {
-      return res.status(400).json({ error: 'New email is required' });
+      return response.badRequest(res, 'New email is required');
     }
 
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(newEmail)) {
-      return res.status(400).json({ error: 'Invalid email format' });
+    if (!validateEmail(newEmail)) {
+      return response.badRequest(res, 'Invalid email format');
     }
 
-    // Check if email is already in use
+    // Check if email is already in use by another user
     const existingUser = await prisma.user.findUnique({
       where: { email: newEmail },
     });
     if (existingUser) {
-      return res.status(409).json({ error: 'Email already in use' });
+      return response.conflict(res, 'Email already in use');
+    }
+
+    // Check if email is already pending verification by any user
+    const existingPending = await prisma.emailVerification.findFirst({
+      where: { new_email: newEmail },
+    });
+    if (existingPending) {
+      return response.conflict(res, 'Email is already pending verification');
     }
 
     // Generate a 6-digit verification code
@@ -349,7 +370,7 @@ router.post('/email/request-change', auth, upload.none(), async (req, res) => {
     });
 
     // Create new verification record
-    await prisma.emailVerification.create({
+    const verification = await prisma.emailVerification.create({
       data: {
         user_id: userId,
         new_email: newEmail,
@@ -359,22 +380,41 @@ router.post('/email/request-change', auth, upload.none(), async (req, res) => {
     });
 
     // Send verification code to the new email
-    await sendEmailVerificationCode({ to: newEmail, code });
+    try {
+      await sendEmailVerificationCode({ to: newEmail, code });
+    } catch (emailError) {
+      // Cleanup on email send failure
+      await prisma.emailVerification.delete({
+        where: { id: verification.id },
+      });
+      console.error('Email send failed, verification record deleted:', emailError);
+      return response.serverError(res, 'Failed to send verification email');
+    }
 
-    res.status(200).json({ message: 'Verification code sent to new email' });
+    return response.success(res, 200, {}, 'Verification code sent to new email');
   } catch (error) {
     console.error('Error requesting email change:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return response.serverError(res, 'Internal server error');
   }
 });
 
-router.post('/email/verify-code', auth, upload.none(), async (req, res) => {
+/**
+ * POST /users/email/verify-code
+ * Verifies email change code and updates user email
+ * @body {string} code - 6-digit verification code
+ * @returns {object} { success: true, data: { user: { id, email } }, message: string }
+ * @throws {400} Invalid or expired verification code
+ * @throws {401} Unauthorized
+ * @throws {403} Code does not belong to user
+ * @throws {500} Server error
+ */
+router.post('/email/verify-code', auth, emailRateLimiter, upload.none(), async (req, res) => {
   try {
     const userId = req.user.id;
     const { code } = req.body;
 
     if (!code || typeof code !== 'string') {
-      return res.status(400).json({ error: 'Verification code is required' });
+      return response.badRequest(res, 'Verification code is required');
     }
 
     // Find the verification record
@@ -383,12 +423,12 @@ router.post('/email/verify-code', auth, upload.none(), async (req, res) => {
     });
 
     if (!verification) {
-      return res.status(400).json({ error: 'Invalid verification code' });
+      return response.badRequest(res, 'Invalid verification code');
     }
 
     // Check if it belongs to the current user
     if (verification.user_id !== userId) {
-      return res.status(403).json({ error: 'Verification code does not match your account' });
+      return response.forbidden(res, 'Verification code does not match your account');
     }
 
     // Check if code has expired
@@ -396,7 +436,7 @@ router.post('/email/verify-code', auth, upload.none(), async (req, res) => {
       await prisma.emailVerification.delete({
         where: { id: verification.id },
       });
-      return res.status(400).json({ error: 'Verification code has expired' });
+      return response.badRequest(res, 'Verification code has expired');
     }
 
     // Update user email
@@ -411,10 +451,10 @@ router.post('/email/verify-code', auth, upload.none(), async (req, res) => {
       where: { id: verification.id },
     });
 
-    res.status(200).json({ message: 'Email updated successfully', user });
+    return response.success(res, 200, { user }, 'Email updated successfully');
   } catch (error) {
     console.error('Error verifying email code:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return response.serverError(res, 'Internal server error');
   }
 });
 

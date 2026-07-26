@@ -3,7 +3,7 @@ const cors = require('cors');
 const dotenv = require("dotenv").config();
 const { startCronJobs } = require("./utils/cron");
 const app = express();
-const port = 4000;
+const port = process.env.PORT || 4000;
 
 app.set('trust proxy', 1);
 
@@ -17,6 +17,8 @@ app.use("/data/concerts", require("./routes/data/notifications"))
 app.use("/data/cities", require("./routes/data/cities"))
 app.use("/data/tmdb", require("./routes/data/tmdb"));
 app.use("/oauth/tmdb", require("./routes/oauth/tmdb"));
+// Every /travel/* route, read or write, passes the limiter first.
+app.use("/travel", require("./middlewares/travelLimits"));
 app.use("/travel/trips", require("./routes/travel/trips"));
 app.use("/travel/trips/:tripId/items", require("./routes/travel/tripItems"));
 app.use("/travel/trips/:tripId/todos", require("./routes/travel/tripTodos"));
@@ -28,9 +30,17 @@ app.use("/travel/rates", require("./routes/travel/rates"));
 app.use("/travel/gear", require("./routes/travel/gear"));
 app.use("/travel/wishlist", require("./routes/travel/wishlist"));
 app.use("/travel/loadouts", require("./routes/travel/loadouts"));
+// Anything that escapes a route. A deliberate 4xx keeps its message — it was
+// written to be read — but a 500 is an internal detail (table names, constraint
+// names, sometimes values), so outside development the client just gets told it
+// broke and the log keeps the rest.
 app.use((err, req, res, _next) => {
   console.error(`[${new Date().toISOString()}] ${req.method} ${req.path}`, err);
-  res.status(err.status ?? 500).json({ error: err.message || 'Internal server error' });
+  const status = err.status ?? 500;
+  const message = status < 500 || process.env.NODE_ENV !== 'production'
+    ? err.message || 'Internal server error'
+    : 'Internal server error';
+  res.status(status).json({ error: message });
 });
 
 process.on('unhandledRejection', (reason) => {

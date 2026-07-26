@@ -5,25 +5,33 @@ const { body, param, validationResult } = require("express-validator");
 const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
+const { fail, paginate, sendList } = require("../../utils/apiResponse");
 
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN", "SYSTEM"]));
 
 // GET /travel/wishlist
 router.get("/", async (req, res) => {
+  const { take, skip } = paginate(req, { defaultLimit: 250, maxLimit: 500 });
   try {
-    const items = await prisma.travelWishlistItem.findMany({
-      where: { user_id: req.user.id },
-      orderBy: [{ bought: "asc" }, { category: "asc" }, { name: "asc" }],
-    });
-    res.json({ data: items });
+    const where = { user_id: req.user.id };
+    const [items, total] = await Promise.all([
+      prisma.travelWishlistItem.findMany({
+        where,
+        orderBy: [{ bought: "asc" }, { category: "asc" }, { name: "asc" }],
+        take,
+        skip,
+      }),
+      prisma.travelWishlistItem.count({ where }),
+    ]);
+    sendList(res, items, { total, take, skip });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, err, { context: "GET wishlist" });
   }
 });
 
 // POST /travel/wishlist
-router.post("/", [body("name").notEmpty().trim()], async (req, res) => {
+router.post("/", body("name").notEmpty().trim(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
@@ -46,7 +54,7 @@ router.post("/", [body("name").notEmpty().trim()], async (req, res) => {
     });
     res.status(201).json({ data: item });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, err, { context: "POST wishlist" });
   }
 });
 
@@ -69,15 +77,28 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   if (bought !== undefined) data.bought = Boolean(bought);
   if (keywords !== undefined) data.keywords = Array.isArray(keywords) ? keywords.map((k) => k.trim()).filter(Boolean) : [];
 
+  const id = parseInt(req.params.id, 10);
   try {
-    const existing = await prisma.travelWishlistItem.findFirst({
-      where: { id: parseInt(req.params.id), user_id: req.user.id },
+    // Ticking "bought" moves the item into the gear closet, but only on the
+    // transition — so the previous value has to be read first. When `bought`
+    // isn't part of the update there is nothing to compare and the write scopes
+    // itself to the caller's rows instead.
+    let wasBought = null;
+    if (bought !== undefined) {
+      const existing = await prisma.travelWishlistItem.findFirst({
+        where: { id, user_id: req.user.id },
+        select: { bought: true },
+      });
+      if (!existing) return res.status(404).json({ error: "Item not found" });
+      wasBought = existing.bought;
+    }
+
+    const item = await prisma.travelWishlistItem.update({
+      where: { id, user_id: req.user.id },
+      data,
     });
-    if (!existing) return res.status(404).json({ error: "Item not found" });
 
-    const item = await prisma.travelWishlistItem.update({ where: { id: parseInt(req.params.id) }, data });
-
-    if (Boolean(bought) && !existing.bought) {
+    if (Boolean(bought) && wasBought === false) {
       await prisma.gearItem.create({
         data: {
           user_id: req.user.id,
@@ -96,7 +117,7 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
 
     res.json({ data: item });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, err, { context: `PATCH wishlist ${req.params.id}`, notFound: "Item not found" });
   }
 });
 
@@ -106,15 +127,12 @@ router.delete("/:id", param("id").isInt(), async (req, res) => {
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
   try {
-    const existing = await prisma.travelWishlistItem.findFirst({
-      where: { id: parseInt(req.params.id), user_id: req.user.id },
+    await prisma.travelWishlistItem.delete({
+      where: { id: parseInt(req.params.id, 10), user_id: req.user.id },
     });
-    if (!existing) return res.status(404).json({ error: "Item not found" });
-
-    await prisma.travelWishlistItem.delete({ where: { id: parseInt(req.params.id) } });
     res.json({ message: "Item deleted" });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, err, { context: `DELETE wishlist ${req.params.id}`, notFound: "Item not found" });
   }
 });
 
@@ -131,7 +149,7 @@ router.get("/keywords", async (req, res) => {
     const unique = [...new Set(items.flatMap((i) => i.keywords))].sort();
     res.json({ data: unique });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, err, { context: "GET wishlist keywords" });
   }
 });
 

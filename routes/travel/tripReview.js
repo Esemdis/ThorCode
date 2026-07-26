@@ -1,32 +1,24 @@
 const express = require("express");
 const router = express.Router({ mergeParams: true });
-const { body, param, validationResult } = require("express-validator");
+const { body, validationResult } = require("express-validator");
 
 const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
+const ownsTrip = require("../../middlewares/ownsTrip");
 const prisma = require("../../prisma/client");
+const { fail } = require("../../utils/apiResponse");
 
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
-
-async function ownsTrip(userId, tripId) {
-  const trip = await prisma.trip.findFirst({ where: { id: tripId, user_id: userId } });
-  return !!trip;
-}
+router.use(ownsTrip);
 
 // GET /travel/trips/:tripId/trip-review — the trip-level review, if any
-router.get("/", param("tripId").isInt(), async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid tripId" });
-
-  const tripId = parseInt(req.params.tripId);
-  if (!(await ownsTrip(req.user.id, tripId))) return res.status(404).json({ error: "Trip not found" });
-
+router.get("/", async (req, res) => {
   try {
-    const review = await prisma.tripReview.findUnique({ where: { trip_id: tripId } });
+    const review = await prisma.tripReview.findUnique({ where: { trip_id: req.tripId } });
     res.json({ data: review });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, err, { context: `GET trip-review (trip ${req.tripId})` });
   }
 });
 
@@ -36,7 +28,6 @@ router.get("/", param("tripId").isInt(), async (req, res) => {
 router.post(
   "/",
   [
-    param("tripId").isInt(),
     body("culture_rating").optional({ nullable: true }).isInt({ min: 1, max: 5 }),
     body("food_rating").optional({ nullable: true }).isInt({ min: 1, max: 5 }),
     body("fun_rating").optional({ nullable: true }).isInt({ min: 1, max: 5 }),
@@ -45,9 +36,6 @@ router.post(
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
-
-    const tripId = parseInt(req.params.tripId);
-    if (!(await ownsTrip(req.user.id, tripId))) return res.status(404).json({ error: "Trip not found" });
 
     const {
       culture_rating, culture_note, food_rating, food_note,
@@ -70,13 +58,13 @@ router.post(
 
     try {
       const review = await prisma.tripReview.upsert({
-        where: { trip_id: tripId },
-        create: { user_id: req.user.id, trip_id: tripId, ...data },
+        where: { trip_id: req.tripId },
+        create: { user_id: req.user.id, trip_id: req.tripId, ...data },
         update: data,
       });
       res.status(201).json({ data: review });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      fail(res, err, { context: `POST trip-review (trip ${req.tripId})` });
     }
   }
 );

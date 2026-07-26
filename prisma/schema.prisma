@@ -18,7 +18,7 @@ model User {
   game_times    GameTime[]    @relation("UserGameTimes")
   movie_reviews MovieReview[] @relation("UserMovieReviews")
   oauth         OAuth[]       @relation("UserOauth")
-  wishlists     Wishlist[]    @relation("UserWishlists")
+  wishlists     Wishlist?     @relation("UserWishlists")
   trips         Trip[]        @relation("UserTrips")
   templates     Template[]    @relation("UserTemplates")
   gear_items       GearItem[]             @relation("UserGearItems")
@@ -47,6 +47,7 @@ model GameTime {
   user_rel   User     @relation("UserGameTimes", fields: [user], references: [id])
 
   @@unique([user, game], name: "user_game")
+  @@index([game])
 }
 
 model Movie {
@@ -65,6 +66,7 @@ model MovieReview {
   user_rel  User   @relation("UserMovieReviews", fields: [user], references: [id])
 
   @@unique([user, movie], name: "user_movie")
+  @@index([movie])
 }
 
 model OAuth {
@@ -121,8 +123,9 @@ model Concert {
   bands             ConcertBandReference[] @relation("ConcertBands")
   attendances       ConcertAttendance[]    @relation("ConcertAttendances")
 
-  @@index([concert_date])
+  @@index([city_id])
   @@index([concert_date, latitude, longitude])
+  @@index([concert_date])
 }
 
 model City {
@@ -157,6 +160,7 @@ model ConcertBandReference {
   concert_rel Concert @relation("ConcertBands", fields: [concert], references: [id])
 
   @@unique([concert, band], name: "concert_band")
+  @@index([band])
 }
 
 model Wishlist {
@@ -181,6 +185,8 @@ model ActivityLog {
   data         String   // JSON
   created_at   DateTime @default(now())
   wishlist_rel Wishlist @relation("WishlistActivityLogs", fields: [wishlist_id], references: [id])
+
+  @@index([wishlist_id])
 }
 
 model WishlistBandReference {
@@ -192,6 +198,7 @@ model WishlistBandReference {
   wishlist_rel Wishlist @relation("WishlistBands", fields: [wishlist_id], references: [id])
 
   @@unique([band_id, wishlist_id], name: "band_wishlist")
+  @@index([wishlist_id])
 }
 
 model ConcertAttendance {
@@ -203,6 +210,7 @@ model ConcertAttendance {
   concert_rel  Concert  @relation("ConcertAttendances", fields: [concert_id], references: [id])
 
   @@unique([wishlist_id, concert_id])
+  @@index([concert_id])
 }
 
 // A user's watch for new concerts: by band, by city, or a band-in-a-specific-city combo.
@@ -282,6 +290,8 @@ model Trip {
   reviews        ItemReview[]      @relation("TripItemReviews")
   trip_review    TripReview?
   todos          TripTodo[]
+
+  @@index([user_id])
 }
 
 // Things to do before a trip that aren't gear — book the taxi, print the
@@ -318,6 +328,10 @@ model TripItem {
   gear_item_rel GearItem?     @relation("GearItemTripItems", fields: [gear_item_id], references: [id], onDelete: SetNull)
   bag_rel       GearItem?     @relation("TripItemBag", fields: [bag_id], references: [id], onDelete: SetNull)
   reviews       ItemReview[]  @relation("TripItemReview")
+
+  @@index([bag_id])
+  @@index([gear_item_id])
+  @@index([trip_id])
 }
 
 model ExpenseEstimate {
@@ -333,6 +347,8 @@ model ExpenseEstimate {
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
   trip_rel   Trip     @relation(fields: [trip_id], references: [id], onDelete: Cascade)
+
+  @@index([trip_id])
 }
 
 model Template {
@@ -344,6 +360,8 @@ model Template {
   updated_at  DateTime       @updatedAt
   user_rel    User           @relation("UserTemplates", fields: [user_id], references: [id])
   items       TemplateItem[]
+
+  @@index([user_id])
 }
 
 model TemplateItem {
@@ -356,6 +374,8 @@ model TemplateItem {
   sort_order   Int      @default(0)
   created_at   DateTime @default(now())
   template_rel Template @relation(fields: [template_id], references: [id], onDelete: Cascade)
+
+  @@index([template_id])
 }
 
 model GearItem {
@@ -394,6 +414,9 @@ model GearItem {
   reviews         ItemReview[]   @relation("GearItemReviews")
   replaced_by_rel GearItem?      @relation("GearUpgrade", fields: [replaced_by_id], references: [id], onDelete: SetNull)
   replaces        GearItem[]     @relation("GearUpgrade")
+
+  @@index([replaced_by_id])
+  @@index([user_id])
 }
 
 model ItemReview {
@@ -417,6 +440,8 @@ model ItemReview {
 
   @@unique([trip_id, trip_item_id])
   @@index([gear_item_id])
+  @@index([trip_item_id])
+  @@index([user_id])
 }
 
 model TripReview {
@@ -436,6 +461,8 @@ model TripReview {
   updated_at            DateTime @updatedAt
   user_rel              User     @relation("UserTripReviews", fields: [user_id], references: [id])
   trip_rel              Trip     @relation(fields: [trip_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
 }
 
 model TravelWishlistItem {
@@ -455,6 +482,8 @@ model TravelWishlistItem {
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
   user_rel   User     @relation("UserTravelWishlist", fields: [user_id], references: [id])
+
+  @@index([user_id])
 }
 
 model Loadout {
@@ -467,6 +496,8 @@ model Loadout {
   updated_at     DateTime       @updatedAt
   user_rel       User           @relation("UserLoadouts", fields: [user_id], references: [id])
   entries        LoadoutEntry[]
+
+  @@index([user_id])
 }
 
 model LoadoutEntry {
@@ -481,6 +512,8 @@ model LoadoutEntry {
   bag_rel       GearItem? @relation("LoadoutEntryBag", fields: [bag_id], references: [id], onDelete: SetNull)
 
   @@unique([loadout_id, gear_item_id])
+  @@index([bag_id])
+  @@index([gear_item_id])
 }
 
 enum PackingStatus {

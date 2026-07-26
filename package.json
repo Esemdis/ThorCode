@@ -9,7 +9,10 @@
     "local": "doppler run -- npm start",
     "start": "nodemon index.js",
     "dev": "doppler run -c dev -- npm start",
-    "prd": "doppler run -c prd -- npm start"
+    "prd": "doppler run -c prd -- npm start",
+    "db:migrate": "doppler run -- sh -c 'prisma migrate deploy && prisma generate'",
+    "db:migrate:prd": "doppler run -c prd -- sh -c 'prisma migrate deploy && prisma generate'",
+    "db:pull": "doppler run -- sh -c 'prisma db pull && prisma generate'"
   },
   "author": "",
   "license": "ISC",

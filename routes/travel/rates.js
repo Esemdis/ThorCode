@@ -73,7 +73,11 @@ router.get("/", async (req, res) => {
     // errors, so this can't reject.
     setCache(cacheKey, payload, datePart === "latest" ? LATEST_TTL : HISTORICAL_TTL);
   } catch (err) {
-    res.status(502).json({ error: `Rate lookup failed: ${err.response?.status || err.message}` });
+    // The upstream status is useful to the client; the rest of an axios error
+    // (hosts, connection strings) is not.
+    console.error(`[${new Date().toISOString()}] rate lookup failed`, err);
+    const upstream = err.response?.status;
+    res.status(502).json({ error: upstream ? `Rate lookup failed (upstream ${upstream})` : "Rate lookup failed" });
   }
 });
 

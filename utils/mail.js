@@ -41,19 +41,40 @@ async function sendDigestEmail({ to, items }) {
   });
 }
 
+/**
+ * Send email verification code
+ * @param {string} to - Recipient email
+ * @param {string} code - Verification code to send
+ * @throws {Error} If email sending fails
+ */
 async function sendEmailVerificationCode({ to, code }) {
+  if (!to || !code) {
+    throw new Error('Email and code are required');
+  }
+
   const html = `
     <p>You requested to change your email address. Please use the following verification code to confirm your new email:</p>
     <p style="font-size: 24px; font-weight: bold; letter-spacing: 2px; margin: 20px 0;">${code}</p>
     <p>This code will expire in 15 minutes. If you did not request this change, please ignore this email.</p>
   `;
 
-  await getResend().emails.send({
-    from: process.env.NOTIFICATIONS_FROM_EMAIL,
-    to,
-    subject: "Verify your new email address",
-    html,
-  });
+  try {
+    const result = await getResend().emails.send({
+      from: process.env.NOTIFICATIONS_FROM_EMAIL,
+      to,
+      subject: "Verify your new email address",
+      html,
+    });
+
+    if (result.error) {
+      throw new Error(`Email service error: ${result.error.message}`);
+    }
+
+    return result;
+  } catch (error) {
+    console.error('Failed to send email verification code:', error);
+    throw error;
+  }
 }
 
 module.exports = { sendDigestEmail, sendEmailVerificationCode };

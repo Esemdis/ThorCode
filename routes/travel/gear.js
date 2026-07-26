@@ -5,6 +5,7 @@ const { body, param, validationResult } = require("express-validator");
 const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
+const { fail, paginate, sendList } = require("../../utils/apiResponse");
 const { recomputeGearReviewStatus } = require("../../utils/reviewStatus");
 
 router.use(auth);
@@ -58,66 +59,69 @@ router.get("/usage-stats", async (req, res) => {
 
     res.json({ data: stats });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, err, { context: "GET gear usage-stats" });
   }
 });
 
 // GET /travel/gear — list all gear items with trip count
 router.get("/", async (req, res) => {
+  const { take, skip } = paginate(req, { defaultLimit: 250, maxLimit: 500 });
   try {
-    const gear = await prisma.gearItem.findMany({
-      where: { user_id: req.user.id },
-      include: {
-        _count: { select: { trip_items: true, loadout_entries: true } },
-        loadout_entries: { select: { loadout_rel: { select: { id: true, name: true } } } },
-        replaced_by_rel: { select: { id: true, name: true, brand: true, model: true } },
-      },
-      orderBy: [{ category: "asc" }, { brand: "asc" }, { name: "asc" }],
-    });
-    res.json({ data: gear });
+    const where = { user_id: req.user.id };
+    const [gear, total] = await Promise.all([
+      prisma.gearItem.findMany({
+        where,
+        include: {
+          _count: { select: { trip_items: true, loadout_entries: true } },
+          loadout_entries: { select: { loadout_rel: { select: { id: true, name: true } } } },
+          replaced_by_rel: { select: { id: true, name: true, brand: true, model: true } },
+        },
+        orderBy: [{ category: "asc" }, { brand: "asc" }, { name: "asc" }],
+        take,
+        skip,
+      }),
+      prisma.gearItem.count({ where }),
+    ]);
+    sendList(res, gear, { total, take, skip });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, err, { context: "GET gear" });
   }
 });
 
 // POST /travel/gear — create gear item
-router.post(
-  "/",
-  [body("name").notEmpty().trim()],
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+router.post("/", body("name").notEmpty().trim(), async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-    const { name, model, brand, category, dimensions, tags, notes, url, worn, photo, retail_price, bought_for, currency, fill_level, price_irrelevant } = req.body;
-    const photoError = invalidPhoto(photo);
-    if (photoError) return res.status(400).json({ error: photoError });
-    try {
-      const item = await prisma.gearItem.create({
-        data: {
-          user_id: req.user.id,
-          photo: photo || null,
-          name: name.trim(),
-          model: model?.trim() || null,
-          brand: brand?.trim() || null,
-          category: category?.trim() || null,
-          dimensions: dimensions ?? null,
-          tags: Array.isArray(tags) ? tags.map((t) => t.trim()).filter(Boolean) : [],
-          notes: notes?.trim() || null,
-          url: url?.trim() || null,
-          worn: Boolean(worn),
-          retail_price: retail_price != null && retail_price !== "" ? parseFloat(retail_price) : null,
-          bought_for: bought_for != null && bought_for !== "" ? parseFloat(bought_for) : null,
-          currency: currency?.trim().toUpperCase() || "SEK",
-          fill_level: fill_level != null && fill_level !== "" ? Math.max(0, Math.min(100, parseInt(fill_level, 10))) : null,
-          price_irrelevant: Boolean(price_irrelevant),
-        },
-      });
-      res.status(201).json({ data: item });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
+  const { name, model, brand, category, dimensions, tags, notes, url, worn, photo, retail_price, bought_for, currency, fill_level, price_irrelevant } = req.body;
+  const photoError = invalidPhoto(photo);
+  if (photoError) return res.status(400).json({ error: photoError });
+  try {
+    const item = await prisma.gearItem.create({
+      data: {
+        user_id: req.user.id,
+        photo: photo || null,
+        name: name.trim(),
+        model: model?.trim() || null,
+        brand: brand?.trim() || null,
+        category: category?.trim() || null,
+        dimensions: dimensions ?? null,
+        tags: Array.isArray(tags) ? tags.map((t) => t.trim()).filter(Boolean) : [],
+        notes: notes?.trim() || null,
+        url: url?.trim() || null,
+        worn: Boolean(worn),
+        retail_price: retail_price != null && retail_price !== "" ? parseFloat(retail_price) : null,
+        bought_for: bought_for != null && bought_for !== "" ? parseFloat(bought_for) : null,
+        currency: currency?.trim().toUpperCase() || "SEK",
+        fill_level: fill_level != null && fill_level !== "" ? Math.max(0, Math.min(100, parseInt(fill_level, 10))) : null,
+        price_irrelevant: Boolean(price_irrelevant),
+      },
+    });
+    res.status(201).json({ data: item });
+  } catch (err) {
+    fail(res, err, { context: "POST gear" });
   }
-);
+});
 
 // GET /travel/gear/:id — get gear item with trip history
 router.get("/:id", param("id").isInt(), async (req, res) => {
@@ -141,7 +145,7 @@ router.get("/:id", param("id").isInt(), async (req, res) => {
     if (!item) return res.status(404).json({ error: "Gear item not found" });
     res.json({ data: item });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, err, { context: `GET gear ${req.params.id}` });
   }
 });
 
@@ -182,16 +186,20 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const SYNCED_FIELDS = ["name", "model", "brand", "category", "dimensions", "tags", "notes", "url", "photo", "retail_price", "bought_for", "currency", "price_irrelevant"];
 
   try {
-    const existing = await prisma.gearItem.findFirst({
-      where: { id: parseInt(req.params.id), user_id: req.user.id },
-    });
-    if (!existing) return res.status(404).json({ error: "Gear item not found" });
-
     const syncData = {};
     for (const f of SYNCED_FIELDS) if (f in data) syncData[f] = data[f];
 
     let item;
     if (Object.keys(syncData).length > 0) {
+      // Renaming a copy renames every copy of the same product, which means the
+      // siblings have to be found by the identity the row had *before* this
+      // update — hence the read. It doubles as the ownership check.
+      const existing = await prisma.gearItem.findFirst({
+        where: { id: parseInt(req.params.id, 10), user_id: req.user.id },
+        select: { id: true, name: true, brand: true, model: true },
+      });
+      if (!existing) return res.status(404).json({ error: "Gear item not found" });
+
       const [updated] = await prisma.$transaction([
         prisma.gearItem.update({ where: { id: existing.id }, data }),
         prisma.gearItem.updateMany({
@@ -201,12 +209,15 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
       ]);
       item = updated;
     } else {
-      item = await prisma.gearItem.update({ where: { id: existing.id }, data });
+      item = await prisma.gearItem.update({
+        where: { id: parseInt(req.params.id, 10), user_id: req.user.id },
+        data,
+      });
     }
     if (essential !== undefined) item = await recomputeGearReviewStatus(item.id);
     res.json({ data: item });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, err, { context: `PATCH gear ${req.params.id}`, notFound: "Gear item not found" });
   }
 });
 
@@ -216,15 +227,12 @@ router.delete("/:id", param("id").isInt(), async (req, res) => {
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
   try {
-    const existing = await prisma.gearItem.findFirst({
-      where: { id: parseInt(req.params.id), user_id: req.user.id },
+    await prisma.gearItem.delete({
+      where: { id: parseInt(req.params.id, 10), user_id: req.user.id },
     });
-    if (!existing) return res.status(404).json({ error: "Gear item not found" });
-
-    await prisma.gearItem.delete({ where: { id: parseInt(req.params.id) } });
     res.json({ message: "Gear item deleted" });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, err, { context: `DELETE gear ${req.params.id}`, notFound: "Gear item not found" });
   }
 });
 
