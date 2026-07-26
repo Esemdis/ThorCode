@@ -267,6 +267,23 @@ model Trip {
   estimates      ExpenseEstimate[]
   reviews        ItemReview[]      @relation("TripItemReviews")
   trip_review    TripReview?
+  todos          TripTodo[]
+}
+
+// Things to do before a trip that aren't gear — book the taxi, print the
+// tickets, refill the water filter. Owned through the trip, so deleting a trip
+// takes its list with it.
+model TripTodo {
+  id         Int      @id @default(autoincrement())
+  trip_id    Int
+  text       String   @db.VarChar(300)
+  done       Boolean  @default(false)
+  sort_order Int      @default(0)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+  trip_rel   Trip     @relation(fields: [trip_id], references: [id], onDelete: Cascade)
+
+  @@index([trip_id])
 }
 
 model TripItem {

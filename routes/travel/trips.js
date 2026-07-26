@@ -82,8 +82,11 @@ router.get("/", async (req, res) => {
       orderBy: [{ start_date: "asc" }, { created_at: "desc" }],
       include: {
         items: {
-          include: { gear_item_rel: { select: { dimensions: true, review_status: true } } },
+          // id/name/fill_level feed the refill tasks on the to-do page, which
+          // works off this list rather than fetching each trip in full.
+          include: { gear_item_rel: { select: { id: true, name: true, fill_level: true, dimensions: true, review_status: true } } },
         },
+        todos: { orderBy: [{ done: "asc" }, { sort_order: "asc" }, { created_at: "asc" }] },
         estimates: { select: { amount: true, currency: true, category: true } },
         reviews: { select: { trip_item_id: true } },
         trip_review: {
@@ -156,6 +159,7 @@ router.get("/:id", param("id").isInt(), async (req, res) => {
         estimates: { orderBy: [{ sort_order: "asc" }, { created_at: "asc" }] },
         reviews: { orderBy: { created_at: "asc" } },
         trip_review: true,
+        todos: { orderBy: [{ done: "asc" }, { sort_order: "asc" }, { created_at: "asc" }] },
       },
     });
     if (!trip) return res.status(404).json({ error: "Trip not found" });

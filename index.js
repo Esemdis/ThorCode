@@ -19,6 +19,7 @@ app.use("/data/tmdb", require("./routes/data/tmdb"));
 app.use("/oauth/tmdb", require("./routes/oauth/tmdb"));
 app.use("/travel/trips", require("./routes/travel/trips"));
 app.use("/travel/trips/:tripId/items", require("./routes/travel/tripItems"));
+app.use("/travel/trips/:tripId/todos", require("./routes/travel/tripTodos"));
 app.use("/travel/trips/:tripId/estimates", require("./routes/travel/estimates"));
 app.use("/travel/trips/:tripId/reviews", require("./routes/travel/reviews"));
 app.use("/travel/trips/:tripId/trip-review", require("./routes/travel/tripReview"));
