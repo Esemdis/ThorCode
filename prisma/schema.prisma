@@ -27,6 +27,7 @@ model User {
   item_reviews     ItemReview[]           @relation("UserItemReviews")
   trip_reviews     TripReview[]           @relation("UserTripReviews")
   notification_subscriptions NotificationSubscription[] @relation("UserNotificationSubscriptions")
+  email_verifications EmailVerification[] @relation("UserEmailVerifications")
 }
 
 model Game {
@@ -225,6 +226,19 @@ model NotificationSubscription {
 model NotificationDigestRun {
   id          Int      @id @default(autoincrement())
   last_run_at DateTime @default(now())
+}
+
+// Email verification codes for email change requests
+model EmailVerification {
+  id        Int      @id @default(autoincrement())
+  user_id   String
+  new_email String
+  code      String   @unique
+  expires_at DateTime
+  created_at DateTime @default(now())
+  user_rel  User     @relation("UserEmailVerifications", fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
 }
 
 enum Role {

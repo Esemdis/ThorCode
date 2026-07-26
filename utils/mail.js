@@ -41,4 +41,19 @@ async function sendDigestEmail({ to, items }) {
   });
 }
 
-module.exports = { sendDigestEmail };
+async function sendEmailVerificationCode({ to, code }) {
+  const html = `
+    <p>You requested to change your email address. Please use the following verification code to confirm your new email:</p>
+    <p style="font-size: 24px; font-weight: bold; letter-spacing: 2px; margin: 20px 0;">${code}</p>
+    <p>This code will expire in 15 minutes. If you did not request this change, please ignore this email.</p>
+  `;
+
+  await getResend().emails.send({
+    from: process.env.NOTIFICATIONS_FROM_EMAIL,
+    to,
+    subject: "Verify your new email address",
+    html,
+  });
+}
+
+module.exports = { sendDigestEmail, sendEmailVerificationCode };

@@ -14,6 +14,7 @@ const { paginationValidation } = require('../utils/validation/pagination');
 const { rateLimiter } = require('../utils/rateLimiter');
 const prisma = require('../prisma/client');
 const signJWT = require('../auth/signJWT');
+const { sendEmailVerificationCode } = require('../utils/mail');
 
 // Defaults to 5 requests per 15 minutes per IP
 const rateLimit = rateLimiter({
@@ -315,5 +316,106 @@ router.get(
     }
   },
 );
+
+router.post('/email/request-change', auth, upload.none(), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { newEmail } = req.body;
+
+    if (!newEmail || typeof newEmail !== 'string') {
+      return res.status(400).json({ error: 'New email is required' });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(newEmail)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+
+    // Check if email is already in use
+    const existingUser = await prisma.user.findUnique({
+      where: { email: newEmail },
+    });
+    if (existingUser) {
+      return res.status(409).json({ error: 'Email already in use' });
+    }
+
+    // Generate a 6-digit verification code
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    // Delete any existing pending verification for this user
+    await prisma.emailVerification.deleteMany({
+      where: { user_id: userId },
+    });
+
+    // Create new verification record
+    await prisma.emailVerification.create({
+      data: {
+        user_id: userId,
+        new_email: newEmail,
+        code,
+        expires_at: expiresAt,
+      },
+    });
+
+    // Send verification code to the new email
+    await sendEmailVerificationCode({ to: newEmail, code });
+
+    res.status(200).json({ message: 'Verification code sent to new email' });
+  } catch (error) {
+    console.error('Error requesting email change:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/email/verify-code', auth, upload.none(), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { code } = req.body;
+
+    if (!code || typeof code !== 'string') {
+      return res.status(400).json({ error: 'Verification code is required' });
+    }
+
+    // Find the verification record
+    const verification = await prisma.emailVerification.findUnique({
+      where: { code },
+    });
+
+    if (!verification) {
+      return res.status(400).json({ error: 'Invalid verification code' });
+    }
+
+    // Check if it belongs to the current user
+    if (verification.user_id !== userId) {
+      return res.status(403).json({ error: 'Verification code does not match your account' });
+    }
+
+    // Check if code has expired
+    if (new Date() > verification.expires_at) {
+      await prisma.emailVerification.delete({
+        where: { id: verification.id },
+      });
+      return res.status(400).json({ error: 'Verification code has expired' });
+    }
+
+    // Update user email
+    const user = await prisma.user.update({
+      where: { id: userId },
+      data: { email: verification.new_email },
+      select: { id: true, email: true },
+    });
+
+    // Delete the verification record
+    await prisma.emailVerification.delete({
+      where: { id: verification.id },
+    });
+
+    res.status(200).json({ message: 'Email updated successfully', user });
+  } catch (error) {
+    console.error('Error verifying email code:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 module.exports = router;
