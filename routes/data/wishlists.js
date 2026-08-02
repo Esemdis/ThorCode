@@ -1056,7 +1056,6 @@ router.post(
         update: {},
       });
 
-      triggerScoreRecompute(wishlistId);
       res.json({ attendance_id: attendance.id });
     } catch (error) {
       console.error("Error adding attendance:", error);
@@ -1096,7 +1095,6 @@ router.delete(
 
       await prisma.concertAttendance.delete({ where: { id: attendance.id } });
 
-      triggerScoreRecompute(wishlistId);
       res.json({ deleted: true });
     } catch (error) {
       console.error("Error removing attendance:", error);
@@ -1175,7 +1173,6 @@ router.post(
         update: {},
       });
 
-      triggerScoreRecompute(wishlistId);
       res.json({ concert_id: concert.id, attendance_id: attendance.id });
 
       // Background: find other bands at the same show via Setlist.fm and link any that exist in the DB

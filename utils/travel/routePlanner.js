@@ -1,0 +1,101 @@
+/**
+ * Client for the route-planner service.
+ *
+ * Kept out of the routes because both endpoints need the same base URL, the
+ * same optional bearer token and the same "the solver being down is not a 500
+ * from us" handling, and because trips.js already shows what happens when a
+ * service call is inlined: the URL is read from the environment in six places.
+ */
+
+const axios = require("axios");
+
+// A solve is synchronous and CPU-bound. It waits on the OSRM matrix, then
+// optionally on a transit matrix (one call per place), then burns its whole
+// search time limit — so three minutes is a real ceiling and not a guess.
+const SOLVE_TIMEOUT_MS = 180_000;
+const GEOCODE_TIMEOUT_MS = 20_000;
+
+const baseUrl = () => (process.env.ROUTE_PLANNER_URL || "").replace(/\/$/, "");
+
+function headers() {
+  const token = process.env.ROUTE_PLANNER_TOKEN;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+class RoutePlannerError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "RoutePlannerError";
+    this.status = status;
+  }
+}
+
+/**
+ * Wrap a failed call in something a route can turn into an honest status.
+ *
+ * A 422 from the solver is the user's trip being unplannable and their message
+ * is worth reading, so it comes back as a 422. Anything else — refused
+ * connection, timeout, a 500 — is our infrastructure and becomes a 503: the
+ * trip is fine, the service is not, and trying again later is the right advice.
+ */
+function wrap(err, what) {
+  const status = err?.response?.status;
+  const detail = err?.response?.data?.detail;
+  if (status === 422 && detail) {
+    return new RoutePlannerError(detail, 422);
+  }
+  console.error(`[${new Date().toISOString()}] route-planner ${what} failed`, err?.message || err);
+  return new RoutePlannerError("The route planner is unavailable — try again shortly", 503);
+}
+
+function assertConfigured() {
+  if (!baseUrl()) {
+    // Named rather than defaulted to localhost: a default would turn a
+    // misconfigured deploy into a connection refused ten minutes later instead
+    // of a sentence saying what is missing.
+    throw new RoutePlannerError(
+      "ROUTE_PLANNER_URL is not set — put it in .env for local work, or in Doppler for a deploy",
+      503
+    );
+  }
+}
+
+/** Solve a trip. Takes the body from buildPlanRequest, returns the plan. */
+async function solve(request) {
+  assertConfigured();
+  try {
+    const { data } = await axios.post(`${baseUrl()}/plan`, request, {
+      timeout: SOLVE_TIMEOUT_MS,
+      headers: headers(),
+    });
+    return data;
+  } catch (err) {
+    throw wrap(err, "solve");
+  }
+}
+
+/**
+ * Resolve a place to coordinates. Returns null when nothing was found.
+ *
+ * Null is not an error here: a place that could not be located is still worth
+ * saving. The solver reports it in `dropped` and the user can paste a map link
+ * later, which is the one method that always works.
+ */
+async function geocode(query, near = null) {
+  assertConfigured();
+  try {
+    const { data } = await axios.post(
+      `${baseUrl()}/geocode`,
+      { query, near },
+      { timeout: GEOCODE_TIMEOUT_MS, headers: headers() }
+    );
+    return data || null;
+  } catch (err) {
+    // Deliberately swallowed. Saving a place must not depend on a geocoder
+    // being up; null coordinates are a supported state all the way through.
+    console.error(`[${new Date().toISOString()}] geocode "${query}" failed`, err?.message || err);
+    return null;
+  }
+}
+
+module.exports = { solve, geocode, RoutePlannerError, SOLVE_TIMEOUT_MS };
