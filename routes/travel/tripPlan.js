@@ -88,6 +88,42 @@ router.post("/", async (req, res) => {
   }
 });
 
+// POST /travel/trips/:tripId/plan/explain/:placeId — what would it take to fit
+// this one in? Solves twice, so it is asked about one place and never a list.
+router.post("/explain/:placeId", async (req, res) => {
+  // Express hands parameters over as strings and the solver matches ids by
+  // identity, so this conversion is the whole difference between an answer and
+  // a confident "already in the plan" about a place that was left out.
+  const placeId = Number(req.params.placeId);
+  try {
+    const [trip, places] = await Promise.all([
+      prisma.trip.findUnique({
+        where: { id: req.tripId },
+        select: { start_date: true, end_date: true, weather_data: true },
+      }),
+      prisma.tripPlace.findMany({
+        where: { trip_id: req.tripId },
+        orderBy: [{ sort_order: "asc" }, { created_at: "asc" }],
+      }),
+    ]);
+
+    if (!places.some((p) => p.id === placeId)) {
+      return res.status(404).json({ error: "Place not found" });
+    }
+
+    // Built from the places as they are now, not from the saved plan. An
+    // explanation of a plan whose places have since changed would be answering
+    // a question nobody asked.
+    const request = buildPlanRequest(trip, places, req.body || {});
+    res.json({ data: await routePlanner.explain(request, placeId) });
+  } catch (err) {
+    if (err instanceof PlanInputError || err instanceof routePlanner.RoutePlannerError) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    fail(res, err, { context: `POST plan explain (trip ${req.tripId}, place ${placeId})` });
+  }
+});
+
 // DELETE /travel/trips/:tripId/plan — throw the plan away, keep the places
 router.delete("/", async (req, res) => {
   try {

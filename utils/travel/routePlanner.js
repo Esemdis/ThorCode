@@ -13,6 +13,11 @@ const axios = require("axios");
 // optionally on a transit matrix (one call per place), then burns its whole
 // search time limit — so three minutes is a real ceiling and not a guess.
 const SOLVE_TIMEOUT_MS = 180_000;
+// Explaining a drop is two solves against one shared matrix, so it is one extra
+// search on top of a solve rather than twice the work — but the ceiling has to
+// cover it or the answer times out precisely on the crowded trips that make
+// anyone ask the question.
+const EXPLAIN_TIMEOUT_MS = 240_000;
 const GEOCODE_TIMEOUT_MS = 20_000;
 
 const baseUrl = () => (process.env.ROUTE_PLANNER_URL || "").replace(/\/$/, "");
@@ -75,6 +80,32 @@ async function solve(request) {
 }
 
 /**
+ * Ask what it would take to fit one dropped place in.
+ *
+ * `placeId` must be the number the place actually has. The solver matches ids
+ * by identity and refuses a mismatched type rather than answering, because "12"
+ * against a place numbered 12 matches nothing and would come back as the
+ * confident, wrong answer "already in the plan" — and Express hands every route
+ * parameter over as a string.
+ */
+async function explain(request, placeId) {
+  assertConfigured();
+  if (!Number.isInteger(placeId)) {
+    throw new RoutePlannerError("A place id is required", 400);
+  }
+  try {
+    const { data } = await axios.post(
+      `${baseUrl()}/explain`,
+      { ...request, place_id: placeId },
+      { timeout: EXPLAIN_TIMEOUT_MS, headers: headers() }
+    );
+    return data;
+  } catch (err) {
+    throw wrap(err, "explain");
+  }
+}
+
+/**
  * Resolve a place to coordinates. Returns null when nothing was found.
  *
  * Null is not an error here: a place that could not be located is still worth
@@ -98,4 +129,4 @@ async function geocode(query, near = null) {
   }
 }
 
-module.exports = { solve, geocode, RoutePlannerError, SOLVE_TIMEOUT_MS };
+module.exports = { solve, explain, geocode, RoutePlannerError, SOLVE_TIMEOUT_MS };

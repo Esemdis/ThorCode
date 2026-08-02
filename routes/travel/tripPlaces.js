@@ -8,7 +8,12 @@ const ownsTrip = require("../../middlewares/ownsTrip");
 const prisma = require("../../prisma/client");
 const { fail } = require("../../utils/apiResponse");
 const { normalisePlaceInput } = require("../../utils/travel/placeInput");
+const { parseBulkPlaces, MAX_PLACES } = require("../../utils/travel/bulkPlaces");
 const routePlanner = require("../../utils/travel/routePlanner");
+
+// Mirrors the PlaceKind enum in schema.prisma. Prisma rejects an unknown value
+// anyway, but with a 500 rather than a sentence saying which values are allowed.
+const PLACE_KINDS = ["SIGHT", "FOOD", "HOTEL"];
 
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
@@ -72,6 +77,104 @@ router.post("/", async (req, res) => {
     res.status(201).json({ data: place });
   } catch (err) {
     fail(res, err, { context: `POST place (trip ${req.tripId})` });
+  }
+});
+
+/**
+ * Fill in coordinates for freshly created places, after the response has gone.
+ *
+ * Geocoding is serialised behind a one-per-second lock on the far side, so
+ * thirty places is thirty seconds — far too long to hold a request open, and
+ * pointless to wait for besides: a place with no coordinates yet is a supported
+ * state everywhere downstream, and the client is already able to show it.
+ *
+ * Deliberately not a job queue. If the process restarts halfway through, the
+ * rows that never resolved look exactly like the ones a geocoder failed on, and
+ * the per-place "find it" button that already exists is the fix for both.
+ */
+async function locateLater(places, near, tripId) {
+  for (const place of places) {
+    try {
+      const found = await locate(place, near);
+      if (found.lat == null) continue;
+      // updateMany, not update: the trip or the place may have been deleted
+      // while this was running, and a background task must not throw about it.
+      await prisma.tripPlace.updateMany({
+        where: { id: place.id, trip_id: tripId },
+        data: found,
+      });
+    } catch (err) {
+      console.error(
+        `[${new Date().toISOString()}] background locate failed for place ${place.id}`,
+        err?.message || err
+      );
+    }
+  }
+}
+
+// POST /travel/trips/:tripId/places/bulk — paste a list, get places.
+// Before /:placeId for the same reason as /reorder.
+router.post("/bulk", async (req, res) => {
+  const { text, kind, near } = req.body || {};
+  if (typeof text !== "string" || !text.trim()) {
+    return res.status(400).json({ error: "Paste a list of places, one per line" });
+  }
+  if (kind && !PLACE_KINDS.includes(kind)) {
+    return res.status(400).json({ error: "Unknown kind" });
+  }
+
+  try {
+    const existing = await prisma.tripPlace.findMany({
+      where: { trip_id: req.tripId },
+      select: { name: true, sort_order: true },
+    });
+
+    const { places, skipped } = parseBulkPlaces(text, {
+      existing: existing.map((p) => p.name),
+      max: Math.max(0, MAX_PLACES - existing.length),
+    });
+    if (places.length === 0) {
+      return res.status(400).json({
+        error: skipped.some((s) => s.reason === "duplicate")
+          ? "Every place on that list is already on the trip"
+          : "Nothing on that list looked like a place",
+        meta: { skipped },
+      });
+    }
+
+    // Appended after whatever is already there, in the order they were pasted —
+    // which is usually the order someone means to do them in.
+    const from = Math.max(0, ...existing.map((p) => p.sort_order ?? 0)) + 1;
+    await prisma.tripPlace.createMany({
+      data: places.map((place, i) => ({
+        ...place,
+        kind: kind || "SIGHT",
+        trip_id: req.tripId,
+        sort_order: from + i,
+      })),
+    });
+
+    // Read back rather than trusting createMany's count: the rows need their
+    // ids for the background locate, and createMany does not return them.
+    const created = await prisma.tripPlace.findMany({
+      where: { trip_id: req.tripId, sort_order: { gte: from } },
+      orderBy: { sort_order: "asc" },
+    });
+
+    res.status(201).json({
+      data: created,
+      meta: { created: created.length, skipped, locating: created.length },
+    });
+
+    // After the response, and not awaited. The catch is required rather than
+    // tidy: an unhandled rejection here would take the process down.
+    locateLater(
+      created.filter((p) => p.lat == null),
+      Array.isArray(near) ? { lat: near[0], lon: near[1] } : null,
+      req.tripId
+    ).catch(() => {});
+  } catch (err) {
+    fail(res, err, { context: `POST places bulk (trip ${req.tripId})` });
   }
 });
 
