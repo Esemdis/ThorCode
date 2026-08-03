@@ -407,18 +407,26 @@ model TripItem {
 }
 
 model ExpenseEstimate {
-  id         Int       @id @default(autoincrement())
-  trip_id    Int
-  category   String    @db.VarChar(100)
-  amount     Decimal   @db.Decimal(10, 2)
-  currency   String    @default("SEK") @db.VarChar(3)
-  date       DateTime? @db.Date
-  end_date   DateTime? @db.Date
-  note       String?   @db.Text
-  sort_order Int       @default(0)
-  created_at DateTime  @default(now())
-  updated_at DateTime  @updatedAt
-  trip_rel   Trip      @relation(fields: [trip_id], references: [id], onDelete: Cascade)
+  id               Int       @id @default(autoincrement())
+  trip_id          Int
+  category         String    @db.VarChar(100)
+  amount           Decimal   @db.Decimal(10, 2)
+  currency         String    @default("SEK") @db.VarChar(3)
+  date             DateTime? @db.Date
+  end_date         DateTime? @db.Date
+  // A paragraph about the place from Wikipedia, with the article it came from.
+  // Cached rather than fetched on view: it does not change, and Wikipedia asks
+  // for politeness. `blurb_checked_at` records that we *looked* — most places
+  // have no article and never will, and without it every load re-asks about the
+  // same neighbourhood restaurant forever.
+  blurb            String?   @db.Text
+  blurb_url        String?   @db.VarChar(500)
+  blurb_checked_at DateTime?
+  note             String?   @db.Text
+  sort_order       Int       @default(0)
+  created_at       DateTime  @default(now())
+  updated_at       DateTime  @updatedAt
+  trip_rel         Trip      @relation(fields: [trip_id], references: [id], onDelete: Cascade)
 
   @@index([trip_id])
 }

@@ -9,6 +9,7 @@ const prisma = require("../../prisma/client");
 const { fail } = require("../../utils/apiResponse");
 const { normalisePlaceInput } = require("../../utils/travel/placeInput");
 const { parseBulkPlaces, MAX_PLACES } = require("../../utils/travel/bulkPlaces");
+const { wikipediaLanguages } = require("../../utils/travel/language");
 const routePlanner = require("../../utils/travel/routePlanner");
 
 // Mirrors the PlaceKind enum in schema.prisma. Prisma rejects an unknown value
@@ -144,6 +145,70 @@ async function locateLater(places, anchor, tripId) {
     }
   }
 }
+
+/**
+ * Fill in Wikipedia descriptions, after the response has gone.
+ *
+ * Same shape as the background geocode, for the same reason: Wikipedia is
+ * queried one place a second out of politeness, so thirty sights is half a
+ * minute nobody should sit through.
+ *
+ * `blurb_checked_at` is written whether or not anything was found. Most places
+ * have no article and never will, and without a record that we looked, every
+ * press of the button asks about the same neighbourhood restaurant again.
+ */
+async function describeLater(places, languages, tripId) {
+  for (const place of places) {
+    try {
+      const found = await routePlanner.describe(place.name, place.lat, place.lon, languages);
+      await prisma.tripPlace.updateMany({
+        where: { id: place.id, trip_id: tripId },
+        data: {
+          blurb: found?.extract ?? null,
+          blurb_url: found?.url ?? null,
+          blurb_checked_at: new Date(),
+        },
+      });
+    } catch (err) {
+      console.error(
+        `[${new Date().toISOString()}] background describe failed for place ${place.id}`,
+        err?.message || err
+      );
+    }
+  }
+}
+
+// POST /travel/trips/:tripId/places/describe — fetch descriptions for the
+// sights that do not have one yet. Answers immediately; the work runs after.
+router.post("/describe", async (req, res) => {
+  try {
+    const trip = await prisma.trip.findUnique({
+      where: { id: req.tripId },
+      select: { destination: true },
+    });
+
+    const todo = await prisma.tripPlace.findMany({
+      where: {
+        trip_id: req.tripId,
+        // Sights only. A hotel and a restaurant are places you go, not places
+        // there is anything to read about, and asking wastes a second each.
+        kind: "SIGHT",
+        lat: { not: null },
+        // Never looked. A place we looked at and found nothing for is not
+        // retried — `blurb_checked_at` is the record of having asked. Passing
+        // `refresh` re-asks everything, for when an article has since appeared.
+        ...(req.body?.refresh ? {} : { blurb_checked_at: null }),
+      },
+      select: { id: true, name: true, lat: true, lon: true },
+    });
+
+    res.json({ data: { looking_up: todo.length } });
+
+    describeLater(todo, wikipediaLanguages(trip?.destination), req.tripId).catch(() => {});
+  } catch (err) {
+    fail(res, err, { context: `POST places describe (trip ${req.tripId})` });
+  }
+});
 
 // POST /travel/trips/:tripId/places/search — candidates for an address.
 // Writes nothing; the client picks one and sends the coordinates back.

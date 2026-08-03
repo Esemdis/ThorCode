@@ -106,6 +106,27 @@ async function explain(request, placeId) {
 }
 
 /**
+ * A paragraph about a place, from Wikipedia. Null when there is no article.
+ *
+ * Swallowed like geocode rather than thrown like search: a missing description
+ * is the normal case for most places, and it must never stop a batch.
+ */
+async function describe(name, lat, lon, languages = ["en"]) {
+  assertConfigured();
+  try {
+    const { data } = await axios.post(
+      `${baseUrl()}/describe`,
+      { name, lat, lon, languages },
+      { timeout: GEOCODE_TIMEOUT_MS, headers: headers() }
+    );
+    return data || null;
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] describe "${name}" failed`, err?.message || err);
+    return null;
+  }
+}
+
+/**
  * Resolve a place to coordinates. Returns null when nothing was found.
  *
  * Null is not an error here: a place that could not be located is still worth
@@ -154,5 +175,5 @@ async function searchPlaces(query, { near = null, context = null, limit = 6 } = 
 }
 
 module.exports = {
-  solve, explain, geocode, searchPlaces, RoutePlannerError, SOLVE_TIMEOUT_MS,
+  solve, explain, geocode, describe, searchPlaces, RoutePlannerError, SOLVE_TIMEOUT_MS,
 };
