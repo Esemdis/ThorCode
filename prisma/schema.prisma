@@ -282,11 +282,6 @@ model Trip {
   weather_updated_at   DateTime?
   exchange_rates       Json?
   tags                 String[]
-  // The last day plan the solver returned, stored whole. Not normalised into
-  // rows: it is one immutable answer to one question, always read in full and
-  // always replaced in full, and the shape belongs to route-planner rather than
-  // to this schema. Null means "never planned", which the UI shows differently
-  // from an empty plan.
   // When you land and when you fly out, as minutes since midnight on the first
   // and last day. Without them the planner offers a 09:00 museum on a day you
   // arrive at 14:00, which is worse than no plan for that day at all.
@@ -300,6 +295,15 @@ model Trip {
   // find.
   arrival_place_id     Int?
   departure_place_id   Int?
+  // How long it takes to get between a terminal and the city, by whatever means
+  // people actually use. Nobody walks out of an airport, and routing one the
+  // same way as a museum produced a five-and-a-half hour walk from CDG.
+  transfer_minutes     Int?
+  // The last day plan the solver returned, stored whole. Not normalised into
+  // rows: it is one immutable answer to one question, always read in full and
+  // always replaced in full, and the shape belongs to route-planner rather than
+  // to this schema. Null means "never planned", which the UI shows differently
+  // from an empty plan.
   plan_data            Json?
   plan_updated_at      DateTime?
   created_at           DateTime          @default(now())
