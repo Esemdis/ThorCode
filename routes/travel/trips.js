@@ -202,7 +202,8 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
 
   const { name, destination, start_date, end_date, notes, weight_budget, money_budget, currency,
           budget_flights, budget_hotel, budget_entertainment, budget_food, exchange_rates, tags,
-          arrival_time, departure_time, arrival_place_id, departure_place_id } = req.body;
+          arrival_time, departure_time, arrival_place_id, departure_place_id,
+          transfer_minutes } = req.body;
   const data = {};
 
   // Minutes since midnight, and a day is 1440 of them. Out of range means a
@@ -220,6 +221,16 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
       return res.status(400).json({ error: `${field} must be minutes since midnight, 0 to 1439` });
     }
     data[field] = parsed;
+  }
+  if (transfer_minutes !== undefined) {
+    const n = transfer_minutes == null || transfer_minutes === ""
+      ? null : parseInt(transfer_minutes, 10);
+    // A whole day of transfer is a typo, not a journey, and would eat the
+    // first and last day of the trip without saying why.
+    if (n !== null && (!Number.isInteger(n) || n < 0 || n > 720)) {
+      return res.status(400).json({ error: "transfer_minutes must be 0 to 720" });
+    }
+    data.transfer_minutes = n;
   }
   for (const [field, value] of [["arrival_place_id", arrival_place_id],
                                 ["departure_place_id", departure_place_id]]) {

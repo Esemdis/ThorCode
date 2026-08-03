@@ -314,6 +314,10 @@ function buildPlanRequest(trip, places = [], options = {}) {
     // Filtered to ids actually on the trip, because a forced id that matches
     // nothing is silently ignored by the solver and would look like the button
     // simply not working.
+    // Only sent when a terminal is actually set: without one there is no leg
+    // for it to price, and it would read as a setting that does nothing.
+    ...((arrivalPlace != null || departurePlace != null)
+      && trip?.transfer_minutes != null && { transfer_minutes: trip.transfer_minutes }),
     ...(Array.isArray(options.force) && options.force.length > 0 && {
       force: options.force
         .map(Number)
