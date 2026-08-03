@@ -281,3 +281,35 @@ describe("overruling the opening hours", () => {
     expect("ignore_hours" in toPlace(sight())).toBe(false);
   });
 });
+
+describe("keeping a place the solver wanted to drop", () => {
+  const trip = { start_date: "2026-09-14", end_date: "2026-09-15" };
+  const places = [
+    { id: 1, name: "Hotel", kind: "HOTEL", lat: 52.52, lon: 13.4 },
+    { id: 2, name: "Theatre", kind: "SIGHT", lat: 52.49, lon: 13.42 },
+  ];
+
+  it("passes on the ids the user decided to keep", () => {
+    expect(buildPlanRequest(trip, places, { force: [2] }).force).toEqual([2]);
+  });
+
+  it("drops an id that is not on this trip", () => {
+    // The solver ignores a forced id it cannot match, which would look exactly
+    // like the button doing nothing.
+    expect(buildPlanRequest(trip, places, { force: [2, 999] }).force).toEqual([2]);
+  });
+
+  it("takes an id that arrived as a string", () => {
+    // Route parameters and JSON round-trips both produce these, and the solver
+    // matches ids by identity: "2" is not 2.
+    expect(buildPlanRequest(trip, places, { force: ["2"] }).force).toEqual([2]);
+  });
+
+  it("says nothing about forcing when nothing was forced", () => {
+    // An empty list would be harmless but is still a claim; omitting it keeps
+    // a normal solve byte-identical to what it was before this existed.
+    for (const force of [undefined, [], null, "nope"]) {
+      expect(buildPlanRequest(trip, places, { force })).not.toHaveProperty("force");
+    }
+  });
+});

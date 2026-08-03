@@ -258,6 +258,15 @@ function buildPlanRequest(trip, places = [], options = {}) {
     time_limit_s: options.time_limit_s ?? 10,
     ...(options.balance != null && { balance: options.balance }),
     ...(options.transit != null && { transit: Boolean(options.transit) }),
+    // Places the user has decided to keep after being told what they cost.
+    // Filtered to ids actually on the trip, because a forced id that matches
+    // nothing is silently ignored by the solver and would look like the button
+    // simply not working.
+    ...(Array.isArray(options.force) && options.force.length > 0 && {
+      force: options.force
+        .map(Number)
+        .filter((id) => places.some((p) => p.id === id)),
+    }),
   };
 }
 
