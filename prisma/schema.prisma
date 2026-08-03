@@ -8,26 +8,26 @@ datasource db {
 }
 
 model User {
-  id            String        @id @default(uuid())
-  email         String        @unique
-  password_hash String?
-  role          Role          @default(USER)
-  created_at    DateTime      @default(now())
-  steam_id      Int?          @unique
-  settings      Json?
-  game_times    GameTime[]    @relation("UserGameTimes")
-  movie_reviews MovieReview[] @relation("UserMovieReviews")
-  oauth         OAuth[]       @relation("UserOauth")
-  wishlists     Wishlist?     @relation("UserWishlists")
-  trips         Trip[]        @relation("UserTrips")
-  templates     Template[]    @relation("UserTemplates")
-  gear_items       GearItem[]             @relation("UserGearItems")
-  travel_wishlist  TravelWishlistItem[]   @relation("UserTravelWishlist")
-  loadouts         Loadout[]              @relation("UserLoadouts")
-  item_reviews     ItemReview[]           @relation("UserItemReviews")
-  trip_reviews     TripReview[]           @relation("UserTripReviews")
+  id                         String                     @id @default(uuid())
+  email                      String                     @unique
+  password_hash              String?
+  role                       Role                       @default(USER)
+  created_at                 DateTime                   @default(now())
+  steam_id                   Int?                       @unique
+  settings                   Json?
+  game_times                 GameTime[]                 @relation("UserGameTimes")
+  movie_reviews              MovieReview[]              @relation("UserMovieReviews")
+  oauth                      OAuth[]                    @relation("UserOauth")
+  wishlists                  Wishlist?                  @relation("UserWishlists")
+  trips                      Trip[]                     @relation("UserTrips")
+  templates                  Template[]                 @relation("UserTemplates")
+  gear_items                 GearItem[]                 @relation("UserGearItems")
+  travel_wishlist            TravelWishlistItem[]       @relation("UserTravelWishlist")
+  loadouts                   Loadout[]                  @relation("UserLoadouts")
+  item_reviews               ItemReview[]               @relation("UserItemReviews")
+  trip_reviews               TripReview[]               @relation("UserTripReviews")
   notification_subscriptions NotificationSubscription[] @relation("UserNotificationSubscriptions")
-  email_verifications EmailVerification[] @relation("UserEmailVerifications")
+  email_verifications        EmailVerification[]        @relation("UserEmailVerifications")
 }
 
 model Game {
@@ -81,17 +81,17 @@ model OAuth {
 }
 
 model Band {
-  id              Int                     @id @default(autoincrement())
-  name            String                  @unique
-  ticketmaster_id String?                 @unique
-  created_at      DateTime?
-  MBID            String?                 @unique
-  songkick_url      String?
-  bandsintown_url   String?
-  setlist            Json?
-  setlist_updated_at DateTime?
-  concerts        ConcertBandReference[]  @relation("BandConcerts")
-  wishlists       WishlistBandReference[] @relation("BandWishlists")
+  id                         Int                        @id @default(autoincrement())
+  name                       String                     @unique
+  ticketmaster_id            String?                    @unique
+  created_at                 DateTime?
+  MBID                       String?                    @unique
+  songkick_url               String?
+  bandsintown_url            String?
+  setlist                    Json?
+  setlist_updated_at         DateTime?
+  concerts                   ConcertBandReference[]     @relation("BandConcerts")
+  wishlists                  WishlistBandReference[]    @relation("BandWishlists")
   notification_subscriptions NotificationSubscription[] @relation("BandNotificationSubscriptions")
 }
 
@@ -129,17 +129,17 @@ model Concert {
 }
 
 model City {
-  id                 Int       @id @default(autoincrement())
-  name               String
-  country            String
-  latitude           Float?
-  longitude          Float?
-  reachable          String?
-  airport_iata       String?
-  weather_monthly    Json?
-  weather_updated_at DateTime?
-  created_at         DateTime  @default(now())
-  concerts           Concert[]
+  id                         Int                        @id @default(autoincrement())
+  name                       String
+  country                    String
+  latitude                   Float?
+  longitude                  Float?
+  reachable                  String?
+  airport_iata               String?
+  weather_monthly            Json?
+  weather_updated_at         DateTime?
+  created_at                 DateTime                   @default(now())
+  concerts                   Concert[]
   notification_subscriptions NotificationSubscription[] @relation("CityNotificationSubscriptions")
 
   @@unique([name, country])
@@ -164,25 +164,25 @@ model ConcertBandReference {
 }
 
 model Wishlist {
-  id                   Int                     @id @default(autoincrement())
-  name                 String
-  user_id              String                  @unique
-  discord_webhook      String?
-  concert_scores       String?
-  city_rankings        String?
-  scores_computed_at   DateTime?
-  last_active_at       DateTime?
-  user_rel             User                    @relation("UserWishlists", fields: [user_id], references: [id])
-  bands                WishlistBandReference[] @relation("WishlistBands")
-  activity_logs        ActivityLog[]           @relation("WishlistActivityLogs")
-  attendance           ConcertAttendance[]     @relation("WishlistAttendance")
+  id                 Int                     @id @default(autoincrement())
+  name               String
+  user_id            String                  @unique
+  discord_webhook    String?
+  concert_scores     String?
+  city_rankings      String?
+  scores_computed_at DateTime?
+  last_active_at     DateTime?
+  user_rel           User                    @relation("UserWishlists", fields: [user_id], references: [id])
+  bands              WishlistBandReference[] @relation("WishlistBands")
+  activity_logs      ActivityLog[]           @relation("WishlistActivityLogs")
+  attendance         ConcertAttendance[]     @relation("WishlistAttendance")
 }
 
 model ActivityLog {
   id           Int      @id @default(autoincrement())
   wishlist_id  Int
-  type         String   // 'BAND_ADDED' | 'NEW_CONCERTS'
-  data         String   // JSON
+  type         String // 'BAND_ADDED' | 'NEW_CONCERTS'
+  data         String // JSON
   created_at   DateTime @default(now())
   wishlist_rel Wishlist @relation("WishlistActivityLogs", fields: [wishlist_id], references: [id])
 
@@ -238,13 +238,13 @@ model NotificationDigestRun {
 
 // Email verification codes for email change requests
 model EmailVerification {
-  id        Int      @id @default(autoincrement())
-  user_id   String
-  new_email String
-  code      String   @unique
+  id         Int      @id @default(autoincrement())
+  user_id    String
+  new_email  String
+  code       String   @unique
   expires_at DateTime
   created_at DateTime @default(now())
-  user_rel  User     @relation("UserEmailVerifications", fields: [user_id], references: [id], onDelete: Cascade)
+  user_rel   User     @relation("UserEmailVerifications", fields: [user_id], references: [id], onDelete: Cascade)
 
   @@index([user_id])
 }
@@ -264,40 +264,53 @@ enum BandTier {
 // ── TRAVEL BAG ────────────────────────────────────────────────────────────────
 
 model Trip {
-  id             Int               @id @default(autoincrement())
-  user_id        String
-  name           String            @db.VarChar(200)
-  destination    String?           @db.VarChar(200)
-  start_date     DateTime?         @db.Date
-  end_date       DateTime?         @db.Date
-  notes          String?           @db.Text
-  weight_budget  Int?
-  money_budget           Decimal?  @db.Decimal(10, 2)
-  currency               String    @default("SEK") @db.VarChar(3)
-  budget_flights         Decimal?  @db.Decimal(10, 2)
-  budget_hotel           Decimal?  @db.Decimal(10, 2)
-  budget_entertainment   Decimal?  @db.Decimal(10, 2)
-  budget_food            Decimal?  @db.Decimal(10, 2)
-  weather_data           Json?
-  weather_updated_at     DateTime?
-  exchange_rates         Json?
-  tags                   String[]
+  id                   Int               @id @default(autoincrement())
+  user_id              String
+  name                 String            @db.VarChar(200)
+  destination          String?           @db.VarChar(200)
+  start_date           DateTime?         @db.Date
+  end_date             DateTime?         @db.Date
+  notes                String?           @db.Text
+  weight_budget        Int?
+  money_budget         Decimal?          @db.Decimal(10, 2)
+  currency             String            @default("SEK") @db.VarChar(3)
+  budget_flights       Decimal?          @db.Decimal(10, 2)
+  budget_hotel         Decimal?          @db.Decimal(10, 2)
+  budget_entertainment Decimal?          @db.Decimal(10, 2)
+  budget_food          Decimal?          @db.Decimal(10, 2)
+  weather_data         Json?
+  weather_updated_at   DateTime?
+  exchange_rates       Json?
+  tags                 String[]
   // The last day plan the solver returned, stored whole. Not normalised into
   // rows: it is one immutable answer to one question, always read in full and
   // always replaced in full, and the shape belongs to route-planner rather than
   // to this schema. Null means "never planned", which the UI shows differently
   // from an empty plan.
-  plan_data              Json?
-  plan_updated_at        DateTime?
-  created_at             DateTime  @default(now())
-  updated_at     DateTime          @updatedAt
-  user_rel       User              @relation("UserTrips", fields: [user_id], references: [id])
-  items          TripItem[]
-  estimates      ExpenseEstimate[]
-  reviews        ItemReview[]      @relation("TripItemReviews")
-  trip_review    TripReview?
-  todos          TripTodo[]
-  places         TripPlace[]
+  // When you land and when you fly out, as minutes since midnight on the first
+  // and last day. Without them the planner offers a 09:00 museum on a day you
+  // arrive at 14:00, which is worse than no plan for that day at all.
+  arrival_time         Int?
+  departure_time       Int?
+  // Where those days begin and end. Optional: left null the hotel is used, which
+  // is right for a train you catch from town and wrong for an airport an hour
+  // out. Not a relation — a foreign key back to TripPlace would have to be
+  // cleared by hand every time a place is deleted, and a stale id here is
+  // already handled by the planner refusing to plan against a place it cannot
+  // find.
+  arrival_place_id     Int?
+  departure_place_id   Int?
+  plan_data            Json?
+  plan_updated_at      DateTime?
+  created_at           DateTime          @default(now())
+  updated_at           DateTime          @updatedAt
+  user_rel             User              @relation("UserTrips", fields: [user_id], references: [id])
+  items                TripItem[]
+  estimates            ExpenseEstimate[]
+  reviews              ItemReview[]      @relation("TripItemReviews")
+  trip_review          TripReview?
+  todos                TripTodo[]
+  places               TripPlace[]
 
   @@index([user_id])
 }
@@ -310,25 +323,25 @@ model Trip {
 // geocode is still worth keeping, flagged, and the solver reports it as dropped
 // rather than refusing to plan the trip.
 model TripPlace {
-  id         Int       @id @default(autoincrement())
-  trip_id    Int
-  name       String    @db.VarChar(200)
-  kind       PlaceKind @default(SIGHT)
-  lat        Float?
-  lon        Float?
-  address    String?   @db.VarChar(500)
-  url        String?   @db.VarChar(1000)
+  id           Int       @id @default(autoincrement())
+  trip_id      Int
+  name         String    @db.VarChar(200)
+  kind         PlaceKind @default(SIGHT)
+  lat          Float?
+  lon          Float?
+  address      String?   @db.VarChar(500)
+  url          String?   @db.VarChar(1000)
   // Minutes to spend there. Null lets the solver apply its own default rather
   // than making every place a form to fill in before the trip can be planned.
-  duration   Int?
-  priority   Int       @default(3)
-  outdoor    Boolean   @default(false)
+  duration     Int?
+  priority     Int       @default(3)
+  outdoor      Boolean   @default(false)
   // Per weekday, [open, close] minute pairs: { "tue": [[570, 1080]] }. Absent
   // means always open; an explicit [] means closed that day. A weekday simply
   // missing from the object means unknown, and unknown is treated as open —
   // guessing "closed" silently deletes places from a trip.
-  hours      Json?
-  pinned_day DateTime? @db.Date
+  hours        Json?
+  pinned_day   DateTime? @db.Date
   // A ticket or a reservation, as minutes since midnight. These bound when you
   // turn up, not when you leave — both set to the same minute is a timed entry.
   // Usually paired with pinned_day: on their own they apply to whichever day
@@ -339,12 +352,12 @@ model TripPlace {
   // seeing a building lit up, a night tour or a concert in a venue that shuts
   // at six have nothing to do with that. The hours stay stored — they are still
   // worth knowing — they just stop constraining the plan.
-  ignore_hours Boolean  @default(false)
-  note       String?   @db.Text
-  sort_order Int       @default(0)
-  created_at DateTime  @default(now())
-  updated_at DateTime  @updatedAt
-  trip_rel   Trip      @relation(fields: [trip_id], references: [id], onDelete: Cascade)
+  ignore_hours Boolean   @default(false)
+  note         String?   @db.Text
+  sort_order   Int       @default(0)
+  created_at   DateTime  @default(now())
+  updated_at   DateTime  @updatedAt
+  trip_rel     Trip      @relation(fields: [trip_id], references: [id], onDelete: Cascade)
 
   @@index([trip_id])
 }
@@ -390,18 +403,18 @@ model TripItem {
 }
 
 model ExpenseEstimate {
-  id         Int      @id @default(autoincrement())
+  id         Int       @id @default(autoincrement())
   trip_id    Int
-  category   String   @db.VarChar(100)
-  amount     Decimal  @db.Decimal(10, 2)
+  category   String    @db.VarChar(100)
+  amount     Decimal   @db.Decimal(10, 2)
   currency   String    @default("SEK") @db.VarChar(3)
   date       DateTime? @db.Date
   end_date   DateTime? @db.Date
   note       String?   @db.Text
   sort_order Int       @default(0)
-  created_at DateTime @default(now())
-  updated_at DateTime @updatedAt
-  trip_rel   Trip     @relation(fields: [trip_id], references: [id], onDelete: Cascade)
+  created_at DateTime  @default(now())
+  updated_at DateTime  @updatedAt
+  trip_rel   Trip      @relation(fields: [trip_id], references: [id], onDelete: Cascade)
 
   @@index([trip_id])
 }
@@ -434,64 +447,64 @@ model TemplateItem {
 }
 
 model GearItem {
-  id         Int        @id @default(autoincrement())
-  user_id    String
-  name       String     @db.VarChar(200)
-  model      String?    @db.VarChar(200)
-  brand      String?    @db.VarChar(100)
-  category   String?    @db.VarChar(100)
-  dimensions Json?
-  tags       String[]
-  sort_order Int      @default(0)
-  worn       Boolean  @default(false)
-  notes      String?    @db.Text
-  url        String?    @db.VarChar(500)
-  created_at DateTime   @default(now())
-  updated_at DateTime   @updatedAt
-  review_status  ReviewStatus?
-  review_streak  Int           @default(0)
-  review_count   Int           @default(0)
-  last_review_at DateTime?
-  essential      Boolean       @default(false)
-  retired        Boolean       @default(false)
-  replaced_by_id Int?
-  photo          String?       @db.Text
-  retail_price   Decimal?      @db.Decimal(10, 2)
-  bought_for     Decimal?      @db.Decimal(10, 2)
-  currency       String        @default("SEK") @db.VarChar(3)
-  fill_level     Int?
-  price_irrelevant Boolean     @default(false)
-  user_rel        User           @relation("UserGearItems", fields: [user_id], references: [id])
-  trip_items      TripItem[]     @relation("GearItemTripItems")
-  trip_bag_items  TripItem[]     @relation("TripItemBag")
-  loadout_entries LoadoutEntry[] @relation("GearItemLoadoutEntries")
-  bag_entries     LoadoutEntry[] @relation("LoadoutEntryBag")
-  reviews         ItemReview[]   @relation("GearItemReviews")
-  replaced_by_rel GearItem?      @relation("GearUpgrade", fields: [replaced_by_id], references: [id], onDelete: SetNull)
-  replaces        GearItem[]     @relation("GearUpgrade")
+  id               Int            @id @default(autoincrement())
+  user_id          String
+  name             String         @db.VarChar(200)
+  model            String?        @db.VarChar(200)
+  brand            String?        @db.VarChar(100)
+  category         String?        @db.VarChar(100)
+  dimensions       Json?
+  tags             String[]
+  sort_order       Int            @default(0)
+  worn             Boolean        @default(false)
+  notes            String?        @db.Text
+  url              String?        @db.VarChar(500)
+  created_at       DateTime       @default(now())
+  updated_at       DateTime       @updatedAt
+  review_status    ReviewStatus?
+  review_streak    Int            @default(0)
+  review_count     Int            @default(0)
+  last_review_at   DateTime?
+  essential        Boolean        @default(false)
+  retired          Boolean        @default(false)
+  replaced_by_id   Int?
+  photo            String?        @db.Text
+  retail_price     Decimal?       @db.Decimal(10, 2)
+  bought_for       Decimal?       @db.Decimal(10, 2)
+  currency         String         @default("SEK") @db.VarChar(3)
+  fill_level       Int?
+  price_irrelevant Boolean        @default(false)
+  user_rel         User           @relation("UserGearItems", fields: [user_id], references: [id])
+  trip_items       TripItem[]     @relation("GearItemTripItems")
+  trip_bag_items   TripItem[]     @relation("TripItemBag")
+  loadout_entries  LoadoutEntry[] @relation("GearItemLoadoutEntries")
+  bag_entries      LoadoutEntry[] @relation("LoadoutEntryBag")
+  reviews          ItemReview[]   @relation("GearItemReviews")
+  replaced_by_rel  GearItem?      @relation("GearUpgrade", fields: [replaced_by_id], references: [id], onDelete: SetNull)
+  replaces         GearItem[]     @relation("GearUpgrade")
 
   @@index([replaced_by_id])
   @@index([user_id])
 }
 
 model ItemReview {
-  id           Int             @id @default(autoincrement())
-  user_id      String
-  trip_id      Int
-  trip_item_id Int?
-  gear_item_id Int?
-  item_name    String          @db.VarChar(200)
-  usage        ReviewUsage?
-  rating       Int?
-  verdict      ReviewVerdict
-  quantity     ReviewQuantity?
-  note         String?         @db.Text
-  created_at   DateTime        @default(now())
-  updated_at   DateTime        @updatedAt
-  user_rel      User      @relation("UserItemReviews", fields: [user_id], references: [id])
-  trip_rel      Trip      @relation("TripItemReviews", fields: [trip_id], references: [id], onDelete: Cascade)
-  trip_item_rel TripItem? @relation("TripItemReview", fields: [trip_item_id], references: [id], onDelete: SetNull)
-  gear_item_rel GearItem? @relation("GearItemReviews", fields: [gear_item_id], references: [id], onDelete: SetNull)
+  id            Int             @id @default(autoincrement())
+  user_id       String
+  trip_id       Int
+  trip_item_id  Int?
+  gear_item_id  Int?
+  item_name     String          @db.VarChar(200)
+  usage         ReviewUsage?
+  rating        Int?
+  verdict       ReviewVerdict
+  quantity      ReviewQuantity?
+  note          String?         @db.Text
+  created_at    DateTime        @default(now())
+  updated_at    DateTime        @updatedAt
+  user_rel      User            @relation("UserItemReviews", fields: [user_id], references: [id])
+  trip_rel      Trip            @relation("TripItemReviews", fields: [trip_id], references: [id], onDelete: Cascade)
+  trip_item_rel TripItem?       @relation("TripItemReview", fields: [trip_item_id], references: [id], onDelete: SetNull)
+  gear_item_rel GearItem?       @relation("GearItemReviews", fields: [gear_item_id], references: [id], onDelete: SetNull)
 
   @@unique([trip_id, trip_item_id])
   @@index([gear_item_id])
@@ -542,15 +555,15 @@ model TravelWishlistItem {
 }
 
 model Loadout {
-  id             Int            @id @default(autoincrement())
-  user_id        String
-  name           String         @db.VarChar(200)
-  description    String?        @db.Text
-  weight_budget  Int?
-  created_at     DateTime       @default(now())
-  updated_at     DateTime       @updatedAt
-  user_rel       User           @relation("UserLoadouts", fields: [user_id], references: [id])
-  entries        LoadoutEntry[]
+  id            Int            @id @default(autoincrement())
+  user_id       String
+  name          String         @db.VarChar(200)
+  description   String?        @db.Text
+  weight_budget Int?
+  created_at    DateTime       @default(now())
+  updated_at    DateTime       @updatedAt
+  user_rel      User           @relation("UserLoadouts", fields: [user_id], references: [id])
+  entries       LoadoutEntry[]
 
   @@index([user_id])
 }

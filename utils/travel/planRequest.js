@@ -150,6 +150,39 @@ function dayBounds(places, date, dayStart, dayEnd) {
   return { start: Math.max(0, start), end: Math.min(MAX_DAY_END, end) };
 }
 
+// Getting out of a terminal and to the first thing you do, or from the last
+// thing to a gate. Generous on purpose: the solver owns the travel matrix and
+// knows the real journey, so this only has to be wide enough not to refuse the
+// day outright, and too tight silently makes the whole first day infeasible.
+const TERMINAL_ALLOWANCE = 90;
+
+/**
+ * Clamp the first and last day to when you actually land and leave.
+ *
+ * Without this the planner offers a 09:00 museum on a day you arrive at 14:00,
+ * and a full evening on a day you fly at 11:00 — both plausible-looking and
+ * both useless. Applied only to the ends of the trip, because those are the
+ * only days that are not yours from start to finish.
+ *
+ * The widening is what stops a late landing being refused rather than planned.
+ * A day whose window is [23:00, 22:00] is not a short day, it is an infeasible
+ * one, and the solver would correctly return nothing for the entire trip.
+ */
+function travelBounds(bounds, { arrival, departure, first, last }) {
+  let { start, end } = bounds;
+
+  if (first && arrival != null) {
+    start = Math.max(start, arrival);
+    end = Math.max(end, start + TERMINAL_ALLOWANCE);
+  }
+  if (last && departure != null) {
+    end = Math.min(end, departure);
+    start = Math.min(start, end - TERMINAL_ALLOWANCE);
+  }
+
+  return { start: Math.max(0, start), end: Math.min(MAX_DAY_END, end) };
+}
+
 /**
  * The hotel each day starts and ends at.
  *
@@ -239,12 +272,31 @@ function buildPlanRequest(trip, places = [], options = {}) {
   const dayStart = options.day_start ?? DEFAULT_DAY_START;
   const dayEnd = options.day_end ?? DEFAULT_DAY_END;
 
-  const days = dates.map((date) => {
+  // A terminal is only used if it is a place on this trip. A stale id — the
+  // airport was deleted, or the trip was copied — would otherwise reach the
+  // solver, which refuses to plan against a place it cannot find, taking the
+  // whole trip down over a field nobody remembers setting.
+  const onTrip = (id) => (places.some((p) => p.id === id) ? id : null);
+  const arrivalPlace = onTrip(trip?.arrival_place_id);
+  const departurePlace = onTrip(trip?.departure_place_id);
+
+  const days = dates.map((date, i) => {
     const hotel = hotelForDate(hotels, date);
+    const first = i === 0;
+    const last = i === dates.length - 1;
     return {
       date,
-      ...dayBounds(places, date, dayStart, dayEnd),
+      ...travelBounds(dayBounds(places, date, dayStart, dayEnd), {
+        arrival: trip?.arrival_time,
+        departure: trip?.departure_time,
+        first,
+        last,
+      }),
       hotel_id: hotel.id,
+      // Only the ends of the trip start or finish anywhere but the hotel, and
+      // on a one-day trip both apply to the same day.
+      ...(first && arrivalPlace != null && { start_id: arrivalPlace }),
+      ...(last && departurePlace != null && { end_id: departurePlace }),
       wet: wet.has(date),
     };
   });
@@ -279,6 +331,7 @@ module.exports = {
   wetDates,
   hotelForDate,
   dayBounds,
+  travelBounds,
   toPlace,
   DEFAULT_MEALS,
   MAX_DAYS,

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildPlanRequest, PlanInputError,
-  dateOnly, datesBetween, wetDates, hotelForDate, dayBounds, toPlace, MAX_DAYS,
+  dateOnly, datesBetween, wetDates, hotelForDate, dayBounds, travelBounds, toPlace, MAX_DAYS,
 } from './planRequest.js';
 
 const hotel = (over = {}) => ({
@@ -311,5 +311,96 @@ describe("keeping a place the solver wanted to drop", () => {
     for (const force of [undefined, [], null, "nope"]) {
       expect(buildPlanRequest(trip, places, { force })).not.toHaveProperty("force");
     }
+  });
+});
+
+describe("landing and departing", () => {
+  const bounds = { start: 540, end: 1320 };
+  const both = { first: true, last: true };
+
+  it("does not offer a morning on a day you land in the afternoon", () => {
+    expect(travelBounds(bounds, { arrival: 840, first: true }).start).toBe(840);
+  });
+
+  it("does not offer an evening on a day you fly out at eleven", () => {
+    expect(travelBounds(bounds, { departure: 660, last: true }).end).toBe(660);
+  });
+
+  it("leaves the days in the middle of the trip alone", () => {
+    // Only the ends of a trip are not yours from start to finish.
+    expect(travelBounds(bounds, { arrival: 840, departure: 660 })).toEqual(bounds);
+  });
+
+  it("widens the day for a late landing rather than refusing it", () => {
+    // A window of [23:00, 22:00] is not a short day, it is an infeasible one,
+    // and the solver would correctly return nothing for the whole trip.
+    const got = travelBounds(bounds, { arrival: 1380, first: true });
+    expect(got.end).toBeGreaterThan(got.start);
+  });
+
+  it("widens it backwards for a departure before the day would have started", () => {
+    const got = travelBounds(bounds, { departure: 400, last: true });
+    expect(got.start).toBeLessThan(got.end);
+    expect(got.start).toBeGreaterThanOrEqual(0);
+  });
+
+  it("applies both to the only day of a one-day trip", () => {
+    const got = travelBounds(bounds, { arrival: 600, departure: 1200, ...both });
+    expect(got).toEqual({ start: 600, end: 1200 });
+  });
+
+  it("changes nothing when no times are recorded", () => {
+    expect(travelBounds(bounds, both)).toEqual(bounds);
+    expect(travelBounds(bounds, { arrival: null, departure: null, ...both })).toEqual(bounds);
+  });
+
+  it("keeps midnight as the earliest a day can start", () => {
+    expect(travelBounds({ start: 60, end: 120 }, { departure: 30, last: true }).start).toBe(0);
+  });
+});
+
+describe("where the first and last day begin and end", () => {
+  const places = [
+    { id: 1, name: "Hotel", kind: "HOTEL", lat: 52.52, lon: 13.4 },
+    { id: 2, name: "Airport", kind: "SIGHT", lat: 52.36, lon: 13.5 },
+    { id: 3, name: "Museum", kind: "SIGHT", lat: 52.51, lon: 13.39 },
+  ];
+  const trip = { start_date: "2026-09-14", end_date: "2026-09-16" };
+
+  it("starts the first day at the terminal and ends the last one there", () => {
+    const got = buildPlanRequest(trip, places, {}, ).days;
+    expect(got[0]).not.toHaveProperty("start_id");
+
+    const withTravel = buildPlanRequest(
+      { ...trip, arrival_place_id: 2, departure_place_id: 2 }, places, {}
+    ).days;
+    expect(withTravel[0].start_id).toBe(2);
+    expect(withTravel[0]).not.toHaveProperty("end_id");
+    expect(withTravel[2].end_id).toBe(2);
+    expect(withTravel[2]).not.toHaveProperty("start_id");
+  });
+
+  it("leaves the middle days at the hotel", () => {
+    const got = buildPlanRequest(
+      { ...trip, arrival_place_id: 2, departure_place_id: 2 }, places, {}
+    ).days;
+    expect(got[1]).not.toHaveProperty("start_id");
+    expect(got[1]).not.toHaveProperty("end_id");
+  });
+
+  it("ignores a terminal that is no longer on the trip", () => {
+    // The airport was deleted, or the trip was copied. Passing the stale id on
+    // would make the solver refuse to plan anything at all, taking the whole
+    // trip down over a field nobody remembers setting.
+    const got = buildPlanRequest({ ...trip, arrival_place_id: 999 }, places, {}).days;
+    expect(got[0]).not.toHaveProperty("start_id");
+  });
+
+  it("uses the same day for both ends of a one-day trip", () => {
+    const oneDay = { start_date: "2026-09-14", end_date: "2026-09-14",
+      arrival_place_id: 2, departure_place_id: 2 };
+    const [only] = buildPlanRequest(oneDay, places, {}).days;
+    expect(only.start_id).toBe(2);
+    expect(only.end_id).toBe(2);
   });
 });

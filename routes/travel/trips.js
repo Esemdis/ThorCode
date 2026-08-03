@@ -201,8 +201,31 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
   const { name, destination, start_date, end_date, notes, weight_budget, money_budget, currency,
-          budget_flights, budget_hotel, budget_entertainment, budget_food, exchange_rates, tags } = req.body;
+          budget_flights, budget_hotel, budget_entertainment, budget_food, exchange_rates, tags,
+          arrival_time, departure_time, arrival_place_id, departure_place_id } = req.body;
   const data = {};
+
+  // Minutes since midnight, and a day is 1440 of them. Out of range means a
+  // client sent something other than minutes, which would silently produce an
+  // impossible day window rather than an error anybody could act on.
+  const minutes = (value) => {
+    if (value == null || value === "") return null;
+    const n = parseInt(value, 10);
+    return Number.isInteger(n) && n >= 0 && n < 1440 ? n : undefined;
+  };
+  for (const [field, value] of [["arrival_time", arrival_time], ["departure_time", departure_time]]) {
+    if (value === undefined) continue;
+    const parsed = minutes(value);
+    if (parsed === undefined) {
+      return res.status(400).json({ error: `${field} must be minutes since midnight, 0 to 1439` });
+    }
+    data[field] = parsed;
+  }
+  for (const [field, value] of [["arrival_place_id", arrival_place_id],
+                                ["departure_place_id", departure_place_id]]) {
+    if (value === undefined) continue;
+    data[field] = value == null || value === "" ? null : parseInt(value, 10);
+  }
   if (tags !== undefined) data.tags = Array.isArray(tags) ? tags.map((t) => t.trim()).filter(Boolean) : [];
   if (exchange_rates !== undefined) data.exchange_rates = exchange_rates ?? null;
   if (name !== undefined) data.name = name.trim();
