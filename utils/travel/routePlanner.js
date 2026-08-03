@@ -112,12 +112,12 @@ async function explain(request, placeId) {
  * saving. The solver reports it in `dropped` and the user can paste a map link
  * later, which is the one method that always works.
  */
-async function geocode(query, near = null) {
+async function geocode(query, near = null, context = null) {
   assertConfigured();
   try {
     const { data } = await axios.post(
       `${baseUrl()}/geocode`,
-      { query, near },
+      { query, near, context },
       { timeout: GEOCODE_TIMEOUT_MS, headers: headers() }
     );
     return data || null;
@@ -129,4 +129,30 @@ async function geocode(query, near = null) {
   }
 }
 
-module.exports = { solve, explain, geocode, RoutePlannerError, SOLVE_TIMEOUT_MS };
+/**
+ * Candidates for an address, for somebody who is watching and can choose.
+ *
+ * Separate from `geocode` because the failure they guard against is different.
+ * Guessing silently is how a hotel ends up in the wrong country; here the
+ * ambiguity is handed back, since only the person typing can resolve it.
+ *
+ * Throws rather than swallowing: an empty list means "nothing matched", and a
+ * search box has to be able to tell that from "the geocoder is down".
+ */
+async function searchPlaces(query, { near = null, context = null, limit = 6 } = {}) {
+  assertConfigured();
+  try {
+    const { data } = await axios.post(
+      `${baseUrl()}/geocode/search`,
+      { query, near, context, limit },
+      { timeout: GEOCODE_TIMEOUT_MS, headers: headers() }
+    );
+    return data?.results ?? [];
+  } catch (err) {
+    throw wrap(err, "search");
+  }
+}
+
+module.exports = {
+  solve, explain, geocode, searchPlaces, RoutePlannerError, SOLVE_TIMEOUT_MS,
+};

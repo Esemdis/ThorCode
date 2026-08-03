@@ -31,15 +31,48 @@ router.use(ownsTrip);
  * Returns coordinates or nulls. Never throws: a place nobody could locate is
  * still worth saving, and the solver reports it as dropped rather than failing.
  */
-async function locate({ url, address, name }, trip) {
-  const near = trip?.lat != null && trip?.lon != null ? [trip.lat, trip.lon] : null;
+async function locate({ url, address, name }, { near = null, context = null } = {}) {
   for (const query of [url, address, name].filter(Boolean)) {
-    const found = await routePlanner.geocode(query, near);
+    const found = await routePlanner.geocode(query, near, context);
     if (found?.lat != null && found?.lon != null) {
       return { lat: found.lat, lon: found.lon };
     }
   }
   return { lat: null, lon: null };
+}
+
+/**
+ * Where this trip is, for biasing a search.
+ *
+ * Both halves matter and they do different jobs. `context` is the destination
+ * text, appended to a bare address — measured as by far the more effective of
+ * the two, because "Hauptstrasse 5" and "Hauptstrasse 5, Berlin" are not a
+ * vague search and a precise one, they are different searches returning
+ * disjoint results. `near` re-ranks whatever comes back by distance.
+ *
+ * The hotel is preferred as the anchor because it is the one place on a trip
+ * whose location is certain and everything else is within a day of it. Any
+ * placed thing will do otherwise — an anchor in the right city beats none.
+ */
+async function tripAnchor(tripId) {
+  const [trip, hotel] = await Promise.all([
+    prisma.trip.findUnique({ where: { id: tripId }, select: { destination: true } }),
+    prisma.tripPlace.findFirst({
+      where: { trip_id: tripId, kind: "HOTEL", lat: { not: null } },
+      select: { lat: true, lon: true },
+    }),
+  ]);
+
+  const anchor = hotel ?? await prisma.tripPlace.findFirst({
+    where: { trip_id: tripId, lat: { not: null } },
+    orderBy: { created_at: "asc" },
+    select: { lat: true, lon: true },
+  });
+
+  return {
+    context: trip?.destination || null,
+    near: anchor ? [anchor.lat, anchor.lon] : null,
+  };
 }
 
 // GET /travel/trips/:tripId/places
@@ -67,7 +100,7 @@ router.post("/", async (req, res) => {
     if (data.lat == null) {
       Object.assign(data, await locate(
         { url: data.url, address: data.address, name: data.name },
-        req.body.near ? { lat: req.body.near[0], lon: req.body.near[1] } : null
+        await tripAnchor(req.tripId)
       ));
     }
 
@@ -92,10 +125,10 @@ router.post("/", async (req, res) => {
  * rows that never resolved look exactly like the ones a geocoder failed on, and
  * the per-place "find it" button that already exists is the fix for both.
  */
-async function locateLater(places, near, tripId) {
+async function locateLater(places, anchor, tripId) {
   for (const place of places) {
     try {
-      const found = await locate(place, near);
+      const found = await locate(place, anchor);
       if (found.lat == null) continue;
       // updateMany, not update: the trip or the place may have been deleted
       // while this was running, and a background task must not throw about it.
@@ -112,10 +145,31 @@ async function locateLater(places, near, tripId) {
   }
 }
 
+// POST /travel/trips/:tripId/places/search — candidates for an address.
+// Writes nothing; the client picks one and sends the coordinates back.
+router.post("/search", async (req, res) => {
+  const query = typeof req.body?.query === "string" ? req.body.query.trim() : "";
+  if (!query) return res.status(400).json({ error: "Type an address or a place name" });
+
+  try {
+    const anchor = await tripAnchor(req.tripId);
+    const results = await routePlanner.searchPlaces(query, { ...anchor, limit: 6 });
+    // `context` comes back so the UI can say what it searched — "no results for
+    // X in Berlin" is a different problem from "no results for X", and only one
+    // of them is fixed by typing the city yourself.
+    res.json({ data: results, meta: { context: anchor.context } });
+  } catch (err) {
+    if (err instanceof routePlanner.RoutePlannerError) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    fail(res, err, { context: `POST places search (trip ${req.tripId})` });
+  }
+});
+
 // POST /travel/trips/:tripId/places/bulk — paste a list, get places.
 // Before /:placeId for the same reason as /reorder.
 router.post("/bulk", async (req, res) => {
-  const { text, kind, near } = req.body || {};
+  const { text, kind } = req.body || {};
   if (typeof text !== "string" || !text.trim()) {
     return res.status(400).json({ error: "Paste a list of places, one per line" });
   }
@@ -161,6 +215,12 @@ router.post("/bulk", async (req, res) => {
       orderBy: { sort_order: "asc" },
     });
 
+    // Resolved before the response, not after: a throw once the response has
+    // gone would reach the catch below and try to send a second one. Read once
+    // rather than per place, too — thirty places should not be thirty-one
+    // lookups of the same trip.
+    const anchor = await tripAnchor(req.tripId);
+
     res.status(201).json({
       data: created,
       meta: { created: created.length, skipped, locating: created.length },
@@ -168,11 +228,7 @@ router.post("/bulk", async (req, res) => {
 
     // After the response, and not awaited. The catch is required rather than
     // tidy: an unhandled rejection here would take the process down.
-    locateLater(
-      created.filter((p) => p.lat == null),
-      Array.isArray(near) ? { lat: near[0], lon: near[1] } : null,
-      req.tripId
-    ).catch(() => {});
+    locateLater(created.filter((p) => p.lat == null), anchor, req.tripId).catch(() => {});
   } catch (err) {
     fail(res, err, { context: `POST places bulk (trip ${req.tripId})` });
   }
@@ -226,11 +282,15 @@ router.patch("/:placeId", param("placeId").isInt(), async (req, res) => {
       });
       if (!existing) return res.status(404).json({ error: "Place not found" });
       if (existing.lat == null) {
+        // The anchor was missing here entirely until it produced hotels in the
+        // wrong country: this is the path an edit takes, which is exactly where
+        // someone is fixing an address and most needs the search to know what
+        // city they mean.
         Object.assign(data, await locate({
           url: data.url ?? existing.url,
           address: data.address ?? existing.address,
           name: data.name ?? existing.name,
-        }));
+        }, await tripAnchor(req.tripId)));
       }
     }
 
@@ -259,7 +319,7 @@ router.post("/:placeId/locate", param("placeId").isInt(), async (req, res) => {
 
     const found = await locate(
       { url: req.body.query || existing.url, address: existing.address, name: existing.name },
-      null
+      await tripAnchor(req.tripId)
     );
     if (found.lat == null) {
       return res.status(404).json({ error: "Still could not find that — try pasting a map link" });
