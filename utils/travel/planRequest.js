@@ -147,7 +147,18 @@ function dayBounds(places, date, dayStart, dayEnd) {
     start = Math.min(start, earliest - RETURN_ALLOWANCE);
     end = Math.max(end, latest);
   }
-  return { start: Math.max(0, start), end: Math.min(MAX_DAY_END, end) };
+  return {
+    start: Math.max(0, start),
+    end: Math.min(MAX_DAY_END, end),
+    // The hours you would actually plan in, as opposed to the window the day is
+    // *permitted* to run in. One 23:00 booking used to stretch the whole day and
+    // then everything with no opening hours became schedulable in the stretch —
+    // producing a real plan that saw a church at 22:05, a monument at 23:41 and
+    // a waterfall at 00:43. The stretch exists for the booking and nothing else,
+    // so only the booking is allowed to use it.
+    core_start: dayStart,
+    core_end: dayEnd,
+  };
 }
 
 // Getting out of a terminal and to the first thing you do, or from the last
@@ -155,6 +166,12 @@ function dayBounds(places, date, dayStart, dayEnd) {
 // knows the real journey, so this only has to be wide enough not to refuse the
 // day outright, and too tight silently makes the whole first day infeasible.
 const TERMINAL_ALLOWANCE = 90;
+
+// Mirrors DEFAULT_TRANSFER_MIN in route-planner's routing.py, and used for the
+// same reason in a different place: there, to price a terminal leg the solver
+// routes; here, to know when someone is actually free on a day they land, when
+// no terminal was named and so there is no leg for the solver to route at all.
+const DEFAULT_TRANSFER_MIN = 60;
 
 /**
  * Clamp the first and last day to when you actually land and leave.
@@ -167,20 +184,36 @@ const TERMINAL_ALLOWANCE = 90;
  * The widening is what stops a late landing being refused rather than planned.
  * A day whose window is [23:00, 22:00] is not a short day, it is an infeasible
  * one, and the solver would correctly return nothing for the entire trip.
+ *
+ * `arrival` and `departure` are already adjusted for the transfer by the caller,
+ * because whether one applies depends on something this function cannot see.
+ * With a terminal named, the day begins at the terminal and the solver routes
+ * the transfer itself. Without one, the day begins at the hotel — and "landing
+ * at 11:30" then has to mean free from 12:30, not standing in the lobby at
+ * 11:30 having teleported out of the airport.
  */
 function travelBounds(bounds, { arrival, departure, first, last }) {
-  let { start, end } = bounds;
+  let { start, end, core_start: coreStart, core_end: coreEnd } = bounds;
 
   if (first && arrival != null) {
     start = Math.max(start, arrival);
+    coreStart = Math.max(coreStart, arrival);
     end = Math.max(end, start + TERMINAL_ALLOWANCE);
   }
   if (last && departure != null) {
     end = Math.min(end, departure);
+    coreEnd = Math.min(coreEnd, departure);
     start = Math.min(start, end - TERMINAL_ALLOWANCE);
   }
 
-  return { start: Math.max(0, start), end: Math.min(MAX_DAY_END, end) };
+  return {
+    start: Math.max(0, start),
+    end: Math.min(MAX_DAY_END, end),
+    // A day you land on at 21:00 has no ordinary sightseeing hours left, and an
+    // inverted core window would be read as a range rather than as none.
+    core_start: Math.max(0, Math.min(coreStart, coreEnd)),
+    core_end: Math.min(MAX_DAY_END, coreEnd),
+  };
 }
 
 /**
@@ -280,6 +313,20 @@ function buildPlanRequest(trip, places = [], options = {}) {
   const arrivalPlace = onTrip(trip?.arrival_place_id);
   const departurePlace = onTrip(trip?.departure_place_id);
 
+  // When you are actually free, as opposed to when the plane touches down.
+  // With a terminal named the day starts there and the solver routes the
+  // transfer, so the landing time is the day's start as given. Without one the
+  // day starts at the hotel, and "landing at 11:30" has to mean free from
+  // 12:30 — otherwise the plan has somebody leaving their hotel at the minute
+  // their flight lands, which is what it did.
+  const transfer = trip?.transfer_minutes ?? DEFAULT_TRANSFER_MIN;
+  const freeFrom = trip?.arrival_time == null
+    ? null
+    : trip.arrival_time + (arrivalPlace != null ? 0 : transfer);
+  const leaveBy = trip?.departure_time == null
+    ? null
+    : trip.departure_time - (departurePlace != null ? 0 : transfer);
+
   const days = dates.map((date, i) => {
     const hotel = hotelForDate(hotels, date);
     const first = i === 0;
@@ -287,8 +334,8 @@ function buildPlanRequest(trip, places = [], options = {}) {
     return {
       date,
       ...travelBounds(dayBounds(places, date, dayStart, dayEnd), {
-        arrival: trip?.arrival_time,
-        departure: trip?.departure_time,
+        arrival: freeFrom,
+        departure: leaveBy,
         first,
         last,
       }),

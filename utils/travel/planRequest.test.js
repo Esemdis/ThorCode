@@ -230,7 +230,8 @@ describe("stretching a day to fit a booking", () => {
   const booked = (over) => sight({ id: 3, duration: 120, ...over });
 
   it("leaves an ordinary day alone", () => {
-    expect(dayBounds([sight()], "2026-09-15", 540, 1320)).toEqual({ start: 540, end: 1320 });
+    expect(dayBounds([sight()], "2026-09-15", 540, 1320))
+      .toMatchObject({ start: 540, end: 1320 });
   });
 
   it("runs past midnight for an event that finishes after it", () => {
@@ -240,7 +241,7 @@ describe("stretching a day to fit a booking", () => {
     // The extra 90 is the journey home: the solver puts the hotel at both ends
     // of a day and the return leg has to land inside the window too.
     expect(dayBounds([booked({ arrive_by: 1350, arrive_after: 1350 })], "2026-09-15", 540, 1320))
-      .toEqual({ start: 540, end: 1560 });
+      .toMatchObject({ start: 540, end: 1560 });
   });
 
   it("starts early enough to travel to a dawn booking", () => {
@@ -315,7 +316,7 @@ describe("keeping a place the solver wanted to drop", () => {
 });
 
 describe("landing and departing", () => {
-  const bounds = { start: 540, end: 1320 };
+  const bounds = { start: 540, end: 1320, core_start: 540, core_end: 1320 };
   const both = { first: true, last: true };
 
   it("does not offer a morning on a day you land in the afternoon", () => {
@@ -346,7 +347,7 @@ describe("landing and departing", () => {
 
   it("applies both to the only day of a one-day trip", () => {
     const got = travelBounds(bounds, { arrival: 600, departure: 1200, ...both });
-    expect(got).toEqual({ start: 600, end: 1200 });
+    expect(got).toMatchObject({ start: 600, end: 1200 });
   });
 
   it("changes nothing when no times are recorded", () => {
@@ -402,5 +403,74 @@ describe("where the first and last day begin and end", () => {
     const [only] = buildPlanRequest(oneDay, places, {}).days;
     expect(only.start_id).toBe(2);
     expect(only.end_id).toBe(2);
+  });
+});
+
+describe("keeping ordinary sightseeing out of a stretched night", () => {
+  it("reports the hours you would plan in alongside the ones the day may use", () => {
+    // One 23:00 booking stretched the whole day and everything with no opening
+    // hours became schedulable in the stretch — a real plan came back with a
+    // church at 22:05, a monument at 23:41 and a waterfall at 00:43.
+    const booked = [{ id: 9, arrive_by: 1320, duration: 120 }];
+    const got = dayBounds(booked, "2026-09-03", 540, 1320);
+    expect(got.end).toBeGreaterThan(1320);
+    expect(got.core_end).toBe(1320);
+    expect(got.core_start).toBe(540);
+  });
+
+  it("keeps the core window where it was on a day nothing stretched", () => {
+    const got = dayBounds([], "2026-09-03", 540, 1320);
+    expect(got).toMatchObject({ start: 540, end: 1320, core_start: 540, core_end: 1320 });
+  });
+
+  it("still holds the core window back to when you land", () => {
+    const got = travelBounds(
+      { start: 540, end: 1530, core_start: 540, core_end: 1320 },
+      { arrival: 690, first: true }
+    );
+    expect(got.core_start).toBe(690);
+    expect(got.end).toBe(1530);
+  });
+
+  it("leaves no sightseeing hours at all on a day you land at nine at night", () => {
+    // An inverted core window would be read as a range rather than as none.
+    const got = travelBounds(
+      { start: 540, end: 1320, core_start: 540, core_end: 1320 },
+      { arrival: 1300, first: true }
+    );
+    expect(got.core_start).toBeLessThanOrEqual(got.core_end);
+  });
+});
+
+describe("when you are actually free on a day you land", () => {
+  const places = [
+    { id: 1, name: "Hotel", kind: "HOTEL", lat: 52.52, lon: 13.4 },
+    { id: 2, name: "Airport", kind: "SIGHT", lat: 52.36, lon: 13.5 },
+  ];
+  const trip = { start_date: "2026-09-14", end_date: "2026-09-16", arrival_time: 690 };
+
+  it("adds the transfer when no terminal was named", () => {
+    // The day starts at the hotel, so "landing at 11:30" cannot mean standing
+    // in the lobby at 11:30 having teleported out of the airport. It did.
+    const [first] = buildPlanRequest(trip, places, {}).days;
+    expect(first.start).toBe(690 + 60);
+  });
+
+  it("uses the landing time as given when the day starts at the terminal", () => {
+    // The solver routes the transfer itself, so adding it here would charge for
+    // the same journey twice.
+    const [first] = buildPlanRequest({ ...trip, arrival_place_id: 2 }, places, {}).days;
+    expect(first.start).toBe(690);
+    expect(first.start_id).toBe(2);
+  });
+
+  it("respects a transfer time the traveller set", () => {
+    const [first] = buildPlanRequest({ ...trip, transfer_minutes: 25 }, places, {}).days;
+    expect(first.start).toBe(690 + 25);
+  });
+
+  it("subtracts it the other way round on the day you leave", () => {
+    const days = buildPlanRequest({ ...trip, departure_time: 660 }, places, {}).days;
+    expect(days[days.length - 1].end).toBe(660 - 60);
   });
 });
