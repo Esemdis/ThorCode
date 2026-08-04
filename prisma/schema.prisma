@@ -327,41 +327,49 @@ model Trip {
 // geocode is still worth keeping, flagged, and the solver reports it as dropped
 // rather than refusing to plan the trip.
 model TripPlace {
-  id           Int       @id @default(autoincrement())
-  trip_id      Int
-  name         String    @db.VarChar(200)
-  kind         PlaceKind @default(SIGHT)
-  lat          Float?
-  lon          Float?
-  address      String?   @db.VarChar(500)
-  url          String?   @db.VarChar(1000)
+  id               Int       @id @default(autoincrement())
+  trip_id          Int
+  name             String    @db.VarChar(200)
+  kind             PlaceKind @default(SIGHT)
+  lat              Float?
+  lon              Float?
+  address          String?   @db.VarChar(500)
+  url              String?   @db.VarChar(1000)
   // Minutes to spend there. Null lets the solver apply its own default rather
   // than making every place a form to fill in before the trip can be planned.
-  duration     Int?
-  priority     Int       @default(3)
-  outdoor      Boolean   @default(false)
+  duration         Int?
+  priority         Int       @default(3)
+  outdoor          Boolean   @default(false)
   // Per weekday, [open, close] minute pairs: { "tue": [[570, 1080]] }. Absent
   // means always open; an explicit [] means closed that day. A weekday simply
   // missing from the object means unknown, and unknown is treated as open —
   // guessing "closed" silently deletes places from a trip.
-  hours        Json?
-  pinned_day   DateTime? @db.Date
+  hours            Json?
+  pinned_day       DateTime? @db.Date
   // A ticket or a reservation, as minutes since midnight. These bound when you
   // turn up, not when you leave — both set to the same minute is a timed entry.
   // Usually paired with pinned_day: on their own they apply to whichever day
   // the place ends up on.
-  arrive_after Int?
-  arrive_by    Int?
+  arrive_after     Int?
+  arrive_by        Int?
   // Demotes `hours` to reference. Opening times are about getting inside, and
   // seeing a building lit up, a night tour or a concert in a venue that shuts
   // at six have nothing to do with that. The hours stay stored — they are still
   // worth knowing — they just stop constraining the plan.
-  ignore_hours Boolean   @default(false)
-  note         String?   @db.Text
-  sort_order   Int       @default(0)
-  created_at   DateTime  @default(now())
-  updated_at   DateTime  @updatedAt
-  trip_rel     Trip      @relation(fields: [trip_id], references: [id], onDelete: Cascade)
+  ignore_hours     Boolean   @default(false)
+  // A paragraph about the place from Wikipedia, with the article it came from.
+  // Cached rather than fetched on view: it does not change, and Wikipedia asks
+  // for politeness. `blurb_checked_at` records that we *looked* — most places
+  // have no article and never will, and without it every load re-asks about the
+  // same neighbourhood restaurant forever.
+  blurb            String?   @db.Text
+  blurb_url        String?   @db.VarChar(500)
+  blurb_checked_at DateTime?
+  note             String?   @db.Text
+  sort_order       Int       @default(0)
+  created_at       DateTime  @default(now())
+  updated_at       DateTime  @updatedAt
+  trip_rel         Trip      @relation(fields: [trip_id], references: [id], onDelete: Cascade)
 
   @@index([trip_id])
 }
@@ -407,26 +415,18 @@ model TripItem {
 }
 
 model ExpenseEstimate {
-  id               Int       @id @default(autoincrement())
-  trip_id          Int
-  category         String    @db.VarChar(100)
-  amount           Decimal   @db.Decimal(10, 2)
-  currency         String    @default("SEK") @db.VarChar(3)
-  date             DateTime? @db.Date
-  end_date         DateTime? @db.Date
-  // A paragraph about the place from Wikipedia, with the article it came from.
-  // Cached rather than fetched on view: it does not change, and Wikipedia asks
-  // for politeness. `blurb_checked_at` records that we *looked* — most places
-  // have no article and never will, and without it every load re-asks about the
-  // same neighbourhood restaurant forever.
-  blurb            String?   @db.Text
-  blurb_url        String?   @db.VarChar(500)
-  blurb_checked_at DateTime?
-  note             String?   @db.Text
-  sort_order       Int       @default(0)
-  created_at       DateTime  @default(now())
-  updated_at       DateTime  @updatedAt
-  trip_rel         Trip      @relation(fields: [trip_id], references: [id], onDelete: Cascade)
+  id         Int       @id @default(autoincrement())
+  trip_id    Int
+  category   String    @db.VarChar(100)
+  amount     Decimal   @db.Decimal(10, 2)
+  currency   String    @default("SEK") @db.VarChar(3)
+  date       DateTime? @db.Date
+  end_date   DateTime? @db.Date
+  note       String?   @db.Text
+  sort_order Int       @default(0)
+  created_at DateTime  @default(now())
+  updated_at DateTime  @updatedAt
+  trip_rel   Trip      @relation(fields: [trip_id], references: [id], onDelete: Cascade)
 
   @@index([trip_id])
 }
