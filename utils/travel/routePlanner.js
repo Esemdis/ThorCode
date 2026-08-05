@@ -119,10 +119,16 @@ async function describe(name, lat, lon, languages = ["en"]) {
       { name, lat, lon, languages },
       { timeout: GEOCODE_TIMEOUT_MS, headers: headers() }
     );
+    // Null here is a real answer with a 200 behind it: Wikipedia has no article
+    // for this place, and it never will. That is worth recording.
     return data || null;
   } catch (err) {
-    console.error(`[${new Date().toISOString()}] describe "${name}" failed`, err?.message || err);
-    return null;
+    // A failure is not that answer, and must not be mistaken for it. The caller
+    // stamps `blurb_checked_at` on whatever comes back, so swallowing this and
+    // returning null marked every sight on the trip as permanently having no
+    // article the one time the planner was restarting — and took the button
+    // that would have let you retry away with it.
+    throw wrap(err, "describe");
   }
 }
 

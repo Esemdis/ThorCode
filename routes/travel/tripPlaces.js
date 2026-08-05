@@ -202,9 +202,14 @@ router.post("/describe", async (req, res) => {
       select: { id: true, name: true, lat: true, lon: true },
     });
 
+    // Resolved before the response, not after: a throw once the response has
+    // gone would reach the catch below and try to send a second one. Same
+    // reason as the bulk route above.
+    const languages = wikipediaLanguages(trip?.destination);
+
     res.json({ data: { looking_up: todo.length } });
 
-    describeLater(todo, wikipediaLanguages(trip?.destination), req.tripId).catch(() => {});
+    describeLater(todo, languages, req.tripId).catch(() => {});
   } catch (err) {
     fail(res, err, { context: `POST places describe (trip ${req.tripId})` });
   }
