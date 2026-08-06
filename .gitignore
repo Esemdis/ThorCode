@@ -1,4 +1,10 @@
 node_modules
 .env
 /generated/prisma
-prisma/migrations/
+
+# prisma/migrations/ was ignored here in June. It has to be tracked: the
+# migration files *are* the schema's history, and a deploy that cannot see them
+# cannot apply anything. Ignoring them is what forced the Dockerfile onto
+# `db push`, which eventually tried to delete a trip's worth of data — see the
+# comment there. Eighteen of the thirty migrations on disk had never been
+# committed by the time it fired.
