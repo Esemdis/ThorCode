@@ -1,4 +1,17 @@
-FROM node:20-slim
+# node 24, matching the npm that writes package-lock.json here.
+#
+# This was node:20-slim, whose npm 10 refused the lock outright: vitest's bundled
+# vite declares a peer of esbuild ^0.27||^0.28, tsx depends on esbuild ~0.25.0,
+# and those ranges are disjoint, so the tree needs a second nested copy. npm 11
+# leaves the peer unsatisfied and calls it valid; npm 10 calls it a broken lock
+# and `npm ci` exits 1. Every image build failed on that from 30 July, which is
+# why the deployed container was still the one built on 26 July while the
+# database moved four migrations ahead of it.
+#
+# Keep this in step with whatever writes the lock, or the same thing recurs
+# silently — a failing build only shows up as an image that quietly stops
+# changing. Node 20 is past end-of-life besides.
+FROM node:24-slim
 
 RUN apt-get update -y && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
 
