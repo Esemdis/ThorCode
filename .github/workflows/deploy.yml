@@ -3,6 +3,11 @@ name: Build and push image
 on:
   push:
     branches: [main]
+  # Start a build by hand, from the Actions tab or `gh workflow run deploy.yml`.
+  # Added after an Actions outage swallowed three pushes: the fix was already on
+  # main, no run had been created for it, and without a manual trigger the only
+  # way to rebuild the image was to invent an empty commit.
+  workflow_dispatch:
 
 jobs:
   build:
