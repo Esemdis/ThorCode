@@ -761,9 +761,26 @@ router.post(
             return res.status(500).json({ error: "Band lookup failed after conflict" });
           }
         } else {
-          console.error("Error creating band:", error.response?.data ?? error.message);
-          const status = error.response?.status || 500;
-          return res.status(status).json(handleError("band", status));
+          // Creating the band is this API calling itself over HTTP at
+          // CALLBACK_URL, so a stale value there answers with a stranger's 404
+          // — which was reported as "Band not found with that Ticketmaster ID"
+          // and sent people hunting for a band that was on Ticketmaster all
+          // along. Only a JSON { error } body is our own answer and safe to
+          // forward; anything else is the call itself failing, not a verdict on
+          // the band.
+          const upstreamMessage = error.response?.data?.error;
+          const status = error.response?.status;
+          console.error(
+            `Error creating band via ${process.env.CALLBACK_URL}/data/concerts/bands:`,
+            status ?? error.code ?? error.message,
+            upstreamMessage ?? "",
+          );
+          if (status && upstreamMessage) {
+            return res.status(status).json({ error: upstreamMessage });
+          }
+          return res.status(502).json({
+            error: "Could not reach the band service — check CALLBACK_URL.",
+          });
         }
       }
 

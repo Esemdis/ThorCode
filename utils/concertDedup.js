@@ -76,10 +76,22 @@ function stringSimilarity(a, b) {
  * Concerts without coordinates are passed through unchanged.
  */
 function deduplicateByCoords(concerts) {
-  const coordKey = (c) =>
-    c.latitude != null && c.longitude != null
-      ? `${Math.round(c.latitude / 0.001)}:${Math.round(c.longitude / 0.001)}`
-      : null;
+  // The calendar day is part of the key, not just the coordinates. Without it a
+  // band playing the same room two nights running — or twice in a year — lost
+  // one of them here, before any of the DB rules below got a look: same venue,
+  // same bucket, one survivor. Undated concerts key on the coordinates alone,
+  // which is the old behaviour and the best available when there is no day to
+  // compare.
+  const dayKey = (value) => {
+    if (!value) return 'undated';
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? 'undated' : toUtcDay(parsed).toISOString().slice(0, 10);
+  };
+  const coordKey = (c) => {
+    if (c.latitude == null || c.longitude == null) return null;
+    const cell = `${Math.round(c.latitude / 0.001)}:${Math.round(c.longitude / 0.001)}`;
+    return `${cell}@${dayKey(c.concert_date)}`;
+  };
 
   const { coordMap, noCoord } = concerts.reduce(
     (acc, concert) => {
@@ -129,6 +141,18 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
     const isMultiBand = (c) => c.festival || c.bands.length >= 3;
     const sharesABand = (c) => c.bands.some((ref) => bandIds.includes(ref.band));
 
+    // The day-apart windows below exist for one show that two sources date
+    // differently — a late set filed as the next morning, a timezone slip. One
+    // source never lists the same show on two days, so when both sides name the
+    // same source and the days differ, that is a second night at the same room
+    // and merging it loses a real concert. Multi-day festivals are exempt: they
+    // genuinely are one event spanning several days.
+    const isSeparateNight = (c) => {
+      if (!concert.source || !c.source || concert.source !== c.source) return false;
+      if (concert.festival && c.festival) return false;
+      return diffDays(c) > 0;
+    };
+
     // 0. Band-schedule conflict
     if (bandIds.length > 0) {
       const sameDayCandidates = candidates.filter((c) => diffDays(c) === 0);
@@ -156,7 +180,13 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
           if (bestSim < 0.8) return false;
           // When only the normalized form matches (different "Artist @ Festival" variants),
           // extend the day window to 7 to cover multi-day festivals.
-          const maxDays = normSim >= 0.8 && rawSim < 0.8 ? 7 : 3;
+          const onlyNormalized = normSim >= 0.8 && rawSim < 0.8;
+          const maxDays = onlyNormalized ? 7 : 3;
+          // Two nights of the same tour carry the identical "Band @ Venue"
+          // fallback name, which used to score 1.0 here and merge them. The
+          // normalized path is exempt: that is the one matching festival name
+          // variants across the days of a single event.
+          if (!onlyNormalized && isSeparateNight(c)) return false;
           if (diffDays(c) > maxDays) return false;
           return sameArea(concert, c) ||
             (concert.city && c.city && stringSimilarity(concert.city, c.city) >= 0.7);
@@ -173,6 +203,7 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
         .filter(({ c, sim }) => {
           const venueMatch = sim >= 0.7 || venueContains(concert.venue, c.venue);
           if (!venueMatch) return false;
+          if (isSeparateNight(c)) return false;
           const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
           const d = diffDays(c);
           // Both flagged as festival + same venue = multi-day festival. Safe to merge
@@ -193,6 +224,7 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
     if (!existingConcert && concert.city) {
       const cityMatches = candidates
         .filter((c) => {
+          if (isSeparateNight(c)) return false;
           const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
           if (bandIds.length > 0 && !sharesABand(c) && !eitherIsMultiBand) return false;
           const d = diffDays(c);

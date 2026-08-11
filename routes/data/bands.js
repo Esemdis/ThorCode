@@ -4,6 +4,7 @@ const { validationResult, body } = require('express-validator');
 const axios = require('axios');
 const { handleError, checkDuplicateConcert } = require('./helpers');
 const { haversineKm, stringSimilarity, venueContains, deduplicateByCoords } = require('../../utils/concertDedup');
+const { cleanLineupNames, cleanLineupJson, canonicalBandName } = require('../../utils/lineupNames');
 
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
@@ -113,6 +114,12 @@ router.post(
           }
 
           try {
+            // Scraped lineup names carry follower counts and profile suffixes
+            // that stop them matching band.name. Clean once here so the two
+            // auto-link lookups below and the row we store all see the same
+            // names.
+            const metadata = cleanLineupJson(concert.metadata);
+
             // Check for duplicates by event_id if provided
             if (concert.event_id) {
               const existingByEventId = await tx.concert.findUnique({
@@ -132,9 +139,9 @@ router.post(
                 let validIds = dbBands.filter(Boolean).map((b) => b.id);
 
                 // Also auto-link any bands from the metadata lineup
-                if (concert.metadata) {
+                if (metadata) {
                   try {
-                    const lineupNames = JSON.parse(concert.metadata);
+                    const lineupNames = JSON.parse(metadata);
                     if (Array.isArray(lineupNames) && lineupNames.length > 0) {
                       const lineupBands = await tx.band.findMany({
                         where: { OR: lineupNames.map((n) => ({ name: { equals: n, mode: 'insensitive' } })) },
@@ -270,7 +277,7 @@ router.post(
                 event_id: concert.event_id || null,
                 latitude: concert.latitude || null,
                 longitude: concert.longitude || null,
-                metadata: concert.metadata || null,
+                metadata,
                 name: concert.name || null,
                 ticket_sale_start: concert.ticket_sale_start ? new Date(concert.ticket_sale_start) : null,
                 url: concert.url || null,
@@ -291,9 +298,9 @@ router.post(
             });
 
             // Auto-link any other bands in the lineup (metadata) that exist in the DB
-            if (concert.metadata) {
+            if (metadata) {
               try {
-                const lineupNames = JSON.parse(concert.metadata);
+                const lineupNames = JSON.parse(metadata);
                 if (Array.isArray(lineupNames) && lineupNames.length > 0) {
                   const lineupBands = await tx.band.findMany({
                     where: {
@@ -1427,27 +1434,37 @@ router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), a
     const toLink = [];
     const matches = [];
 
-    for (const name of band_names) {
-      if (!name || !name.trim()) continue;
-      const needle = name.trim().toLowerCase();
+    // The enricher posts link text straight off the event page, so a name can
+    // arrive as "Counterparts266K Followers" — clean before matching and before
+    // storing, or a support act on the wishlist stays an unlinked string.
+    const lineup = cleanLineupNames(band_names);
 
-      let bestBand = null;
-      let bestScore = 0;
-      for (const band of allBands) {
-        const score = stringSimilarity(needle, (band.name || '').toLowerCase());
-        if (score > bestScore) { bestScore = score; bestBand = band; }
-      }
+    // Matched on the canonical form rather than a similarity score. The score
+    // this replaced put "Alestorm" on "Halestorm" at 0.93 and "Nothing" on
+    // "Nothing More" at 0.75 — close enough to link, different enough to put a
+    // show on the map that the band is not playing.
+    const bandsByCanonical = new Map();
+    for (const band of allBands) {
+      const key = canonicalBandName(band.name);
+      if (key && !bandsByCanonical.has(key)) bandsByCanonical.set(key, band);
+    }
 
-      if (bestScore >= 0.75 && bestBand && !existingIds.has(bestBand.id)) {
-        toLink.push(bestBand.id);
-        existingIds.add(bestBand.id);
-        matches.push({ input_name: name, band_name: bestBand.name, band_id: bestBand.id, score: Math.round(bestScore * 100) });
+    for (const name of lineup) {
+      const match = bandsByCanonical.get(canonicalBandName(name));
+      if (match && !existingIds.has(match.id)) {
+        toLink.push(match.id);
+        existingIds.add(match.id);
+        matches.push({ input_name: name, band_name: match.name, band_id: match.id });
       }
     }
 
     // Resolve the best name to store: prefer a real event name from the enricher;
     // only overwrite the existing name if we have something better.
-    const concertUpdate = { metadata: JSON.stringify((band_names || []).filter(Boolean)) };
+    //
+    // A post carrying only an event name leaves the lineup alone — it used to
+    // write "[]" over whatever the JSON-LD scrape had already found.
+    const concertUpdate = {};
+    if (lineup.length > 0) concertUpdate.metadata = JSON.stringify(lineup);
     if (event_name) {
       const existing = await prisma.concert.findUnique({ where: { id: concertId }, select: { name: true } });
       const currentName = existing?.name || '';
@@ -1462,7 +1479,7 @@ router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), a
         data: toLink.map((bandId) => ({ concert: concertId, band: bandId })),
         skipDuplicates: true,
       }),
-      prisma.concert.update({
+      Object.keys(concertUpdate).length > 0 && prisma.concert.update({
         where: { id: concertId },
         data: concertUpdate,
       }),

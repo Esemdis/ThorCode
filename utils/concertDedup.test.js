@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { haversineKm, stringSimilarity, venueContains, deduplicateByCoords, deduplicateConcerts } from './concertDedup.js';
+import { haversineKm, stringSimilarity, venueContains, deduplicateByCoords, deduplicateConcerts, checkDuplicateConcert } from './concertDedup.js';
 
 describe('haversineKm', () => {
   it('is 0 for the same point', () => {
@@ -70,6 +70,36 @@ describe('deduplicateByCoords', () => {
   it('passes concerts without coordinates through unchanged', () => {
     const concerts = [{ bands: [1] }, { bands: [2] }];
     expect(deduplicateByCoords(concerts)).toHaveLength(2);
+  });
+
+  it('keeps both nights of a two-night stand at one venue', () => {
+    // The coordinates are identical to the metre; only the day differs. Keyed on
+    // position alone this dropped the second night before it reached the DB.
+    const concerts = [
+      { name: 'Night 1', latitude: 59.2964153, longitude: 18.0755919, concert_date: '2026-11-27T19:00:00Z', bands: [1] },
+      { name: 'Night 2', latitude: 59.2964153, longitude: 18.0755919, concert_date: '2026-11-28T19:00:00Z', bands: [1] },
+    ];
+    expect(deduplicateByCoords(concerts).map((c) => c.name)).toEqual(['Night 1', 'Night 2']);
+  });
+
+  it('still collapses two reports of the same show on the same day', () => {
+    const concerts = [
+      { latitude: 48.8566, longitude: 2.3522, concert_date: '2026-06-01T20:00:00Z', bands: [1] },
+      { latitude: 48.8566, longitude: 2.3522, concert_date: '2026-06-01T18:30:00Z', bands: [1, 2, 3] },
+    ];
+    const result = deduplicateByCoords(concerts);
+    expect(result).toHaveLength(1);
+    expect(result[0].bands).toEqual([1, 2, 3]);
+  });
+
+  it('treats an unparseable date as undated rather than throwing', () => {
+    const concerts = [
+      { latitude: 48.8566, longitude: 2.3522, concert_date: 'not a date', bands: [1] },
+      { latitude: 48.8566, longitude: 2.3522, concert_date: 'also not a date', bands: [1, 2] },
+    ];
+    const result = deduplicateByCoords(concerts);
+    expect(result).toHaveLength(1);
+    expect(result[0].bands).toEqual([1, 2]);
   });
 });
 
@@ -145,5 +175,78 @@ describe('deduplicateConcerts', () => {
   it('passes concerts with no name, venue, or date straight through', () => {
     const concerts = [{ participating_bands: [] }, { participating_bands: [] }];
     expect(deduplicateConcerts(concerts)).toHaveLength(2);
+  });
+});
+
+describe('checkDuplicateConcert and a second night at the same venue', () => {
+  // A stand-in for the Prisma transaction: findMany supplies the candidate rows,
+  // and the merge writes are recorded rather than performed.
+  const txWith = (rows) => ({
+    concert: { findMany: async () => rows, update: async () => ({}) },
+    concertBandReference: { findMany: async () => [], createMany: async () => ({}) },
+  });
+
+  const existing = (over = {}) => ({
+    id: 1,
+    venue: 'Fållan',
+    city: 'Johanneshov',
+    latitude: '59.2964153',
+    longitude: '18.0755919',
+    concert_date: new Date('2026-11-27T19:00:00Z'),
+    name: 'THROWN @ Fållan',
+    source: 'bandsintown',
+    festival: false,
+    bands: [{ band: 93 }],
+    ...over,
+  });
+
+  const incoming = (over = {}) => ({
+    venue: 'Fållan',
+    city: 'Johanneshov',
+    latitude: '59.2964153',
+    longitude: '18.0755919',
+    concert_date: '2026-11-28T19:00:00Z',
+    name: 'THROWN @ Fållan',
+    source: 'bandsintown',
+    festival: false,
+    ...over,
+  });
+
+  it('treats the next night at the same venue from the same source as a new concert', async () => {
+    const { isDuplicate } = await checkDuplicateConcert({
+      concert: incoming(),
+      bandIds: [93],
+      tx: txWith([existing()]),
+    });
+    expect(isDuplicate).toBe(false);
+  });
+
+  it('still merges the same show when two sources date it a day apart', async () => {
+    // This is what the day-apart window was for: one show, two sources, a date
+    // that slipped over midnight. Different sources, so it must still collapse.
+    const { isDuplicate } = await checkDuplicateConcert({
+      concert: incoming({ source: 'songkick' }),
+      bandIds: [93],
+      tx: txWith([existing()]),
+    });
+    expect(isDuplicate).toBe(true);
+  });
+
+  it('still merges the same show reported twice on the same day', async () => {
+    const { isDuplicate } = await checkDuplicateConcert({
+      concert: incoming({ concert_date: '2026-11-27T20:00:00Z' }),
+      bandIds: [93],
+      tx: txWith([existing()]),
+    });
+    expect(isDuplicate).toBe(true);
+  });
+
+  it('still merges the days of a multi-day festival from one source', async () => {
+    const { isDuplicate } = await checkDuplicateConcert({
+      concert: incoming({ festival: true, name: 'Resurrection Fest 2026', venue: 'Campo de Fútbol Celeiro' }),
+      bandIds: [93],
+      tx: txWith([existing({ festival: true, name: 'Resurrection Fest 2026', venue: 'Campo de Fútbol Celeiro' })]),
+    });
+    expect(isDuplicate).toBe(true);
   });
 });
