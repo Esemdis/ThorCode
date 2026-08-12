@@ -87,7 +87,7 @@ router.get("/callback", rateLimit, auth, async (req, res) => {
     const tmdbUserId = accountRes.data.id;
 
     try {
-      await prisma.oauth.upsert({
+      await prisma.oAuth.upsert({
         where: {
           user_provider: {
             user: userId,

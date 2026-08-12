@@ -14,9 +14,11 @@ app.use("/users", require("./routes/users"));
 app.use("/data/steam", require("./routes/data/steam"));
 app.use("/data/concerts", require("./routes/data/ticketmaster"))
 app.use("/data/concerts", require("./routes/data/notifications"))
+app.use("/data/concerts", require("./routes/data/playlists"))
 app.use("/data/cities", require("./routes/data/cities"))
 app.use("/data/tmdb", require("./routes/data/tmdb"));
 app.use("/oauth/tmdb", require("./routes/oauth/tmdb"));
+app.use("/oauth/spotify", require("./routes/oauth/spotify"));
 // Every /travel/* route, read or write, passes the limiter first.
 app.use("/travel", require("./middlewares/travelLimits"));
 app.use("/travel/trips", require("./routes/travel/trips"));

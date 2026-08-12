@@ -14,7 +14,7 @@ router.post("/me", auth, rateLimit, async (req, res) => {
     const userId = req.user.id;
 
     // Fetch oauth row for TMDB
-    const oauth = await prisma.oauth.findUnique({
+    const oauth = await prisma.oAuth.findUnique({
       where: {
         user_provider: {
           user: userId,

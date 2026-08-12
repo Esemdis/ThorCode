@@ -70,12 +70,19 @@ model MovieReview {
 }
 
 model OAuth {
-  id               Int    @id @default(autoincrement())
+  id               Int       @id @default(autoincrement())
   provider         String
   provider_user_id String
   access_token     String
+  // TMDB hands out session ids that never expire, which is why these three were
+  // not needed until now. A Spotify access token lasts an hour and has to be
+  // exchanged for a new one with the refresh token, so they are nullable and
+  // stay null on the TMDB rows.
+  refresh_token    String?
+  expires_at       DateTime?
+  scope            String?
   user             String
-  user_rel         User   @relation("UserOauth", fields: [user], references: [id])
+  user_rel         User      @relation("UserOauth", fields: [user], references: [id])
 
   @@unique([user, provider], name: "user_provider")
 }
