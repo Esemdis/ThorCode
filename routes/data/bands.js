@@ -102,6 +102,29 @@ router.post(
         const newlySoldOut = [];
         const errors = [];
 
+        // Every band once, keyed by canonical name, so a lineup entry is matched
+        // the same way here as in enrich-lineup. The exact match this replaces
+        // linked "Architects" but not "Architects (UK)", so which path a bill
+        // arrived by decided whether the band ended up on it. /bulk creates no
+        // bands, so one snapshot holds for the whole request.
+        const allBands = await tx.band.findMany({ select: { id: true, name: true } });
+        const bandsByCanonical = new Map();
+        for (const band of allBands) {
+          const key = canonicalBandName(band.name);
+          if (key && !bandsByCanonical.has(key)) bandsByCanonical.set(key, band.id);
+        }
+        const lineupBandIds = (json) => {
+          try {
+            const names = JSON.parse(json);
+            if (!Array.isArray(names)) return [];
+            return [...new Set(
+              names.map((n) => bandsByCanonical.get(canonicalBandName(n))).filter((id) => id !== undefined),
+            )];
+          } catch {
+            return [];
+          }
+        };
+
         // Must be sequential — each insert affects subsequent duplicate checks within the tx
         for (const [i, concert] of deduplicatedConcerts.entries()) {
           if (!concert.country || !concert.venue || !concert.city) {
@@ -139,18 +162,9 @@ router.post(
                 let validIds = dbBands.filter(Boolean).map((b) => b.id);
 
                 // Also auto-link any bands from the metadata lineup
-                if (metadata) {
-                  try {
-                    const lineupNames = JSON.parse(metadata);
-                    if (Array.isArray(lineupNames) && lineupNames.length > 0) {
-                      const lineupBands = await tx.band.findMany({
-                        where: { OR: lineupNames.map((n) => ({ name: { equals: n, mode: 'insensitive' } })) },
-                        select: { id: true },
-                      });
-                      const validSet = new Set(validIds);
-                      lineupBands.forEach((b) => { if (!validSet.has(b.id)) validIds.push(b.id); });
-                    }
-                  } catch (_) {}
+                const validSet = new Set(validIds);
+                for (const id of lineupBandIds(metadata)) {
+                  if (!validSet.has(id)) { validSet.add(id); validIds.push(id); }
                 }
 
                 const existingRefs = await tx.concertBandReference.findMany({
@@ -298,27 +312,12 @@ router.post(
             });
 
             // Auto-link any other bands in the lineup (metadata) that exist in the DB
-            if (metadata) {
-              try {
-                const lineupNames = JSON.parse(metadata);
-                if (Array.isArray(lineupNames) && lineupNames.length > 0) {
-                  const lineupBands = await tx.band.findMany({
-                    where: {
-                      OR: lineupNames.map((n) => ({ name: { equals: n, mode: 'insensitive' } })),
-                    },
-                    select: { id: true },
-                  });
-                  const linkedSet = new Set(bandIds);
-                  const extraIds = lineupBands.map((b) => b.id).filter((id) => !linkedSet.has(id));
-                  if (extraIds.length > 0) {
-                    await tx.concertBandReference.createMany({
-                      data: extraIds.map((band) => ({ concert: newConcert.id, band })),
-                    });
-                  }
-                }
-              } catch (_) {
-                // malformed metadata — skip silently
-              }
+            const linkedSet = new Set(bandIds);
+            const extraIds = lineupBandIds(metadata).filter((id) => !linkedSet.has(id));
+            if (extraIds.length > 0) {
+              await tx.concertBandReference.createMany({
+                data: extraIds.map((band) => ({ concert: newConcert.id, band })),
+              });
             }
 
             insertedConcerts.push({
@@ -1538,6 +1537,11 @@ router.get('/bands/:bandId/setlist-history', auth, async (req, res) => {
         venue: venue.name ?? null,
         city: city.name ?? null,
         country: city.country?.code ?? null,
+        // setlist.fm gives the venue's city coordinates and this used to drop
+        // them, so every show imported from history landed with no position and
+        // was filtered straight off the map.
+        latitude: city.coords?.lat ?? null,
+        longitude: city.coords?.long ?? null,
         tour: s.tour?.name ?? null,
         songs,
         url: s.url ?? null,
@@ -1603,6 +1607,8 @@ router.get('/setlist-lookup', auth, async (req, res) => {
       venue: venue.name ?? null,
       city: city.name ?? null,
       country: city.country?.code ?? null,
+      latitude: city.coords?.lat ?? null,
+      longitude: city.coords?.long ?? null,
       tour: s.tour?.name ?? null,
       songs,
       url: s.url ?? null,

@@ -15,7 +15,7 @@
 //   doppler run -c prd -- node scripts/backfill-lineup-names.js
 
 const prisma = require('../prisma/client');
-const { cleanLineupNames } = require('../utils/lineupNames');
+const { cleanLineupNames, canonicalBandName } = require('../utils/lineupNames');
 
 async function main() {
   const dryRun = process.argv.includes('--dry-run');
@@ -32,7 +32,13 @@ async function main() {
   });
 
   const bands = await prisma.band.findMany({ select: { id: true, name: true } });
-  const bandsByName = new Map(bands.map((b) => [b.name.toLowerCase(), b.id]));
+  // Canonical, matching /bulk and enrich-lineup. A plain lowercase compare left
+  // "Polaris (AUS)" on a bill unlinked from the Polaris row it belongs to.
+  const bandsByName = new Map();
+  for (const band of bands) {
+    const key = canonicalBandName(band.name);
+    if (key && !bandsByName.has(key)) bandsByName.set(key, band.id);
+  }
 
   let cleaned = 0;
   let linked = 0;
@@ -54,7 +60,7 @@ async function main() {
     const alreadyLinked = new Set(concert.bands.map((b) => b.band));
     const toLink = [...new Set(
       names
-        .map((n) => bandsByName.get(n.toLowerCase()))
+        .map((n) => bandsByName.get(canonicalBandName(n)))
         .filter((id) => id !== undefined && !alreadyLinked.has(id)),
     )];
 

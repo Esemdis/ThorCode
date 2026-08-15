@@ -13,6 +13,11 @@ const client = new Redis(REDIS_URL, {
   maxRetriesPerRequest: 3,
   lazyConnect: true,
   retryDelayOnClusterDown: 300000, // 5 minutes
+  // Commands issued while the connection is down fail immediately instead of
+  // queueing until it comes back. Without this a dead Redis does not disable the
+  // cache, it just makes every cached route twelve seconds slower — measured
+  // against a REDIS_URL whose host had stopped resolving.
+  enableOfflineQueue: false,
   retryStrategy: (times) => {
     // Exponential backoff with max delay of 5 minutes
     const delay = Math.min(times * 2000, 300000); // Max 5 minutes
@@ -25,6 +30,12 @@ const client = new Redis(REDIS_URL, {
     return err.message.includes(targetError);
   }
 });
+
+// lazyConnect means nothing dials Redis until the first command, and with the
+// offline queue off that first command would fail while the handshake is still
+// in flight. Kick it here so the connection is either up or known-down by the
+// time a request needs it.
+client.connect().catch(() => {});
 
 client.on("connect", () => console.log("Redis connected"));
 client.on("ready", () => console.log("Redis ready"));
@@ -55,17 +66,34 @@ async function cacheData({ prefix, data, ttl = 3600 }) {
     throw new Error("Failed to cache data");
   }
 }
+// Reads and deletes answer "nothing there" when Redis is unreachable rather
+// than throwing. Only cacheData still throws: a caller storing something it
+// intends to read back — OAuth state, in tmdb.js — has to know it did not land,
+// whereas a miss is a cache behaving exactly as a cache may.
 async function getCachedData({ key }) {
-  const data = await client.get(key);
-  return data ? JSON.parse(data) : null;
+  try {
+    const data = await client.get(key);
+    return data ? JSON.parse(data) : null;
+  } catch (error) {
+    console.error("Error reading cached data:", error.message);
+    return null;
+  }
 }
 async function deleteCachedData({ key }) {
-  await client.del(key);
+  try {
+    await client.del(key);
+  } catch (error) {
+    console.error("Error deleting cached data:", error.message);
+  }
 }
 async function clearCache({ prefix }) {
-  const keys = await client.keys(`${prefix}:*`);
-  if (keys.length > 0) {
-    await client.del(keys);
+  try {
+    const keys = await client.keys(`${prefix}:*`);
+    if (keys.length > 0) {
+      await client.del(keys);
+    }
+  } catch (error) {
+    console.error("Error clearing cache:", error.message);
   }
 }
 

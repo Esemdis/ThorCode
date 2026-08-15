@@ -422,11 +422,14 @@ router.get(
                   weather: true,
                   reachable: true,
                   city_rel: {
+                    // `reachable` is the only field the client reads off this
+                    // relation. airport_iata and weather_monthly rode along on
+                    // every concert in the payload without a single consumer —
+                    // and airport_iata has no producer either: nothing writes it
+                    // but PATCH /data/cities/:id, by hand.
                     select: {
                       id: true,
                       reachable: true,
-                      airport_iata: true,
-                      weather_monthly: true,
                     },
                   },
                   bands: {
@@ -1133,6 +1136,8 @@ router.post(
     body("city").isString().notEmpty(),
     body("country").isString().notEmpty(),
     body("band_id").isInt().withMessage("band_id must be an integer"),
+    body("latitude").optional({ nullable: true }).isFloat().withMessage("latitude must be a number"),
+    body("longitude").optional({ nullable: true }).isFloat().withMessage("longitude must be a number"),
   ],
   async (req, res) => {
     try {
@@ -1140,7 +1145,7 @@ router.post(
       if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
 
       const wishlistId = parseInt(req.params.id, 10);
-      const { setlistfm_id, date, venue, city, country, band_id, url, songs } = req.body;
+      const { setlistfm_id, date, venue, city, country, band_id, url, songs, latitude, longitude } = req.body;
       const bandId = parseInt(band_id, 10);
 
       const wishlist = await prisma.wishlist.findUnique({
@@ -1159,6 +1164,33 @@ router.post(
 
       const eventId = `sfm_${setlistfm_id}`;
 
+      // Coordinates and a city link, both of which this route used to leave
+      // empty: a concert without a position is dropped by the map's grouping and
+      // simply never appears, and the city link is what carries reachability.
+      // The client passes setlist.fm's own venue coordinates through.
+      const hasCoords = latitude != null && longitude != null;
+      let cityId = null;
+      if (city && country) {
+        const cityRecord = await prisma.city.upsert({
+          where: { name_country: { name: city, country } },
+          create: {
+            name: city,
+            country,
+            latitude: hasCoords ? parseFloat(latitude) : null,
+            longitude: hasCoords ? parseFloat(longitude) : null,
+          },
+          update: {},
+          select: { id: true, latitude: true },
+        });
+        cityId = cityRecord.id;
+        if (hasCoords && cityRecord.latitude == null) {
+          await prisma.city.update({
+            where: { id: cityRecord.id },
+            data: { latitude: parseFloat(latitude), longitude: parseFloat(longitude) },
+          });
+        }
+      }
+
       const concert = await prisma.concert.upsert({
         where: { event_id: eventId },
         create: {
@@ -1171,10 +1203,29 @@ router.post(
           created_at: new Date(),
           url: url ?? null,
           source: "setlistfm",
+          latitude: hasCoords ? String(latitude) : null,
+          longitude: hasCoords ? String(longitude) : null,
+          city_id: cityId,
         },
         update: {},
         select: { id: true },
       });
+
+      // Gaps only, and never an overwrite. What setlist.fm returns is the
+      // venue's *city* coordinates, so a row already placed at the venue itself
+      // — by /bulk, or by the coordinate backfill — must keep what it has.
+      if (hasCoords) {
+        await prisma.concert.updateMany({
+          where: { id: concert.id, OR: [{ latitude: null }, { longitude: null }] },
+          data: { latitude: String(latitude), longitude: String(longitude) },
+        });
+      }
+      if (cityId) {
+        await prisma.concert.updateMany({
+          where: { id: concert.id, city_id: null },
+          data: { city_id: cityId },
+        });
+      }
 
       // Link band to concert, storing the specific setlist if provided
       const setlistData = Array.isArray(songs) && songs.length > 0 ? { songs } : undefined;
