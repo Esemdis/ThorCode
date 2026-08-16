@@ -26,6 +26,7 @@ app.use("/travel/trips/:tripId/items", require("./routes/travel/tripItems"));
 app.use("/travel/trips/:tripId/todos", require("./routes/travel/tripTodos"));
 app.use("/travel/trips/:tripId/places", require("./routes/travel/tripPlaces"));
 app.use("/travel/trips/:tripId/plan", require("./routes/travel/tripPlan"));
+app.use("/travel/trips/:tripId/weather-verdict", require("./routes/travel/weatherVerdict"));
 app.use("/travel/trips/:tripId/estimates", require("./routes/travel/estimates"));
 app.use("/travel/trips/:tripId/reviews", require("./routes/travel/reviews"));
 app.use("/travel/trips/:tripId/trip-review", require("./routes/travel/tripReview"));
