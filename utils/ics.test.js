@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { concertEventFields, concertToIcs, concertsToIcs, icsFilename, foldIcsLine } from './ics.js';
+import { concertEventFields, concertToIcs, concertsToIcs, icsFilename, foldIcsLine, storesRealInstant } from './ics.js';
 
 const NOW = new Date('2026-08-17T09:30:00.000Z');
 
@@ -287,5 +287,64 @@ describe('concertsToIcs', () => {
       metadata: JSON.stringify(Array.from({ length: 30 }, (_, i) => `Band Number ${i}`)),
     })], NOW);
     expect(ics.split('\r\n').every((l) => new TextEncoder().encode(l).length <= 75)).toBe(true);
+  });
+});
+
+describe('storesRealInstant', () => {
+  it('says Songkick rows already hold a true UTC instant', () => {
+    // Verified against the live pages on 2026-08-27: a Songkick concert whose
+    // page reads "Doors open: 20:00" in Cologne is stored as 18:00Z, and one
+    // reading 18:00 in Utrecht is stored as 17:00Z. Both are correct UTC.
+    expect(storesRealInstant('songkick')).toBe(true);
+  });
+
+  it('says the other sources hold a wall clock wearing a Z', () => {
+    // Bandsintown's 19:00 Stockholm show is stored as 19:00Z, which as an
+    // instant is 20:00 local — an hour out. post_tours.py builds Ticketmaster
+    // values as `${localDate}T${localTime}Z` outright.
+    expect(storesRealInstant('bandsintown')).toBe(false);
+    expect(storesRealInstant('ticketmaster')).toBe(false);
+  });
+
+  it('treats an unknown or missing source as a wall clock', () => {
+    // 208 rows carry no source and 25 come from setlist.fm; neither has been
+    // verified. Floating is the reading that was already shipping, so treating
+    // them this way changes nothing rather than guessing in a new direction.
+    expect(storesRealInstant(null)).toBe(false);
+    expect(storesRealInstant('setlistfm')).toBe(false);
+  });
+});
+
+describe('concertEventFields — per-source times', () => {
+  const at = (source, date) => concertEventFields(concert({ source, concert_date: date }));
+
+  it('writes a Songkick time as an instant, so calendars localise it', () => {
+    // 17:00Z is 18:00 in Utrecht. Written floating it would read 17:00 — an
+    // hour early — which is what 269 concerts were doing.
+    const f = at('songkick', '2026-11-02T17:00:00.000Z');
+    expect(f.start).toBe('20261102T170000Z');
+    expect(f.end).toBe('20261102T200000Z');
+  });
+
+  it('leaves a Bandsintown time floating, because the number is the wall clock', () => {
+    const f = at('bandsintown', '2026-11-27T19:00:00.000Z');
+    expect(f.start).toBe('20261127T190000');
+    expect(f.end).toBe('20261127T220000');
+  });
+
+  it('still makes a midnight-stamped concert all-day whatever the source', () => {
+    // No time was published; that is true regardless of how the source stores
+    // the ones that were.
+    expect(at('songkick', '2026-11-02T00:00:00.000Z').allDay).toBe(true);
+    expect(at('bandsintown', '2026-11-27T00:00:00.000Z').allDay).toBe(true);
+  });
+});
+
+describe('concertToIcs — per-source times', () => {
+  it('marks a Songkick DTSTART as UTC and a Bandsintown one as floating', () => {
+    const sk = concertToIcs(concert({ source: 'songkick', concert_date: '2026-11-02T17:00:00.000Z' }), NOW);
+    const bit = concertToIcs(concert({ source: 'bandsintown', concert_date: '2026-11-27T19:00:00.000Z' }), NOW);
+    expect(sk).toContain('DTSTART:20261102T170000Z');
+    expect(bit).toContain('DTSTART:20261127T190000\r\n');
   });
 });

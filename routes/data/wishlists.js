@@ -9,7 +9,8 @@ const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const { rateLimiter } = require("../../utils/rateLimiter");
 const prisma = require("../../prisma/client");
-const { generateCalendarToken, feedUrl } = require("../../utils/calendarToken");
+const { generateCalendarToken, feedUrl, isPubliclyReachable } = require("../../utils/calendarToken");
+const { storesRealInstant } = require("../../utils/ics");
 
 const rateLimit = rateLimiter({
   message: "Too many requests to the Ticketmaster data route, please try again later.",
@@ -993,6 +994,9 @@ router.get(
         token: wishlist.calendar_token,
         url: feedUrl(process.env.CALLBACK_URL, wishlist.calendar_token),
         created_at: wishlist.calendar_token_at,
+        // Reported rather than assumed: on a development config this URL is
+        // loopback, which no calendar service can fetch.
+        publicly_reachable: isPubliclyReachable(process.env.CALLBACK_URL),
       });
     } catch (error) {
       console.error("Error reading calendar token:", error);
@@ -1020,7 +1024,11 @@ router.post(
           data: { calendar_token: token, calendar_token_at: new Date() },
         });
       }
-      return res.json({ token, url: feedUrl(process.env.CALLBACK_URL, token) });
+      return res.json({
+        token,
+        url: feedUrl(process.env.CALLBACK_URL, token),
+        publicly_reachable: isPubliclyReachable(process.env.CALLBACK_URL),
+      });
     } catch (error) {
       console.error("Error creating calendar token:", error);
       res.status(500).json({ error: "Failed to create calendar token" });
@@ -1085,6 +1093,13 @@ router.get(
               concert_date: true,
               url: true,
               festival: true,
+              // The support acts on the bill: bands nobody put on a wishlist
+              // live only here. Without it concertLineup finds no extra names
+              // and half a festival lineup is invisible in the app.
+              metadata: true,
+              // Read to derive time_is_instant below; not returned raw, so no
+              // client grows its own copy of the per-source rule.
+              source: true,
               latitude: true,
               longitude: true,
               on_sale: true,
@@ -1107,6 +1122,12 @@ router.get(
         created_at: r.created_at,
         concert: {
           ...r.concert_rel,
+          source: undefined,
+          // concert_date does not mean the same thing for every row: some
+          // sources store a true UTC instant, others the venue's wall clock
+          // wearing a Z. The client cannot render a time correctly without
+          // knowing which, and deriving it here keeps that rule in one place.
+          time_is_instant: storesRealInstant(r.concert_rel.source),
           participating_bands: r.concert_rel.bands.map((b) => ({
             id: b.band_rel.id,
             name: b.band_rel.name,

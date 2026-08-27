@@ -46,4 +46,35 @@ function feedUrl(baseUrl, token) {
   return `${String(baseUrl).replace(/\/+$/, '')}${FEED_PATH}/${token}/going.ics`;
 }
 
-module.exports = { generateCalendarToken, feedUrl, TOKEN_LENGTH };
+
+// Hostnames only this machine, or only this LAN, can resolve.
+const LOOPBACK = /^(localhost|127\.\d+\.\d+\.\d+|\[?::1\]?)$/i;
+const PRIVATE_V4 = /^(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)$/;
+const LOCAL_TLD = /\.local$/i;
+
+/**
+ * Whether a base URL can be fetched by someone else's server.
+ *
+ * A calendar feed is not fetched by the browser that subscribed — Google,
+ * Apple and Outlook fetch it from their own infrastructure on their own
+ * schedule. So a base URL of http://127.0.0.1:4000, which is exactly what a
+ * development config holds, resolves to *their* machine and the subscription
+ * quietly never populates. Nothing errors; the calendar is simply always empty.
+ *
+ * Anything unparseable counts as unreachable. A needless warning is a small
+ * cost; a missing one buys the user a subscription that can never work.
+ *
+ * @param {string} baseUrl
+ * @returns {boolean}
+ */
+function isPubliclyReachable(baseUrl) {
+  try {
+    const { hostname } = new URL(String(baseUrl));
+    if (!hostname) return false;
+    return !LOOPBACK.test(hostname) && !PRIVATE_V4.test(hostname) && !LOCAL_TLD.test(hostname);
+  } catch {
+    return false;
+  }
+}
+
+module.exports = { generateCalendarToken, feedUrl, isPubliclyReachable, TOKEN_LENGTH };

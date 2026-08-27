@@ -25,6 +25,11 @@ const CONCERT_SELECT = {
   city: true,
   country: true,
   concert_date: true,
+  // utils/ics.js needs the source to know whether concert_date is a real
+  // instant or a wall clock — the column does not mean the same thing for
+  // every row. Dropping this field silently reverts 269 Songkick concerts to
+  // rendering an hour or two early.
+  source: true,
   url: true,
   metadata: true,
   price_min: true,

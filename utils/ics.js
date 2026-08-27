@@ -101,6 +101,38 @@ function priceLine(concert) {
   return `Tickets ${range} ${currency}`.trim();
 }
 
+
+// Sources whose stored concert_date is already a true UTC instant.
+//
+// The column does not mean the same thing for every row. Verified against the
+// live pages on 2026-08-27: a Songkick concert reading "Doors open: 20:00" in
+// Cologne is stored as 18:00Z, and one reading 18:00 in Utrecht as 17:00Z —
+// both correct conversions. Bandsintown's 19:00 Stockholm show is stored as
+// 19:00Z, which is the wall clock wearing a Z, and post_tours.py builds
+// Ticketmaster values as `${localDate}T${localTime}Z` outright.
+//
+// Written floating, a Songkick time renders an hour or two early — 269 concerts
+// were doing exactly that. Written as an instant, the calendar localises it.
+//
+// This is a stopgap. The real fix is to make the column mean one thing; see
+// docs/superpowers/specs/2026-08-27-concert-time-normalisation-design.md in
+// concert-map. Until then the rule lives here, named, rather than as an
+// assumption spread across the file.
+const UTC_INSTANT_SOURCES = new Set(['songkick']);
+
+/**
+ * Whether this source's stored time is a real instant rather than a wall clock.
+ *
+ * Anything unverified counts as a wall clock: that is the reading already
+ * shipping, so it changes nothing rather than guessing in a new direction.
+ *
+ * @param {string|null|undefined} source
+ * @returns {boolean}
+ */
+function storesRealInstant(source) {
+  return UTC_INSTANT_SOURCES.has(source);
+}
+
 /**
  * The calendar-facing view of a concert. Null when there is no usable date —
  * there is no event to place.
@@ -126,6 +158,8 @@ function concertEventFields(concert) {
   if (allDay) end.setUTCDate(end.getUTCDate() + 1);
   else end.setUTCHours(end.getUTCHours() + EVENT_HOURS);
 
+  const timed = storesRealInstant(concert.source) ? icsInstant : icsFloating;
+
   return {
     title: concert.name || concert.band || 'Concert',
     location: [concert.venue, concert.city, countryName(concert.country)].filter(Boolean).join(', '),
@@ -140,8 +174,8 @@ function concertEventFields(concert) {
     // 19:00 at an Oslo venue is stored as 19:00Z. Treating that as an instant
     // puts the gig in the calendar at 21:00. Floating keeps the wall clock the
     // venue posted, which is the number on the ticket.
-    start: allDay ? icsDay(start) : icsFloating(start),
-    end: allDay ? icsDay(end) : icsFloating(end),
+    start: allDay ? icsDay(start) : timed(start),
+    end: allDay ? icsDay(end) : timed(end),
   };
 }
 
@@ -248,6 +282,7 @@ function icsFilename(concert) {
 }
 
 module.exports = {
+  storesRealInstant,
   concertEventFields,
   foldIcsLine,
   concertToIcs,

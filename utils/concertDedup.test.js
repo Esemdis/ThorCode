@@ -250,3 +250,57 @@ describe('checkDuplicateConcert and a second night at the same venue', () => {
     expect(isDuplicate).toBe(true);
   });
 });
+
+describe('deduplicateConcerts — adopting a time from a duplicate', () => {
+  // Two sources describing the same gig. Songkick is scraped first and so
+  // becomes the base, but 182 of its rows carry no time at all.
+  const pair = (baseDate, incomingDate, over = {}) => ([
+    {
+      name: 'THROWN @ Fållan', venue: 'Fållan', city: 'Stockholm',
+      source: 'songkick', concert_date: baseDate,
+      participating_bands: [{ id: 1 }],
+    },
+    {
+      name: 'thrown official @ Fållan', venue: 'Fållan', city: 'Stockholm',
+      source: 'bandsintown', concert_date: incomingDate,
+      participating_bands: [{ id: 1 }],
+      ...over,
+    },
+  ]);
+
+  it('takes the duplicate\'s time when the base has none', () => {
+    // Without this the 19:00 is thrown away and the gig stays an all-day event
+    // purely because of which scraper happened to run first.
+    const [merged] = deduplicateConcerts(pair('2026-11-27T00:00:00Z', '2026-11-27T19:00:00Z'));
+    expect(new Date(merged.concert_date).toISOString()).toBe('2026-11-27T19:00:00.000Z');
+  });
+
+  it('takes the source along with the time, so the two cannot disagree', () => {
+    // A Bandsintown time is a wall clock; a Songkick time is a real instant.
+    // Keeping source: 'songkick' on a row now holding a Bandsintown time would
+    // make the calendar read it as UTC and render the gig hours out.
+    const [merged] = deduplicateConcerts(pair('2026-11-27T00:00:00Z', '2026-11-27T19:00:00Z'));
+    expect(merged.source).toBe('bandsintown');
+  });
+
+  it('keeps the base time when it already has one', () => {
+    const [merged] = deduplicateConcerts(pair('2026-11-27T18:00:00Z', '2026-11-27T19:00:00Z'));
+    expect(new Date(merged.concert_date).toISOString()).toBe('2026-11-27T18:00:00.000Z');
+    expect(merged.source).toBe('songkick');
+  });
+
+  it('leaves the day alone when neither side has a time', () => {
+    const [merged] = deduplicateConcerts(pair('2026-11-27T00:00:00Z', '2026-11-27T00:00:00Z'));
+    expect(new Date(merged.concert_date).toISOString()).toBe('2026-11-27T00:00:00.000Z');
+    expect(merged.source).toBe('songkick');
+  });
+
+  it('still merges the lineups when it adopts a time', () => {
+    // The time is extra behaviour, not a replacement for what merging already
+    // did.
+    const [merged] = deduplicateConcerts(pair('2026-11-27T00:00:00Z', '2026-11-27T19:00:00Z', {
+      participating_bands: [{ id: 1 }, { id: 2 }],
+    }));
+    expect(merged.participating_bands.map((b) => b.id).sort()).toEqual([1, 2]);
+  });
+});

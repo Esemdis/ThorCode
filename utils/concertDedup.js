@@ -337,6 +337,22 @@ function deduplicateByNameVenue(concerts) {
  * Pass 2 — merge concerts on the same calendar day that share at least one
  * participating band. Bands and metadata names from duplicates are merged in.
  */
+/**
+ * Whether a concert date carries a time of day rather than just a day.
+ *
+ * A concert scraped without a start time is stored at exactly midnight UTC, so
+ * midnight is the marker for "no time published" rather than a real 00:00 show.
+ *
+ * @param {string|Date|null|undefined} concertDate
+ * @returns {boolean}
+ */
+function hasTimeOfDay(concertDate) {
+  if (!concertDate) return false;
+  const d = new Date(concertDate);
+  if (Number.isNaN(d.getTime())) return false;
+  return d.getUTCHours() !== 0 || d.getUTCMinutes() !== 0 || d.getUTCSeconds() !== 0;
+}
+
 function mergeByDayAndBands(concerts) {
   const dayBuckets = new Map();
   const result = [];
@@ -370,6 +386,21 @@ function mergeByDayAndBands(concerts) {
       let baseMeta = []; try { baseMeta = JSON.parse(base.metadata || '[]'); } catch {}
       let concMeta = []; try { concMeta = JSON.parse(concert.metadata || '[]'); } catch {}
       base.metadata = JSON.stringify([...new Set([...baseMeta, ...concMeta])]);
+
+      // A published time beats no time. The base is whichever source was
+      // scraped first, not whichever knows most: Songkick runs first and 182 of
+      // its rows sit at midnight, so a Bandsintown duplicate carrying a real
+      // 19:00 used to lose it purely on scrape order.
+      //
+      // The source moves with the time deliberately. concert_date does not mean
+      // the same thing for every source — Songkick stores a true UTC instant,
+      // Bandsintown a local wall clock — so a row holding a Bandsintown time
+      // while still labelled songkick would be read as UTC and render the gig
+      // hours out. Whoever supplied the time owns how it is interpreted.
+      if (!hasTimeOfDay(base.concert_date) && hasTimeOfDay(concert.concert_date)) {
+        base.concert_date = concert.concert_date;
+        base.source = concert.source;
+      }
     } else {
       const idx = result.length;
       result.push({ ...concert });
