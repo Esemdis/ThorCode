@@ -3,6 +3,7 @@ const router = express.Router();
 const { body, param, validationResult } = require("express-validator");
 const { Prisma } = require("@prisma/client");
 const axios = require("axios");
+const { pythonServicePost } = require('../../utils/pythonService');
 
 const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
@@ -43,8 +44,7 @@ router.get("/weather-pending", roleCheck(["SYSTEM"]), async (_req, res) => {
 // POST /travel/trips/sync-weather — proxy to Python trip weather sync (ADMIN only)
 router.post("/sync-weather", roleCheck(["ADMIN"]), async (_req, res) => {
   try {
-    const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
-    await axios.post(`${pythonServiceUrl}/sync-trip-weather`, {}, { timeout: 300000 });
+    await pythonServicePost(`/sync-trip-weather`, {}, { timeout: 300000 });
     res.status(200).json({ status: "success" });
   } catch (err) {
     fail(res, err, { context: "POST sync-weather", message: "Weather sync failed" });

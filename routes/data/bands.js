@@ -2,9 +2,11 @@ const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
 const axios = require('axios');
+const { pythonServicePost } = require('../../utils/pythonService');
 const { handleError, checkDuplicateConcert } = require('./helpers');
 const { haversineKm, stringSimilarity, venueContains, deduplicateByCoords } = require('../../utils/concertDedup');
 const { cleanLineupNames, cleanLineupJson, canonicalBandName } = require('../../utils/lineupNames');
+const { shapeBandOverview } = require('../../utils/bandOverview');
 
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
@@ -459,53 +461,37 @@ router.get('/bands/search', async (req, res) => {
 router.get('/upcoming/bands', async (req, res) => {
   try {
     const now = new Date();
-    const bands = await prisma.band.findMany({
-      select: {
-        id: true,
-        name: true,
-        songkick_url: true,
-        bandsintown_url: true,
-        _count: { select: { concerts: { where: { concert_rel: { concert_date: { gte: now } } } } } },
-      },
-      orderBy: { name: 'asc' },
-    });
 
-    const mapped = bands.map((b) => ({
-      id: b.id,
-      name: b.name,
-      songkick_url: b.songkick_url,
-      bandsintown_url: b.bandsintown_url,
-      concertCount: b._count.concerts,
-    }));
-
-    // Enrich with next upcoming concert (date & country)
-    await Promise.all(
-      mapped.map(async (b) => {
-        try {
-          const next = await prisma.concert.findFirst({
-            where: {
-              concert_date: { gte: now },
-              bands: { some: { band: b.id } }, // concerts having this band
-            },
-            select: { concert_date: true, country: true },
-            orderBy: { concert_date: 'asc' },
-          });
-          if (next) {
-            b.nextConcertDate = next.concert_date; // raw Date; frontend can format
-            b.nextConcertCountry = next.country;
-          } else {
-            b.nextConcertDate = null;
-            b.nextConcertCountry = null;
-          }
-        } catch (e) {
-          console.error(`Error fetching next concert for band ${b.id} (${b.name}):`, e);
-          b.nextConcertDate = null;
-          b.nextConcertCountry = null;
-        }
+    // DISTINCT ON picks one row per band: the earliest concert still to come,
+    // and the latest that has already happened. This replaced one findFirst per
+    // band inside a Promise.all — 114 queries for the current band list, and it
+    // would have been 228 once the last-seen column was added.
+    const [bands, nextRows, lastRows] = await Promise.all([
+      prisma.band.findMany({
+        select: {
+          id: true,
+          name: true,
+          songkick_url: true,
+          bandsintown_url: true,
+          _count: { select: { concerts: { where: { concert_rel: { concert_date: { gte: now } } } } } },
+        },
+        orderBy: { name: 'asc' },
       }),
-    );
+      prisma.$queryRaw`
+        SELECT DISTINCT ON (r.band) r.band AS band_id, c.concert_date, c.country
+        FROM "ConcertBandReference" r
+        JOIN "Concert" c ON c.id = r.concert
+        WHERE c.concert_date >= ${now}
+        ORDER BY r.band, c.concert_date ASC`,
+      prisma.$queryRaw`
+        SELECT DISTINCT ON (r.band) r.band AS band_id, c.concert_date, c.country
+        FROM "ConcertBandReference" r
+        JOIN "Concert" c ON c.id = r.concert
+        WHERE c.concert_date < ${now}
+        ORDER BY r.band, c.concert_date DESC`,
+    ]);
 
-    res.json(mapped);
+    res.json(shapeBandOverview(bands, nextRows, lastRows));
   } catch (error) {
     console.error('Error fetching bands:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -548,9 +534,7 @@ router.post(
       }
 
       // Call the Python service to sync concerts for this band
-      const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
-      const syncResponse = await axios.post(
-        `${pythonServiceUrl}/sync/${band.id}`,
+      const syncResponse = await pythonServicePost(`/sync/${band.id}`,
         { songkick_url: band.songkick_url ?? null, bandsintown_url: band.bandsintown_url ?? null, ticketmaster_id: band.ticketmaster_id ?? null, band_name: band.name },
       );
 
@@ -861,9 +845,7 @@ router.post(
             },
           }).catch((e) => console.error(`[findSourceUrl] DB update failed for ${newBand.name}:`, e.message));
         }
-        const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
-        await axios.post(
-          `${pythonServiceUrl}/sync/${newBand.id}`,
+        await pythonServicePost(`/sync/${newBand.id}`,
           { songkick_url: songkickUrl || null, bandsintown_url: bandsintownUrl || null, ticketmaster_id: resolvedTicketmasterId, band_name: newBand.name },
         );
         console.log(`[findSourceUrl] Sync queued for ${newBand.name}`);
@@ -1273,8 +1255,7 @@ router.get('/bands/ticketmaster-search', async (req, res) => {
 
 router.post('/bands/sync-all', auth, roleCheck(['ADMIN']), async (_req, res) => {
   try {
-    const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
-    const syncResponse = await axios.post(`${pythonServiceUrl}/trigger`);
+    const syncResponse = await pythonServicePost(`/trigger`);
     res.status(200).json({ status: 'success', ...syncResponse.data });
   } catch (error) {
     console.error('Error triggering full sync:', error.message);
@@ -1285,8 +1266,7 @@ router.post('/bands/sync-all', auth, roleCheck(['ADMIN']), async (_req, res) => 
 // POST /sync-weather — proxy to Python weather sync (ADMIN only)
 router.post('/sync-weather', auth, roleCheck(['ADMIN']), async (_req, res) => {
   try {
-    const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
-    await axios.post(`${pythonServiceUrl}/sync-weather`, {}, { timeout: 300000 });
+    await pythonServicePost(`/sync-weather`, {}, { timeout: 300000 });
     res.status(200).json({ status: 'success' });
   } catch (error) {
     console.error('Error triggering weather sync:', error.message);
@@ -1297,8 +1277,7 @@ router.post('/sync-weather', auth, roleCheck(['ADMIN']), async (_req, res) => {
 // POST /bands/sync-setlists — proxy to Python setlist sync (ADMIN only)
 router.post('/bands/sync-setlists', auth, roleCheck(['ADMIN']), async (_req, res) => {
   try {
-    const pythonServiceUrl = process.env.PYTHON_SERVICE_URL;
-    await axios.post(`${pythonServiceUrl}/sync-setlists`, {}, { timeout: 300000 });
+    await pythonServicePost(`/sync-setlists`, {}, { timeout: 300000 });
     res.status(200).json({ status: 'success' });
   } catch (error) {
     console.error('Error triggering setlist sync:', error.message);
