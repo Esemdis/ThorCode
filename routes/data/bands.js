@@ -10,6 +10,7 @@ const { shapeBandOverview } = require('../../utils/bandOverview');
 const { searchArtists } = require('../../utils/spotify');
 const { enrichAttractions } = require('../../utils/spotifyArtistMatch');
 const { getArtistInfo } = require('../../utils/lastfm');
+const { collapseDuplicates } = require('../../utils/attractions');
 
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
@@ -1238,6 +1239,10 @@ router.get('/bands/ticketmaster-search', async (req, res) => {
         id: attraction.id,
         name: attraction.name,
         url: attraction.url || null,
+        // How many shows this attraction still has. It is what separates a
+        // touring act from a stale duplicate record with the same name, and
+        // it is the id that will actually return concerts on ingest.
+        upcomingEvents: attraction.upcomingEvents?._total ?? 0,
         // Include image if available
         image:
           attraction.images && attraction.images.length > 0
@@ -1264,7 +1269,9 @@ router.get('/bands/ticketmaster-search', async (req, res) => {
         console.warn('[spotify] Artist enrichment failed:', error.response?.data ?? error.message);
       }
 
-      const payload = enrichAttractions(bands, artists);
+      // Collapsed before enrichment: a dropped row must not cost a Last.fm
+      // request, and the enrichment cap should apply to what is actually shown.
+      const payload = enrichAttractions(collapseDuplicates(bands), artists);
 
       // Spotify supplies the photo; everything descriptive comes from Last.fm,
       // because a Development Mode Spotify app is not given genres or follower
