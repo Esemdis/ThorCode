@@ -13,7 +13,7 @@ const band = (id, name, over = {}) => ({
 describe('shapeBandOverview', () => {
 
   it('carries the band through with its upcoming-concert count', () => {
-    const out = shapeBandOverview([band(1, 'Silverstein', { _count: { concerts: 4 } })], [], []);
+    const out = shapeBandOverview([band(1, 'Silverstein', { _count: { concerts: 4 } })], [], [], []);
 
     expect(out).toEqual([expect.objectContaining({ id: 1, name: 'Silverstein', concertCount: 4 })]);
   });
@@ -95,4 +95,66 @@ describe('shapeBandOverview', () => {
     expect(out.bandsintown_url).toBeNull();
   });
 
+  it('lists every country a band is touring, not just the next one', () => {
+    // The table used to show only the next concert's country, so a band playing
+    // Germany, the Netherlands and Belgium read as a German band.
+    const out = shapeBandOverview(
+      [band(1, 'Thrown')], [], [],
+      [{ band_id: 1, countries: ['DE', 'NL', 'BE'] }],
+    );
+
+    expect(out[0].touringCountries).toEqual(['DE', 'NL', 'BE']);
+  });
+
+  it('gives a band with nothing coming up an empty touring list', () => {
+    // An array either way, so the column can map over it without a guard.
+    const [out] = shapeBandOverview([band(1, 'Sleep Token')], [], [], []);
+
+    expect(out.touringCountries).toEqual([]);
+  });
+
+  it('drops nulls out of the touring list', () => {
+    // Concerts carry a null country, and array_agg keeps it — a null would
+    // render as a stray empty flag in the column.
+    const out = shapeBandOverview(
+      [band(1, 'Thrown')], [], [],
+      [{ band_id: 1, countries: ['DE', null, 'NL'] }],
+    );
+
+    expect(out[0].touringCountries).toEqual(['DE', 'NL']);
+  });
+
+});
+
+describe('shapeBandOverview — sold out', () => {
+  const band = (id, name) => ({ id, name, songkick_url: null, bandsintown_url: null, _count: { concerts: 1 } });
+
+  it('flags a next show that is sold out', () => {
+    const out = shapeBandOverview(
+      [band(1, 'Spiritbox')],
+      [{ band_id: 1, concert_date: new Date('2026-10-01'), country: 'DE', sold_out: true }],
+      [], [],
+    );
+
+    expect(out[0].nextConcertSoldOut).toBe(true);
+  });
+
+  it('is false rather than undefined when nothing says otherwise', () => {
+    // No scraper currently sets sold_out — it is false on all 1002 rows — so
+    // this is the case that actually ships. It has to be a boolean the table
+    // can test, not undefined.
+    const out = shapeBandOverview(
+      [band(1, 'Spiritbox')],
+      [{ band_id: 1, concert_date: new Date('2026-10-01'), country: 'DE' }],
+      [], [],
+    );
+
+    expect(out[0].nextConcertSoldOut).toBe(false);
+  });
+
+  it('is false for a band with no next show at all', () => {
+    const [out] = shapeBandOverview([band(1, 'Sleep Token')], [], [], []);
+
+    expect(out.nextConcertSoldOut).toBe(false);
+  });
 });

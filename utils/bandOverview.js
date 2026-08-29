@@ -24,7 +24,7 @@ function byBandId(rows) {
 }
 
 /**
- * Merge the band list with its next and last concert rows.
+ * Merge the band list with its next concert, last concert and touring rows.
  *
  * Driven by the band list, not by the concert rows: the two concert queries are
  * not scoped to whatever filtered this page, so a row for a band that is not
@@ -34,9 +34,10 @@ function byBandId(rows) {
  * concerts at all — the table renders a column apiece and `undefined` would
  * reach the row as a missing value rather than an empty one.
  */
-function shapeBandOverview(bands, nextRows, lastRows) {
+function shapeBandOverview(bands, nextRows, lastRows, countryRows) {
   const next = byBandId(nextRows);
   const last = byBandId(lastRows);
+  const touring = byBandId(countryRows);
 
   return (bands ?? []).map((band) => {
     const n = next.get(String(band.id));
@@ -50,8 +51,15 @@ function shapeBandOverview(bands, nextRows, lastRows) {
       concertCount: band._count?.concerts ?? 0,
       nextConcertDate: n?.concert_date ?? null,
       nextConcertCountry: n?.country ?? null,
+      // Carried so the table can flag a sold-out next show. Note this is only
+      // ever true once a scraper actually sets it — see the note on the route.
+      nextConcertSoldOut: n?.sold_out ?? false,
       lastConcertDate: l?.concert_date ?? null,
       lastConcertCountry: l?.country ?? null,
+      // Always an array, so the column can map over it without a guard. Nulls
+      // are stripped: concerts carry a null country and array_agg keeps it,
+      // which would render as a stray blank flag.
+      touringCountries: (touring.get(String(band.id))?.countries ?? []).filter(Boolean),
     };
   });
 }

@@ -465,8 +465,8 @@ router.get('/upcoming/bands', async (req, res) => {
     // DISTINCT ON picks one row per band: the earliest concert still to come,
     // and the latest that has already happened. This replaced one findFirst per
     // band inside a Promise.all — 114 queries for the current band list, and it
-    // would have been 228 once the last-seen column was added.
-    const [bands, nextRows, lastRows] = await Promise.all([
+    // would have been 228 once the last-seen column was added, 342 with touring.
+    const [bands, nextRows, lastRows, countryRows] = await Promise.all([
       prisma.band.findMany({
         select: {
           id: true,
@@ -478,7 +478,7 @@ router.get('/upcoming/bands', async (req, res) => {
         orderBy: { name: 'asc' },
       }),
       prisma.$queryRaw`
-        SELECT DISTINCT ON (r.band) r.band AS band_id, c.concert_date, c.country
+        SELECT DISTINCT ON (r.band) r.band AS band_id, c.concert_date, c.country, c.sold_out
         FROM "ConcertBandReference" r
         JOIN "Concert" c ON c.id = r.concert
         WHERE c.concert_date >= ${now}
@@ -489,9 +489,18 @@ router.get('/upcoming/bands', async (req, res) => {
         JOIN "Concert" c ON c.id = r.concert
         WHERE c.concert_date < ${now}
         ORDER BY r.band, c.concert_date DESC`,
+      // Every country a band is playing next, not just the one its soonest
+      // concert is in — a band touring DE, NL and BE used to read as German.
+      // Ordered by country so the flags do not reshuffle between requests.
+      prisma.$queryRaw`
+        SELECT r.band AS band_id, array_agg(DISTINCT c.country ORDER BY c.country) AS countries
+        FROM "ConcertBandReference" r
+        JOIN "Concert" c ON c.id = r.concert
+        WHERE c.concert_date >= ${now} AND c.country IS NOT NULL
+        GROUP BY r.band`,
     ]);
 
-    res.json(shapeBandOverview(bands, nextRows, lastRows));
+    res.json(shapeBandOverview(bands, nextRows, lastRows, countryRows));
   } catch (error) {
     console.error('Error fetching bands:', error);
     res.status(500).json({ error: 'Internal server error' });
