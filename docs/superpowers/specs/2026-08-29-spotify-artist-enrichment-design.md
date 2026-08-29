@@ -1,0 +1,136 @@
+# Spotify artist enrichment on band search
+
+Adding a band starts with a search you cannot judge. The Ticketmaster
+autocomplete in `AddBandModal` gives a name, sometimes an event banner, and a
+classification like `Rock / Alternative` — not enough to tell the band you meant
+from the covers act with the same name. This puts Spotify's artist data behind
+that dropdown: genres, follower count, a press photo.
+
+## What this is not
+
+Spotify does not become the source of band identity.
+
+`Band.ticketmaster_id` is `@unique` and is the join key the whole ingest
+pipeline runs on: `services/music_api.py` fetches events by `attractionId`, and
+`main.py` only pulls tours for a band that has one. Picking a Spotify artist
+instead of a Ticketmaster attraction would create a band that never gets
+concerts. So the Ticketmaster result stays the thing you select, and Spotify
+data is attached to it for display only.
+
+Nothing here is persisted. No migration, no `spotify_id` column. The enrichment
+is computed onto a search response and thrown away, which is what makes a wrong
+name match harmless — it can put the wrong genres under a name for one render,
+and it can never write a bad row.
+
+## The matching problem
+
+Ticketmaster and Spotify share no identifier, so the join is by name, and one
+Spotify search per query is matched onto the whole Ticketmaster result set
+rather than one lookup per row. Ten attractions would otherwise mean ten Spotify
+searches per debounced keystroke.
+
+Matching by name is a hint, not a claim, and the UI says so.
+
+## Where the decisions live
+
+Two halves, following `setlistPlaylist.js` / `spotify.js`: the judgement is pure
+and tested without a token, the network is not.
+
+**`utils/spotify.js`** gains the two functions that talk to Spotify:
+
+- `getAppToken()` — a `client_credentials` grant. Artist search needs no user
+  scope, and most users have not connected Spotify, so this cannot use
+  `getValidToken`. Reuses the existing `basicAuthHeader()` and
+  `EXPIRY_MARGIN_MS`. Held in a module-level memo rather than Redis: it is one
+  token per process, and re-fetching it on a cold start is cheaper than a cache
+  round trip.
+- `searchArtists(token, query)` — `GET /v1/search?type=artist`, at the same
+  `SEARCH_LIMIT = 10` the file already documents for dev-mode apps.
+
+**`utils/spotifyArtistMatch.js`** is new and pure:
+
+```
+matchArtistsToAttractions(attractions, artists) -> Map<attractionId, enrichment|null>
+```
+
+where an enrichment is `{ genres, followers, image, spotifyUrl, matchedName }`.
+
+Two passes. The first matches on `canonicalBandName` from
+`utils/lineupNames.js`, which already strips diacritics and punctuation, so
+*Motörhead* meets *Motorhead*. Attractions still unmatched then go through
+`stringSimilarity` from `utils/concertDedup.js`, taking the best artist scoring
+**0.85 or higher**.
+
+That threshold is high on purpose. `stringSimilarity` is a bigram score, and at
+0.7 *Anthrax* and *Anthem* are a match; the cost of a wrong match here is
+genres and a photo belonging to a different band, while the cost of a missed one
+is the row looking exactly as it does today. Missing is the cheaper failure.
+
+Each Spotify artist is consumed at most once, so two same-named attractions
+cannot both claim it — the exact pass takes precedence, and within the fuzzy
+pass the higher score wins.
+
+`matchedName` carries Spotify's spelling so the UI can show it when it differs
+from the Ticketmaster name. A match that had to go through the similarity
+fallback is a guess, and hiding that makes it look like a lookup.
+
+## The route
+
+`GET /data/concerts/bands/ticketmaster-search` keeps its contract and gains a
+`spotify` key on each result, `null` where nothing matched.
+
+The Spotify call runs alongside the Ticketmaster one. **Enrichment is never
+allowed to break the search**, which is the only invariant in this document that
+matters at runtime:
+
+- Spotify 429s, errors, or times out → return the Ticketmaster results
+  unenriched.
+- `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` unset → skip Spotify entirely,
+  no error. Unlike `routes/oauth/spotify.js`, which 503s on missing config
+  because connecting is the whole point of that route, here the feature is
+  optional decoration.
+
+The merged response is cached per normalised query with `setCache` from
+`utils/cache.js`, TTL 6h, matching the existing per-query caches in this file.
+Backspacing a character then retyping it costs nothing.
+
+## The UI
+
+`AddBandModal`, in the `From Ticketmaster` block only:
+
+| | Today | With enrichment |
+|---|---|---|
+| Image | `attraction.images[0]` — often an event banner | Spotify's press photo, falling back to the banner |
+| Genres | `Rock / Alternative` | Spotify's tags, falling back to the classifications |
+| Scale | — | Follower count |
+
+The section header becomes `From Ticketmaster · info from Spotify`. The rows are
+still Ticketmaster attractions; only the decoration is Spotify's, and the header
+should not imply the list came from there.
+
+## Testing
+
+Vitest, as everywhere else here.
+
+`spotifyArtistMatch` gets the unit tests, because it holds all the judgement:
+exact match, diacritics, a leading `The`, two attractions with the same name and
+one Spotify artist, no match at all, and an empty Spotify response.
+
+At the route level, one test that matters: Spotify failing still returns the
+Ticketmaster results. Everything else about this feature can be broken and the
+band still gets added.
+
+## Known limits
+
+**The 10-result cap.** Spotify's dev-mode search returns at most 10 artists, so
+an obscure band may not be in the response at all even though it exists. Those
+rows stay exactly as they look today. This is the expected case for small local
+acts, not a bug.
+
+**Empty genres.** Spotify returns `genres: []` for a large share of artists,
+particularly smaller ones. The fallback to Ticketmaster classifications is the
+normal path for those, not an error path.
+
+**One external call in the typing path.** The query cache absorbs repeats, but a
+first-time query now depends on two APIs instead of one. This is why the failure
+behaviour above is specified before the happy path.
