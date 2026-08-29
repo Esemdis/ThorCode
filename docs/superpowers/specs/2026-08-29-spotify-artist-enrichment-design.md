@@ -50,10 +50,20 @@ and tested without a token, the network is not.
 **`utils/spotifyArtistMatch.js`** is new and pure:
 
 ```
-matchArtistsToAttractions(attractions, artists) -> Map<attractionId, enrichment|null>
+enrichAttractions(attractions, artists) -> attraction[]
 ```
 
-where an enrichment is `{ genres, followers, image, spotifyUrl, matchedName }`.
+Each returned attraction is the Ticketmaster one with a `spotify` key added,
+either `null` or `{ genres, followers, image, spotifyUrl, matchedName }`.
+
+`artists` is nullable, and `null` means *Spotify did not answer*. That is
+deliberate: it puts the "enrichment must never break the search" invariant
+inside the pure function, where it can be tested. ThorCode has no route tests —
+all twenty test files are pure unit tests, and `externalSetlists.test.js`
+records why (vitest externalises `node_modules`, so a CommonJS `require('axios')`
+never sees a mock and assertions against one pass for the wrong reason). Putting
+the fallback in the route would have made the one invariant that matters
+untestable.
 
 Matching is **exact on a canonical key**, and there is no fuzzy fallback. The
 key is `canonicalBandName` from `utils/lineupNames.js` — which strips diacritics
