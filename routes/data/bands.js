@@ -7,6 +7,8 @@ const { handleError, checkDuplicateConcert } = require('./helpers');
 const { haversineKm, stringSimilarity, venueContains, deduplicateByCoords } = require('../../utils/concertDedup');
 const { cleanLineupNames, cleanLineupJson, canonicalBandName } = require('../../utils/lineupNames');
 const { shapeBandOverview } = require('../../utils/bandOverview');
+const { searchArtists } = require('../../utils/spotify');
+const { enrichAttractions } = require('../../utils/spotifyArtistMatch');
 
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
@@ -1210,6 +1212,10 @@ router.get('/bands/ticketmaster-search', async (req, res) => {
 
     const searchTerm = q.trim();
 
+    const cacheKey = `tm:search:${searchTerm.toLowerCase()}`;
+    const cached = await getCache(cacheKey);
+    if (cached) return res.json(cached);
+
     try {
       const response = await axios.get(`${ticketmasterURL}attractions.json`, {
         params: {
@@ -1243,7 +1249,19 @@ router.get('/bands/ticketmaster-search', async (req, res) => {
           : [],
       }));
 
-      res.json(bands);
+      // Spotify is decoration. A 429, a bad credential, no credential at all —
+      // none of it may take the search down with it, so a failure becomes a
+      // null artist list and every row comes back exactly as it does today.
+      let artists = null;
+      try {
+        artists = await searchArtists(searchTerm);
+      } catch (error) {
+        console.warn('[spotify] Artist enrichment failed:', error.response?.data ?? error.message);
+      }
+
+      const payload = enrichAttractions(bands, artists);
+      await setCache(cacheKey, payload, 21600); // 6h — an artist's genres and follower count barely move
+      res.json(payload);
     } catch (error) {
       if (error.response?.status === 404) {
         return res.json([]);
