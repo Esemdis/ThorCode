@@ -135,6 +135,36 @@ async function getValidToken(userId) {
   return data.access_token;
 }
 
+// An app-level token, for reads that are about an artist rather than about a
+// user. Artist search needs no scope, and most users have never connected
+// Spotify, so getValidToken is the wrong door entirely.
+//
+// Held in a module-level memo rather than Redis: it is one token per process,
+// and re-fetching it on a cold start is cheaper than a cache round trip.
+let appToken = null;
+
+/**
+ * A client-credentials token for the app itself.
+ *
+ * @throws {SpotifyAuthError} When the server has no Spotify credentials.
+ */
+async function getAppToken() {
+  if (appToken && appToken.expiresAt > Date.now()) return appToken.value;
+
+  if (!clientId() || !clientSecret()) {
+    throw new SpotifyAuthError('Spotify is not configured on this server');
+  }
+
+  const { data } = await axios.post(
+    `${ACCOUNTS_URL}/api/token`,
+    new URLSearchParams({ grant_type: 'client_credentials' }),
+    { headers: { Authorization: basicAuthHeader(), 'Content-Type': 'application/x-www-form-urlencoded' } },
+  );
+
+  appToken = { value: data.access_token, expiresAt: expiryFrom(data.expires_in).getTime() };
+  return appToken.value;
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
@@ -180,6 +210,24 @@ async function findTrack(accessToken, track) {
   return null;
 }
 
+/**
+ * Artists matching a free-text query, in Spotify's relevance order.
+ *
+ * Capped at SEARCH_LIMIT like every other search here — dev-mode apps error on
+ * a larger limit rather than truncating.
+ *
+ * @returns {Promise<object[]>} Raw artist objects; the caller decides what of
+ *   them to use.
+ */
+async function searchArtists(query) {
+  const token = await getAppToken();
+  const { data } = await getWithBackoff(`${API_URL}/search`, {
+    headers: { Authorization: `Bearer ${token}` },
+    params: { q: query, type: 'artist', limit: SEARCH_LIMIT },
+  });
+  return data?.artists?.items ?? [];
+}
+
 /** Create an empty private playlist on the connected account. */
 async function createPlaylist(accessToken, { name, description }) {
   const { data } = await axios.post(
@@ -221,6 +269,8 @@ module.exports = {
   expiryFrom,
   me,
   getValidToken,
+  getAppToken,
+  searchArtists,
   findTrack,
   createPlaylist,
   addItems,
