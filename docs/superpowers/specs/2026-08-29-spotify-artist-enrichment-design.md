@@ -55,20 +55,41 @@ matchArtistsToAttractions(attractions, artists) -> Map<attractionId, enrichment|
 
 where an enrichment is `{ genres, followers, image, spotifyUrl, matchedName }`.
 
-Two passes. The first matches on `canonicalBandName` from
-`utils/lineupNames.js`, which already strips diacritics and punctuation, so
-*Motörhead* meets *Motorhead*. Attractions still unmatched then go through
-`stringSimilarity` from `utils/concertDedup.js`, taking the best artist scoring
-**0.85 or higher**.
+Matching is **exact on a canonical key**, and there is no fuzzy fallback. The
+key is `canonicalBandName` from `utils/lineupNames.js` — which strips diacritics
+and punctuation, so *Motörhead* meets *Motorhead* and *Spirit Box* meets
+*Spiritbox* — applied after removing a leading `The`, `A` or `An`.
 
-That threshold is high on purpose. `stringSimilarity` is a bigram score, and at
-0.7 *Anthrax* and *Anthem* are a match; the cost of a wrong match here is
-genres and a photo belonging to a different band, while the cost of a missed one
-is the row looking exactly as it does today. Missing is the cheaper failure.
+### Why there is no fuzzy pass
 
-Each Spotify artist is consumed at most once, so two same-named attractions
-cannot both claim it — the exact pass takes precedence, and within the fuzzy
-pass the higher score wins.
+The obvious design was a `stringSimilarity` fallback above some threshold. It
+was measured against real band names before being written, and the two score
+distributions overlap, so no threshold exists:
+
+| | pair | score |
+|---|---|---|
+| Different bands | Architects / Architect | 0.941 |
+| | Loathe / Loath | 0.889 |
+| | The Used / The Uses | 0.833 |
+| Same band | The Anthrax / Anthrax | 0.800 |
+| | The Hu / Hu | 0.400 |
+
+Any cutoff admits at least one wrong band or rejects at least one right one.
+The reason is structural rather than a matter of tuning: `stringSimilarity` is a
+bigram score, so it rewards character overlap — but the same band spelled two
+ways differs by whole *words* (an article, an abbreviation), while two different
+bands routinely differ by one character (a plural, a near-namesake). The metric
+scores the wrong axis.
+
+Exact matching on the canonical key, over the same sixteen pairs, produced seven
+correct matches, zero wrong matches, eight correct rejections and one miss
+(*Nine Inch Nails* / *NIN*, which no string metric resolves). The variation that
+actually occurs between these two APIs — punctuation, spacing, diacritics,
+articles — is a set of rules, and rules belong in the key, not in a threshold.
+
+Each Spotify artist is consumed at most once, so two attractions sharing a
+canonical key cannot both claim it; the first wins, which is the higher-ranked
+Ticketmaster result.
 
 `matchedName` carries Spotify's spelling so the UI can show it when it differs
 from the Ticketmaster name. A match that had to go through the similarity
@@ -113,8 +134,10 @@ should not imply the list came from there.
 Vitest, as everywhere else here.
 
 `spotifyArtistMatch` gets the unit tests, because it holds all the judgement:
-exact match, diacritics, a leading `The`, two attractions with the same name and
-one Spotify artist, no match at all, and an empty Spotify response.
+exact match, diacritics, spacing (*Spirit Box* / *Spiritbox*), a leading `The`,
+two attractions sharing a canonical key against one Spotify artist, a
+near-namesake that must **not** match (*Architects* / *Architect*), no match at
+all, and an empty Spotify response.
 
 At the route level, one test that matters: Spotify failing still returns the
 Ticketmaster results. Everything else about this feature can be broken and the
@@ -130,6 +153,12 @@ acts, not a bug.
 **Empty genres.** Spotify returns `genres: []` for a large share of artists,
 particularly smaller ones. The fallback to Ticketmaster classifications is the
 normal path for those, not an error path.
+
+**Names that differ by more than punctuation stay unenriched.** Abbreviations
+(*NIN*) and genuine spelling disagreements between the two APIs will not match,
+by design. If this turns out to be common in real use, the next step is a better
+key — token-set overlap, or seeding Spotify ids from the `Band.MBID` column via
+MusicBrainz — not a lowered threshold. The measurements above are why.
 
 **One external call in the typing path.** The query cache absorbs repeats, but a
 first-time query now depends on two APIs instead of one. This is why the failure
