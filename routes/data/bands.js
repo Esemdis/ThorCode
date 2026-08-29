@@ -9,6 +9,7 @@ const { cleanLineupNames, cleanLineupJson, canonicalBandName } = require('../../
 const { shapeBandOverview } = require('../../utils/bandOverview');
 const { searchArtists } = require('../../utils/spotify');
 const { enrichAttractions } = require('../../utils/spotifyArtistMatch');
+const { getArtistInfo } = require('../../utils/lastfm');
 
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
@@ -16,6 +17,10 @@ const { rateLimiter } = require('../../utils/rateLimiter');
 const prisma = require('../../prisma/client');
 const { Prisma } = require('@prisma/client');
 const { setCache, getCache } = require('../../utils/cache');
+
+// Last.fm has no batch endpoint, so enriching a row costs a request. Three is
+// what fits on screen without scrolling the dropdown.
+const LASTFM_ROWS = 3;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1260,8 +1265,33 @@ router.get('/bands/ticketmaster-search', async (req, res) => {
       }
 
       const payload = enrichAttractions(bands, artists);
-      await setCache(cacheKey, payload, 21600); // 6h — an artist's genres and follower count barely move
-      res.json(payload);
+
+      // Spotify supplies the photo; everything descriptive comes from Last.fm,
+      // because a Development Mode Spotify app is not given genres or follower
+      // counts on any endpoint. Last.fm has no batch call, so this is one
+      // request per artist and only the rows you actually read are enriched.
+      const withInfo = await Promise.all(payload.map(async (row, i) => {
+        if (i >= LASTFM_ROWS) return { ...row, lastfm: null };
+
+        const artistKey = `lfm:artist:${canonicalBandName(row.name)}`;
+        const hit = await getCache(artistKey);
+        // Wrapped rather than stored bare: "we looked and Last.fm has nothing"
+        // is worth caching, and a bare null is indistinguishable from a miss.
+        if (hit) return { ...row, lastfm: hit.info };
+
+        try {
+          const info = await getArtistInfo(row.name);
+          await setCache(artistKey, { info }, 604800); // 7d — tags and listener counts move slowly
+          return { ...row, lastfm: info };
+        } catch (error) {
+          // Never cached: a timeout is about today, not about the artist.
+          console.warn('[lastfm] Artist info failed:', error.response?.status ?? error.message);
+          return { ...row, lastfm: null };
+        }
+      }));
+
+      await setCache(cacheKey, withInfo, 21600); // 6h
+      res.json(withInfo);
     } catch (error) {
       if (error.response?.status === 404) {
         return res.json([]);
