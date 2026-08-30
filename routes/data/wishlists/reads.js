@@ -17,6 +17,52 @@ const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
 const { rateLimit } = require("./shared");
 
+// Deduplicates by date+venue+city (same logic as the Attended tab display),
+// preferring sfm_ records so a TM + sfm_ pair for the same show counts as 1.
+async function computeSeenCounts(wishlistId) {
+  const attendances = await prisma.concertAttendance.findMany({
+    where: {
+      wishlist_id: wishlistId,
+      concert_rel: { concert_date: { lt: new Date() } },
+    },
+    select: {
+      concert_id: true,
+      concert_rel: {
+        select: {
+          event_id: true,
+          concert_date: true,
+          venue: true,
+          city: true,
+          bands: { select: { band: true } },
+        },
+      },
+    },
+  });
+
+  // Sort sfm_ first so they win deduplication
+  attendances.sort((a, b) => {
+    const aS = a.concert_rel.event_id?.startsWith('sfm_') ? 0 : 1;
+    const bS = b.concert_rel.event_id?.startsWith('sfm_') ? 0 : 1;
+    return aS - bS;
+  });
+
+  const deduped = new Map(); // "date|venue|city" -> attendance
+  for (const a of attendances) {
+    const c = a.concert_rel;
+    const day = c.concert_date ? new Date(c.concert_date).toISOString().slice(0, 10) : 'unknown';
+    const key = `${day}|${c.venue ?? ''}|${c.city ?? ''}`;
+    if (!deduped.has(key)) deduped.set(key, a);
+  }
+
+  const seenCountMap = new Map();
+  for (const a of deduped.values()) {
+    for (const b of a.concert_rel.bands) {
+      seenCountMap.set(b.band, (seenCountMap.get(b.band) || 0) + 1);
+    }
+  }
+  return seenCountMap;
+}
+
 // GET /wishlists — list the user's single wishlist
 router.get(
   "/wishlists",

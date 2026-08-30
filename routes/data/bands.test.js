@@ -10,6 +10,8 @@ const prisma = installFakePrisma({
   wishlist: { findUnique: vi.fn(), findFirst: vi.fn() },
   wishlistBandReference: { findMany: vi.fn(), create: vi.fn(), findUnique: vi.fn() },
   concertBandReference: { findMany: vi.fn() },
+  // /bands answers with raw SQL rather than the query builder.
+  $queryRaw: vi.fn(async () => []),
 });
 
 const { default: router } = await import('./bands.js');
@@ -97,6 +99,36 @@ describe('auth', () => {
   it('lets an ordinary user search without a token at all', async () => {
     prisma.band.findMany.mockResolvedValue([]);
     const res = await request(app).get('/bands/search').query({ q: 'opeth' });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('the handlers actually run', () => {
+  // The manifest proves a route is registered; it does not prove the handler
+  // can execute. Splitting wishlists.js dropped a top-level helper and left two
+  // endpoints returning 500 with every routing and auth test still green. These
+  // exercise the bodies of the reads the frontend depends on.
+  beforeEach(() => {
+    prisma.band.findMany.mockResolvedValue([
+      { id: 1, name: 'Opeth', songkick_url: 'sk', bandsintown_url: 'bit', concerts: [] },
+    ]);
+    prisma.band.findUnique.mockResolvedValue({ id: 1, name: 'Opeth', concerts: [] });
+    prisma.concert.findMany.mockResolvedValue([]);
+    prisma.concertBandReference.findMany.mockResolvedValue([]);
+  });
+
+  it('serves the upcoming-bands list', async () => {
+    const res = await request(app).get('/upcoming/bands');
+    expect(res.status).toBe(200);
+  });
+
+  it('serves the band list', async () => {
+    const res = await request(app).get('/bands');
+    expect(res.status).toBe(200);
+  });
+
+  it('serves one band\'s upcoming shows', async () => {
+    const res = await request(app).get('/bands/1/upcoming');
     expect(res.status).toBe(200);
   });
 });

@@ -102,3 +102,52 @@ describe('POST /wishlists/notify', () => {
     expect(res.status).toBeLessThan(500);
   });
 });
+
+describe('the handlers actually run', () => {
+  // The manifest above proves a route is registered; it says nothing about
+  // whether the handler can execute. Splitting the file dropped a top-level
+  // helper that two of these handlers call, and every routing and auth test
+  // still passed while both endpoints returned 500 to real traffic. These
+  // exercise the bodies.
+  const WISHLIST = {
+    id: 7,
+    user_id: 'user-1',
+    name: 'My Wishlist',
+    bands: [{ band_id: 1, tier: 'LOVE', band_rel: { id: 1, name: 'Opeth' } }],
+  };
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue(WISHLIST);
+    prisma.wishlist.findMany.mockResolvedValue([WISHLIST]);
+    prisma.band.findMany.mockResolvedValue([
+      { id: 1, name: 'Opeth', concerts: [] },
+    ]);
+    prisma.concertAttendance.findMany.mockResolvedValue([]);
+    prisma.concert.findMany.mockResolvedValue([]);
+    prisma.concertBandReference.findMany.mockResolvedValue([]);
+  });
+
+  it('serves a single wishlist', async () => {
+    const res = await request(app)
+      .get('/wishlists/7')
+      .query({ start_date: '2026-09-01', end_date: '2026-09-30' })
+      .set(...authHeader({ id: 'user-1' }));
+    expect(res.status).toBe(200);
+  });
+
+  it('serves a single wishlist with no date range', async () => {
+    const res = await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+    expect(res.status).toBe(200);
+  });
+
+  it('serves the raw wishlist list', async () => {
+    // SYSTEM-only: it is what the Python scoring service reads.
+    const res = await request(app).get('/wishlists/raw').set(...authHeader({ role: 'SYSTEM' }));
+    expect(res.status).toBe(200);
+  });
+
+  it('serves the wishlist list', async () => {
+    const res = await request(app).get('/wishlists').set(...authHeader({ id: 'user-1' }));
+    expect(res.status).toBe(200);
+  });
+});
