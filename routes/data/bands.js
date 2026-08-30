@@ -8,9 +8,8 @@ const { haversineKm, stringSimilarity, venueContains, deduplicateByCoords } = re
 const { cleanLineupNames, cleanLineupJson, canonicalBandName } = require('../../utils/lineupNames');
 const { shapeBandOverview } = require('../../utils/bandOverview');
 const { searchArtists } = require('../../utils/spotify');
-const { enrichAttractions } = require('../../utils/spotifyArtistMatch');
 const { getArtistInfo } = require('../../utils/lastfm');
-const { collapseDuplicates } = require('../../utils/attractions');
+const { relevantArtists } = require('../../utils/artistSearch');
 
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
@@ -80,7 +79,6 @@ async function findSourceUrls(bandName, mbid = null) {
 }
 
 // Defaults to 5 requests per 15 minutes per IP
-const ticketmasterURL = 'https://app.ticketmaster.com/discovery/v2/';
 const rateLimit = rateLimiter({
   message:
     'Too many requests to the Ticketmaster data route, please try again later.',
@@ -474,7 +472,7 @@ router.get('/upcoming/bands', async (req, res) => {
     // and the latest that has already happened. This replaced one findFirst per
     // band inside a Promise.all — 114 queries for the current band list, and it
     // would have been 228 once the last-seen column was added, 342 with touring.
-    const [bands, nextRows, lastRows, countryRows] = await Promise.all([
+    const [bands, nextRows, lastRows, countryRows, perCountryRows] = await Promise.all([
       prisma.band.findMany({
         select: {
           id: true,
@@ -506,9 +504,21 @@ router.get('/upcoming/bands', async (req, res) => {
         JOIN "Concert" c ON c.id = r.concert
         WHERE c.concert_date >= ${now} AND c.country IS NOT NULL
         GROUP BY r.band`,
+      // The soonest show in every country, not just the soonest show overall.
+      // The overview leads with the one nearest you, and "nearest" depends on
+      // your home country and where you have been — both client-side state.
+      // Sending the ranking up instead would make this per-user and kill the
+      // cacheability, for a payload that grows by a few hundred small rows.
+      prisma.$queryRaw`
+        SELECT DISTINCT ON (r.band, c.country)
+               r.band AS band_id, c.country, c.concert_date, c.sold_out
+        FROM "ConcertBandReference" r
+        JOIN "Concert" c ON c.id = r.concert
+        WHERE c.concert_date >= ${now} AND c.country IS NOT NULL
+        ORDER BY r.band, c.country, c.concert_date ASC`,
     ]);
 
-    res.json(shapeBandOverview(bands, nextRows, lastRows, countryRows));
+    res.json(shapeBandOverview(bands, nextRows, lastRows, countryRows, perCountryRows));
   } catch (error) {
     console.error('Error fetching bands:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -518,7 +528,9 @@ router.get('/upcoming/bands', async (req, res) => {
 router.get('/bands', async (req, res) => {
   try {
     const bands = await prisma.band.findMany({
-      select: { id: true, ticketmaster_id: true, name: true, MBID: true, songkick_url: true, bandsintown_url: true },
+      // No ticketmaster_id: the scraper polls Ticketmaster only for bands it
+      // receives one for, and that source is no longer used.
+      select: { id: true, name: true, MBID: true, songkick_url: true, bandsintown_url: true },
       orderBy: { created_at: 'asc' },
     });
     res.json(bands);
@@ -539,7 +551,7 @@ router.post(
       // Fetch the band from the database
       const band = await prisma.band.findUnique({
         where: { id: parseInt(bandId) },
-        select: { id: true, name: true, ticketmaster_id: true, songkick_url: true, bandsintown_url: true },
+        select: { id: true, name: true, songkick_url: true, bandsintown_url: true },
       });
 
       if (!band) {
@@ -552,7 +564,9 @@ router.post(
 
       // Call the Python service to sync concerts for this band
       const syncResponse = await pythonServicePost(`/sync/${band.id}`,
-        { songkick_url: band.songkick_url ?? null, bandsintown_url: band.bandsintown_url ?? null, ticketmaster_id: band.ticketmaster_id ?? null, band_name: band.name },
+        // ticketmaster_id is deliberately not sent: the scraper only polls
+        // Ticketmaster when it receives one, and it was 1.1% of the concerts.
+        { songkick_url: band.songkick_url ?? null, bandsintown_url: band.bandsintown_url ?? null, band_name: band.name },
       );
 
       res.status(200).json({
@@ -611,7 +625,7 @@ router.post(
         bands: {
           include: {
             band_rel: {
-              select: { id: true, name: true, songkick_url: true, bandsintown_url: true, ticketmaster_id: true },
+              select: { id: true, name: true, songkick_url: true, bandsintown_url: true },
             },
           },
         },
@@ -684,7 +698,7 @@ router.post(
 
     const resyncBands = [...resyncBandMap.values()].map((b) => ({
       id: b.id, name: b.name,
-      songkick_url: b.songkick_url, bandsintown_url: b.bandsintown_url, ticketmaster_id: b.ticketmaster_id,
+      songkick_url: b.songkick_url, bandsintown_url: b.bandsintown_url,
     }));
 
     console.log(`[reconcile] Band ${bandId}: removed ${staleIds.length} stale concert(s), re-syncing: ${resyncBands.map((b) => b.name).join(', ') || 'none'}`);
@@ -703,11 +717,6 @@ router.post(
     .isString()
     .notEmpty()
     .withMessage('Band name must be a non-empty string'),
-  body('ticketmaster_id')
-    .optional()
-    .isString()
-    .notEmpty()
-    .withMessage('Ticketmaster ID must be a non-empty string'),
   body('wishlistId')
     .optional()
     .isInt()
@@ -720,93 +729,30 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { name, ticketmaster_id, wishlistId } = req.body;
+      const { name, wishlistId } = req.body;
 
-      // Validate that either name or ticketmaster_id is provided
-      if (!name && !ticketmaster_id) {
-        return res.status(400).json({
-          error: "Either 'name' or 'ticketmaster_id' must be provided",
-        });
+      if (!name) {
+        return res.status(400).json({ error: "'name' must be provided" });
       }
 
-      const bandName = name ? name.trim() : null;
-      const ticketmasterId = ticketmaster_id ? ticketmaster_id.trim() : null;
+      const bandName = name.trim();
 
-      // Check if band already exists in the database
-      let existingBand = null;
-
-      if (ticketmasterId) {
-        existingBand = await prisma.band.findUnique({
-          where: { ticketmaster_id: ticketmasterId },
-        });
-      } else if (bandName) {
-        existingBand = await prisma.band.findUnique({
-          where: { name: bandName },
-        });
-      }
-
+      const existingBand = await prisma.band.findUnique({ where: { name: bandName } });
       if (existingBand) {
         return res.status(409).json({ error: 'Band already exists.' });
       }
 
-      // Fetch band data from Ticketmaster API
-      let bandData;
-      let resolvedTicketmasterId;
-      try {
-        if (ticketmasterId) {
-          // Fetch band data by Ticketmaster ID
-          const response = await axios.get(
-            `${ticketmasterURL}attractions/${ticketmasterId}.json`,
-            {
-              params: {
-                apikey: process.env.TICKETMASTER_KEY,
-              },
-            },
-          );
-          if (!response.data) {
-            return res
-              .status(404)
-              .json({ error: 'Band not found with that Ticketmaster ID' });
-          }
-
-          bandData = response.data;
-          resolvedTicketmasterId = response.data.id;
-        } else {
-          // Fetch band data from Ticketmaster API by name
-          const response = await axios.get(`${ticketmasterURL}attractions.json`, {
-            params: {
-              apikey: process.env.TICKETMASTER_KEY,
-              keyword: bandName,
-              size: 1,
-            },
-          });
-
-          if (!response.data._embedded?.attractions?.[0]) {
-            return res.status(404).json({ error: 'No band found.' });
-          }
-
-          bandData = response.data._embedded.attractions[0];
-          resolvedTicketmasterId = bandData.id;
-        }
-      } catch (error) {
-        if (error.response?.status === 404) {
-          return res.status(404).json({ error: 'Band not found on Ticketmaster.' });
-        } else if (error.response?.status === 429) {
-          return res
-            .status(429)
-            .json({ error: 'Too many requests, please try again later.' });
-        }
-        console.error('Error fetching band from Ticketmaster:', error);
-        return res.status(500).json({ error: 'Internal server error' });
-      }
-
+      // No Ticketmaster lookup. It used to resolve the name here and 404 with
+      // "No band found." for anything its catalogue lacked, which is the only
+      // reason such a band could not be added — MusicBrainz and findSourceUrls
+      // below both key off the name, and they are what produce concerts.
       // Fetch MBID from MusicBrainz
       let mbid = null;
       try {
         const mbResponse = await axios.get(
           'https://musicbrainz.org/ws/2/artist/',
           {
-            params: { query: `artist:"${bandData.name}"`, limit: 1, fmt: 'json' },
+            params: { query: `artist:"${bandName}"`, limit: 1, fmt: 'json' },
             headers: {
               'User-Agent': `${process.env.APP_NAME}/${process.env.APP_VERSION} (${process.env.APP_CONTACT})`,
             },
@@ -819,8 +765,7 @@ router.post(
       // Create band in database
       const newBand = await prisma.band.create({
         data: {
-          name: bandData.name,
-          ticketmaster_id: resolvedTicketmasterId,
+          name: bandName,
           created_at: new Date(),
           MBID: mbid,
         },
@@ -842,7 +787,6 @@ router.post(
         band: {
           id: newBand.id,
           name: newBand.name,
-          ticketmaster_id: newBand.ticketmaster_id,
           mbid: newBand.MBID,
         },
         sync: { status: 'queued' },
@@ -863,7 +807,7 @@ router.post(
           }).catch((e) => console.error(`[findSourceUrl] DB update failed for ${newBand.name}:`, e.message));
         }
         await pythonServicePost(`/sync/${newBand.id}`,
-          { songkick_url: songkickUrl || null, bandsintown_url: bandsintownUrl || null, ticketmaster_id: resolvedTicketmasterId, band_name: newBand.name },
+          { songkick_url: songkickUrl || null, bandsintown_url: bandsintownUrl || null, band_name: newBand.name },
         );
         console.log(`[findSourceUrl] Sync queued for ${newBand.name}`);
       }).catch((e) => console.error(`[findSourceUrl] Background sync failed for ${newBand.name}:`, e.message));
@@ -1208,110 +1152,73 @@ router.delete(
 );
 
 // Search bands on Ticketmaster to get their IDs (helpful for disambiguation)
-router.get('/bands/ticketmaster-search', async (req, res) => {
+/**
+ * GET /bands/artist-search?q=
+ *
+ * Artists to add, from Spotify. This replaced a Ticketmaster attractions
+ * search, which answered a band query with films, plays, a basketball team,
+ * tribute acts and multi-act bills, and which 404'd anything it did not carry.
+ * Spotify's catalogue is recording artists and nothing else, so the noise is
+ * gone rather than filtered.
+ *
+ * Genres and listener counts are Last.fm's — Spotify gives a Development Mode
+ * app neither, on any endpoint.
+ */
+router.get('/bands/artist-search', async (req, res) => {
   try {
-    const { q, limit = 10 } = req.query;
-
-    if (!q || q.trim().length < 2) {
-      return res.json([]);
-    }
+    const { q } = req.query;
+    if (!q || q.trim().length < 2) return res.json([]);
 
     const searchTerm = q.trim();
-
-    const cacheKey = `tm:search:${searchTerm.toLowerCase()}`;
+    const cacheKey = `artist:search:${searchTerm.toLowerCase()}`;
     const cached = await getCache(cacheKey);
     if (cached) return res.json(cached);
 
+    let artists;
     try {
-      const response = await axios.get(`${ticketmasterURL}attractions.json`, {
-        params: {
-          apikey: process.env.TICKETMASTER_KEY,
-          keyword: searchTerm,
-          size: Math.min(parseInt(limit, 10), 20), // Cap at 20 for API limits
-        },
-      });
-
-      if (!response.data._embedded || !response.data._embedded.attractions) {
-        return res.json([]);
-      }
-
-      const bands = response.data._embedded.attractions.map((attraction) => ({
-        id: attraction.id,
-        name: attraction.name,
-        url: attraction.url || null,
-        // How many shows this attraction still has. It is what separates a
-        // touring act from a stale duplicate record with the same name, and
-        // it is the id that will actually return concerts on ingest.
-        upcomingEvents: attraction.upcomingEvents?._total ?? 0,
-        // Include image if available
-        image:
-          attraction.images && attraction.images.length > 0
-            ? attraction.images[0].url
-            : null,
-        // Include genre if available
-        classifications: attraction.classifications
-          ? attraction.classifications
-              .map((c) => ({
-                genre: c.genre?.name || null,
-                subGenre: c.subGenre?.name || null,
-              }))
-              .filter((c) => c.genre || c.subGenre)
-          : [],
-      }));
-
-      // Spotify is decoration. A 429, a bad credential, no credential at all —
-      // none of it may take the search down with it, so a failure becomes a
-      // null artist list and every row comes back exactly as it does today.
-      let artists = null;
-      try {
-        artists = await searchArtists(searchTerm);
-      } catch (error) {
-        console.warn('[spotify] Artist enrichment failed:', error.response?.data ?? error.message);
-      }
-
-      // Collapsed before enrichment: a dropped row must not cost a Last.fm
-      // request, and the enrichment cap should apply to what is actually shown.
-      const payload = enrichAttractions(collapseDuplicates(bands), artists);
-
-      // Spotify supplies the photo; everything descriptive comes from Last.fm,
-      // because a Development Mode Spotify app is not given genres or follower
-      // counts on any endpoint. Last.fm has no batch call, so this is one
-      // request per artist and only the rows you actually read are enriched.
-      const withInfo = await Promise.all(payload.map(async (row, i) => {
-        if (i >= LASTFM_ROWS) return { ...row, lastfm: null };
-
-        const artistKey = `lfm:artist:${canonicalBandName(row.name)}`;
-        const hit = await getCache(artistKey);
-        // Wrapped rather than stored bare: "we looked and Last.fm has nothing"
-        // is worth caching, and a bare null is indistinguishable from a miss.
-        if (hit) return { ...row, lastfm: hit.info };
-
-        try {
-          const info = await getArtistInfo(row.name);
-          await setCache(artistKey, { info }, 604800); // 7d — tags and listener counts move slowly
-          return { ...row, lastfm: info };
-        } catch (error) {
-          // Never cached: a timeout is about today, not about the artist.
-          console.warn('[lastfm] Artist info failed:', error.response?.status ?? error.message);
-          return { ...row, lastfm: null };
-        }
-      }));
-
-      await setCache(cacheKey, withInfo, 21600); // 6h
-      res.json(withInfo);
+      artists = await searchArtists(searchTerm);
     } catch (error) {
-      if (error.response?.status === 404) {
-        return res.json([]);
-      } else if (error.response?.status === 429) {
-        const payload = handleError('wishlist', 429);
-        return res.status(429).json(payload);
-      }
-      console.error('Error searching Ticketmaster:', error);
-      const payload = handleError('wishlist', 500);
-      return res.status(500).json(payload);
+      console.error('[spotify] Artist search failed:', error.response?.data ?? error.message);
+      const payload = handleError('wishlist', 502);
+      return res.status(502).json(payload);
     }
+
+    // Spotify's search recommends as much as it matches, so a query for
+    // "architects" comes back with Spiritbox behind it. Narrow to the name
+    // before anything else looks at the list.
+    const rows = relevantArtists(artists, searchTerm).map((artist) => ({
+      id: artist.id,
+      name: artist.name,
+      image: artist.images?.[0]?.url ?? null,
+      spotifyUrl: artist.external_urls?.spotify ?? null,
+    }));
+
+    // Last.fm has no batch endpoint, so enrichment costs a request per artist
+    // and only the rows you actually read get it.
+    const withInfo = await Promise.all(rows.map(async (row, i) => {
+      if (i >= LASTFM_ROWS) return { ...row, lastfm: null };
+
+      const artistKey = `lfm:artist:${canonicalBandName(row.name)}`;
+      const hit = await getCache(artistKey);
+      // Wrapped rather than stored bare: "we looked and Last.fm has nothing" is
+      // worth caching, and a bare null is indistinguishable from a miss.
+      if (hit) return { ...row, lastfm: hit.info };
+
+      try {
+        const info = await getArtistInfo(row.name);
+        await setCache(artistKey, { info }, 604800); // 7d — tags and listener counts move slowly
+        return { ...row, lastfm: info };
+      } catch (error) {
+        // Never cached: a timeout is about today, not about the artist.
+        console.warn('[lastfm] Artist info failed:', error.response?.status ?? error.message);
+        return { ...row, lastfm: null };
+      }
+    }));
+
+    await setCache(cacheKey, withInfo, 21600); // 6h
+    res.json(withInfo);
   } catch (error) {
-    console.error('Error in Ticketmaster search:', error);
+    console.error('Error in artist search:', error);
     const payload = handleError('wishlist', 500);
     return res.status(500).json(payload);
   }
