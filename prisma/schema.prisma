@@ -178,9 +178,6 @@ model Wishlist {
   name               String
   user_id            String                  @unique
   discord_webhook    String?
-  concert_scores     String?
-  city_rankings      String?
-  scores_computed_at DateTime?
   last_active_at     DateTime?
   calendar_token     String?                 @unique
   calendar_token_at  DateTime?
