@@ -97,6 +97,8 @@ model Band {
   bandsintown_url            String?
   setlist                    Json?
   setlist_updated_at         DateTime?
+  spotify_id                 String?                    @unique
+  spotify_checked_at         DateTime?
   concerts                   ConcertBandReference[]     @relation("BandConcerts")
   wishlists                  WishlistBandReference[]    @relation("BandWishlists")
   notification_subscriptions NotificationSubscription[] @relation("BandNotificationSubscriptions")

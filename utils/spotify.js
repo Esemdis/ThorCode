@@ -8,6 +8,7 @@
 // and POST /playlists/{id}/items. The same change capped search results at 10.
 
 const axios = require('axios');
+const { retryDelayMs } = require('./spotifyRetry');
 const prisma = require('./../prisma/client');
 const { searchQueries, pickBestTrack } = require('./setlistPlaylist');
 
@@ -168,9 +169,8 @@ async function getAppToken() {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * A GET that waits out a 429 rather than failing the whole playlist for it.
- * Spotify's Retry-After is in seconds. Bounded, so a sustained limit gives up
- * instead of hanging the request.
+ * A GET that waits out a brief 429 rather than failing the whole playlist for
+ * it, and gives up rather than sleeping through a long one.
  */
 async function getWithBackoff(url, config, attempts = 3) {
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -180,7 +180,11 @@ async function getWithBackoff(url, config, attempts = 3) {
       const status = error.response?.status;
       if (status === 401) throw new SpotifyAuthError('Spotify rejected the token');
       if (status !== 429 || attempt === attempts) throw error;
-      const wait = (Number(error.response.headers['retry-after']) || 2) * 1000;
+      const wait = retryDelayMs(error.response.headers['retry-after']);
+      if (wait === null) {
+        console.error(`[spotify] Rate limited for ${error.response.headers['retry-after']}s — giving up rather than waiting it out`);
+        throw error;
+      }
       console.warn(`[spotify] Rate limited, waiting ${wait}ms (attempt ${attempt}/${attempts})`);
       await sleep(wait);
     }
@@ -228,6 +232,37 @@ async function searchArtists(query) {
   return data?.artists?.items ?? [];
 }
 
+/**
+ * Artist objects for a set of ids.
+ *
+ * One request per id, not the /artists?ids= batch endpoint: that endpoint
+ * answers 403 Forbidden for a Development Mode app, the same restriction that
+ * costs this app genres and popularity elsewhere. The caller keeps the id list
+ * small (see ARTIST_CONCURRENCY in bandImages) so this stays a short burst
+ * rather than a few hundred parallel requests.
+ *
+ * An id that fails individually is dropped rather than failing the set — one
+ * artist Spotify will not serve should cost one photo, not all of them.
+ *
+ * @returns {Promise<object[]>} Raw artist objects, failures and nulls stripped.
+ */
+async function getArtists(ids) {
+  if (!ids?.length) return [];
+  const token = await getAppToken();
+  const headers = { Authorization: `Bearer ${token}` };
+
+  const results = await Promise.all((ids).map(async (id) => {
+    try {
+      const { data } = await getWithBackoff(`${API_URL}/artists/${id}`, { headers });
+      return data;
+    } catch (error) {
+      console.error(`[spotify] Artist ${id} lookup failed:`, error.response?.status ?? error.message);
+      return null;
+    }
+  }));
+  return results.filter(Boolean);
+}
+
 /** Create an empty private playlist on the connected account. */
 async function createPlaylist(accessToken, { name, description }) {
   const { data } = await axios.post(
@@ -271,6 +306,7 @@ module.exports = {
   getValidToken,
   getAppToken,
   searchArtists,
+  getArtists,
   findTrack,
   createPlaylist,
   addItems,

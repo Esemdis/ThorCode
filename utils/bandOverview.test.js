@@ -158,3 +158,120 @@ describe('shapeBandOverview — sold out', () => {
     expect(out.nextConcertSoldOut).toBe(false);
   });
 });
+
+describe('shapeBandOverview — next show per country', () => {
+
+  it('keys each band\'s soonest show in a country by that country', () => {
+    const out = shapeBandOverview(
+      [band(1, 'Thrown')], [], [],
+      [{ band_id: 1, countries: ['DE', 'DK'] }],
+      [
+        { band_id: 1, country: 'DE', concert_date: new Date('2026-09-03'), sold_out: false },
+        { band_id: 1, country: 'DK', concert_date: new Date('2027-03-01'), sold_out: false },
+      ],
+    );
+
+    expect(out[0].nextByCountry).toEqual({
+      DE: { date: new Date('2026-09-03'), soldOut: false },
+      DK: { date: new Date('2027-03-01'), soldOut: false },
+    });
+  });
+
+  it('carries the sold-out flag per country, not just for the global next show', () => {
+    // The near-you show is the one the table now leads with, so its own
+    // sold_out is what the badge has to read — the global next show's flag
+    // says nothing about the gig you would actually go to.
+    const out = shapeBandOverview(
+      [band(1, 'Thrown')], [], [], [],
+      [
+        { band_id: 1, country: 'DE', concert_date: new Date('2026-09-03'), sold_out: false },
+        { band_id: 1, country: 'DK', concert_date: new Date('2027-03-01'), sold_out: true },
+      ],
+    );
+
+    expect(out[0].nextByCountry.DK.soldOut).toBe(true);
+  });
+
+  it('is an empty object for a band with nothing coming up', () => {
+    // An object either way, so the client can look a country up without a guard.
+    const [out] = shapeBandOverview([band(1, 'Sleep Token')], [], [], [], []);
+
+    expect(out.nextByCountry).toEqual({});
+  });
+
+  it('holds several bands apart', () => {
+    const out = shapeBandOverview(
+      [band(1, 'Thrown'), band(2, 'Polaris')], [], [], [],
+      [
+        { band_id: 1, country: 'DE', concert_date: new Date('2026-09-03'), sold_out: false },
+        { band_id: 2, country: 'DK', concert_date: new Date('2026-10-01'), sold_out: false },
+      ],
+    );
+
+    expect(Object.keys(out[0].nextByCountry)).toEqual(['DE']);
+    expect(Object.keys(out[1].nextByCountry)).toEqual(['DK']);
+  });
+
+  it('reads a band id that arrives as a string', () => {
+    // Same driver quirk the other raw-SQL rows hit: this query is one row per
+    // band and country, so it cannot go through byBandId and needs its own
+    // coercion.
+    const out = shapeBandOverview(
+      [band(1, 'Thrown')], [], [], [],
+      [{ band_id: '1', country: 'DE', concert_date: new Date('2026-09-03'), sold_out: false }],
+    );
+
+    expect(out[0].nextByCountry.DE.date).toEqual(new Date('2026-09-03'));
+  });
+
+  it('ignores rows for bands that are not in the list', () => {
+    const out = shapeBandOverview(
+      [band(1, 'Thrown')], [], [], [],
+      [{ band_id: 99, country: 'ES', concert_date: new Date('2026-09-03'), sold_out: false }],
+    );
+
+    expect(out[0].nextByCountry).toEqual({});
+  });
+
+  it('leaves the global next show alone, because it may be in a null country', () => {
+    // nextByCountry drops null-country concerts, so it is not a superset of the
+    // global next show and cannot replace it.
+    const out = shapeBandOverview(
+      [band(1, 'Thrown')],
+      [{ band_id: 1, concert_date: new Date('2026-08-01'), country: null }],
+      [], [], [],
+    );
+
+    expect(out[0].nextConcertDate).toEqual(new Date('2026-08-01'));
+    expect(out[0].nextByCountry).toEqual({});
+  });
+
+});
+
+describe('shapeBandOverview band photos', () => {
+  it('attaches the photo belonging to the band matched to that Spotify artist', () => {
+    const out = shapeBandOverview(
+      [band(1, 'Spiritbox', { spotify_id: 'sb' }), band(2, 'Polaris', { spotify_id: 'pl' })],
+      [], [], [], [],
+      { sb: 'spiritbox.jpg' },
+    );
+
+    expect(out[0].image).toBe('spiritbox.jpg');
+    // Matched to Spotify but photoless, which is not the same as unmatched.
+    expect(out[1].image).toBeNull();
+  });
+
+  // Every other field on a row is present whatever happens, so the avatar has
+  // one thing to test rather than two.
+  it('gives a band that was never matched a null photo rather than no field', () => {
+    const [out] = shapeBandOverview([band(1, 'Sleep Token')], [], [], [], [], {});
+
+    expect(out).toHaveProperty('image', null);
+  });
+
+  it('leaves every photo null when the images could not be resolved at all', () => {
+    const [out] = shapeBandOverview([band(1, 'Sleep Token', { spotify_id: 'st' })], [], [], []);
+
+    expect(out.image).toBeNull();
+  });
+});

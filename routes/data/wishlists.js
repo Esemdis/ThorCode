@@ -4,6 +4,7 @@ const { validationResult, param, body } = require("express-validator");
 const axios = require("axios");
 const { handleError } = require("./helpers");
 const { deduplicateConcerts } = require("../../utils/concertDedup");
+const { groupConcertsByBand } = require("../../utils/concertUpdateGroups");
 
 const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
@@ -275,7 +276,10 @@ router.get(
   }
 );
 
-// GET /wishlists/:id/recent-concerts — 30 most recently inserted future concerts for this wishlist
+// GET /wishlists/:id/recent-concerts — newest future concerts for this wishlist, grouped by band.
+// Fetches far more rows than it returns: a single band announcing a long tour used to
+// occupy every row of a flat top-30, so the window has to be wide enough that other
+// bands survive the grouping.
 router.get(
   "/wishlists/:id/recent-concerts",
   [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
@@ -298,7 +302,7 @@ router.get(
           bands: { some: { band: { in: bandIds } } },
         },
         orderBy: { created_at: "desc" },
-        take: 30,
+        take: 300,
         select: {
           id: true,
           name: true,
@@ -327,7 +331,7 @@ router.get(
         })),
       }));
 
-      res.json({ concerts: result });
+      res.json({ groups: groupConcertsByBand(result) });
     } catch (error) {
       console.error("Error fetching recent concerts:", error);
       return res.status(500).json({ error: "Internal server error" });

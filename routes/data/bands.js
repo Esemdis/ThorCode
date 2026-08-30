@@ -7,9 +7,11 @@ const { handleError, checkDuplicateConcert } = require('./helpers');
 const { haversineKm, stringSimilarity, venueContains, deduplicateByCoords } = require('../../utils/concertDedup');
 const { cleanLineupNames, cleanLineupJson, canonicalBandName } = require('../../utils/lineupNames');
 const { shapeBandOverview } = require('../../utils/bandOverview');
-const { searchArtists } = require('../../utils/spotify');
+const { searchArtists, getArtists } = require('../../utils/spotify');
 const { getArtistInfo } = require('../../utils/lastfm');
 const { relevantArtists } = require('../../utils/artistSearch');
+const { resolveArtistImages } = require('../../utils/bandImages');
+const { matchBandToSpotify, backfillSpotifyIds } = require('../../utils/bandSpotifyMatch');
 
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
@@ -23,6 +25,11 @@ const { setCache, getCache } = require('../../utils/cache');
 const LASTFM_ROWS = 3;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Bound to the module's cache and Spotify client once, so no route has to
+// remember which three functions resolveArtistImages needs.
+const bandImageDeps = { getCache, setCache, getArtists };
+
 
 const MB_HEADERS = {
   'User-Agent': `${process.env.APP_NAME || 'ConcertMap'}/1.0 (${process.env.APP_CONTACT || 'contact@example.com'})`,
@@ -479,6 +486,7 @@ router.get('/upcoming/bands', async (req, res) => {
           name: true,
           songkick_url: true,
           bandsintown_url: true,
+          spotify_id: true,
           _count: { select: { concerts: { where: { concert_rel: { concert_date: { gte: now } } } } } },
         },
         orderBy: { name: 'asc' },
@@ -518,7 +526,14 @@ router.get('/upcoming/bands', async (req, res) => {
         ORDER BY r.band, c.country, c.concert_date ASC`,
     ]);
 
-    res.json(shapeBandOverview(bands, nextRows, lastRows, countryRows, perCountryRows));
+    // Cache-only, and deliberately so: this route lists every band there is, and
+    // fetching the misses here is one Spotify request per band on the request
+    // path — 120 of them, ten seconds, past the client's timeout, and enough
+    // volume to trip Spotify's rate limit outright. The cron warms the cache;
+    // anything not warm yet renders as a monogram until it is.
+    const images = await resolveArtistImages(bands.map((b) => b.spotify_id), bandImageDeps, { cacheOnly: true });
+
+    res.json(shapeBandOverview(bands, nextRows, lastRows, countryRows, perCountryRows, images));
   } catch (error) {
     console.error('Error fetching bands:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -874,12 +889,22 @@ router.get('/bands/:bandId/upcoming', async (req, res) => {
 
     const band = await prisma.band.findUnique({
       where: { id: bandId },
-      select: { id: true, name: true, songkick_url: true, bandsintown_url: true, setlist: true, MBID: true },
+      select: {
+        id: true, name: true, songkick_url: true, bandsintown_url: true, setlist: true, MBID: true,
+        spotify_id: true, spotify_checked_at: true,
+      },
     });
 
     if (!band) {
       return res.status(404).json({ error: 'Band not found' });
     }
+
+    // Opening a band is the one place a Spotify search is affordable — one
+    // band, one request, once ever — so this is where unmatched bands get their
+    // id, and the overview picks the photo up from there on the next load.
+    const spotifyId = await matchBandToSpotify(band);
+    const images = await resolveArtistImages([spotifyId], bandImageDeps);
+    const bandWithImage = { ...band, image: images[spotifyId] ?? null, spotify_checked_at: undefined };
 
     const now = new Date();
     const concerts = await prisma.concert.findMany({
@@ -933,7 +958,7 @@ router.get('/bands/:bandId/upcoming', async (req, res) => {
       };
     });
 
-    res.json({ band, upcoming: formatted });
+    res.json({ band: bandWithImage, upcoming: formatted });
   } catch (error) {
     console.error('Error fetching upcoming concerts for band:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -1221,6 +1246,24 @@ router.get('/bands/artist-search', async (req, res) => {
     console.error('Error in artist search:', error);
     const payload = handleError('wishlist', 500);
     return res.status(500).json(payload);
+  }
+});
+
+/**
+ * Match unsearched bands to Spotify artists, so the overview has photos before
+ * anyone has opened each band individually.
+ *
+ * The manual door to the same backfill the daily cron runs; useful after
+ * clearing `spotify_checked_at` on a band that was matched wrongly. Capped per
+ * run, and resumable — hitting the cap just means running it again.
+ */
+router.post('/bands/sync-spotify-ids', auth, roleCheck(['ADMIN']), async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    res.json({ status: 'success', ...(await backfillSpotifyIds({ limit })) });
+  } catch (error) {
+    console.error('Error backfilling Spotify artist ids:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 

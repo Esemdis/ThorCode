@@ -1,9 +1,18 @@
 const cron = require("node-cron");
 const { runNotificationDigest } = require("./concertNotifyDigest");
+const { backfillSpotifyIds, warmBandImages } = require("./bandSpotifyMatch");
 const prisma = require("../prisma/client");
 
 // Default: once a day at 08:00 server time.
 const NOTIFICATION_DIGEST_CRON = process.env.NOTIFICATION_DIGEST_CRON || "0 8 * * *";
+
+// Matches new bands to Spotify artists and refreshes every band's photo url.
+// Daily is the required cadence, not a preference: the cached urls expire just
+// under 24 hours (Spotify's cap), and the overview never fetches them itself.
+// 04:00 keeps it off the digest's hour; 200 is well above the number of bands
+// added in a day while still bounding a first run on a fresh database.
+const SPOTIFY_BACKFILL_CRON = process.env.SPOTIFY_BACKFILL_CRON || "0 4 * * *";
+const SPOTIFY_BACKFILL_LIMIT = 200;
 
 /**
  * Clean up expired email verification codes
@@ -35,6 +44,26 @@ function startCronJobs() {
 
   // Cleanup expired email verifications - runs every hour
   cron.schedule("0 * * * *", cleanupExpiredEmailVerifications);
+
+  // Give newly added bands their Spotify artist id, so the band overview has a
+  // photo before anyone has opened them. Silent when there is nothing to do —
+  // once the queue is empty this is a single count query.
+  cron.schedule(SPOTIFY_BACKFILL_CRON, async () => {
+    try {
+      const { searched, matched, remaining } = await backfillSpotifyIds({ limit: SPOTIFY_BACKFILL_LIMIT });
+      if (searched > 0) {
+        console.log(`[cron] Spotify backfill: searched ${searched}, matched ${matched}, ${remaining} still unmatched.`);
+      }
+
+      // Warming runs after matching, in the same job, so a band added today has
+      // both an id and a photo by morning. The band overview only reads the
+      // cache, so this is the step that actually puts photos on the page.
+      const { bands, withPhoto } = await warmBandImages();
+      console.log(`[cron] Spotify images: warmed ${withPhoto} photo(s) for ${bands} matched band(s).`);
+    } catch (err) {
+      console.error("[cron] Spotify backfill failed:", err);
+    }
+  });
 }
 
 module.exports = { startCronJobs };

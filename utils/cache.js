@@ -1,11 +1,23 @@
 const { v4: uuidv4 } = require("uuid");
 const { Redis } = require("ioredis");
+const { resolveRedisUrl } = require("./redisUrl");
 
 // Managed instances are reached over rediss:// and need TLS. A self-hosted
 // Redis/Valkey on the LAN speaks plain redis:// and will fail the handshake if
 // we offer TLS anyway, so only turn it on when the URL asks for it.
-const REDIS_URL = process.env.REDIS_URL;
+const REDIS_URL = resolveRedisUrl();
 const useTls = /^rediss:\/\//i.test(REDIS_URL || "");
+
+// Said once, loudly, at boot. ioredis treats a missing url as localhost:6379 and
+// every cache miss thereafter looks ordinary, so an environment with no Redis
+// configured at all is otherwise indistinguishable from a cold one — it just
+// runs everything uncached and slow.
+if (!REDIS_URL) {
+  console.error(
+    "[cache] No REDIS_URL, and no UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN to derive one from. " +
+    "Caching is disabled and every cached route will do its full work on every request.",
+  );
+}
 
 const client = new Redis(REDIS_URL, {
   ...(useTls ? { tls: {} } : {}),
