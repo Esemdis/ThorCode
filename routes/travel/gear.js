@@ -163,7 +163,6 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   }
   if (essential !== undefined) data.essential = Boolean(essential);
   if (retired !== undefined) data.retired = Boolean(retired);
-  if (replaced_by_id !== undefined) data.replaced_by_id = replaced_by_id != null ? parseInt(replaced_by_id, 10) : null;
   if (name !== undefined) data.name = name.trim();
   if (model !== undefined) data.model = model?.trim() || null;
   if (brand !== undefined) data.brand = brand?.trim() || null;
@@ -186,6 +185,22 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const SYNCED_FIELDS = ["name", "model", "brand", "category", "dimensions", "tags", "notes", "url", "photo", "retail_price", "bought_for", "currency", "price_irrelevant"];
 
   try {
+    if (replaced_by_id !== undefined) {
+      if (replaced_by_id == null) {
+        data.replaced_by_id = null;
+      } else {
+        const replacedById = parseInt(replaced_by_id, 10);
+        // Must belong to the same user — otherwise this becomes a link an
+        // attacker controls, and reads of their own gear leak the target's name/brand/model.
+        const replacement = await prisma.gearItem.findFirst({
+          where: { id: replacedById, user_id: req.user.id },
+          select: { id: true },
+        });
+        if (!replacement) return res.status(400).json({ error: "replaced_by_id must reference your own gear item" });
+        data.replaced_by_id = replacedById;
+      }
+    }
+
     const syncData = {};
     for (const f of SYNCED_FIELDS) if (f in data) syncData[f] = data[f];
 

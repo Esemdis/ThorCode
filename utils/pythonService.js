@@ -55,8 +55,16 @@ async function pythonServicePost(path, body = {}, config = {}, client = axios) {
   const primary = process.env.PYTHON_SERVICE_URL;
   const fallback = process.env.PYTHON_SERVICE_FALLBACK_URL;
 
+  // The Python service's mutating endpoints (/sync/*, /trigger, ...) now
+  // require this shared secret, since they used to accept unauthenticated
+  // requests that could point their scraper at an arbitrary URL (SSRF).
+  const authConfig = {
+    ...config,
+    headers: { ...config.headers, Authorization: `Bearer ${process.env.SCRAPER_TOKEN}` },
+  };
+
   try {
-    return await client.post(`${primary}${path}`, body, config);
+    return await client.post(`${primary}${path}`, body, authConfig);
   } catch (error) {
     // Same host in both variables would only repeat the identical failure.
     if (!shouldFallBack(error) || !fallback || fallback === primary) throw error;
@@ -64,7 +72,7 @@ async function pythonServicePost(path, body = {}, config = {}, client = axios) {
     // Said out loud: the work is about to run somewhere other than where the
     // caller thinks it will, and it writes real data when it gets there.
     console.warn(`[python-service] ${primary}${path} unreachable (${error.code || 'no response'}); retrying on ${fallback}`);
-    return client.post(`${fallback}${path}`, body, config);
+    return client.post(`${fallback}${path}`, body, authConfig);
   }
 }
 

@@ -12,6 +12,7 @@ const { getArtistInfo } = require('../../utils/lastfm');
 const { relevantArtists } = require('../../utils/artistSearch');
 const { resolveArtistImages } = require('../../utils/bandImages');
 const { matchBandToSpotify, backfillSpotifyIds } = require('../../utils/bandSpotifyMatch');
+const { findSourceUrls } = require('../../utils/bandSourceUrls');
 
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
@@ -24,66 +25,10 @@ const { setCache, getCache } = require('../../utils/cache');
 // what fits on screen without scrolling the dropdown.
 const LASTFM_ROWS = 3;
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 // Bound to the module's cache and Spotify client once, so no route has to
 // remember which three functions resolveArtistImages needs.
 const bandImageDeps = { getCache, setCache, getArtists };
 
-
-const MB_HEADERS = {
-  'User-Agent': `${process.env.APP_NAME || 'ConcertMap'}/1.0 (${process.env.APP_CONTACT || 'contact@example.com'})`,
-  'Accept': 'application/json',
-};
-
-// Fetch Songkick + Bandsintown URLs from MusicBrainz URL relationships.
-// Uses MBID directly if known; otherwise searches by artist name first.
-async function findSourceUrls(bandName, mbid = null) {
-  let resolvedMbid = mbid;
-
-  if (!resolvedMbid) {
-    try {
-      const searchRes = await axios.get('https://musicbrainz.org/ws/2/artist/', {
-        params: { query: `artist:"${bandName}"`, limit: 1, fmt: 'json' },
-        headers: MB_HEADERS,
-        timeout: 10000,
-      });
-      resolvedMbid = searchRes.data?.artists?.[0]?.id ?? null;
-      if (resolvedMbid) {
-        console.log(`[findSourceUrls] MusicBrainz resolved "${bandName}" → ${resolvedMbid}`);
-      } else {
-        console.log(`[findSourceUrls] MusicBrainz found no artist for "${bandName}"`);
-        return [null, null];
-      }
-    } catch (e) {
-      console.error(`[findSourceUrls] MusicBrainz search failed for "${bandName}":`, e.message);
-      return [null, null];
-    }
-    await sleep(1100); // MusicBrainz rate limit: 1 req/sec
-  }
-
-  try {
-    const relRes = await axios.get(`https://musicbrainz.org/ws/2/artist/${resolvedMbid}`, {
-      params: { inc: 'url-rels', fmt: 'json' },
-      headers: MB_HEADERS,
-      timeout: 10000,
-    });
-    const relations = relRes.data?.relations ?? [];
-    let songkickUrl = null;
-    let bandsintownUrl = null;
-    for (const rel of relations) {
-      const url = rel.url?.resource;
-      if (!url) continue;
-      if (!songkickUrl && url.includes('songkick.com')) songkickUrl = url.split('?')[0].replace(/\/$/, '');
-      if (!bandsintownUrl && url.includes('bandsintown.com')) bandsintownUrl = url.split('?')[0].replace(/\/$/, '');
-    }
-    console.log(`[findSourceUrls] ${bandName} → songkick: ${songkickUrl}, bandsintown: ${bandsintownUrl}`);
-    return [songkickUrl, bandsintownUrl];
-  } catch (e) {
-    console.error(`[findSourceUrls] MusicBrainz URL relations failed for "${bandName}" (${resolvedMbid}):`, e.message);
-    return [null, null];
-  }
-}
 
 // Defaults to 5 requests per 15 minutes per IP
 const rateLimit = rateLimiter({
@@ -812,15 +757,21 @@ router.post(
       // before URLs are known.
       findSourceUrls(newBand.name, mbid).then(async ([songkickUrl, bandsintownUrl]) => {
         console.log(`[findSourceUrl] ${newBand.name} → songkick: ${songkickUrl}, bandsintown: ${bandsintownUrl}`);
-        if (songkickUrl || bandsintownUrl) {
-          await prisma.band.update({
-            where: { id: newBand.id },
-            data: {
-              ...(songkickUrl    && { songkick_url:    songkickUrl }),
-              ...(bandsintownUrl && { bandsintown_url: bandsintownUrl }),
-            },
-          }).catch((e) => console.error(`[findSourceUrl] DB update failed for ${newBand.name}:`, e.message));
-        }
+        await prisma.band.update({
+          where: { id: newBand.id },
+          data: {
+            ...(songkickUrl    && { songkick_url:    songkickUrl }),
+            ...(bandsintownUrl && { bandsintown_url: bandsintownUrl }),
+            source_urls_checked_at: new Date(),
+          },
+        }).catch((e) => console.error(`[findSourceUrl] DB update failed for ${newBand.name}:`, e.message));
+        return [songkickUrl, bandsintownUrl];
+      }, (e) => {
+        // Not stamped: MusicBrainz being unreachable is not evidence the URLs
+        // don't exist, so the cron backfill retries this band on its next sweep.
+        console.error(`[findSourceUrl] MusicBrainz lookup failed for ${newBand.name}:`, e.message);
+        return [null, null];
+      }).then(async ([songkickUrl, bandsintownUrl]) => {
         await pythonServicePost(`/sync/${newBand.id}`,
           { songkick_url: songkickUrl || null, bandsintown_url: bandsintownUrl || null, band_name: newBand.name },
         );
@@ -1036,20 +987,20 @@ router.post(
     // Respond immediately — URL discovery runs in the background
     res.json({ status: 'searching', message: `Looking up URLs for ${band.name} in the background` });
 
-    findSourceUrls(band.name, band.MBID).then(([songkickUrl, bandsintownUrl]) => {
+    findSourceUrls(band.name, band.MBID).then((result) => {
+      const [songkickUrl, bandsintownUrl] = result;
       if (!songkickUrl)    console.warn(`\n⚠️  [refresh-urls] WARNING: No Songkick URL found for "${band.name}" (MBID: ${band.MBID ?? 'none'})\n`);
       if (!bandsintownUrl) console.warn(`\n⚠️  [refresh-urls] WARNING: No Bandsintown URL found for "${band.name}" (MBID: ${band.MBID ?? 'none'})\n`);
       console.log(`[refresh-urls] ${band.name} → songkick: ${songkickUrl}, bandsintown: ${bandsintownUrl}`);
-      if (songkickUrl || bandsintownUrl) {
-        prisma.band.update({
-          where: { id: bandId },
-          data: {
-            ...(songkickUrl    && { songkick_url:    songkickUrl }),
-            ...(bandsintownUrl && { bandsintown_url: bandsintownUrl }),
-          },
-        }).catch((e) => console.error(`[refresh-urls] DB update failed for ${band.name}:`, e.message));
-      }
-    }).catch(() => {});
+      return prisma.band.update({
+        where: { id: bandId },
+        data: {
+          ...(songkickUrl    && { songkick_url:    songkickUrl }),
+          ...(bandsintownUrl && { bandsintown_url: bandsintownUrl }),
+          source_urls_checked_at: new Date(),
+        },
+      }).catch((e) => console.error(`[refresh-urls] DB update failed for ${band.name}:`, e.message));
+    }).catch((e) => console.error(`[refresh-urls] MusicBrainz lookup failed for ${band.name}:`, e.message));
   },
 );
 

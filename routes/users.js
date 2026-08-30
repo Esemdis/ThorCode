@@ -89,7 +89,7 @@ router.post(
         where: { email },
       });
       if (!existingUser) {
-        return res.status(403).json({ error: 'Invalid credentials' });
+        return res.status(401).json({ error: 'Invalid credentials' });
       }
 
       // Hash the password

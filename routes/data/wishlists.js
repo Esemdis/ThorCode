@@ -19,6 +19,16 @@ const rateLimit = rateLimiter({
 
 const VALID_TIERS = ["LOVE", "LIKE", "FOLLOW"];
 
+// Discord's own webhook host+path shape — anything else lets a user aim the
+// server's outbound POST at an internal address (SSRF) via /wishlists/notify.
+const DISCORD_WEBHOOK_RE = /^https:\/\/(discord\.com|discordapp\.com)\/api\/webhooks\/\d+\/[\w-]+$/;
+function validateDiscordWebhook(value) {
+  if (!DISCORD_WEBHOOK_RE.test(value)) {
+    throw new Error("Discord webhook must be a valid https://discord.com/api/webhooks/... URL");
+  }
+  return true;
+}
+
 // Helper: compute per-band seen counts from past attendance.
 // Deduplicates by date+venue+city (same logic as the Attended tab display),
 // preferring sfm_ records so a TM + sfm_ pair for the same show counts as 1.
@@ -635,7 +645,7 @@ router.post(
     auth,
     roleCheck(["ADMIN", "USER"]),
     body("name").trim().isLength({ min: 1, max: 100 }).withMessage("Wishlist name must be between 1 and 100 characters"),
-    body("discord_webhook").optional({ nullable: true }).isURL().withMessage("Discord webhook must be a valid URL"),
+    body("discord_webhook").optional({ nullable: true }).custom(validateDiscordWebhook),
   ],
   rateLimit,
   async (req, res) => {
@@ -677,7 +687,7 @@ router.put(
     roleCheck(["ADMIN"]),
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
     body("name").trim().isLength({ min: 1, max: 100 }).withMessage("Wishlist name must be between 1 and 100 characters"),
-    body("discord_webhook").optional({ nullable: true }).isURL().withMessage("Discord webhook must be a valid URL"),
+    body("discord_webhook").optional({ nullable: true }).custom(validateDiscordWebhook),
   ],
   rateLimit,
   async (req, res) => {
