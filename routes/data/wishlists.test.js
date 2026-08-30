@@ -151,3 +151,83 @@ describe('the handlers actually run', () => {
     expect(res.status).toBe(200);
   });
 });
+
+describe('GET /wishlists/:id setlist placement', () => {
+  // A band's setlist belongs to the band, not to each of its concerts, but the
+  // payload attached a copy to every band on every concert. On the live data
+  // that was 85 distinct setlists sent as 1532 copies — 1.1MB of a 2MB
+  // response. It is sent once in `bands` and looked up by id on the client.
+  const SETLIST = { songs: [{ name: 'Ghost of Perdition', tape: false }], tour: 'Tour' };
+  const OPETH = { id: 1, name: 'Opeth', setlist: SETLIST, MBID: null, songkick_url: null, bandsintown_url: null };
+
+  const concert = (id, date, city = 'Stockholm', venue = 'Slakthuset') => ({
+    concert_rel: {
+      id, event_id: `e${id}`, name: null, city, country: 'SE',
+      venue, concert_date: new Date(date), metadata: null,
+      latitude: '59.3', longitude: '18.0', on_sale: true, ticket_sale_start: null,
+      price_min: null, price_max: null, price_currency: null, sold_out: false,
+      festival: false, source: 'songkick', url: null, weather: null, reachable: null,
+      city_rel: null,
+      bands: [{ band_rel: OPETH }],
+    },
+  });
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue({
+      id: 7, user_id: 'user-1', name: 'My Wishlist',
+      bands: [{ band_id: 1, tier: 'LOVE', band_rel: OPETH }],
+    });
+    // Two concerts for the same band: the duplication this guards against only
+    // shows up once a band plays more than one date.
+    prisma.band.findMany.mockResolvedValue([
+      // Different nights and cities, or deduplicateConcerts folds them into one
+      // and the duplication under test cannot show up.
+      { id: 1, name: 'Opeth', concerts: [
+        concert(10, '2026-09-10'),
+        concert(11, '2026-10-02', 'Gothenburg', 'Pustervik'),
+      ] },
+    ]);
+    prisma.concertAttendance.findMany.mockResolvedValue([]);
+  });
+
+  it('sends each setlist once, on the band', async () => {
+    const res = await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+    expect(res.status).toBe(200);
+    expect(res.body.bands).toHaveLength(1);
+    expect(res.body.bands[0]).toMatchObject({ id: 1, setlist: SETLIST });
+  });
+
+  it('omits setlists for bands with no concerts in the response', async () => {
+    // Sending every wishlist band's setlist regardless made a narrow date range
+    // worse than before the dedup: on live data a one-week window was 122KB, of
+    // which 87KB was setlists for bands playing nothing that week.
+    prisma.wishlist.findUnique.mockResolvedValue({
+      id: 7, user_id: 'user-1', name: 'My Wishlist',
+      bands: [
+        { band_id: 1, tier: 'LOVE', band_rel: OPETH },
+        { band_id: 2, tier: 'LIKE', band_rel: { ...OPETH, id: 2, name: 'Tool' } },
+      ],
+    });
+    // Band 2 is on the wishlist but plays nothing in range.
+    prisma.band.findMany.mockResolvedValue([
+      { id: 1, name: 'Opeth', concerts: [concert(10, '2026-09-10')] },
+      { id: 2, name: 'Tool', concerts: [] },
+    ]);
+
+    const res = await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+    const byId = new Map(res.body.bands.map((b) => [b.id, b]));
+    expect(byId.get(1).setlist).toEqual(SETLIST);
+    expect(byId.get(2).setlist).toBeNull();
+    // Still listed, so tier and times_seen keep working.
+    expect(byId.get(2)).toMatchObject({ id: 2, name: 'Tool', tier: 'LIKE' });
+  });
+
+  it('does not repeat the setlist on every concert', async () => {
+    const res = await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+    expect(res.body.concerts).toHaveLength(2);
+    for (const c of res.body.concerts) {
+      expect(c.participating_bands[0]).toEqual({ id: 1, name: 'Opeth', tier: 'LOVE' });
+      expect(c.participating_bands[0]).not.toHaveProperty('setlist');
+    }
+  });
+});

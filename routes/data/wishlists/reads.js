@@ -437,7 +437,11 @@ router.get(
                   bands: {
                     include: {
                       band_rel: {
-                        select: { name: true, id: true, setlist: true },
+                        // No setlist here. It belongs to the band, so selecting
+                        // it on the concert join pulled the same blob once per
+                        // concert the band plays — 1532 rows for 85 setlists on
+                        // live data. It is sent once in `bands` below instead.
+                        select: { name: true, id: true },
                       },
                     },
                   },
@@ -474,7 +478,6 @@ router.get(
                 id: b.band_rel.id,
                 name: b.band_rel.name,
                 tier: bandTierMap.get(b.band_rel.id) ?? null,
-                setlist: b.band_rel.setlist ?? null,
               }))
               .filter((b) => bandIds.includes(b.id));
 
@@ -512,17 +515,7 @@ router.get(
 
       const seenCountMap = await computeSeenCounts(wishlistId);
 
-      // Simplified bands array with tier and seen count
-      const simplifiedBands = wishlist.bands.map((ref) => ({
-        id: ref.band_rel.id,
-        name: ref.band_rel.name,
-        mbid: ref.band_rel.MBID ?? null,
-        concertCount: formattedBands.find((b) => b.id === ref.band_id)?.concertCount ?? 0,
-        tier: ref.tier,
-        times_seen: seenCountMap.get(ref.band_id) ?? 0,
-        songkick_url: ref.band_rel.songkick_url ?? null,
-        bandsintown_url: ref.band_rel.bandsintown_url ?? null,
-      }));
+
 
       // Deduplicated concerts across all bands (by id first)
       const allConcerts = new Map();
@@ -533,6 +526,31 @@ router.get(
       });
 
       const concertsArray = deduplicateConcerts([...allConcerts.values()]);
+
+      // Which bands the caller is actually being shown, so the setlists below
+      // can be limited to them.
+      const bandsOnScreen = new Set();
+      for (const c of concertsArray) {
+        for (const b of c.participating_bands ?? []) bandsOnScreen.add(b.id);
+      }
+
+      // Simplified bands array with tier and seen count
+      const simplifiedBands = wishlist.bands.map((ref) => ({
+        id: ref.band_rel.id,
+        name: ref.band_rel.name,
+        mbid: ref.band_rel.MBID ?? null,
+        concertCount: formattedBands.find((b) => b.id === ref.band_id)?.concertCount ?? 0,
+        tier: ref.tier,
+        times_seen: seenCountMap.get(ref.band_id) ?? 0,
+        songkick_url: ref.band_rel.songkick_url ?? null,
+        bandsintown_url: ref.band_rel.bandsintown_url ?? null,
+        // The band's setlist, sent once, and only when the band actually
+        // appears in the concerts below. Sending every wishlist band's setlist
+        // regardless made a narrow date range heavier than it was before the
+        // dedup — most of a one-week payload was setlists for bands playing
+        // nothing that week.
+        setlist: bandsOnScreen.has(ref.band_rel.id) ? (ref.band_rel.setlist ?? null) : null,
+      }));
 
       res.json({
         id: wishlist.id,
