@@ -41,7 +41,14 @@ function byBandAndCountry(rows) {
     if (!row?.country) continue;
     const id = String(row.band_id);
     const forBand = index.get(id) ?? {};
-    forBand[row.country] = { date: row.concert_date, soldOut: row.sold_out ?? false };
+    // The id is what lets the client tell whether you are going to *this* show.
+    // Matching on date and country instead would mark the wrong concert on any
+    // night a band plays two cities in one country.
+    forBand[row.country] = {
+      id: row.concert_id ?? null,
+      date: row.concert_date,
+      soldOut: row.sold_out ?? false,
+    };
     index.set(id, forBand);
   }
   return index;

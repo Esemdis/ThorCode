@@ -519,7 +519,7 @@ router.get('/upcoming/bands', async (req, res) => {
       // cacheability, for a payload that grows by a few hundred small rows.
       prisma.$queryRaw`
         SELECT DISTINCT ON (r.band, c.country)
-               r.band AS band_id, c.country, c.concert_date, c.sold_out
+               r.band AS band_id, c.country, c.concert_date, c.sold_out, c.id AS concert_id
         FROM "ConcertBandReference" r
         JOIN "Concert" c ON c.id = r.concert
         WHERE c.concert_date >= ${now} AND c.country IS NOT NULL

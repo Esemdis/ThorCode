@@ -172,8 +172,8 @@ describe('shapeBandOverview — next show per country', () => {
     );
 
     expect(out[0].nextByCountry).toEqual({
-      DE: { date: new Date('2026-09-03'), soldOut: false },
-      DK: { date: new Date('2027-03-01'), soldOut: false },
+      DE: { id: null, date: new Date('2026-09-03'), soldOut: false },
+      DK: { id: null, date: new Date('2027-03-01'), soldOut: false },
     });
   });
 
@@ -273,5 +273,25 @@ describe('shapeBandOverview band photos', () => {
     const [out] = shapeBandOverview([band(1, 'Sleep Token', { spotify_id: 'st' })], [], [], []);
 
     expect(out.image).toBeNull();
+  });
+});
+
+describe('shapeBandOverview — concert ids per country', () => {
+  it('carries the concert id, which is how the client knows you are going', () => {
+    const out = shapeBandOverview(
+      [band(1, 'Thrown')], [], [], [],
+      [{ band_id: 1, country: 'SE', concert_date: new Date('2026-11-28'), sold_out: false, concert_id: 412 }],
+    );
+
+    expect(out[0].nextByCountry.SE.id).toBe(412);
+  });
+
+  it('is null rather than undefined when the row has no id', () => {
+    const out = shapeBandOverview(
+      [band(1, 'Thrown')], [], [], [],
+      [{ band_id: 1, country: 'SE', concert_date: new Date('2026-11-28') }],
+    );
+
+    expect(out[0].nextByCountry.SE.id).toBeNull();
   });
 });
