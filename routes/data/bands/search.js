@@ -78,7 +78,7 @@ router.get('/upcoming/bands', async (req, res) => {
     // and the latest that has already happened. This replaced one findFirst per
     // band inside a Promise.all — 114 queries for the current band list, and it
     // would have been 228 once the last-seen column was added, 342 with touring.
-    const [bands, nextRows, lastRows, countryRows, perCountryRows] = await Promise.all([
+    const [bands, nextRows, lastRows, countryRows, perCityRows] = await Promise.all([
       prisma.band.findMany({
         select: {
           id: true,
@@ -111,18 +111,22 @@ router.get('/upcoming/bands', async (req, res) => {
         JOIN "Concert" c ON c.id = r.concert
         WHERE c.concert_date >= ${now} AND c.country IS NOT NULL
         GROUP BY r.band`,
-      // The soonest show in every country, not just the soonest show overall.
-      // The overview leads with the one nearest you, and "nearest" depends on
-      // your home country and where you have been — both client-side state.
-      // Sending the ranking up instead would make this per-user and kill the
-      // cacheability, for a payload that grows by a few hundred small rows.
+      // The soonest show in every city, not just the soonest show overall. The
+      // overview leads with the one nearest you, and "nearest" depends on your
+      // home city and where you have been — both client-side state. Sending
+      // your position up instead would make this per-user and kill the
+      // cacheability, for a payload that stays a few thousand small rows.
       prisma.$queryRaw`
-        SELECT DISTINCT ON (r.band, c.country)
-               r.band AS band_id, c.country, c.concert_date, c.sold_out, c.id AS concert_id
+        SELECT DISTINCT ON (r.band, c.country, c.city)
+               r.band AS band_id, c.id AS concert_id, c.concert_date, c.sold_out,
+               c.country, c.city,
+               city.latitude AS city_lat, city.longitude AS city_lng,
+               c.latitude AS raw_lat, c.longitude AS raw_lng
         FROM "ConcertBandReference" r
         JOIN "Concert" c ON c.id = r.concert
-        WHERE c.concert_date >= ${now} AND c.country IS NOT NULL
-        ORDER BY r.band, c.country, c.concert_date ASC`,
+        LEFT JOIN "City" city ON city.id = c.city_id
+        WHERE c.concert_date >= ${now}
+        ORDER BY r.band, c.country, c.city, c.concert_date ASC`,
     ]);
 
     // Cache-only, and deliberately so: this route lists every band there is, and
@@ -132,7 +136,7 @@ router.get('/upcoming/bands', async (req, res) => {
     // anything not warm yet renders as a monogram until it is.
     const images = await resolveArtistImages(bands.map((b) => b.spotify_id), bandImageDeps, { cacheOnly: true });
 
-    res.json(shapeBandOverview(bands, nextRows, lastRows, countryRows, perCountryRows, images));
+    res.json(shapeBandOverview(bands, nextRows, lastRows, countryRows, perCityRows, images));
   } catch (error) {
     console.error('Error fetching bands:', error);
     res.status(500).json({ error: 'Internal server error' });

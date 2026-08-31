@@ -159,93 +159,66 @@ describe('shapeBandOverview — sold out', () => {
   });
 });
 
-describe('shapeBandOverview — next show per country', () => {
-
-  it('keys each band\'s soonest show in a country by that country', () => {
-    const out = shapeBandOverview(
-      [band(1, 'Thrown')], [], [],
-      [{ band_id: 1, countries: ['DE', 'DK'] }],
-      [
-        { band_id: 1, country: 'DE', concert_date: new Date('2026-09-03'), sold_out: false },
-        { band_id: 1, country: 'DK', concert_date: new Date('2027-03-01'), sold_out: false },
-      ],
-    );
-
-    expect(out[0].nextByCountry).toEqual({
-      DE: { id: null, date: new Date('2026-09-03'), soldOut: false },
-      DK: { id: null, date: new Date('2027-03-01'), soldOut: false },
-    });
+describe('nextByCity', () => {
+  const row = (over = {}) => ({
+    band_id: '1', concert_id: 10, concert_date: new Date('2026-09-03'), sold_out: false,
+    country: 'DK', city: 'Copenhagen',
+    city_lat: 55.6761, city_lng: 12.5683, raw_lat: null, raw_lng: null,
+    ...over,
   });
 
-  it('carries the sold-out flag per country, not just for the global next show', () => {
-    // The near-you show is the one the table now leads with, so its own
-    // sold_out is what the badge has to read — the global next show's flag
-    // says nothing about the gig you would actually go to.
-    const out = shapeBandOverview(
-      [band(1, 'Thrown')], [], [], [],
-      [
-        { band_id: 1, country: 'DE', concert_date: new Date('2026-09-03'), sold_out: false },
-        { band_id: 1, country: 'DK', concert_date: new Date('2027-03-01'), sold_out: true },
-      ],
-    );
+  it('gives every city the band plays its soonest show, soonest first', () => {
+    const out = shapeBandOverview([{ id: 1, name: 'Opeth' }], [], [], [], [
+      row({ concert_id: 11, city: 'Malmö', country: 'SE', concert_date: new Date('2026-09-17') }),
+      row({ concert_id: 10, city: 'Copenhagen', concert_date: new Date('2026-09-03') }),
+    ]);
 
-    expect(out[0].nextByCountry.DK.soldOut).toBe(true);
+    expect(out[0].nextByCity.map((s) => s.city)).toEqual(['Copenhagen', 'Malmö']);
   });
 
-  it('is an empty object for a band with nothing coming up', () => {
-    // An object either way, so the client can look a country up without a guard.
-    const [out] = shapeBandOverview([band(1, 'Sleep Token')], [], [], [], []);
+  it('prefers the City row position over the concert\'s own', () => {
+    // City has clean Float coordinates and a unique name/country pair; the
+    // concert's pair is a VarChar filled by whichever scraper got there first.
+    const out = shapeBandOverview([{ id: 1, name: 'Opeth' }], [], [], [], [
+      row({ city_lat: 55.6761, city_lng: 12.5683, raw_lat: '1.0', raw_lng: '2.0' }),
+    ]);
 
-    expect(out.nextByCountry).toEqual({});
+    expect(out[0].nextByCity[0]).toMatchObject({ lat: 55.6761, lng: 12.5683 });
   });
 
-  it('holds several bands apart', () => {
-    const out = shapeBandOverview(
-      [band(1, 'Thrown'), band(2, 'Polaris')], [], [], [],
-      [
-        { band_id: 1, country: 'DE', concert_date: new Date('2026-09-03'), sold_out: false },
-        { band_id: 2, country: 'DK', concert_date: new Date('2026-10-01'), sold_out: false },
-      ],
-    );
+  it('falls back to the concert\'s own position when the city has none', () => {
+    const out = shapeBandOverview([{ id: 1, name: 'Opeth' }], [], [], [], [
+      row({ city_lat: null, city_lng: null, raw_lat: '55.6761', raw_lng: '12.5683' }),
+    ]);
 
-    expect(Object.keys(out[0].nextByCountry)).toEqual(['DE']);
-    expect(Object.keys(out[1].nextByCountry)).toEqual(['DK']);
+    expect(out[0].nextByCity[0]).toMatchObject({ lat: 55.6761, lng: 12.5683 });
   });
 
-  it('reads a band id that arrives as a string', () => {
-    // Same driver quirk the other raw-SQL rows hit: this query is one row per
-    // band and country, so it cannot go through byBandId and needs its own
-    // coercion.
-    const out = shapeBandOverview(
-      [band(1, 'Thrown')], [], [], [],
-      [{ band_id: '1', country: 'DE', concert_date: new Date('2026-09-03'), sold_out: false }],
-    );
+  it('keeps a show whose position is unknown, with nulls', () => {
+    // Dropping it would lose a real concert from the "elsewhere" column. The
+    // client's near-me rule already refuses to call an unknown position near.
+    const out = shapeBandOverview([{ id: 1, name: 'Opeth' }], [], [], [], [
+      row({ city_lat: null, city_lng: null, raw_lat: null, raw_lng: null }),
+    ]);
 
-    expect(out[0].nextByCountry.DE.date).toEqual(new Date('2026-09-03'));
+    expect(out[0].nextByCity[0]).toMatchObject({ city: 'Copenhagen', lat: null, lng: null });
   });
 
-  it('ignores rows for bands that are not in the list', () => {
-    const out = shapeBandOverview(
-      [band(1, 'Thrown')], [], [], [],
-      [{ band_id: 99, country: 'ES', concert_date: new Date('2026-09-03'), sold_out: false }],
-    );
+  it('survives a coordinate a scraper wrote as prose', () => {
+    // The reason this resolves in JavaScript rather than a SQL ::float cast:
+    // one bad row must not take down the whole query and empty the overview.
+    const out = shapeBandOverview([{ id: 1, name: 'Opeth' }], [], [], [], [
+      row({ city_lat: null, city_lng: null, raw_lat: 'somewhere', raw_lng: 'else' }),
+    ]);
 
-    expect(out[0].nextByCountry).toEqual({});
+    expect(out[0].nextByCity[0]).toMatchObject({ lat: null, lng: null });
   });
 
-  it('leaves the global next show alone, because it may be in a null country', () => {
-    // nextByCountry drops null-country concerts, so it is not a superset of the
-    // global next show and cannot replace it.
-    const out = shapeBandOverview(
-      [band(1, 'Thrown')],
-      [{ band_id: 1, concert_date: new Date('2026-08-01'), country: null }],
-      [], [], [],
-    );
+  it('is an empty array for a band with no upcoming shows', () => {
+    const out = shapeBandOverview([{ id: 1, name: 'Opeth' }], [], [], [], []);
 
-    expect(out[0].nextConcertDate).toEqual(new Date('2026-08-01'));
-    expect(out[0].nextByCountry).toEqual({});
+    expect(out[0].nextByCity).toEqual([]);
   });
-
 });
 
 describe('shapeBandOverview band photos', () => {
@@ -276,23 +249,30 @@ describe('shapeBandOverview band photos', () => {
   });
 });
 
-describe('shapeBandOverview — concert ids per country', () => {
+describe('shapeBandOverview — concert ids per city', () => {
+  const row = (over = {}) => ({
+    band_id: '1', concert_id: 412, concert_date: new Date('2026-11-28'), sold_out: false,
+    country: 'SE', city: 'Stockholm',
+    city_lat: null, city_lng: null, raw_lat: null, raw_lng: null,
+    ...over,
+  });
+
   it('carries the concert id, which is how the client knows you are going', () => {
     const out = shapeBandOverview(
       [band(1, 'Thrown')], [], [], [],
-      [{ band_id: 1, country: 'SE', concert_date: new Date('2026-11-28'), sold_out: false, concert_id: 412 }],
+      [row()],
     );
 
-    expect(out[0].nextByCountry.SE.id).toBe(412);
+    expect(out[0].nextByCity[0].id).toBe(412);
   });
 
   it('is null rather than undefined when the row has no id', () => {
     const out = shapeBandOverview(
       [band(1, 'Thrown')], [], [], [],
-      [{ band_id: 1, country: 'SE', concert_date: new Date('2026-11-28') }],
+      [row({ concert_id: null })],
     );
 
-    expect(out[0].nextByCountry.SE.id).toBeNull();
+    expect(out[0].nextByCity[0].id).toBeNull();
   });
 });
 
