@@ -185,23 +185,43 @@ router.post(
     const band = await prisma.band.findUnique({ where: { id: bandId }, select: { name: true, MBID: true } });
     if (!band) return res.status(404).json({ error: 'Band not found' });
 
-    // Respond immediately — URL discovery runs in the background
-    res.json({ status: 'searching', message: `Looking up URLs for ${band.name} in the background` });
+    // Awaited, not fired and forgotten. This used to answer `{status:'searching'}`
+    // straight away and do the lookup in the background, which meant the caller
+    // could never be told anything: the client reads `songkick_url` and
+    // `bandsintown_url` off this response, so the fields it fills were always
+    // undefined and the button appeared to do nothing however well the lookup
+    // went. A background failure could not reach the user either — it went to
+    // the server log, and the band kept its missing urls.
+    //
+    // The wait is short enough to hold a request open: one MusicBrainz call
+    // when the band has an MBID, and two separated by the mandatory 1.1s of
+    // rate-limit spacing when it has to be searched for by name.
+    try {
+      const [songkickUrl, bandsintownUrl] = await findSourceUrls(band.name, band.MBID);
 
-    findSourceUrls(band.name, band.MBID).then((result) => {
-      const [songkickUrl, bandsintownUrl] = result;
-      if (!songkickUrl)    console.warn(`\n⚠️  [refresh-urls] WARNING: No Songkick URL found for "${band.name}" (MBID: ${band.MBID ?? 'none'})\n`);
-      if (!bandsintownUrl) console.warn(`\n⚠️  [refresh-urls] WARNING: No Bandsintown URL found for "${band.name}" (MBID: ${band.MBID ?? 'none'})\n`);
-      console.log(`[refresh-urls] ${band.name} → songkick: ${songkickUrl}, bandsintown: ${bandsintownUrl}`);
-      return prisma.band.update({
+      if (!songkickUrl)    console.warn(`[refresh-urls] No Songkick url for "${band.name}" (MBID: ${band.MBID ?? 'none'})`);
+      if (!bandsintownUrl) console.warn(`[refresh-urls] No Bandsintown url for "${band.name}" (MBID: ${band.MBID ?? 'none'})`);
+
+      await prisma.band.update({
         where: { id: bandId },
         data: {
           ...(songkickUrl    && { songkick_url:    songkickUrl }),
           ...(bandsintownUrl && { bandsintown_url: bandsintownUrl }),
           source_urls_checked_at: new Date(),
         },
-      }).catch((e) => console.error(`[refresh-urls] DB update failed for ${band.name}:`, e.message));
-    }).catch((e) => console.error(`[refresh-urls] MusicBrainz lookup failed for ${band.name}:`, e.message));
+      });
+
+      // Always both keys, null when nothing was found: the client distinguishes
+      // "looked and found nothing" from "the call failed", and an absent key
+      // reads as neither.
+      return res.json({ songkick_url: songkickUrl ?? null, bandsintown_url: bandsintownUrl ?? null });
+    } catch (e) {
+      // Not stamped: MusicBrainz being unreachable is not evidence the urls do
+      // not exist, so the band stays queued for the next backfill sweep. Same
+      // rule as bandSourceUrlBackfill.
+      console.error(`[refresh-urls] Lookup failed for ${band.name}:`, e.message);
+      return res.status(502).json({ error: 'Could not reach MusicBrainz. Try again in a moment.' });
+    }
   },
 );
 
