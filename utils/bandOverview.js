@@ -105,6 +105,11 @@ function shapeBandOverview(bands, nextRows, lastRows, countryRows, perCountryRow
       // Explicitly null rather than absent for the same reason as the concert
       // fields above: the avatar reads one value and falls back to a monogram.
       image: (band.spotify_id && images[band.spotify_id]) || null,
+      // The listen link, unlike the photo, needs nothing but the id — no Redis
+      // round trip and no Spotify call. Sent even when `image` came back null, so
+      // a band showing a monogram still links to its artist rather than falling
+      // back to a name search that can land on the wrong band.
+      spotifyId: band.spotify_id ?? null,
     };
   });
 }

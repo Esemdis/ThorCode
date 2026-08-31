@@ -295,3 +295,29 @@ describe('shapeBandOverview — concert ids per country', () => {
     expect(out[0].nextByCountry.SE.id).toBeNull();
   });
 });
+
+describe('shapeBandOverview — the Spotify artist id', () => {
+  it('carries the id through, so a row can link to the artist without a second fetch', () => {
+    const [out] = shapeBandOverview([band(1, 'Spiritbox', { spotify_id: '2p1fiYHY' })], [], [], []);
+
+    expect(out.spotifyId).toBe('2p1fiYHY');
+  });
+
+  // Explicitly null for the same reason as `image` above: the row reads one
+  // value and falls back to a name search, and `undefined` reads as neither.
+  it('is null rather than absent for a band Spotify has nothing for', () => {
+    const [out] = shapeBandOverview([band(1, 'Some Local Support')], [], [], []);
+
+    expect(out.spotifyId).toBeNull();
+  });
+
+  // The photo needs both an id and a resolved image; the link needs only the
+  // id. Keeping them independent is what lets an unmatched-looking row — a
+  // monogram, because Spotify had no photo — still link to the right artist.
+  it('survives on a band whose id resolved to no photo', () => {
+    const [out] = shapeBandOverview([band(1, 'Thrown', { spotify_id: 'th1' })], [], [], [], [], {});
+
+    expect(out.image).toBeNull();
+    expect(out.spotifyId).toBe('th1');
+  });
+});
