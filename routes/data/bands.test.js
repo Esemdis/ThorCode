@@ -66,6 +66,7 @@ const EXPECTED_ROUTES = [
   'DELETE /bands/:bandId [3]',
   'GET /bands/artist-search [1]',
   'POST /bands/sync-spotify-ids [3]',
+  'POST /bands/sync-photos [3]',
   'POST /bands/sync-all [3]',
   'POST /sync-weather [3]',
   'POST /bands/sync-setlists [3]',

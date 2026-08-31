@@ -10,7 +10,7 @@ const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
 const { pythonServicePost } = require('../../../utils/pythonService');
-const { matchBandToSpotify, backfillSpotifyIds } = require('../../../utils/bandSpotifyMatch');
+const { matchBandToSpotify, backfillSpotifyIds, warmBandImages } = require('../../../utils/bandSpotifyMatch');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
@@ -30,6 +30,38 @@ router.post('/bands/sync-spotify-ids', auth, roleCheck(['ADMIN']), async (req, r
     res.json({ status: 'success', ...(await backfillSpotifyIds({ limit })) });
   } catch (error) {
     console.error('Error backfilling Spotify artist ids:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * Put photos on the artist overview now, rather than waiting for the cron.
+ *
+ * The same two steps the nightly job runs, in the same order and for the same
+ * reason: a band with no `spotify_id` can never resolve a photo, so matching
+ * has to happen before warming or the bands you actually notice missing are
+ * the ones warming skips.
+ *
+ * Warming is the step that matters. The overview reads the image cache and
+ * never fetches — see resolveArtistImages' `cacheOnly` — so before this
+ * existed a cold cache meant monograms until the nightly job came round, with
+ * no way to hurry it.
+ *
+ * Photos cannot be synced once and left. Spotify's terms cap image caching at
+ * 24 hours and the CDN urls rotate, so this refreshes entries that are about to
+ * expire; it does not make them permanent.
+ *
+ * Matching is capped per run and resumable, so hitting the cap just means
+ * running it again. Warming always covers every matched band.
+ */
+router.post('/bands/sync-photos', auth, roleCheck(['ADMIN']), async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const { searched, matched, remaining } = await backfillSpotifyIds({ limit });
+    const { bands, withPhoto } = await warmBandImages();
+    res.json({ status: 'success', searched, matched, remaining, bands, withPhoto });
+  } catch (error) {
+    console.error('Error syncing artist photos:', error.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
