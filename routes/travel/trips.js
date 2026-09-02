@@ -3,12 +3,12 @@ const router = express.Router();
 const { body, param, validationResult } = require("express-validator");
 const { Prisma } = require("@prisma/client");
 const axios = require("axios");
-const { pythonServicePost } = require('../../utils/pythonService');
+const { pythonServicePost, pythonServiceFailure } = require('../../utils/pythonService');
 
 const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
-const { fail, paginate, sendList } = require("../../utils/apiResponse");
+const { fail, error: sendError, paginate, sendList } = require("../../utils/apiResponse");
 
 router.use(auth);
 
@@ -47,7 +47,11 @@ router.post("/sync-weather", roleCheck(["ADMIN"]), async (_req, res) => {
     await pythonServicePost(`/sync-trip-weather`, {}, { timeout: 300000 });
     res.status(200).json({ status: "success" });
   } catch (err) {
-    fail(res, err, { context: "POST sync-weather", message: "Weather sync failed" });
+    // Not `fail`: that answers 500 for everything, which reported the sync
+    // service's own rejection as a fault in this API.
+    console.error(`[${new Date().toISOString()}] POST sync-weather`, err);
+    const { status, message } = pythonServiceFailure(err);
+    sendError(res, status, message);
   }
 });
 

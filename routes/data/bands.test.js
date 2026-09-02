@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 
@@ -131,5 +131,53 @@ describe('the handlers actually run', () => {
   it('serves one band\'s upcoming shows', async () => {
     const res = await request(app).get('/bands/1/upcoming');
     expect(res.status).toBe(200);
+  });
+});
+
+describe('a sync the Python service turns away', () => {
+  // The failure this pins: the sync service began requiring SCRAPER_TOKEN, this
+  // API was never given one, and every admin sync answered a 500 whose body was
+  // axios's "Request failed with status code 401" — a status the admin's own
+  // login had nothing to do with, naming nothing to go and fix.
+  //
+  // Served by a real socket rather than a stubbed client: the routers require
+  // pythonService through CommonJS, so vi.mock cannot reach it for the same
+  // reason installFakePrisma exists.
+  let server;
+
+  beforeAll(async () => {
+    const { createServer } = await import('node:http');
+    server = createServer((_req, res) => {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ detail: 'Unauthorized' }));
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    process.env.PYTHON_SERVICE_URL = `http://127.0.0.1:${server.address().port}`;
+    delete process.env.PYTHON_SERVICE_FALLBACK_URL;
+  });
+
+  afterAll(() => new Promise((resolve) => server.close(resolve)));
+
+  for (const path of ['/bands/sync-all', '/sync-weather', '/bands/sync-setlists']) {
+    it(`answers ${path} with a bad gateway naming the shared secret`, async () => {
+      const res = await request(app).post(path).set(...authHeader({ role: 'ADMIN' }));
+
+      expect(res.status).toBe(502);
+      expect(res.body.error).toMatch(/SCRAPER_TOKEN/);
+      expect(res.body.error).not.toMatch(/Request failed with status/);
+    });
+  }
+
+  it('reports a rejected single-band sync the same way', async () => {
+    // Same laundering, on the route an admin reaches from one band's page
+    // rather than from the sync panel.
+    prisma.band.findUnique.mockResolvedValue({
+      id: 1, name: 'Opeth', songkick_url: 'sk', bandsintown_url: null,
+    });
+
+    const res = await request(app).post('/bands/1/sync-concerts').set(...authHeader({ role: 'ADMIN' }));
+
+    expect(res.status).toBe(502);
+    expect(res.body.error).toMatch(/SCRAPER_TOKEN/);
   });
 });

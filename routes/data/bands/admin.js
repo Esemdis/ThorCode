@@ -9,7 +9,8 @@
 const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
-const { pythonServicePost } = require('../../../utils/pythonService');
+const { pythonServicePost, pythonServiceFailure } = require('../../../utils/pythonService');
+const { error: sendError } = require('../../../utils/apiResponse');
 const { matchBandToSpotify, backfillSpotifyIds, warmBandImages } = require('../../../utils/bandSpotifyMatch');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
@@ -70,9 +71,10 @@ router.post('/bands/sync-all', auth, roleCheck(['ADMIN']), async (_req, res) => 
   try {
     const syncResponse = await pythonServicePost(`/trigger`);
     res.status(200).json({ status: 'success', ...syncResponse.data });
-  } catch (error) {
-    console.error('Error triggering full sync:', error.message);
-    res.status(500).json({ error: error.message || 'Internal server error' });
+  } catch (err) {
+    console.error('Error triggering full sync:', err.message);
+    const { status, message } = pythonServiceFailure(err);
+    sendError(res, status, message);
   }
 });
 
@@ -81,9 +83,10 @@ router.post('/sync-weather', auth, roleCheck(['ADMIN']), async (_req, res) => {
   try {
     await pythonServicePost(`/sync-weather`, {}, { timeout: 300000 });
     res.status(200).json({ status: 'success' });
-  } catch (error) {
-    console.error('Error triggering weather sync:', error.message);
-    res.status(500).json({ error: error.message || 'Internal server error' });
+  } catch (err) {
+    console.error('Error triggering weather sync:', err.message);
+    const { status, message } = pythonServiceFailure(err);
+    sendError(res, status, message);
   }
 });
 
@@ -92,9 +95,10 @@ router.post('/bands/sync-setlists', auth, roleCheck(['ADMIN']), async (_req, res
   try {
     await pythonServicePost(`/sync-setlists`, {}, { timeout: 300000 });
     res.status(200).json({ status: 'success' });
-  } catch (error) {
-    console.error('Error triggering setlist sync:', error.message);
-    res.status(500).json({ error: error.message || 'Internal server error' });
+  } catch (err) {
+    console.error('Error triggering setlist sync:', err.message);
+    const { status, message } = pythonServiceFailure(err);
+    sendError(res, status, message);
   }
 });
 

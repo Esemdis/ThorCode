@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import { shouldFallBack, pythonServicePost } from './pythonService.js';
+import { shouldFallBack, pythonServicePost, pythonServiceFailure } from './pythonService.js';
 
 // A stand-in client rather than a module mock: vitest externalises axios for
 // this CommonJS module, so vi.mock silently does nothing and the tests reach
@@ -91,5 +91,50 @@ describe('pythonServicePost', () => {
 
     await expect(pythonServicePost('/trigger', {}, {}, client)).rejects.toThrow();
     expect(post).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('pythonServiceFailure', () => {
+  it('names the shared secret when the sync service rejects our credentials', () => {
+    // The failure this exists for: the service started requiring SCRAPER_TOKEN,
+    // the backend was never given one, and every admin sync button answered
+    // "Request failed with status code 401" — a status the caller's own login
+    // had nothing to do with, and a message naming nothing to go and fix.
+    const { status, message } = pythonServiceFailure(httpError(401));
+
+    expect(status).toBe(502);
+    expect(message).toMatch(/SCRAPER_TOKEN/);
+  });
+
+  it('treats a forbidden the same as an unauthorized', () => {
+    expect(pythonServiceFailure(httpError(403))).toEqual(pythonServiceFailure(httpError(401)));
+  });
+
+  it('never passes axios’s own wording on to the client', () => {
+    // Whatever went wrong upstream, the status in that sentence is the sync
+    // service's, and repeating it here makes it read as this API's own.
+    for (const upstream of [401, 403, 404, 429, 500, 503]) {
+      const { message } = pythonServiceFailure(httpError(upstream));
+      expect(message).not.toMatch(/Request failed with status/);
+    }
+  });
+
+  it('answers a bad gateway when the sync service itself failed', () => {
+    const { status, message } = pythonServiceFailure(httpError(500));
+
+    expect(status).toBe(502);
+    expect(message).toMatch(/500/);
+  });
+
+  it('answers service unavailable when nothing answered at all', () => {
+    // Distinct from the above on purpose: nothing ran, so retrying is safe.
+    // A 502 would say the scrape happened and went wrong.
+    expect(pythonServiceFailure(connectionError('ECONNREFUSED')).status).toBe(503);
+  });
+
+  it('keeps a bug on our own side a plain server error', () => {
+    // No request was ever made, so blaming the sync service would send the
+    // next person to read the wrong service's logs.
+    expect(pythonServiceFailure(new TypeError('bad argument')).status).toBe(500);
   });
 });

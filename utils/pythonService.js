@@ -76,4 +76,47 @@ async function pythonServicePost(path, body = {}, config = {}, client = axios) {
   }
 }
 
-module.exports = { shouldFallBack, pythonServicePost };
+/**
+ * The client-facing status and message for a failed call to the sync service.
+ *
+ * Every one of these used to become `500 { error: err.message }`, which put
+ * axios's own "Request failed with status code 401" in front of an admin — a
+ * status their login had nothing to do with, naming nothing they could go and
+ * fix. It cost an afternoon to trace back to an unset shared secret, so the
+ * credential case says which secret and where.
+ *
+ * 502 for anything the service answered, rather than passing its status
+ * through: the sync service's 401 is not this API's 401, and a 500 here would
+ * claim the fault was local. 503 is kept for the one case where nothing
+ * answered, because that is the only one where no work happened and retrying
+ * costs nothing.
+ *
+ * @param {Error} error - The error thrown by `pythonServicePost`.
+ * @returns {{ status: number, message: string }}
+ */
+function pythonServiceFailure(error) {
+  const upstream = error?.response?.status;
+
+  if (upstream === 401 || upstream === 403) {
+    return {
+      status: 502,
+      message:
+        'The sync service rejected our credentials. Check that SCRAPER_TOKEN is set '
+        + 'to the same value on this API and on the sync service.',
+    };
+  }
+
+  if (upstream) {
+    return { status: 502, message: `The sync service answered ${upstream}.` };
+  }
+
+  // Reuses the reachability rule rather than restating it, so "nothing
+  // answered" cannot come to mean two different things in one file.
+  if (shouldFallBack(error)) {
+    return { status: 503, message: 'The sync service could not be reached.' };
+  }
+
+  return { status: 500, message: 'The sync request could not be sent.' };
+}
+
+module.exports = { shouldFallBack, pythonServicePost, pythonServiceFailure };

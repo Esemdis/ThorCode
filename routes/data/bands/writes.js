@@ -10,7 +10,8 @@ const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
 const axios = require('axios');
-const { pythonServicePost } = require('../../../utils/pythonService');
+const { pythonServicePost, pythonServiceFailure } = require('../../../utils/pythonService');
+const { error: sendError } = require('../../../utils/apiResponse');
 const { haversineKm, stringSimilarity, venueContains, deduplicateByCoords } = require('../../../utils/concertDedup');
 const { findSourceUrls } = require('../../../utils/bandSourceUrls');
 const auth = require('../../../auth/verifyJWT');
@@ -66,7 +67,8 @@ router.post(
         return res.status(429).json({ error: 'Too many requests, please try again later.' });
       }
       console.error('Error syncing concerts:', error.message);
-      res.status(500).json({ error: error.message || 'Internal server error' });
+      const { status, message } = pythonServiceFailure(error);
+      sendError(res, status, message);
     }
   },
 );
