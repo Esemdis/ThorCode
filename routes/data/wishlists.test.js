@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 
@@ -19,6 +19,7 @@ const prisma = installFakePrisma({
   concertAttendance: model(),
   activityLog: model(),
   city: model(),
+  notificationSubscription: model(),
   $transaction: vi.fn(async (arg) => (typeof arg === 'function' ? arg(prisma) : Promise.all(arg))),
 });
 
@@ -229,5 +230,147 @@ describe('GET /wishlists/:id setlist placement', () => {
       expect(c.participating_bands[0]).toEqual({ id: 1, name: 'Opeth', tier: 'LOVE' });
       expect(c.participating_bands[0]).not.toHaveProperty('setlist');
     }
+  });
+});
+
+describe('POST /wishlists/notify subscription delivery', () => {
+  // Served by a real socket for the same reason bands.test.js does it: the
+  // route requires axios through CommonJS, so vi.mock cannot reach it.
+  let server;
+  let received;
+  const hook = (path) => `http://127.0.0.1:${server.address().port}${path}`;
+
+  beforeAll(async () => {
+    const { createServer } = await import('node:http');
+    server = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        received.push({ path: req.url, body: JSON.parse(body || '{}') });
+        res.writeHead(204);
+        res.end();
+      });
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  });
+
+  afterAll(() => new Promise((resolve) => server.close(resolve)));
+
+  const MINE = () => ({
+    id: 7, user_id: 'user-1', discord_webhook: hook('/mine'),
+    bands: [{ band_rel: { id: 1, name: 'Opeth', ticketmaster_id: null } }],
+  });
+  const THEIRS = () => ({
+    id: 8, user_id: 'user-2', discord_webhook: hook('/theirs'),
+    bands: [{ band_rel: { id: 9, name: 'Someone Elses Band', ticketmaster_id: null } }],
+  });
+
+  // Band 9 plays Stockholm, which is city_id 12. The row as the endpoint
+  // re-reads it, so city_id is resolved and the lineup is whole.
+  const CONCERT = {
+    id: 100, name: null, venue: 'Debaser', city: 'Stockholm', country: 'SE',
+    concert_date: new Date('2026-11-02T19:00:00Z'), url: null, metadata: null,
+    city_id: 12, bands: [{ band_rel: { id: 9, name: 'Someone Elses Band' } }],
+  };
+
+  const payload = (bandId, name, concertId = 100) => ({
+    bands: [{
+      band_id: bandId, name, inserted: 1,
+      concerts: [{
+        concert_id: concertId, concert_date: '2026-11-02T19:00:00.000Z',
+        city: 'Stockholm', country: 'SE', venue: 'Debaser', url: null, metadata: null,
+      }],
+    }],
+  });
+
+  const post = (body) => request(app)
+    .post('/wishlists/notify')
+    .set(...authHeader({ role: 'SYSTEM' }))
+    .send(body);
+
+  beforeEach(() => {
+    received = [];
+    prisma.wishlist.findMany.mockResolvedValue([MINE(), THEIRS()]);
+    prisma.concert.findMany.mockResolvedValue([CONCERT]);
+    prisma.notificationSubscription.findMany.mockResolvedValue([]);
+    prisma.activityLog.findMany.mockResolvedValue([]);
+    prisma.activityLog.create.mockResolvedValue({});
+    prisma.activityLog.deleteMany.mockResolvedValue({ count: 0 });
+  });
+
+  it('stays silent on my webhook for a band only someone else wishlists', async () => {
+    // The bug this exists for: a single global webhook meant every band in the
+    // database pinged one person, including bands they had never heard of.
+    const res = await post(payload(9, 'Someone Elses Band'));
+
+    expect(res.status).toBe(200);
+    expect(received.filter((r) => r.path === '/theirs')).toHaveLength(1);
+    expect(received.filter((r) => r.path === '/mine')).toHaveLength(0);
+  });
+
+  it('posts to a subscriber when a watched band plays a watched city', async () => {
+    prisma.notificationSubscription.findMany.mockResolvedValue([
+      { user_id: 'user-1', band_id: 9, city_id: 12, user_rel: { id: 'user-1', email: 'me@example.com', settings: null } },
+    ]);
+
+    const res = await post(payload(9, 'Someone Elses Band'));
+
+    expect(res.status).toBe(200);
+    const mine = received.filter((r) => r.path === '/mine');
+    expect(mine).toHaveLength(1);
+    expect(mine[0].body.embeds[0].fields[0].value).toContain('Debaser');
+  });
+
+  it('does not post to a subscriber whose watch matches nothing in this batch', async () => {
+    prisma.notificationSubscription.findMany.mockResolvedValue([
+      { user_id: 'user-1', band_id: 4242, city_id: null, user_rel: { id: 'user-1', email: 'me@example.com', settings: null } },
+    ]);
+
+    await post(payload(9, 'Someone Elses Band'));
+
+    expect(received.filter((r) => r.path === '/mine')).toHaveLength(0);
+  });
+
+  it('sends one message for a concert that is both wishlisted and watched', async () => {
+    // Subscribing to a band already on your wishlist is the ordinary case, and
+    // it must not double every notification.
+    prisma.concert.findMany.mockResolvedValue([
+      { ...CONCERT, bands: [{ band_rel: { id: 1, name: 'Opeth' } }] },
+    ]);
+    prisma.notificationSubscription.findMany.mockResolvedValue([
+      { user_id: 'user-1', band_id: 1, city_id: null, user_rel: { id: 'user-1', email: 'me@example.com', settings: null } },
+    ]);
+
+    await post(payload(1, 'Opeth'));
+
+    expect(received.filter((r) => r.path === '/mine')).toHaveLength(1);
+  });
+
+  it('mentions the subscriber when they have a discord id in their settings', async () => {
+    // Replaces the hardcoded mention the deleted Stockholm pinger carried, so
+    // a watched show still buzzes a phone rather than arriving silently.
+    prisma.notificationSubscription.findMany.mockResolvedValue([
+      {
+        user_id: 'user-1', band_id: 9, city_id: 12,
+        user_rel: { id: 'user-1', email: 'me@example.com', settings: { discord_user_id: '4242' } },
+      },
+    ]);
+
+    await post(payload(9, 'Someone Elses Band'));
+
+    const mine = received.filter((r) => r.path === '/mine');
+    expect(mine[0].body.content).toBe('<@4242>');
+  });
+
+  it('skips the concert read entirely when no concert ids came through', async () => {
+    // Older scraper builds post without them. The wishlist digest still has to
+    // work, and matching subscriptions is impossible without a resolved city.
+    const body = payload(9, 'Someone Elses Band');
+    delete body.bands[0].concerts[0].concert_id;
+
+    await post(body);
+
+    expect(prisma.concert.findMany).not.toHaveBeenCalled();
+    expect(received.filter((r) => r.path === '/theirs')).toHaveLength(1);
   });
 });

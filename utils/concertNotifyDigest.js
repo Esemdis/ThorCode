@@ -1,18 +1,9 @@
 const prisma = require("../prisma/client");
 const { sendDigestEmail } = require("./mail");
-
-// Which subscription kinds match a given concert:
-// - band + city both set  -> that band, playing that exact city
-// - band only             -> that band, any city
-// - city only              -> any band, that exact city
-function subscriptionMatches(sub, concert, bandIds) {
-  if (sub.band_id != null && sub.city_id != null) {
-    return bandIds.includes(sub.band_id) && concert.city_id === sub.city_id;
-  }
-  if (sub.band_id != null) return bandIds.includes(sub.band_id);
-  if (sub.city_id != null) return concert.city_id === sub.city_id;
-  return false;
-}
+// Shared with POST /wishlists/notify, which posts the same matches to Discord
+// the moment the scraper reports them. See notificationMatch.js for why the
+// rule cannot live in either caller.
+const { subscriptionMatches } = require("./notificationMatch");
 
 // Scans concerts created since the last run, matches them against all
 // NotificationSubscription rows, and sends one digest email per affected user.
