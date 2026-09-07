@@ -13,7 +13,26 @@
 # changing. Node 20 is past end-of-life besides.
 FROM node:24-slim
 
-RUN apt-get update -y && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update -y && apt-get install -y openssl curl gnupg && rm -rf /var/lib/apt/lists/*
+
+# Doppler CLI. The container gets exactly one secret — DOPPLER_TOKEN, a
+# read-only service token — and fetches DATABASE_URL, SCRAPER_TOKEN and the
+# rest at boot, so a value lives in Doppler and nowhere else. Previously they
+# were also typed into the Unraid container template, which is how ThorCode's
+# SCRAPER_TOKEN and the scraper's drifted apart.
+#
+# Pinned on purpose. `install.sh` has no --version flag and always takes the
+# latest, so an unrelated push to main could rebuild this image onto a CLI the
+# code was never run against — the same silent-drift failure the node version
+# comment above is about. Bump this deliberately.
+RUN curl -sLf --retry 3 --tlsv1.2 --proto "=https" \
+      'https://packages.doppler.com/public/cli/gpg.DE2A7741A397C129.key' \
+      | gpg --dearmor -o /usr/share/keyrings/doppler-archive-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" \
+      > /etc/apt/sources.list.d/doppler-cli.list \
+    && apt-get update && apt-get install -y doppler=3.76.5 \
+    && rm -rf /var/lib/apt/lists/* \
+    && doppler --version
 
 WORKDIR /app
 
@@ -25,6 +44,8 @@ COPY prisma ./prisma/
 RUN npm ci
 
 COPY . .
+
+RUN mkdir -p /doppler
 
 EXPOSE 4000
 
@@ -47,4 +68,13 @@ EXPOSE 4000
 #
 # The `&&` is deliberate: a failed migration should stop the server, not leave
 # it serving requests against a schema it does not match.
-CMD ["sh", "-c", "npx prisma migrate deploy && node index.js"]
+# Wrapped in `doppler run` so migrate deploy and the server both see the same
+# injected secrets — prisma reads DATABASE_URL from the environment, so the
+# wrapper has to be outside the `&&`, not inside it.
+#
+# --fallback is what keeps boot from depending on the WAN: doppler run fetches
+# over the network at process start, and without a fallback a Doppler outage
+# becomes a container that will not start. It writes an encrypted copy after
+# each successful fetch and reads it only when the API is unreachable. Map
+# /doppler to a host path on Unraid or the file dies with the container.
+CMD ["doppler", "run", "--fallback", "/doppler/fallback.json", "--", "sh", "-c", "npx prisma migrate deploy && node index.js"]
