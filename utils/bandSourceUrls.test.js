@@ -67,6 +67,39 @@ describe('findSourceUrls', () => {
     expect(bandsintown).toBeNull();
   });
 
+  // The third element exists so the band-create route can store a *vetted*
+  // MBID. It used to run its own `artist:"name"` search, take artists[0].id
+  // with no name check, save that, and hand it back here — which made this
+  // function skip the very guard above, on the one path where a brand-new band
+  // is being identified for the first time.
+  it('reports the MBID it resolved, so a caller can store a vetted one', async () => {
+    const get = vi.fn()
+      .mockResolvedValueOnce({ data: { artists: [{ id: 'right-mbid', name: 'Example Band' }] } })
+      .mockResolvedValueOnce(relationsResponse([]));
+
+    const [, , mbid] = await findSourceUrls('Example Band', null, { get });
+
+    expect(mbid).toBe('right-mbid');
+  });
+
+  it('reports no MBID when the top match was too different to trust', async () => {
+    const get = vi.fn().mockResolvedValue({
+      data: { artists: [{ id: 'wrong-mbid', name: 'A Totally Different Band' }] },
+    });
+
+    const [, , mbid] = await findSourceUrls('Example Band', null, { get });
+
+    expect(mbid).toBeNull();
+  });
+
+  it('reports back the MBID it was given rather than inventing one', async () => {
+    const get = vi.fn().mockResolvedValue(relationsResponse([]));
+
+    const [, , mbid] = await findSourceUrls('Example', 'known-mbid', { get });
+
+    expect(mbid).toBe('known-mbid');
+  });
+
   it('throws when MusicBrainz cannot be reached, instead of resolving to nulls', async () => {
     const get = vi.fn().mockRejectedValue(new Error('ETIMEDOUT'));
 

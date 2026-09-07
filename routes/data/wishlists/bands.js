@@ -223,6 +223,7 @@ router.post(
       if (existingWishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
 
       let band;
+      let lookupWarning = null;
       try {
         const bandPayload = {};
         if (ticketmasterId) bandPayload.ticketmaster_id = ticketmasterId;
@@ -233,6 +234,11 @@ router.post(
           { headers: { Authorization: req.headers.authorization } },
         );
         band = createResponse.data.band;
+        // Carried through rather than dropped: the band-create route reports
+        // here when MusicBrainz could not be reached, and this endpoint is the
+        // one the app actually calls — swallowing it is what made "added, but
+        // with no links and so no concerts" look identical to a clean add.
+        lookupWarning = createResponse.data.warning ?? null;
         if (!band) {
           console.error("Band creation response missing band object:", createResponse.data);
           return res.status(500).json({ error: "Band creation failed: no band returned" });
@@ -284,6 +290,7 @@ router.post(
       res.status(201).json({
         message: "Band added to wishlist successfully",
         band: { id: band.id, name: band.name, ticketmaster_id: band.ticketmaster_id },
+        ...(lookupWarning && { warning: lookupWarning }),
       });
     } catch (error) {
       console.error("Error adding band to wishlist:", error);

@@ -38,6 +38,39 @@ describe('GET /bands/search', () => {
   });
 });
 
+describe('POST /bands', () => {
+  // Only the paths that answer before the MusicBrainz lookup are covered here.
+  // The lookup itself is unit-tested in utils/bandSourceUrls.test.js with an
+  // injected client: vi.mock does not reach a CommonJS `require`, so a route
+  // test that got as far as findSourceUrls would make a real network call.
+  it('refuses a request with no name rather than creating an unnamed band', async () => {
+    const res = await request(app).post('/bands').set(...authHeader()).send({});
+
+    expect(res.status).toBe(400);
+    expect(prisma.band.create).not.toHaveBeenCalled();
+  });
+
+  it('reports an existing band as a conflict without looking anything up', async () => {
+    // The name is the unique key, so this is the ordinary "already added" case
+    // rather than an error — and it must not spend a MusicBrainz call on a band
+    // whose urls were resolved when it was first added.
+    prisma.band.findUnique.mockResolvedValue({ id: 5, name: 'Architects' });
+
+    const res = await request(app).post('/bands').set(...authHeader()).send({ name: 'Architects' });
+
+    expect(res.status).toBe(409);
+    expect(prisma.band.create).not.toHaveBeenCalled();
+  });
+
+  it('trims the name before deciding whether the band already exists', async () => {
+    prisma.band.findUnique.mockResolvedValue({ id: 5, name: 'Architects' });
+
+    await request(app).post('/bands').set(...authHeader()).send({ name: '  Architects  ' });
+
+    expect(prisma.band.findUnique).toHaveBeenCalledWith({ where: { name: 'Architects' } });
+  });
+});
+
 /**
  * The full routing surface of this file, in registration order.
  *

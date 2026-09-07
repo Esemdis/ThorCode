@@ -9,7 +9,6 @@
 const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
-const axios = require('axios');
 const { pythonServicePost, pythonServiceFailure } = require('../../../utils/pythonService');
 const { error: sendError } = require('../../../utils/apiResponse');
 const { haversineKm, stringSimilarity, venueContains, deduplicateByCoords } = require('../../../utils/concertDedup');
@@ -231,29 +230,44 @@ router.post(
       // No Ticketmaster lookup. It used to resolve the name here and 404 with
       // "No band found." for anything its catalogue lacked, which is the only
       // reason such a band could not be added — MusicBrainz and findSourceUrls
-      // below both key off the name, and they are what produce concerts.
-      // Fetch MBID from MusicBrainz
+      // both key off the name, and they are what produce concerts.
+      //
+      // This route used to run its own `artist:"name"` search and keep
+      // artists[0].id unconditionally. That was a second copy of the search in
+      // findSourceUrls with none of its protections: no isConfidentNameMatch,
+      // so MusicBrainz's closest guess for an unlisted band was stored as that
+      // band's identity; no retry, so the ~1-in-3 "server is currently busy"
+      // 503 simply lost the id; and no rate-limit spacing, so it fired a second
+      // request into a 1 req/sec API in the same instant. Worse, handing the
+      // unvetted id back in as `mbid` made findSourceUrls skip the very guard
+      // that would have caught it. One guarded lookup now does both jobs.
+      //
+      // Awaited rather than left in the background, for the same reason
+      // refresh-urls was changed: what this finds is the only thing that
+      // produces concerts, and a background failure could reach nobody. It
+      // costs one MusicBrainz call plus the mandatory 1.1s of spacing.
+      let songkickUrl = null;
+      let bandsintownUrl = null;
       let mbid = null;
+      let lookupReachedMusicBrainz = true;
       try {
-        const mbResponse = await axios.get(
-          'https://musicbrainz.org/ws/2/artist/',
-          {
-            params: { query: `artist:"${bandName}"`, limit: 1, fmt: 'json' },
-            headers: {
-              'User-Agent': `${process.env.APP_NAME}/${process.env.APP_VERSION} (${process.env.APP_CONTACT})`,
-            },
-          },
-        );
-        mbid = mbResponse.data?.artists?.[0]?.id ?? null;
-      } catch (mbError) {
-        console.error('Error fetching MBID from MusicBrainz:', mbError.message);
+        [songkickUrl, bandsintownUrl, mbid] = await findSourceUrls(bandName);
+      } catch (lookupError) {
+        lookupReachedMusicBrainz = false;
+        console.error(`[bands] MusicBrainz lookup failed for ${bandName}:`, lookupError.message);
       }
-      // Create band in database
+
       const newBand = await prisma.band.create({
         data: {
           name: bandName,
           created_at: new Date(),
           MBID: mbid,
+          ...(songkickUrl    && { songkick_url:    songkickUrl }),
+          ...(bandsintownUrl && { bandsintown_url: bandsintownUrl }),
+          // Stamped only when MusicBrainz actually answered. Unreachable is not
+          // evidence the urls do not exist, so the band stays queued for the
+          // next backfill sweep — same rule as refresh-urls and the backfill.
+          ...(lookupReachedMusicBrainz && { source_urls_checked_at: new Date() }),
         },
       });
 
@@ -267,7 +281,10 @@ router.post(
         });
       }
 
-      // Respond immediately — sync happens in the background after URL discovery
+      // Says what was actually found. The old shape answered
+      // {sync:{status:'queued'}} before the lookup had run, so "no links, no
+      // concerts, no idea why" and "everything worked" were the same response —
+      // which is why a band with no urls looked identical to a healthy one.
       res.status(201).json({
         status: 'success',
         band: {
@@ -275,34 +292,26 @@ router.post(
           name: newBand.name,
           mbid: newBand.MBID,
         },
+        // Always both keys, null when nothing was found, matching refresh-urls:
+        // the client distinguishes "looked and found nothing" from "the call
+        // failed", and an absent key reads as neither.
+        songkick_url: songkickUrl ?? null,
+        bandsintown_url: bandsintownUrl ?? null,
         sync: { status: 'queued' },
+        ...(!lookupReachedMusicBrainz && {
+          warning: 'Could not reach MusicBrainz, so no Songkick or Bandsintown links were found yet. The nightly backfill will retry this band.',
+        }),
       });
 
-      // Discover Songkick + Bandsintown URLs, save them, THEN trigger sync so all
-      // three sources are available in one pass — avoids the race where sync fires
-      // before URLs are known.
-      findSourceUrls(newBand.name, mbid).then(async ([songkickUrl, bandsintownUrl]) => {
-        console.log(`[findSourceUrl] ${newBand.name} → songkick: ${songkickUrl}, bandsintown: ${bandsintownUrl}`);
-        await prisma.band.update({
-          where: { id: newBand.id },
-          data: {
-            ...(songkickUrl    && { songkick_url:    songkickUrl }),
-            ...(bandsintownUrl && { bandsintown_url: bandsintownUrl }),
-            source_urls_checked_at: new Date(),
-          },
-        }).catch((e) => console.error(`[findSourceUrl] DB update failed for ${newBand.name}:`, e.message));
-        return [songkickUrl, bandsintownUrl];
-      }, (e) => {
-        // Not stamped: MusicBrainz being unreachable is not evidence the URLs
-        // don't exist, so the cron backfill retries this band on its next sweep.
-        console.error(`[findSourceUrl] MusicBrainz lookup failed for ${newBand.name}:`, e.message);
-        return [null, null];
-      }).then(async ([songkickUrl, bandsintownUrl]) => {
-        await pythonServicePost(`/sync/${newBand.id}`,
-          { songkick_url: songkickUrl || null, bandsintown_url: bandsintownUrl || null, band_name: newBand.name },
-        );
-        console.log(`[findSourceUrl] Sync queued for ${newBand.name}`);
-      }).catch((e) => console.error(`[findSourceUrl] Background sync failed for ${newBand.name}:`, e.message));
+      // The scrape itself stays in the background: it is long-running, and
+      // unlike the lookup above there is a retry path for it — the band now has
+      // its urls stored, so an admin re-sync or the cron picks it up.
+      pythonServicePost(`/sync/${newBand.id}`,
+        { songkick_url: songkickUrl || null, bandsintown_url: bandsintownUrl || null, band_name: newBand.name },
+      ).then(
+        () => console.log(`[bands] Sync queued for ${newBand.name}`),
+        (e) => console.error(`[bands] Background sync failed for ${newBand.name}:`, e.message),
+      );
     } catch (error) {
       console.error('Error creating band:', error);
       res.status(500).json({ error: 'Internal server error' });

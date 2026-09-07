@@ -99,12 +99,18 @@ function isConfidentNameMatch(bandName, candidateName) {
  * found" from "never got an answer" (e.g. to decide whether to stamp
  * `source_urls_checked_at`) needs those to be distinguishable.
  *
+ * Returns the MBID it ended up using as a third element. That exists for the
+ * band-create route: it needs an MBID to store, and resolving one itself meant
+ * a second, unguarded copy of the search above — which then defeated the guard
+ * by handing the result back in through `mbid`.
+ *
  * @param {string} bandName
  * @param {string|null} [mbid]
  * @param {{ get: Function }} [client] - HTTP client; injectable so this can be
  *   tested without a network or a module mock (vitest externalises axios for
  *   this CommonJS module, so mocking it does not take).
- * @returns {Promise<[string|null, string|null]>}
+ * @returns {Promise<[string|null, string|null, string|null]>} songkick url,
+ *   bandsintown url, and the MBID used — null when none could be trusted.
  */
 async function findSourceUrls(bandName, mbid = null, client = axios) {
   let resolvedMbid = mbid;
@@ -118,13 +124,13 @@ async function findSourceUrls(bandName, mbid = null, client = axios) {
     const candidate = searchRes.data?.artists?.[0] ?? null;
     if (!candidate) {
       console.log(`[findSourceUrls] MusicBrainz found no artist for "${bandName}"`);
-      return [null, null];
+      return [null, null, null];
     }
     if (!isConfidentNameMatch(bandName, candidate.name)) {
       console.log(
         `[findSourceUrls] MusicBrainz top match for "${bandName}" was "${candidate.name}" — too different to trust, treating as no match`,
       );
-      return [null, null];
+      return [null, null, null];
     }
     resolvedMbid = candidate.id;
     console.log(`[findSourceUrls] MusicBrainz resolved "${bandName}" → ${resolvedMbid} (${candidate.name})`);
@@ -146,7 +152,7 @@ async function findSourceUrls(bandName, mbid = null, client = axios) {
     if (!bandsintownUrl && url.includes('bandsintown.com')) bandsintownUrl = url.split('?')[0].replace(/\/$/, '');
   }
   console.log(`[findSourceUrls] ${bandName} → songkick: ${songkickUrl}, bandsintown: ${bandsintownUrl}`);
-  return [songkickUrl, bandsintownUrl];
+  return [songkickUrl, bandsintownUrl, resolvedMbid];
 }
 
 module.exports = {
