@@ -38,6 +38,7 @@ beforeEach(() => { vi.clearAllMocks(); });
 const EXPECTED_ROUTES = [
   'GET /wishlists [4]',
   'GET /wishlists/raw [3]',
+  'GET /wishlists/bands [3]',
   'GET /wishlists/:id/new [4]',
   'GET /wishlists/:id/recent-concerts [4]',
   'GET /wishlists/:id/activity [4]',
@@ -72,6 +73,15 @@ describe('the routing surface', () => {
     expect(manifest.indexOf('GET /wishlists/raw [3]'))
       .toBeLessThan(manifest.indexOf('GET /wishlists/:id [4]'));
   });
+
+  it('keeps /wishlists/bands ahead of /wishlists/:id', () => {
+    // Same trap as /wishlists/raw, with a sharper edge: /wishlists/:id validates
+    // the id as an integer, so registered the other way round this does not fall
+    // through to the right handler — it answers 400 for every caller.
+    const manifest = routeManifest(router);
+    expect(manifest.indexOf('GET /wishlists/bands [3]'))
+      .toBeLessThan(manifest.indexOf('GET /wishlists/:id [4]'));
+  });
 });
 
 describe('auth', () => {
@@ -88,6 +98,62 @@ describe('auth', () => {
   it('turns away a non-system caller from the bulk weather write', async () => {
     const res = await request(app).patch('/weather/bulk').set(...authHeader({ role: 'USER' })).send({});
     expect(res.status).toBe(403);
+  });
+});
+
+describe('GET /wishlists/bands', () => {
+  const REFS = [
+    { tier: 'LOVE', band_rel: { id: 1, name: 'Opeth' } },
+    { tier: 'FOLLOW', band_rel: { id: 2, name: 'Tool' } },
+  ];
+
+  it('turns away an unauthenticated caller', async () => {
+    const res = await request(app).get('/wishlists/bands');
+    expect(res.status).toBe(401);
+  });
+
+  it('answers with the caller’s own bands, flattened to id, name and tier', async () => {
+    prisma.wishlistBandReference.findMany.mockResolvedValue(REFS);
+
+    const res = await request(app).get('/wishlists/bands').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([
+      { id: 1, name: 'Opeth', tier: 'LOVE' },
+      { id: 2, name: 'Tool', tier: 'FOLLOW' },
+    ]);
+  });
+
+  it('scopes the query to the caller, not to a wishlist id in the path', async () => {
+    // There is no id in this route on purpose — Wishlist.user_id is unique, so
+    // the token is the only thing that should decide whose bands come back. A
+    // filter built any other way is how one account reads another's.
+    prisma.wishlistBandReference.findMany.mockResolvedValue([]);
+
+    await request(app).get('/wishlists/bands').set(...authHeader({ id: 'user-2' }));
+
+    const [{ where }] = prisma.wishlistBandReference.findMany.mock.calls[0];
+    expect(where).toEqual({ wishlist_rel: { user_id: 'user-2' } });
+  });
+
+  it('answers with an empty list for a user who has no wishlist yet', async () => {
+    prisma.wishlistBandReference.findMany.mockResolvedValue([]);
+
+    const res = await request(app).get('/wishlists/bands').set(...authHeader({ id: 'user-3' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+  });
+
+  it('does not read concerts, which is the whole point of the route', async () => {
+    // The band overview used to get this list from GET /wishlists/:id, which
+    // loads every band's full concert history to hand back a set of ids.
+    prisma.wishlistBandReference.findMany.mockResolvedValue(REFS);
+
+    await request(app).get('/wishlists/bands').set(...authHeader({ id: 'user-1' }));
+
+    expect(prisma.concert.findMany).not.toHaveBeenCalled();
+    expect(prisma.band.findMany).not.toHaveBeenCalled();
   });
 });
 
