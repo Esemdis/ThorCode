@@ -19,7 +19,7 @@ const axios = require("axios");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
-const { matchesByUser } = require("../../../utils/notificationMatch");
+const { matchesByUser, followedBandsByUser } = require("../../../utils/notificationMatch");
 const { buildDiscordEmbeds } = require("../../../utils/discordEmbeds");
 
 // The concert row the subscription pass matches against. Deliberately the same
@@ -193,13 +193,16 @@ async function notifySubscribers(bands, allWishlists, reportedByWishlist) {
   const webhookByUser = new Map(
     allWishlists.filter((w) => w.discord_webhook).map((w) => [w.user_id, w]),
   );
+  // City-only watches only fire for bands the watcher follows. allWishlists is
+  // already loaded with its band references, so this costs no extra query.
+  const followed = followedBandsByUser(allWishlists);
   const settingsByUser = new Map(
     subscriptions.filter((s) => s.user_rel).map((s) => [s.user_rel.id, s.user_rel.settings]),
   );
 
   let notified = 0;
   await Promise.all(
-    [...matchesByUser(concerts, subscriptions)].map(async ([userId, { concerts: matched }]) => {
+    [...matchesByUser(concerts, subscriptions, followed)].map(async ([userId, { concerts: matched }]) => {
       const wishlist = webhookByUser.get(userId);
       if (!wishlist) return;
 

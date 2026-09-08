@@ -3,7 +3,7 @@ const { sendDigestEmail } = require("./mail");
 // Shared with POST /wishlists/notify, which posts the same matches to Discord
 // the moment the scraper reports them. See notificationMatch.js for why the
 // rule cannot live in either caller.
-const { subscriptionMatches } = require("./notificationMatch");
+const { matchesByUser, followedBandsByUser } = require("./notificationMatch");
 
 // Scans concerts created since the last run, matches them against all
 // NotificationSubscription rows, and sends one digest email per affected user.
@@ -38,37 +38,37 @@ async function runNotificationDigest() {
     include: { user_rel: { select: { id: true, email: true } } },
   });
 
-  // user_id -> { email, items: Map(concertId -> concert summary) }
-  const userMatches = new Map();
+  // A city-only watch is scoped to the subscriber's own wishlist, so the
+  // matcher needs each watcher's followed bands. Only users who actually hold a
+  // subscription are read — on a database where most accounts never set one up,
+  // that is a much smaller query than every wishlist.
+  const watcherIds = [...new Set(subscriptions.map((s) => s.user_id))];
+  const wishlists = await prisma.wishlist.findMany({
+    where: { user_id: { in: watcherIds } },
+    select: { user_id: true, bands: { select: { band_id: true } } },
+  });
+  const followed = followedBandsByUser(wishlists);
 
-  for (const concert of concerts) {
-    const bandIds = concert.bands.map((b) => b.band_rel.id);
-    const bandNames = concert.bands.map((b) => b.band_rel.name);
-    for (const sub of subscriptions) {
-      if (!subscriptionMatches(sub, concert, bandIds)) continue;
-
-      const uid = sub.user_rel.id;
-      if (!userMatches.has(uid)) userMatches.set(uid, { email: sub.user_rel.email, items: new Map() });
-      const bucket = userMatches.get(uid);
-      if (!bucket.items.has(concert.id)) {
-        bucket.items.set(concert.id, {
-          name: concert.name,
-          bandNames,
-          venue: concert.venue,
-          city: concert.city,
-          country: concert.country,
-          date: concert.concert_date,
-          url: concert.url,
-        });
-      }
-    }
-  }
+  // Grouping is matchesByUser's job rather than a second loop here. This used
+  // to be an inline copy of it, which is exactly the drift notificationMatch.js
+  // warns about — the Discord path would have gained wishlist scoping and the
+  // email path silently kept the old wildcard.
+  const byUser = matchesByUser(concerts, subscriptions, followed);
 
   let sent = 0;
-  for (const [userId, { email, items }] of userMatches) {
-    if (items.size === 0) continue;
+  for (const [userId, { email, concerts: matched }] of byUser) {
+    if (!email || matched.length === 0) continue;
+    const items = matched.map((c) => ({
+      name: c.name,
+      bandNames: c.bands.map((b) => b.band_rel.name),
+      venue: c.venue,
+      city: c.city,
+      country: c.country,
+      date: c.concert_date,
+      url: c.url,
+    }));
     try {
-      await sendDigestEmail({ to: email, items: [...items.values()] });
+      await sendDigestEmail({ to: email, items });
       sent++;
     } catch (err) {
       console.error(`[notifyDigest] Failed to send digest to user ${userId}:`, err.message);
