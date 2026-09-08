@@ -176,6 +176,44 @@ describe('deduplicateConcerts', () => {
     const concerts = [{ participating_bands: [] }, { participating_bands: [] }];
     expect(deduplicateConcerts(concerts)).toHaveLength(2);
   });
+
+  it('keeps the headline record when a support act\'s own listing merges into it', () => {
+    // The Glasgow rows, in the order the wishlist happened to serve them. The
+    // support act's row is a Bandsintown listing under the fallback "Band @
+    // Venue" name and the room next door; the headline row is the gig itself.
+    // Merging is order-driven, so arriving first used to make the support act's
+    // listing the surviving record and title the gig after it.
+    const supportListing = {
+      id: 13899, name: 'As December Falls @ SWG3 Garden', venue: 'SWG3 Garden', city: 'Glasgow',
+      concert_date: '2026-09-08T17:00:00Z', source: 'bandsintown',
+      participating_bands: [{ id: 226 }],
+    };
+    const headlineShow = {
+      id: 12818, name: 'Dance Gavin Dance', venue: 'Galvanizers SWG3', city: 'Glasgow',
+      concert_date: '2026-09-08T19:00:00Z', source: null,
+      participating_bands: [{ id: 75 }, { id: 226 }],
+    };
+
+    const [merged] = deduplicateConcerts([supportListing, headlineShow]);
+
+    expect(merged.id).toBe(12818);
+    expect(merged.name).toBe('Dance Gavin Dance');
+    expect(merged.venue).toBe('Galvanizers SWG3');
+    expect(merged.participating_bands.map((b) => b.id).sort((a, b) => a - b)).toEqual([75, 226]);
+  });
+
+  it('still keeps the first record when neither name is a fallback', () => {
+    const first = {
+      id: 1, name: 'Opening Act', venue: 'Zenith', city: 'Paris',
+      concert_date: '2026-09-10T18:00:00Z', participating_bands: [{ id: 1 }],
+    };
+    const second = {
+      id: 2, name: 'Headline Show', venue: 'Zenith Annex', city: 'Paris',
+      concert_date: '2026-09-10T20:00:00Z', participating_bands: [{ id: 1 }, { id: 2 }],
+    };
+
+    expect(deduplicateConcerts([first, second])[0].id).toBe(1);
+  });
 });
 
 describe('checkDuplicateConcert and a second night at the same venue', () => {

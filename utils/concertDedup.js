@@ -258,9 +258,8 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
 
   if (existingConcert) {
     const incomingWins = bandIds.length > existingConcert.bands.length;
-    const isAtFormat = (s) => s.includes(' @ ') || / at /i.test(s);
-    const existingIsAtFormat = isAtFormat(existingConcert.name || '');
-    const incomingIsAtFormat = isAtFormat(concert.name || '');
+    const existingIsAtFormat = isFallbackName(existingConcert.name);
+    const incomingIsAtFormat = isFallbackName(concert.name);
     const bestName = (!existingIsAtFormat && incomingIsAtFormat)
       ? existingConcert.name
       : (existingIsAtFormat && !incomingIsAtFormat && concert.name)
@@ -353,6 +352,18 @@ function hasTimeOfDay(concertDate) {
   return d.getUTCHours() !== 0 || d.getUTCMinutes() !== 0 || d.getUTCSeconds() !== 0;
 }
 
+/**
+ * Whether a name is the "Band @ Venue" shape a scraper falls back to when the
+ * event published none. The same test picks the better name at insert time.
+ *
+ * @param {string|null|undefined} name
+ * @returns {boolean}
+ */
+function isFallbackName(name) {
+  const s = name || '';
+  return s.includes(' @ ') || / at /i.test(s);
+}
+
 function mergeByDayAndBands(concerts) {
   const dayBuckets = new Map();
   const result = [];
@@ -379,28 +390,43 @@ function mergeByDayAndBands(concerts) {
     if (mergedIdx !== null && !concert.festival && !result[mergedIdx].festival) {
       const base = result[mergedIdx];
       const baseIds = new Set((base.participating_bands || []).map((b) => b.id));
-      base.participating_bands = [
+      const bands = [
         ...(base.participating_bands || []),
         ...(concert.participating_bands || []).filter((b) => !baseIds.has(b.id)),
       ];
       let baseMeta = []; try { baseMeta = JSON.parse(base.metadata || '[]'); } catch {}
       let concMeta = []; try { concMeta = JSON.parse(concert.metadata || '[]'); } catch {}
-      base.metadata = JSON.stringify([...new Set([...baseMeta, ...concMeta])]);
 
-      // A published time beats no time. The base is whichever source was
-      // scraped first, not whichever knows most: Songkick runs first and 182 of
-      // its rows sit at midnight, so a Bandsintown duplicate carrying a real
-      // 19:00 used to lose it purely on scrape order.
+      // Which row survives is otherwise decided by arrival order, and the order
+      // is whatever the caller's wishlist iteration produced. A support act's
+      // own scraped listing — "As December Falls @ SWG3 Garden", the room next
+      // door — arriving before the headline row it belongs to therefore titled
+      // the gig after the support act and moved it to the wrong room.
+      //
+      // The tie-break is the one insert-time dedup already uses: "Band @ Venue"
+      // is the name a scraper falls back to when the event had none, so a row
+      // carrying a real event name is the better record of the two.
+      const winner = isFallbackName(base.name) && !isFallbackName(concert.name) ? concert : base;
+      const merged = { ...winner, participating_bands: bands };
+      merged.metadata = JSON.stringify([...new Set([...baseMeta, ...concMeta])]);
+
+      // A published time beats no time. The surviving record is not necessarily
+      // whichever knows most: Songkick runs first and 182 of its rows sit at
+      // midnight, so a Bandsintown duplicate carrying a real 19:00 used to lose
+      // it purely on scrape order.
       //
       // The source moves with the time deliberately. concert_date does not mean
       // the same thing for every source — Songkick stores a true UTC instant,
       // Bandsintown a local wall clock — so a row holding a Bandsintown time
       // while still labelled songkick would be read as UTC and render the gig
       // hours out. Whoever supplied the time owns how it is interpreted.
-      if (!hasTimeOfDay(base.concert_date) && hasTimeOfDay(concert.concert_date)) {
-        base.concert_date = concert.concert_date;
-        base.source = concert.source;
+      const other = winner === base ? concert : base;
+      if (!hasTimeOfDay(merged.concert_date) && hasTimeOfDay(other.concert_date)) {
+        merged.concert_date = other.concert_date;
+        merged.source = other.source;
       }
+
+      result[mergedIdx] = merged;
     } else {
       const idx = result.length;
       result.push({ ...concert });

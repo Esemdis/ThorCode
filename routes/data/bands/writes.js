@@ -13,6 +13,7 @@ const { pythonServicePost, pythonServiceFailure } = require('../../../utils/pyth
 const { error: sendError } = require('../../../utils/apiResponse');
 const { haversineKm, stringSimilarity, venueContains, deduplicateByCoords } = require('../../../utils/concertDedup');
 const { findSourceUrls } = require('../../../utils/bandSourceUrls');
+const { backlinkBandToConcerts } = require('../../../utils/bandBacklink');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const { rateLimiter } = require('../../../utils/rateLimiter');
@@ -281,6 +282,21 @@ router.post(
         });
       }
 
+      // A band is usually added because it was seen on a bill already stored,
+      // where its name sits in metadata as a loose string: /bulk links lineup
+      // names against the bands existing at ingest time, and this band did not
+      // exist yet. Left unlinked it shows grey on that bill, and the next scrape
+      // of the band files its own copy of the gig — checkDuplicateConcert needs
+      // a shared band to recognise the two as one show.
+      //
+      // Never fails the request: the band is created either way, and a missing
+      // link is recoverable by hand.
+      try {
+        await backlinkBandToConcerts({ bandId: newBand.id, bandName, prisma });
+      } catch (backlinkError) {
+        console.error(`[bands] Back-linking existing concerts failed for ${bandName}:`, backlinkError.message);
+      }
+
       // Says what was actually found. The old shape answered
       // {sync:{status:'queued'}} before the lookup had run, so "no links, no
       // concerts, no idea why" and "everything worked" were the same response —
@@ -344,6 +360,13 @@ router.post('/bands/quick-add', auth, async (req, res) => {
         data: { name: name.trim(), MBID: mbid ?? null, created_at: new Date() },
         select: { id: true, name: true },
       });
+      // Same reason as the create route above. Only for a band that was just
+      // created: one that already existed was linked as its bills were ingested.
+      try {
+        await backlinkBandToConcerts({ bandId: band.id, bandName: band.name, prisma });
+      } catch (backlinkError) {
+        console.error(`[bands/quick-add] Back-linking existing concerts failed for ${band.name}:`, backlinkError.message);
+      }
     }
 
     // Add to wishlist if provided (skip if already there)
