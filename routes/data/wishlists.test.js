@@ -17,6 +17,7 @@ const prisma = installFakePrisma({
   concert: model(),
   concertBandReference: model(),
   concertAttendance: model(),
+  concertMedia: model(),
   activityLog: model(),
   city: model(),
   notificationSubscription: model(),
@@ -438,5 +439,55 @@ describe('POST /wishlists/notify subscription delivery', () => {
 
     expect(prisma.concert.findMany).not.toHaveBeenCalled();
     expect(received.filter((r) => r.path === '/theirs')).toHaveLength(1);
+  });
+});
+
+describe('DELETE /wishlists/:id/attendance/:concertId', () => {
+  // This is the one call site of the four that refuses instead of detaching:
+  // un-attending a show is the user's own call, not a cleanup sweep, and it is
+  // not a request to delete their photographs. The other three call sites
+  // (admin concert delete, and the two orphan sweeps in routes/data/bands/)
+  // are covered in routes/data/bands.test.js.
+  const WISHLIST = { id: 7, user_id: 'user-1', bands: [] };
+  const ATTENDANCE = { id: 42 };
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue(WISHLIST);
+    prisma.concertAttendance.findUnique.mockResolvedValue(ATTENDANCE);
+  });
+
+  it('refuses with a 409 naming the photo count, and deletes nothing, when media is attached', async () => {
+    prisma.concertMedia.count.mockResolvedValue(3);
+
+    const res = await request(app)
+      .delete('/wishlists/7/attendance/99')
+      .set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/3 photos attached/);
+    expect(prisma.concertAttendance.delete).not.toHaveBeenCalled();
+  });
+
+  it('singularises the count for exactly one photo', async () => {
+    prisma.concertMedia.count.mockResolvedValue(1);
+
+    const res = await request(app)
+      .delete('/wishlists/7/attendance/99')
+      .set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/1 photo attached/);
+  });
+
+  it('deletes the attendance normally when no media is attached', async () => {
+    prisma.concertMedia.count.mockResolvedValue(0);
+    prisma.concertAttendance.delete.mockResolvedValue(ATTENDANCE);
+
+    const res = await request(app)
+      .delete('/wishlists/7/attendance/99')
+      .set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(prisma.concertAttendance.delete).toHaveBeenCalledWith({ where: { id: 42 } });
   });
 });

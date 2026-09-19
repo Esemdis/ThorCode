@@ -304,6 +304,9 @@ router.delete(
 
       const concertIds = band.concerts.map((r) => r.concert);
 
+      // 30s, not the 5s default: detachAttendances below renames a folder per
+      // orphaned show on an SMB-mounted share, and a band with several
+      // orphaned concerts can outrun the default before the last rename lands.
       const result = await prisma.$transaction(async (tx) => {
         const wishlistRefsDeleted = await tx.wishlistBandReference.deleteMany({
           where: { band_id: bandId },
@@ -333,7 +336,19 @@ router.delete(
             // the key restricts rather than cascades. Passed tx, not prisma: a
             // rollback here must not leave media rows deleted while the band
             // and concert it belonged to survive.
-            await detachAttendances(tx, orphanConcertIds);
+            //
+            // detachAttendances takes ATTENDANCE ids, not concert ids.
+            // ConcertAttendance and Concert both use autoincrement ints in the
+            // same database, so the ranges overlap: passing orphanConcertIds
+            // straight through either detaches nothing (and the Restrict key
+            // then rolls this whole transaction back on every orphan that has
+            // real attendance) or, on a collision, renames an unrelated
+            // user's show folder into _detached and deletes their media rows.
+            const doomed = await tx.concertAttendance.findMany({
+              where: { concert_id: { in: orphanConcertIds } },
+              select: { id: true },
+            });
+            await detachAttendances(tx, doomed.map((a) => a.id));
             await tx.concertAttendance.deleteMany({ where: { concert_id: { in: orphanConcertIds } } });
             await tx.concert.deleteMany({ where: { id: { in: orphanConcertIds } } });
           }
@@ -345,7 +360,7 @@ router.delete(
           removedConcertReferences: concertRefsDeleted.count,
           removedConcerts: orphanConcertIds,
         };
-      });
+      }, { timeout: 30000 });
 
       res.json(result);
     } catch (error) {

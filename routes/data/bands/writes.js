@@ -170,6 +170,9 @@ router.post(
     // Unlink this band from stale concerts rather than deleting immediately.
     // The participating bands' own reconcile pass will decide if the concert is
     // valid for them; any concert left with no bands after unlinking is an orphan.
+    // 30s, not the 5s default: detachAttendances below renames a folder per
+    // orphaned show on an SMB-mounted share, and a reconcile with several
+    // orphaned concerts can outrun the default before the last rename lands.
     await prisma.$transaction(async (tx) => {
       await tx.concertBandReference.deleteMany({ where: { concert: { in: staleIds }, band: bandId } });
       const orphans = await tx.concert.findMany({
@@ -183,11 +186,23 @@ router.post(
         // key restricts rather than cascades. Passed tx, not prisma: a
         // rollback here must not leave media rows deleted while the concert
         // this band was reconciled against survives.
-        await detachAttendances(tx, orphanIds);
+        //
+        // detachAttendances takes ATTENDANCE ids, not concert ids.
+        // ConcertAttendance and Concert both use autoincrement ints in the
+        // same database, so the ranges overlap: passing orphanIds straight
+        // through either detaches nothing (and the Restrict key then rolls
+        // this whole transaction back on every orphan that has real
+        // attendance) or, on a collision, renames an unrelated user's show
+        // folder into _detached and deletes their media rows.
+        const doomed = await tx.concertAttendance.findMany({
+          where: { concert_id: { in: orphanIds } },
+          select: { id: true },
+        });
+        await detachAttendances(tx, doomed.map((a) => a.id));
         await tx.concertAttendance.deleteMany({ where: { concert_id: { in: orphanIds } } });
         await tx.concert.deleteMany({ where: { id: { in: orphanIds } } });
       }
-    });
+    }, { timeout: 30000 });
 
     const resyncBands = [...resyncBandMap.values()].map((b) => ({
       id: b.id, name: b.name,

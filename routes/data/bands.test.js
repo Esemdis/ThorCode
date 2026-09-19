@@ -5,13 +5,20 @@ import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../te
 // Seeded before the router is imported — see installFakePrisma for why this
 // is a global rather than a vi.mock.
 const prisma = installFakePrisma({
-  band: { findMany: vi.fn(), findUnique: vi.fn(), findFirst: vi.fn(), create: vi.fn(), update: vi.fn() },
-  concert: { findMany: vi.fn(), count: vi.fn() },
+  band: { findMany: vi.fn(), findUnique: vi.fn(), findFirst: vi.fn(), create: vi.fn(), update: vi.fn(), delete: vi.fn() },
+  concert: { findMany: vi.fn(), count: vi.fn(), findUnique: vi.fn(), delete: vi.fn(), deleteMany: vi.fn() },
   wishlist: { findUnique: vi.fn(), findFirst: vi.fn() },
-  wishlistBandReference: { findMany: vi.fn(), create: vi.fn(), findUnique: vi.fn() },
-  concertBandReference: { findMany: vi.fn() },
+  wishlistBandReference: { findMany: vi.fn(), create: vi.fn(), findUnique: vi.fn(), deleteMany: vi.fn() },
+  concertBandReference: { findMany: vi.fn(), deleteMany: vi.fn() },
+  concertAttendance: { findMany: vi.fn(), deleteMany: vi.fn() },
+  concertMedia: { findMany: vi.fn(), deleteMany: vi.fn() },
   // /bands answers with raw SQL rather than the query builder.
   $queryRaw: vi.fn(async () => []),
+  // The array form ($transaction([...])) resolves an already-built list of
+  // query promises; the interactive form ($transaction(async tx => ...)) runs
+  // its callback against the fake client itself, same as the real client runs
+  // it against a scoped one.
+  $transaction: vi.fn(async (arg) => (typeof arg === 'function' ? arg(prisma) : Promise.all(arg))),
 });
 
 const { default: router } = await import('./bands.js');
@@ -164,6 +171,124 @@ describe('the handlers actually run', () => {
   it('serves one band\'s upcoming shows', async () => {
     const res = await request(app).get('/bands/1/upcoming');
     expect(res.status).toBe(200);
+  });
+});
+
+// Three sites detach media before deleting the ConcertAttendance rows that
+// gate it. All three once passed the CONCERT id into detachAttendances, which
+// reads and deletes ConcertMedia by ATTENDANCE id — both autoincrement ints in
+// the same table space, so the bug either detached nothing (then the Restrict
+// key rolled the whole transaction back on any orphan with real attendance)
+// or, on an id collision, renamed an unrelated user's show folder into
+// _detached and deleted their media rows. Each test below asserts the actual
+// argument shape passed to concertMedia.findMany, with the concert id and the
+// attendance id deliberately different numbers so a regression cannot pass by
+// coincidence.
+describe('DELETE /concerts/:concertId', () => {
+  beforeEach(() => {
+    prisma.concert.findUnique.mockResolvedValue({ id: 55 });
+    prisma.concertAttendance.findMany.mockResolvedValue([{ id: 501 }]);
+    prisma.concertMedia.findMany.mockResolvedValue([]);
+    prisma.concertBandReference.deleteMany.mockResolvedValue({ count: 0 });
+    prisma.concertAttendance.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.concert.delete.mockResolvedValue({ id: 55 });
+  });
+
+  it('detaches media by this concert\'s attendance ids, not the concert id, before the rows go', async () => {
+    const res = await request(app).delete('/concerts/55').set(...authHeader({ role: 'ADMIN' }));
+
+    expect(res.status).toBe(200);
+    expect(prisma.concertAttendance.findMany).toHaveBeenCalledWith({
+      where: { concert_id: 55 },
+      select: { id: true },
+    });
+    // Names the attendance id (501), not the concert id (55) — the swap this
+    // guards against would have made this [55] instead.
+    expect(prisma.concertMedia.findMany).toHaveBeenCalledWith({
+      where: { attendance_id: { in: [501] } },
+      select: { rel_path: true },
+    });
+    // Order matters: deleting the index before every folder move has
+    // succeeded is not recoverable. See utils/mediaDetach.js.
+    const mediaCallOrder = prisma.concertMedia.findMany.mock.invocationCallOrder[0];
+    const deleteCallOrder = prisma.concertAttendance.deleteMany.mock.invocationCallOrder[0];
+    expect(mediaCallOrder).toBeLessThan(deleteCallOrder);
+  });
+});
+
+describe('DELETE /bands/:bandId', () => {
+  beforeEach(() => {
+    prisma.band.findUnique.mockResolvedValue({ id: 9, concerts: [{ concert: 700 }] });
+    prisma.wishlistBandReference.deleteMany.mockResolvedValue({ count: 0 });
+    prisma.concertBandReference.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.band.delete.mockResolvedValue({ id: 9 });
+    prisma.concert.findMany.mockResolvedValue([{ id: 700 }]); // the orphan left with zero bands
+    prisma.concertAttendance.findMany.mockResolvedValue([{ id: 901 }]);
+    prisma.concertMedia.findMany.mockResolvedValue([]);
+    prisma.concertAttendance.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.concert.deleteMany.mockResolvedValue({ count: 1 });
+  });
+
+  it('looks up media by the attendance ids behind an orphaned concert, not the concert id itself', async () => {
+    const res = await request(app).delete('/bands/9').set(...authHeader({ role: 'ADMIN' }));
+
+    expect(res.status).toBe(200);
+    expect(prisma.concertAttendance.findMany).toHaveBeenCalledWith({
+      where: { concert_id: { in: [700] } },
+      select: { id: true },
+    });
+    // Names the attendance id (901), not the orphaned concert id (700).
+    expect(prisma.concertMedia.findMany).toHaveBeenCalledWith({
+      where: { attendance_id: { in: [901] } },
+      select: { rel_path: true },
+    });
+  });
+});
+
+describe('POST /bands/:bandId/reconcile', () => {
+  // A concert the scraper no longer reports for this band. Support-act-only,
+  // so unlinking the reconciled band leaves it with zero bands and orphans it.
+  const staleDbConcert = {
+    id: 800,
+    event_id: null,
+    concert_date: new Date('2030-06-01T20:00:00Z'),
+    venue: 'Slakthuset',
+    city: 'Stockholm',
+    latitude: '59.3',
+    longitude: '18.0',
+    festival: false,
+    bands: [{ band_rel: { id: 3, name: 'Support Act', songkick_url: null, bandsintown_url: null } }],
+  };
+
+  beforeEach(() => {
+    prisma.concert.findMany
+      .mockResolvedValueOnce([staleDbConcert]) // this band's future concerts, checked against `upcoming`
+      .mockResolvedValueOnce([{ id: 800 }]); // the orphans query inside the transaction
+    prisma.concertBandReference.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.concertAttendance.findMany.mockResolvedValue([{ id: 950 }]);
+    prisma.concertMedia.findMany.mockResolvedValue([]);
+    prisma.concertAttendance.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.concert.deleteMany.mockResolvedValue({ count: 1 });
+  });
+
+  it('looks up media by the attendance ids behind an orphaned concert, not the concert id itself', async () => {
+    const res = await request(app)
+      .post('/bands/5/reconcile')
+      .set(...authHeader({ role: 'ADMIN' }))
+      // Decades away from staleDbConcert's date, so nothing matches and it is
+      // flagged stale regardless of the day-window/venue/coordinate rules.
+      .send({ upcoming: [{ concert_date: '2005-01-01', venue: 'Somewhere Else', city: 'Elsewhere' }] });
+
+    expect(res.status).toBe(200);
+    expect(prisma.concertAttendance.findMany).toHaveBeenCalledWith({
+      where: { concert_id: { in: [800] } },
+      select: { id: true },
+    });
+    // Names the attendance id (950), not the orphaned concert id (800).
+    expect(prisma.concertMedia.findMany).toHaveBeenCalledWith({
+      where: { attendance_id: { in: [950] } },
+      select: { rel_path: true },
+    });
   });
 });
 

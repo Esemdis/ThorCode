@@ -199,20 +199,30 @@ router.delete('/concerts/:concertId', auth, roleCheck(['ADMIN']), async (req, re
   const concert = await prisma.concert.findUnique({ where: { id: concertId } });
   if (!concert) return res.status(404).json({ error: 'Concert not found' });
 
-  // Detach before the attendance rows go, or the restricting foreign key
-  // fails the whole transaction. See utils/mediaDetach.js for why the key
-  // restricts rather than cascades.
-  const doomed = await prisma.concertAttendance.findMany({
-    where: { concert_id: concertId },
-    select: { id: true },
-  });
-  await detachAttendances(prisma, doomed.map((a) => a.id));
-
-  await prisma.$transaction([
-    prisma.concertBandReference.deleteMany({ where: { concert: concertId } }),
-    prisma.concertAttendance.deleteMany({ where: { concert_id: concertId } }),
-    prisma.concert.delete({ where: { id: concertId } }),
-  ]);
+  // Detach and delete now share one interactive transaction rather than
+  // running detach ahead of an array-form $transaction. The array form has no
+  // tx to detach through, but doing the detach on the global client first was
+  // worse than doing nothing: if the deleteMany/delete batch then failed, the
+  // show folders were already moved and the ConcertMedia rows already
+  // committed-deleted, while the concert and its attendances survived the
+  // rollback — and the rebuild script deliberately skips _detached, so nothing
+  // would have noticed or repaired it. Detaching inside the transaction means
+  // a failed delete rolls the row deletion back too; only the folder rename
+  // (which cannot be transactional) stays done, which is the recoverable
+  // direction — files misplaced, rows intact.
+  //
+  // 30s, not the 5s default: the work inside includes a folder rename per
+  // attendee's worth of media on an SMB-mounted share.
+  await prisma.$transaction(async (tx) => {
+    const doomed = await tx.concertAttendance.findMany({
+      where: { concert_id: concertId },
+      select: { id: true },
+    });
+    await detachAttendances(tx, doomed.map((a) => a.id));
+    await tx.concertBandReference.deleteMany({ where: { concert: concertId } });
+    await tx.concertAttendance.deleteMany({ where: { concert_id: concertId } });
+    await tx.concert.delete({ where: { id: concertId } });
+  }, { timeout: 30000 });
 
   res.json({ deleted: concertId });
 });
