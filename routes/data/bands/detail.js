@@ -18,6 +18,7 @@ const { relevantArtists } = require('../../../utils/artistSearch');
 const { resolveArtistImages } = require('../../../utils/bandImages');
 const { matchBandToSpotify, backfillSpotifyIds } = require('../../../utils/bandSpotifyMatch');
 const { findSourceUrls } = require('../../../utils/bandSourceUrls');
+const { detachAttendances } = require('../../../utils/mediaDetach');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
@@ -327,6 +328,12 @@ router.delete(
           });
           orphanConcertIds = orphans.map((c) => c.id);
           if (orphanConcertIds.length) {
+            // Detach before the attendance rows go, or the restricting foreign
+            // key fails the whole transaction. See utils/mediaDetach.js for why
+            // the key restricts rather than cascades. Passed tx, not prisma: a
+            // rollback here must not leave media rows deleted while the band
+            // and concert it belonged to survive.
+            await detachAttendances(tx, orphanConcertIds);
             await tx.concertAttendance.deleteMany({ where: { concert_id: { in: orphanConcertIds } } });
             await tx.concert.deleteMany({ where: { id: { in: orphanConcertIds } } });
           }

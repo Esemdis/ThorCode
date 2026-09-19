@@ -16,6 +16,7 @@ const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
 const { Prisma } = require('@prisma/client');
+const { detachAttendances } = require('../../../utils/mediaDetach');
 
 /**
  * Match unsearched bands to Spotify artists, so the overview has photos before
@@ -197,6 +198,15 @@ router.delete('/concerts/:concertId', auth, roleCheck(['ADMIN']), async (req, re
 
   const concert = await prisma.concert.findUnique({ where: { id: concertId } });
   if (!concert) return res.status(404).json({ error: 'Concert not found' });
+
+  // Detach before the attendance rows go, or the restricting foreign key
+  // fails the whole transaction. See utils/mediaDetach.js for why the key
+  // restricts rather than cascades.
+  const doomed = await prisma.concertAttendance.findMany({
+    where: { concert_id: concertId },
+    select: { id: true },
+  });
+  await detachAttendances(prisma, doomed.map((a) => a.id));
 
   await prisma.$transaction([
     prisma.concertBandReference.deleteMany({ where: { concert: concertId } }),

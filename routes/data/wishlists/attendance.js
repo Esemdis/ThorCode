@@ -14,6 +14,8 @@ const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
 const { storesRealInstant } = require("../../../utils/ics");
+const { conflict } = require("../../../utils/apiResponse");
+const { countMediaForAttendances } = require("../../../utils/mediaDetach");
 
 // GET /wishlists/:id/attendance — all attended/going concerts for this wishlist
 router.get(
@@ -176,6 +178,14 @@ router.delete(
         where: { wishlist_id_concert_id: { wishlist_id: wishlistId, concert_id: concertId } },
       });
       if (!attendance) return res.status(404).json({ error: "Attendance record not found" });
+
+      // Un-attending a show is not a request to delete photographs. The
+      // foreign key would refuse this anyway; catching it here is what turns a
+      // 500 into a sentence that says what to do about it.
+      const mediaCount = await countMediaForAttendances(prisma, [attendance.id]);
+      if (mediaCount > 0) {
+        return conflict(res, `This show has ${mediaCount} photo${mediaCount === 1 ? '' : 's'} attached. Delete them first if you really did not go.`);
+      }
 
       await prisma.concertAttendance.delete({ where: { id: attendance.id } });
 
