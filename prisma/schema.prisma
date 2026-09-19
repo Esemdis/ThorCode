@@ -103,6 +103,7 @@ model Band {
   concerts                   ConcertBandReference[]     @relation("BandConcerts")
   wishlists                  WishlistBandReference[]    @relation("BandWishlists")
   notification_subscriptions NotificationSubscription[] @relation("BandNotificationSubscriptions")
+  media                      ConcertMedia[]             @relation("BandMedia")
 }
 
 model Concert {
@@ -211,15 +212,50 @@ model WishlistBandReference {
 }
 
 model ConcertAttendance {
-  id           Int      @id @default(autoincrement())
+  id           Int            @id @default(autoincrement())
   wishlist_id  Int
   concert_id   Int
-  created_at   DateTime @default(now())
-  wishlist_rel Wishlist @relation("WishlistAttendance", fields: [wishlist_id], references: [id])
-  concert_rel  Concert  @relation("ConcertAttendances", fields: [concert_id], references: [id])
+  created_at   DateTime       @default(now())
+  wishlist_rel Wishlist       @relation("WishlistAttendance", fields: [wishlist_id], references: [id])
+  concert_rel  Concert        @relation("ConcertAttendances", fields: [concert_id], references: [id])
+  media        ConcertMedia[] @relation("AttendanceMedia")
 
   @@unique([wishlist_id, concert_id])
   @@index([concert_id])
+}
+
+/// Photos and video from a show you went to.
+///
+/// Anchored to the attendance rather than to the concert, because the
+/// attendance already carries both "which show" and "whose" in one key and
+/// proves the user was actually there.
+///
+/// The attendance relation is deliberately NOT onDelete: Cascade. Postgres
+/// restricting the delete is the guarantee that no code path — including the
+/// three orphan-cleanup paths that delete attendances in bulk — can quietly
+/// destroy the only copy of a photograph. See utils/mediaDetach.js.
+model ConcertMedia {
+  id            Int       @id @default(autoincrement())
+  attendance_id Int
+  band_id       Int?
+  rel_path      String
+  filename      String
+  kind          MediaKind
+  bytes         Int
+  sha256        String
+  width         Int?
+  height        Int?
+  duration_ms   Int?
+  caption       String?
+  taken_at      DateTime?
+  created_at    DateTime  @default(now())
+
+  attendance_rel ConcertAttendance @relation("AttendanceMedia", fields: [attendance_id], references: [id], onDelete: Restrict)
+  band_rel       Band?             @relation("BandMedia", fields: [band_id], references: [id], onDelete: SetNull)
+
+  @@unique([attendance_id, filename])
+  @@index([band_id])
+  @@index([attendance_id])
 }
 
 // A user's watch for new concerts: by band, by city, or a band-in-a-specific-city combo.
@@ -268,6 +304,11 @@ enum BandTier {
   LOVE
   LIKE
   FOLLOW
+}
+
+enum MediaKind {
+  PHOTO
+  VIDEO
 }
 
 // ── TRAVEL BAG ────────────────────────────────────────────────────────────────

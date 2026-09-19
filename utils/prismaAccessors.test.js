@@ -10,7 +10,7 @@ import { PrismaClient } from '@prisma/client';
 // Constructing the client does not connect, so this needs no database. It pins
 // the accessors the code actually uses; rename a model and this fails here
 // rather than in a route.
-const ACCESSORS = ['oAuth', 'concert', 'band', 'concertBandReference', 'wishlist', 'user'];
+const ACCESSORS = ['oAuth', 'concert', 'band', 'concertBandReference', 'wishlist', 'user', 'concertMedia'];
 
 describe('the Prisma client exposes the models the routes reach for', () => {
   const client = new PrismaClient();
@@ -23,5 +23,11 @@ describe('the Prisma client exposes the models the routes reach for', () => {
 
   it('does not have the lower-cased spelling of OAuth that used to be used', () => {
     expect(client.oauth).toBeUndefined();
+  });
+});
+
+describe('ConcertMedia is wired so media cannot be orphaned', () => {
+  it('exposes prisma.concertMedia', () => {
+    expect(typeof new PrismaClient().concertMedia?.findMany).toBe('function');
   });
 });
