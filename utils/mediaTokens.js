@@ -34,6 +34,7 @@ const sign = (payload, secret) =>
  * @returns {string}
  */
 function signMediaToken({ mediaId, userId, secret, now = Math.floor(Date.now() / 1000) }) {
+  if (typeof userId !== 'string') throw new Error('userId must be a string');
   const key = mediaSecret(secret);
   const payload = Buffer
     .from(JSON.stringify({ m: mediaId, u: userId, e: now + MEDIA_TOKEN_TTL_SECONDS }))
@@ -50,7 +51,11 @@ function signMediaToken({ mediaId, userId, secret, now = Math.floor(Date.now() /
  * Returns a reason rather than throwing so the route can log which check failed
  * while telling the client only that it was refused.
  */
-function verifyMediaToken(token, { mediaId, secret, now = Math.floor(Date.now() / 1000) }) {
+function verifyMediaToken(token, { mediaId, secret, now } = {}) {
+  // Coerce now to current time if null or non-numeric, since null disables expiry
+  // and a string expiry would coerce and pass the comparison.
+  const timestamp = typeof now === 'number' ? now : Math.floor(Date.now() / 1000);
+
   let key;
   try {
     key = mediaSecret(secret);
@@ -78,8 +83,18 @@ function verifyMediaToken(token, { mediaId, secret, now = Math.floor(Date.now() 
     return { ok: false, reason: 'malformed' };
   }
 
+  // A validly-signed payload is still untrusted input. Every field here feeds an
+  // authorisation decision, so validate the shape: m and e must be numbers, u must
+  // be a string. This also prevents undefined userId and non-numeric expiry coercion.
+  if (typeof claims !== 'object' || claims === null
+      || typeof claims.m !== 'number'
+      || typeof claims.e !== 'number'
+      || typeof claims.u !== 'string') {
+    return { ok: false, reason: 'malformed' };
+  }
+
   if (claims.m !== mediaId) return { ok: false, reason: 'mismatch' };
-  if (!(claims.e > now)) return { ok: false, reason: 'expired' };
+  if (!(claims.e > timestamp)) return { ok: false, reason: 'expired' };
   return { ok: true, userId: claims.u };
 }
 
@@ -93,10 +108,11 @@ function verifyMediaToken(token, { mediaId, secret, now = Math.floor(Date.now() 
 function mediaUrls(baseUrl, mediaId, token) {
   if (!baseUrl) throw new Error('No public base URL configured (CALLBACK_URL)');
   const base = String(baseUrl).replace(/\/+$/, '');
+  const id = encodeURIComponent(mediaId);
   const q = `?t=${encodeURIComponent(token)}`;
   return {
-    file: `${base}${MEDIA_PATH}/${mediaId}/file${q}`,
-    thumb: `${base}${MEDIA_PATH}/${mediaId}/thumb${q}`,
+    file: `${base}${MEDIA_PATH}/${id}/file${q}`,
+    thumb: `${base}${MEDIA_PATH}/${id}/thumb${q}`,
   };
 }
 

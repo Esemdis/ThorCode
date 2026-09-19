@@ -1,9 +1,26 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import crypto from 'node:crypto';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   MEDIA_TOKEN_TTL_SECONDS, signMediaToken, verifyMediaToken, mediaUrls,
 } from './mediaTokens.js';
 
-beforeEach(() => { process.env.MEDIA_URL_SECRET = 'test-media-secret'; });
+let savedJwtSecret;
+
+const sign = (payload, secret) =>
+  crypto.createHmac('sha256', secret).update(payload).digest('base64url');
+
+beforeEach(() => {
+  process.env.MEDIA_URL_SECRET = 'test-media-secret';
+  savedJwtSecret = process.env.JWT_SECRET;
+});
+
+afterEach(() => {
+  if (savedJwtSecret !== undefined) {
+    process.env.JWT_SECRET = savedJwtSecret;
+  } else {
+    delete process.env.JWT_SECRET;
+  }
+});
 
 describe('signMediaToken and verifyMediaToken', () => {
   it('verifies a token it just minted', () => {
@@ -63,6 +80,51 @@ describe('signMediaToken and verifyMediaToken', () => {
   it('refuses to sign with no secret configured', () => {
     delete process.env.MEDIA_URL_SECRET;
     expect(() => signMediaToken({ mediaId: 7, userId: 'user-1' })).toThrow(/MEDIA_URL_SECRET/);
+  });
+
+  it('refuses to sign with no user id configured', () => {
+    expect(() => signMediaToken({ mediaId: 7, userId: undefined })).toThrow(/userId/);
+  });
+
+  it('a token carrying no user claim is refused rather than verifying with no user', () => {
+    const secret = process.env.MEDIA_URL_SECRET;
+    const forged = Buffer.from(JSON.stringify({ m: 7, e: 9e9 })).toString('base64url');
+    const sig = sign(forged, secret);
+    expect(verifyMediaToken(`${forged}.${sig}`, { mediaId: 7 })).toEqual({ ok: false, reason: 'malformed' });
+  });
+
+  it('a token whose media id is a string where the route passes a number is refused', () => {
+    const secret = process.env.MEDIA_URL_SECRET;
+    const forged = Buffer.from(JSON.stringify({ m: '7', u: 'user-1', e: 9e9 })).toString('base64url');
+    const sig = sign(forged, secret);
+    expect(verifyMediaToken(`${forged}.${sig}`, { mediaId: 7 })).toEqual({ ok: false, reason: 'malformed' });
+  });
+
+  it('a token with a missing or non-numeric expiry is refused', () => {
+    const secret = process.env.MEDIA_URL_SECRET;
+    const forgedNoExpiry = Buffer.from(JSON.stringify({ m: 7, u: 'user-1' })).toString('base64url');
+    const forgedStringExpiry = Buffer.from(JSON.stringify({ m: 7, u: 'user-1', e: '9e9' })).toString('base64url');
+    const sigNoExpiry = sign(forgedNoExpiry, secret);
+    const sigStringExpiry = sign(forgedStringExpiry, secret);
+    expect(verifyMediaToken(`${forgedNoExpiry}.${sigNoExpiry}`, { mediaId: 7 })).toEqual({ ok: false, reason: 'malformed' });
+    expect(verifyMediaToken(`${forgedStringExpiry}.${sigStringExpiry}`, { mediaId: 7 })).toEqual({ ok: false, reason: 'malformed' });
+  });
+
+  it('a validly-signed payload that is literally null is refused rather than throwing', () => {
+    const secret = process.env.MEDIA_URL_SECRET;
+    const nullPayload = Buffer.from('null').toString('base64url');
+    const sig = sign(nullPayload, secret);
+    expect(verifyMediaToken(`${nullPayload}.${sig}`, { mediaId: 7 })).toEqual({ ok: false, reason: 'malformed' });
+  });
+
+  it('verifyMediaToken with no options argument returns a reason instead of throwing', () => {
+    const token = signMediaToken({ mediaId: 7, userId: 'user-1' });
+    // Without mediaId, it should fail on signature check because mediaId is undefined
+    // Actually, with no mediaId provided, the check `claims.m !== mediaId` will be `claims.m !== undefined`
+    // which will be true (since m is a number), so it returns 'mismatch'.
+    // The test should be that calling with no argument doesn't throw.
+    expect(() => verifyMediaToken(token)).not.toThrow();
+    expect(verifyMediaToken(token).ok).toBe(false);
   });
 });
 
