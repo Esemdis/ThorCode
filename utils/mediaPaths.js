@@ -13,6 +13,7 @@ const path = require('path');
 const ARCHIVE_DIR = 'archive';
 const CACHE_DIR = 'cache';
 const DETACHED_DIR = '_detached';
+const POSTERS_DIR = '.posters';
 
 // Long enough for any real venue or band, short enough that a nested path stays
 // well inside the 255-byte per-component limit with a suffix added.
@@ -109,8 +110,24 @@ function thumbPath(sha256) {
   return path.join(thumbCacheRoot(), `${slugSegment(sha256)}.webp`);
 }
 
+/**
+ * Where a video's poster frame lives.
+ *
+ * In the archive, not the cache, and this is the one asymmetry in the storage
+ * layout. Photo thumbnails are derived from their originals and can always be
+ * remade; a video poster comes from the browser that uploaded it, because
+ * nothing on this server can decode video. Losing it means losing it.
+ *
+ * The leading dot keeps it out of a file browser's default view, so the show
+ * folder still reads as the night's photographs.
+ */
+function posterPath(relPath) {
+  const abs = resolveArchivePath(relPath);
+  return path.join(path.dirname(abs), POSTERS_DIR, `${path.basename(abs)}.webp`);
+}
+
 module.exports = {
-  ARCHIVE_DIR, CACHE_DIR, DETACHED_DIR, MAX_SEGMENT,
+  ARCHIVE_DIR, CACHE_DIR, DETACHED_DIR, MAX_SEGMENT, POSTERS_DIR,
   archiveRoot, thumbCacheRoot, slugSegment, showFolderName,
-  showFolderRelPath, uniqueFilename, resolveArchivePath, thumbPath,
+  showFolderRelPath, uniqueFilename, resolveArchivePath, thumbPath, posterPath,
 };

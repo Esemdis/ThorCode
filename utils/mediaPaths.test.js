@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   slugSegment, showFolderName, showFolderRelPath, uniqueFilename,
-  resolveArchivePath, thumbPath, archiveRoot,
+  resolveArchivePath, thumbPath, archiveRoot, posterPath,
 } from './mediaPaths.js';
 
 beforeEach(() => { process.env.MEDIA_ROOT = '/media'; });
@@ -111,5 +111,19 @@ describe('thumbPath', () => {
     // Keyed by content, so the same photo uploaded to two shows is rendered
     // once, and a cache entry can never be stale for its key.
     expect(thumbPath('abc123')).toBe('/media/cache/thumbs/abc123.webp');
+  });
+});
+
+describe('posterPath', () => {
+  it('puts a video poster in a dotted folder beside the video', () => {
+    // Dotted so a file browser hides it and the show folder still reads as the
+    // night's photographs. In the archive rather than the cache because nothing
+    // on the server can decode video to remake it.
+    expect(posterPath('user-1/2026-06-12 Oslo - Gojira/VID_1.mp4'))
+      .toBe('/media/archive/user-1/2026-06-12 Oslo - Gojira/.posters/VID_1.mp4.webp');
+  });
+
+  it('refuses a poster path that climbs out of the archive', () => {
+    expect(() => posterPath('../../etc/passwd')).toThrow(/outside the archive/i);
   });
 });
