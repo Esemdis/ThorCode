@@ -8,3 +8,7 @@ node_modules
 # `db push`, which eventually tried to delete a trip's worth of data — see the
 # comment there. Eighteen of the thirty migrations on disk had never been
 # committed by the time it fired.
+
+# Scratch for subagent-driven plan execution: ledgers, briefs, review packages.
+# Regenerable from the plan and git history, and git clean -fdx will take it.
+/.superpowers
