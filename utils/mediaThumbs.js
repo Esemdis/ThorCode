@@ -91,6 +91,18 @@ async function ensureThumb({ absPath, kind, sha256, relPath }) {
 
   const target = thumbPath(sha256);
   if (await exists(target)) return target;
+  // Tagged like NO_POSTER above, and for the same reason. An original that has
+  // gone missing is ordinary archive drift, not a server fault: the file route
+  // already answers it with a bare 404, and the thumb route said 500 with
+  // sharp's own "Input file is missing: <absolute path>" as the message. That
+  // path only escapes to the client outside production, but the status is
+  // wrong everywhere, and a normal state that logs as a 500 buries the ones
+  // that are not.
+  if (!await exists(absPath)) {
+    const err = new Error(`no original at ${absPath}`);
+    err.code = 'NO_SOURCE';
+    throw err;
+  }
   await mkdir(thumbCacheRoot(), { recursive: true });
   return writeWebp(absPath, target);
 }

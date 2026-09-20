@@ -146,3 +146,17 @@ describe('ensureThumb for a video', () => {
       .rejects.toThrow(/no poster/i);
   });
 });
+
+describe('ensureThumb for a photo whose original is gone', () => {
+  it('reports the missing original in a form the caller can tell apart', async () => {
+    // Left to sharp this surfaced as "Input file contains unsupported image
+    // format"-style prose with no code on it, indistinguishable from a real
+    // failure, so the thumb route answered ordinary archive drift with a 500
+    // and put the container's absolute path in the message. The tag is what
+    // lets the route say 404 for this and only this.
+    const err = await ensureThumb({
+      absPath: join(root, 'not-there.jpg'), kind: 'PHOTO', sha256: 'gone1', relPath: 'u/s/x.jpg',
+    }).catch((e) => e);
+    expect(err.code).toBe('NO_SOURCE');
+  });
+});

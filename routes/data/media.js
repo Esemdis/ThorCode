@@ -24,7 +24,7 @@ const {
   showFolderRelPath, uniqueFilename, resolveArchivePath, slugSegment, posterPath,
 } = require('../../utils/mediaPaths');
 const {
-  emptySidecar, upsertFile, removeFile, readSidecar, writeSidecar,
+  emptySidecar, upsertFile, removeFile, readSidecar, writeSidecar, SIDECAR_NAME,
 } = require('../../utils/mediaSidecar');
 const { kindForMime, MAX_FILE_BYTES } = require('../../utils/mediaTypes');
 const { storePoster, ensureThumb } = require('../../utils/mediaThumbs');
@@ -188,7 +188,18 @@ router.post(
       const existing = await prisma.concertMedia.findMany({
         where: { attendance_id: attendanceId }, select: { filename: true },
       });
-      const taken = new Set([...existing.map((e) => e.filename), ...sidecar.files.map((f) => f.name)]);
+      // SIDECAR_NAME is seeded because the sidecar is not one of its own
+      // entries, so nothing else in `taken` covers it. A client picks both the
+      // filename and the MIME type of a part, so an upload named
+      // concert-media.json declaring image/jpeg used to land at 201 and write
+      // its bytes straight over the record of truth. The sidecar write at the
+      // end of the batch then put valid JSON back, which meant the file that
+      // actually vanished was the user's photo, leaving a row and an entry
+      // both pointing at a path that now held JSON. Reverse the ordering and
+      // it is the archive's record of truth that becomes a JPEG.
+      const taken = new Set([
+        SIDECAR_NAME, ...existing.map((e) => e.filename), ...sidecar.files.map((f) => f.name),
+      ]);
 
       const created = [];
       const pairedPosters = [];
@@ -576,7 +587,7 @@ async function serveMedia(req, res, which) {
     // A plain parseInt accepts '1abc' as 1 and would serve media 1 under a
     // path meant to 404. Not exploitable on its own — the token still has to
     // be signed for that id — but the param should mean what it looks like.
-    if (!/^\d+$/.test(req.params.id)) return res.status(400).end();
+    if (!/^[1-9]\d*$/.test(req.params.id)) return res.status(400).end();
     const mediaId = parseInt(req.params.id, 10);
 
     const verdict = verifyMediaToken(req.query.t, { mediaId });
@@ -602,27 +613,35 @@ async function serveMedia(req, res, which) {
     const archivePath = resolveArchivePath(row.rel_path);
 
     let absPath;
-    let sendOpts;
     if (which === 'thumb') {
       try {
         absPath = await ensureThumb({
           absPath: archivePath, kind: row.kind, sha256: row.sha256, relPath: row.rel_path,
         });
       } catch (err) {
-        if (err.code !== 'NO_POSTER') throw err;
+        if (err.code !== 'NO_POSTER' && err.code !== 'NO_SOURCE') throw err;
         // A video whose poster extraction failed in the browser has none, and
-        // nothing here can decode one. 404 so the grid draws its placeholder
+        // nothing here can decode one. NO_SOURCE is the same answer for a
+        // photo whose original is gone, which is what the file route already
+        // says about the same row. 404 so the grid draws its placeholder
         // rather than retrying an image that is never coming.
         return res.status(404).end();
       }
-      // A poster lives at <show>/.posters/<name>.webp. `send` defaults to
-      // dotfiles: 'ignore' and 404s a path under a dot-segment regardless of
-      // permissions, so without this every video thumb was a silent
-      // placeholder even when the poster was sitting right there on disk.
-      sendOpts = { dotfiles: 'allow' };
     } else {
       absPath = archivePath;
     }
+
+    // `send` defaults to dotfiles: 'ignore' and 404s a path with a dot segment
+    // regardless of permissions. A poster lives at <show>/.posters/<name>.webp,
+    // so without this every video thumb was a silent placeholder even with the
+    // poster sitting right there on disk. It applies to the file route too,
+    // and for a reason that has nothing to do with posters: with no `root`
+    // option set, send tests every segment of the ABSOLUTE path, so a single
+    // dot directory anywhere in MEDIA_ROOT turns every download in the archive
+    // into a 404. resolveArchivePath has already confined the path by this
+    // point, so send's dotfile heuristic guards nothing here and only breaks
+    // deploys whose mount happens to sit under a hidden directory.
+    const sendOpts = { dotfiles: 'allow' };
 
     // Immutable: both paths are keyed by content that never changes in place.
     // A replaced photo is a new row with a new id.
@@ -639,6 +658,22 @@ async function serveMedia(req, res, which) {
       // (see res.sendFile's source: "if (done) return done(err)"), so
       // anything past ENOENT has to be logged and answered here, not thrown —
       // this runs after the surrounding try/catch has already returned.
+      //
+      // Opting out also loses the res.headersSent guard that Express's default
+      // error handler applies, and that is the half that bites. Every error
+      // send reports mid-body arrives after the headers: the common one is a
+      // client that closed the tab or seeked in a video, which send reports as
+      // "Request aborted". Calling fail() there tried to write a second
+      // response, threw ERR_HTTP_HEADERS_SENT from inside send's own callback
+      // where nothing catches it, and index.js answers uncaughtException with
+      // process.exit(1) — so one viewer scrubbing a video took the whole API
+      // down with it, on a feature whose stated premise is a flaky home
+      // connection. Once the response is committed the only honest move is to
+      // log it and drop the socket.
+      if (res.headersSent) {
+        console.error(`[${new Date().toISOString()}] GET /media/:id/${which} aborted mid-body`, err);
+        return res.destroy();
+      }
       return fail(res, err, { context: `GET /media/:id/${which}` });
     });
   } catch (err) {

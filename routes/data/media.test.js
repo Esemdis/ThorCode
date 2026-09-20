@@ -902,3 +902,123 @@ describe('GET /media/:id/thumb', () => {
     expect(res.status).not.toBe(404);
   });
 });
+
+describe('the byte routes under conditions the archive really meets', () => {
+  const point = (row) => {
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      id: 1, attendance_rel: { wishlist_rel: { user_id: 'user-1' } }, ...row,
+    }));
+  };
+  const tok = () => signMediaToken({ mediaId: 1, userId: 'user-1' });
+
+  it('survives a client that hangs up in the middle of a download', async () => {
+    // This crashed the whole API before the headersSent guard. send reports a
+    // hang-up as "Request aborted" through the sendFile callback, which fires
+    // after the headers are already on the wire; answering it with fail()
+    // threw ERR_HTTP_HEADERS_SENT from inside send's own callback, where no
+    // try/catch is left to see it, and index.js meets uncaughtException with
+    // process.exit(1). Closing a tab during playback was enough to do it.
+    // The body has to be bigger than one chunk or the abort lands after the
+    // response has already finished and nothing is exercised.
+    const dir = join(root, 'archive', 'user-1', 'show');
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'big.bin'), Buffer.alloc(6 * 1024 * 1024, 7));
+    point({ kind: 'PHOTO', sha256: 'h1', filename: 'big.bin', rel_path: 'user-1/show/big.bin' });
+
+    const uncaught = [];
+    const onUncaught = (e) => uncaught.push(e);
+    process.on('uncaughtException', onUncaught);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const http = await import('node:http');
+    const server = app().listen(0);
+    const { port } = server.address();
+    await new Promise((resolve) => {
+      const req = http.get({ port, path: `/data/concerts/media/1/file?t=${tok()}` }, (res) => {
+        res.once('data', () => { req.destroy(); resolve(); });
+      });
+      req.on('error', () => resolve());
+    });
+    await new Promise((r) => { setTimeout(r, 300); });
+    process.off('uncaughtException', onUncaught);
+    server.close();
+    vi.restoreAllMocks();
+
+    expect(uncaught.map((e) => e.code)).toEqual([]);
+  });
+
+  it('serves a file even when the archive sits under a hidden directory', async () => {
+    // send tests every segment of the absolute path for a leading dot when no
+    // `root` option is given, so one hidden directory anywhere in MEDIA_ROOT
+    // used to 404 every download in the archive — not just the posters this
+    // was first noticed on. resolveArchivePath has already confined the path
+    // by then, so the check guards nothing and only breaks such a deploy.
+    const dotted = join(root, '.appdata');
+    process.env.MEDIA_ROOT = dotted;
+    const dir = join(dotted, 'archive', 'user-1', 'show');
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'a.jpg'), jpeg());
+    point({ kind: 'PHOTO', sha256: 'h1', filename: 'a.jpg', rel_path: 'user-1/show/a.jpg' });
+
+    const res = await request(app()).get(`/data/concerts/media/1/file?t=${tok()}`);
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/image\/jpeg/);
+  });
+
+  it('calls a photo whose original has gone missing a 404, like the file route does', async () => {
+    // An original that is not there is ordinary archive drift, not a fault.
+    // sharp answers it with "Input file is missing: <absolute path>", which
+    // carries no ENOENT code, so it used to reach the outer catch as a 500 —
+    // logging noise in production and the container's real path in the
+    // response anywhere else.
+    point({ kind: 'PHOTO', sha256: 'h1', filename: 'gone.jpg', rel_path: 'user-1/show/gone.jpg' });
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await request(app()).get(`/data/concerts/media/1/thumb?t=${tok()}`);
+
+    expect(res.status).toBe(404);
+    expect(res.text).toBe('');
+    expect(errSpy).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it('refuses an id that is not written the way the router writes it', async () => {
+    point({ kind: 'PHOTO', sha256: 'h1', filename: 'a.jpg', rel_path: 'user-1/show/a.jpg' });
+    await request(app()).get(`/data/concerts/media/01/file?t=${tok()}`).expect(400);
+  });
+});
+
+describe('an upload that collides with the archive\'s own bookkeeping', () => {
+  it('will not let a file named concert-media.json land on the sidecar', async () => {
+    // A multipart part carries both its filename and its content type, and the
+    // client picks both, so declaring image/jpeg over a part named
+    // concert-media.json got past the MIME gate and wrote its bytes onto the
+    // record of truth. `taken` is built from database rows and sidecar
+    // entries, and the sidecar is not one of its own entries, so nothing
+    // covered its name. In the ordering that actually runs, the sidecar write
+    // at the end of the batch put valid JSON back over the photo, so it was
+    // the user's file that vanished while a row and an entry both went on
+    // pointing at it; a different ordering loses the sidecar instead.
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    await request(app()).post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(201);
+    prisma.concertMedia.findMany = vi.fn(async () => [{ filename: 'IMG_1.jpg' }]);
+
+    await request(app()).post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .attach('files', jpeg(), { filename: 'concert-media.json', contentType: 'image/jpeg' })
+      .expect(201);
+
+    const stored = prisma.concertMedia.create.mock.calls.at(-1)[0].data;
+    expect(stored.filename).toBe('concert-media (2).json');
+    // The sidecar is still the sidecar, and still knows about both files.
+    const sidecar = JSON.parse(await readFile(join(dir, 'concert-media.json'), 'utf8'));
+    expect(sidecar.files.map((f) => f.name).sort())
+      .toEqual(['IMG_1.jpg', 'concert-media (2).json']);
+    // And the uploaded bytes are still a JPEG, at the name the row claims.
+    const bytes = await readFile(join(dir, 'concert-media (2).json'));
+    expect(bytes.slice(0, 3)).toEqual(Buffer.from([0xff, 0xd8, 0xff]));
+  });
+});
