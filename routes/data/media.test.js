@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
+import { signMediaToken } from '../../utils/mediaTokens.js';
 
 let root;
 
@@ -61,15 +62,17 @@ describe('POST /attendances/:id/media', () => {
   it('exposes exactly the expected routes, with auth in front of every one of them', () => {
     // The handler count is part of this on purpose: dropping `auth` or
     // `roleCheck` while touching this file would shrink a number silently
-    // otherwise. GET /media/:id/file and /thumb are a later task — they carry
-    // their own auth via a signed URL token rather than this middleware, so
-    // they do not belong in this router yet.
+    // otherwise. GET /media/:id/file and /thumb are the exception — they carry
+    // their own auth via a signed URL token instead of this middleware, so
+    // their count is 1: just the handler, no `auth` or `roleCheck` in front.
     expect(routeManifest(router)).toEqual([
       'POST /attendances/:attendanceId/media [5]',
       'GET /attendances/:attendanceId/media [4]',
       'GET /bands/:bandId/media [4]',
       'PATCH /media [7]',
       'DELETE /media/:id [4]',
+      'GET /media/:id/file [1]',
+      'GET /media/:id/thumb [1]',
     ]);
   });
 
@@ -759,5 +762,81 @@ describe('DELETE /media/:id', () => {
       .expect(200);
 
     expect(await readdir(join(dir, '.posters'))).not.toContain('VID_1.mp4.webp');
+  });
+});
+
+describe('GET /media/:id/file', () => {
+  const uploadOne = async () => {
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .field('band_id', '92')
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(201);
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      id: 1, kind: 'PHOTO', sha256: 'h1', filename: 'IMG_1.jpg',
+      rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_1.jpg',
+      attendance_rel: { wishlist_rel: { user_id: 'user-1' } },
+    }));
+  };
+
+  it('serves the bytes to a request carrying a valid token and no header', async () => {
+    // No Authorization header anywhere in this test, on purpose. That is the
+    // whole reason the token exists.
+    await uploadOne();
+    const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
+    const res = await request(app()).get(`/data/concerts/media/1/file?t=${t}`).expect(200);
+    expect(res.headers['content-type']).toMatch(/image\/jpeg/);
+  });
+
+  it('refuses a request with no token', async () => {
+    await uploadOne();
+    await request(app()).get('/data/concerts/media/1/file').expect(401);
+  });
+
+  it('refuses a token minted for a different file', async () => {
+    await uploadOne();
+    const t = signMediaToken({ mediaId: 999, userId: 'user-1' });
+    await request(app()).get(`/data/concerts/media/1/file?t=${t}`).expect(401);
+  });
+
+  it('refuses a token whose user no longer owns the file', async () => {
+    await uploadOne();
+    const t = signMediaToken({ mediaId: 1, userId: 'someone-else' });
+    await request(app()).get(`/data/concerts/media/1/file?t=${t}`).expect(403);
+  });
+
+  it('answers a range request with a partial body, so video can seek', async () => {
+    await uploadOne();
+    const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
+    const res = await request(app())
+      .get(`/data/concerts/media/1/file?t=${t}`)
+      .set('Range', 'bytes=0-9')
+      .expect(206);
+    expect(res.headers['content-range']).toMatch(/^bytes 0-9\//);
+  });
+});
+
+describe('GET /media/:id/thumb', () => {
+  it('generates the thumbnail on a cache miss rather than 404ing', async () => {
+    // The cache directory is safe to delete at any time precisely because of
+    // this. It is also what lets the upload skip thumbnails on failure.
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .field('band_id', '92')
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(201);
+
+    const created = prisma.concertMedia.create.mock.calls[0][0].data;
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      id: 1, kind: 'PHOTO', sha256: created.sha256, filename: 'IMG_1.jpg',
+      rel_path: created.rel_path,
+      attendance_rel: { wishlist_rel: { user_id: 'user-1' } },
+    }));
+
+    const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
+    const res = await request(app()).get(`/data/concerts/media/1/thumb?t=${t}`).expect(200);
+    expect(res.headers['content-type']).toMatch(/image\/webp/);
   });
 });

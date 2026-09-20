@@ -29,7 +29,7 @@ const {
 const { kindForMime, MAX_FILE_BYTES } = require('../../utils/mediaTypes');
 const { storePoster, ensureThumb } = require('../../utils/mediaThumbs');
 const { bandMediaOverview } = require('../../utils/mediaOverview');
-const { signMediaToken, mediaUrls } = require('../../utils/mediaTokens');
+const { signMediaToken, verifyMediaToken, mediaUrls } = require('../../utils/mediaTokens');
 
 const router = express.Router();
 
@@ -559,5 +559,66 @@ router.delete(
     }
   },
 );
+
+/**
+ * The two routes that serve bytes.
+ *
+ * Deliberately no `auth` middleware. An <img src> and a <video src> issue their
+ * own requests and cannot attach an Authorization header, so these authenticate
+ * on the signed token in the query string instead. The token carries the media
+ * id, so one valid URL unlocks one file and not the archive.
+ *
+ * res.sendFile goes through `send`, which already implements Range and
+ * conditional gets. That is the whole of video seeking support.
+ */
+async function serveMedia(req, res, which) {
+  try {
+    const mediaId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(mediaId)) return res.status(400).end();
+
+    const verdict = verifyMediaToken(req.query.t, { mediaId });
+    if (!verdict.ok) {
+      console.warn(`[media] refused ${mediaId}: ${verdict.reason}`);
+      return res.status(401).end();
+    }
+
+    const row = await prisma.concertMedia.findUnique({
+      where: { id: mediaId },
+      include: { attendance_rel: { include: { wishlist_rel: { select: { user_id: true } } } } },
+    });
+    if (!row) return res.status(404).end();
+    // Ownership is re-checked against the database, not taken from the token.
+    // A token stays valid for six hours, and the file may have changed hands or
+    // been detached in that time.
+    if (row.attendance_rel.wishlist_rel.user_id !== verdict.userId) return res.status(403).end();
+
+    let absPath;
+    if (which === 'thumb') {
+      try {
+        absPath = await ensureThumb({
+          absPath: resolveArchivePath(row.rel_path), kind: row.kind,
+          sha256: row.sha256, relPath: row.rel_path,
+        });
+      } catch {
+        // A video whose poster extraction failed in the browser has none, and
+        // nothing here can decode one. 404 so the grid draws its placeholder
+        // rather than retrying an image that is never coming.
+        return res.status(404).end();
+      }
+    } else {
+      absPath = resolveArchivePath(row.rel_path);
+    }
+
+    // Immutable: both paths are keyed by content that never changes in place.
+    // A replaced photo is a new row with a new id.
+    res.set('Cache-Control', 'private, max-age=31536000, immutable');
+    return res.sendFile(absPath);
+  } catch (err) {
+    return fail(res, err, { context: `GET /media/:id/${which}` });
+  }
+}
+
+router.get('/media/:id/file', (req, res) => serveMedia(req, res, 'file'));
+router.get('/media/:id/thumb', (req, res) => serveMedia(req, res, 'thumb'));
 
 module.exports = router;
