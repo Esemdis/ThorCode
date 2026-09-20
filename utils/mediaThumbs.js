@@ -23,6 +23,7 @@
 
 const { mkdir, rename, unlink, access } = require('node:fs/promises');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 const sharp = require('sharp');
 const { thumbPath, thumbCacheRoot, posterPath } = require('./mediaPaths');
 
@@ -34,9 +35,14 @@ const exists = (p) => access(p).then(() => true, () => false);
 
 // Written to a temp name and renamed, for the same reason the sidecar is: a
 // half-written image at the final path would be served forever, because neither
-// the cache nor the poster folder re-examines a path it already has.
+// the cache nor the poster folder re-examines a path it already has. The pid
+// alone is not enough to make the temp name unique: a retrying upload client
+// on a flaky home connection can produce two concurrent calls for the same
+// key from the same process, and a shared temp path means the loser's rename
+// throws ENOENT after the winner already moved it. The random nonce is what
+// keeps two concurrent writes of the same key from colliding on one temp path.
 async function writeWebp(bufferOrPath, target) {
-  const temp = `${target}.${process.pid}.tmp`;
+  const temp = `${target}.${process.pid}.${randomUUID()}.tmp`;
   await mkdir(path.dirname(target), { recursive: true });
   try {
     await sharp(bufferOrPath)
