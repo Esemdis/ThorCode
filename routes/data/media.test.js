@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
-import { mkdtemp, readFile, readdir } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
@@ -393,11 +393,20 @@ describe('GET /bands/:bandId/media', () => {
   });
 
   it('returns the stats, the rail and the files for the caller only', async () => {
-    prisma.concertAttendance.findMany = vi.fn(async ({ where }) => {
+    prisma.concertAttendance.findMany = vi.fn(async ({ where, select }) => {
       // The route must scope by the caller's own wishlist. A band's shows are
       // not global information: Band rows are shared across every account.
       expect(where.wishlist_rel.user_id).toBe('user-1');
-      return [{ id: 1, concert_rel: { id: 8417, concert_date: new Date('2026-06-12T19:00:00Z'), venue: 'Sentrum Scene', city: 'Oslo' } }];
+      // Asserted on the query itself, not just the fixture below: this fake
+      // client returns whatever a test hands it regardless of `select`, so
+      // checking only the response would keep passing even if the real
+      // query stopped asking for `bands` — the rail needs it for the tagging
+      // picker's choices, and only the query shape can prove it is asked for.
+      expect(select.concert_rel.select.bands).toBeTruthy();
+      return [{ id: 1, concert_rel: {
+        id: 8417, concert_date: new Date('2026-06-12T19:00:00Z'), venue: 'Sentrum Scene', city: 'Oslo',
+        bands: [{ band_rel: { id: 92, name: 'Gojira' } }],
+      } }];
     });
     prisma.concertMedia.findMany = vi.fn(async () => [
       { id: 5, attendance_id: 1, band_id: 92, filename: 'IMG_1.jpg', kind: 'PHOTO',
@@ -410,8 +419,42 @@ describe('GET /bands/:bandId/media', () => {
       .expect(200);
 
     expect(res.body.data.stats).toMatchObject({ files: 1, shows_attended: 1, shows_with_media: 1 });
-    expect(res.body.data.rail[0]).toMatchObject({ attendance_id: 1, count: 1 });
+    // The bill travels on the rail row too: it is what a tagging picker in
+    // the band view would offer, and deleting the query's `bands` select
+    // should fail this, not just look wrong in a screenshot.
+    expect(res.body.data.rail[0]).toMatchObject({ attendance_id: 1, count: 1, bands: [{ id: 92, name: 'Gojira' }] });
     expect(res.body.data.files[0].thumb).toMatch(/^https:\/\/api\.example\.com\/data\/concerts\/media\/5\/thumb\?t=/);
+  });
+
+  it('does not let an unconfirmed show date corrupt the year stats', async () => {
+    // dateOnly(null) does not throw — it slices a Unix-epoch string and
+    // returns '1970-01-01' — so a TBD concert_date would otherwise drag
+    // first_year to 1970 and inflate per_year into a decades-long gap-filled
+    // series. Probed directly against the unfiltered route: this exact
+    // fixture produced first_year: 1970 and a 57-entry per_year.
+    prisma.concertAttendance.findMany = vi.fn(async () => [
+      { id: 1, concert_rel: { id: 8417, concert_date: null, venue: 'TBD', city: 'Oslo', bands: [] } },
+      { id: 2, concert_rel: {
+        id: 8418, concert_date: new Date('2026-06-12T19:00:00Z'), venue: 'Sentrum Scene', city: 'Oslo',
+        bands: [{ band_rel: { id: 92, name: 'Gojira' } }],
+      } },
+    ]);
+    // A photo tied to the dateless attendance too, so the fix is proven by
+    // the whole show dropping out cleanly rather than by there being nothing
+    // to drop.
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 9, attendance_id: 1, band_id: 92, filename: 'ghost.jpg', kind: 'PHOTO', sha256: 'h9' },
+      { id: 5, attendance_id: 2, band_id: 92, filename: 'IMG_1.jpg', kind: 'PHOTO', sha256: 'h5' },
+    ]);
+
+    const res = await request(app())
+      .get('/data/concerts/bands/92/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(res.body.data.stats).toMatchObject({ first_year: 2026, last_year: 2026 });
+    expect(res.body.data.rail).toHaveLength(1);
+    expect(res.body.data.files).toHaveLength(1);
   });
 
   it('returns an empty overview for a band with no attended shows', async () => {
@@ -466,9 +509,20 @@ describe('PATCH /media', () => {
   it('sets the band on several files at once', async () => {
     // The grid multi-selects, so this takes a list. One request per tile would
     // be forty requests to fix a festival import.
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    await mkdir(dir, { recursive: true });
+
     prisma.concertMedia.findMany = vi.fn(async () => [
       { id: 5, attendance_id: 1, rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_1.jpg', filename: 'IMG_1.jpg',
-        attendance_rel: { wishlist_rel: { user_id: 'user-1' }, concert_rel: { bands: [{ band_rel: { id: 92, name: 'Gojira' } }] } } },
+        kind: 'PHOTO', sha256: 'h5', bytes: 1234, width: 4080, height: 3072, duration_ms: null,
+        caption: null, taken_at: null, band_id: null,
+        attendance_rel: {
+          wishlist_rel: { user_id: 'user-1' },
+          concert_rel: {
+            id: 8417, concert_date: new Date('2026-06-12T19:00:00Z'), venue: 'Sentrum Scene', city: 'Oslo', country: 'NO',
+            bands: [{ band_rel: { id: 92, name: 'Gojira' } }],
+          },
+        } },
     ]);
     prisma.concertMedia.update = vi.fn(async ({ data }) => ({ id: 5, ...data }));
     prisma.$transaction = vi.fn(async (fns) => Promise.all(fns.map((f) => (typeof f === 'function' ? f() : f))));
@@ -480,6 +534,8 @@ describe('PATCH /media', () => {
       .expect(200);
 
     expect(prisma.concertMedia.update).toHaveBeenCalled();
+    const sidecar = JSON.parse(await readFile(join(dir, 'concert-media.json'), 'utf8'));
+    expect(sidecar.files[0]).toMatchObject({ band_id: 92, band_name: 'Gojira', caption: 'stage dive' });
   });
 
   it('refuses to touch a file that is not the caller\'s', async () => {
@@ -492,6 +548,153 @@ describe('PATCH /media', () => {
       .set(...authHeader({ id: 'user-1' }))
       .send({ ids: [5], caption: 'nope' })
       .expect(403);
+  });
+
+  it('refuses everything when only the second of two rows belongs to someone else', async () => {
+    // A `rows.some(...)` check over the whole list looks the same as a
+    // first-row-only check when every test sends one row. This sends two, with
+    // the offending row second, so a check that only inspects rows[0] would
+    // wrongly let this through and start updating the caller's own file.
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 5, attendance_id: 1, rel_path: 'user-1/showA/IMG_1.jpg', filename: 'IMG_1.jpg',
+        attendance_rel: { wishlist_rel: { user_id: 'user-1' }, concert_rel: { bands: [{ band_rel: { id: 92, name: 'Gojira' } }] } } },
+      { id: 6, attendance_id: 2, rel_path: 'someone-else/showB/IMG_2.jpg', filename: 'IMG_2.jpg',
+        attendance_rel: { wishlist_rel: { user_id: 'someone-else' }, concert_rel: { bands: [] } } },
+    ]);
+    prisma.concertMedia.update = vi.fn(async ({ data }) => ({ id: 5, ...data }));
+
+    await request(app())
+      .patch('/data/concerts/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ ids: [5, 6], caption: 'nope' })
+      .expect(403);
+
+    expect(prisma.concertMedia.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses a band that is only on the first of two selected shows\' bills, and updates neither', async () => {
+    // Same shape of gap as the ownership check above: a `rows.every(...)`
+    // that only ever sees one row in the tests would let a bill mismatch on
+    // the second show through silently.
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 5, attendance_id: 1, rel_path: 'user-1/showA/IMG_1.jpg', filename: 'IMG_1.jpg',
+        attendance_rel: { wishlist_rel: { user_id: 'user-1' }, concert_rel: { bands: [{ band_rel: { id: 92, name: 'Gojira' } }] } } },
+      { id: 6, attendance_id: 2, rel_path: 'user-1/showB/IMG_2.jpg', filename: 'IMG_2.jpg',
+        attendance_rel: { wishlist_rel: { user_id: 'user-1' }, concert_rel: { bands: [{ band_rel: { id: 7, name: 'Mastodon' } }] } } },
+    ]);
+    prisma.concertMedia.update = vi.fn(async ({ data }) => ({ id: 5, ...data }));
+
+    await request(app())
+      .patch('/data/concerts/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ ids: [5, 6], band_id: 92 })
+      .expect(400);
+
+    expect(prisma.concertMedia.update).not.toHaveBeenCalled();
+  });
+
+  it('treats a repeated id as one file, not a missing one', async () => {
+    // {ids:[5,5]} asks for the same file twice. Comparing the raw request
+    // array's length against the rows Postgres returned for the deduplicated
+    // id set would read the repeat as "one id came back missing" and 404 a
+    // file that exists and belongs to the caller.
+    const dir = join(root, 'archive', 'user-1', 'showA');
+    await mkdir(dir, { recursive: true });
+
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 5, attendance_id: 1, rel_path: 'user-1/showA/IMG_1.jpg', filename: 'IMG_1.jpg',
+        kind: 'PHOTO', sha256: 'h5', bytes: 1234, width: 4080, height: 3072, duration_ms: null,
+        caption: null, taken_at: null, band_id: null,
+        attendance_rel: {
+          wishlist_rel: { user_id: 'user-1' },
+          concert_rel: {
+            id: 8417, concert_date: new Date('2026-06-12T19:00:00Z'), venue: 'Sentrum Scene', city: 'Oslo', country: 'NO',
+            bands: [{ band_rel: { id: 92, name: 'Gojira' } }],
+          },
+        } },
+    ]);
+    prisma.concertMedia.update = vi.fn(async ({ data }) => ({ id: 5, ...data }));
+    prisma.$transaction = vi.fn(async (fns) => Promise.all(fns.map((f) => (typeof f === 'function' ? f() : f))));
+
+    const res = await request(app())
+      .patch('/data/concerts/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ ids: [5, 5], caption: 'twice' })
+      .expect(200);
+
+    expect(res.body.data.updated).toBe(1);
+    expect(prisma.concertMedia.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates the sidecar when a retag lands on a show that never got one', async () => {
+    // Postgres is explicitly a disposable index rebuilt from sidecars, so a
+    // tag that reaches only the database is a tag that vanishes the next time
+    // anything rebuilds. Probed directly against the pre-fix route: this
+    // fixture returned 200 with no concert-media.json ever written.
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    await mkdir(dir, { recursive: true });
+
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 5, attendance_id: 1, rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_1.jpg', filename: 'IMG_1.jpg',
+        kind: 'PHOTO', sha256: 'h5', bytes: 1234, width: 4080, height: 3072, duration_ms: null,
+        caption: null, taken_at: null, band_id: null,
+        attendance_rel: {
+          wishlist_rel: { user_id: 'user-1' },
+          concert_rel: {
+            id: 8417, concert_date: new Date('2026-06-12T19:00:00Z'), venue: 'Sentrum Scene', city: 'Oslo', country: 'NO',
+            bands: [{ band_rel: { id: 92, name: 'Gojira' } }],
+          },
+        } },
+    ]);
+    prisma.concertMedia.update = vi.fn(async ({ data }) => ({ id: 5, ...data }));
+    prisma.$transaction = vi.fn(async (fns) => Promise.all(fns.map((f) => (typeof f === 'function' ? f() : f))));
+
+    await request(app())
+      .patch('/data/concerts/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ ids: [5], band_id: 92 })
+      .expect(200);
+
+    const sidecar = JSON.parse(await readFile(join(dir, 'concert-media.json'), 'utf8'));
+    expect(sidecar).toMatchObject({ concert_id: 8417, user_id: 'user-1' });
+    expect(sidecar.files[0]).toMatchObject({ name: 'IMG_1.jpg', band_id: 92, band_name: 'Gojira' });
+  });
+
+  it('adds a sidecar entry built from the database row when the sidecar exists but never recorded this file', async () => {
+    // Same failure, narrower trigger: the sidecar file is there, but this
+    // particular filename has no entry in it. Probed directly: the pre-fix
+    // route silently skipped this row too and still answered 200.
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'concert-media.json'), JSON.stringify({
+      version: 1, concert_id: 8417, user_id: 'user-1',
+      concert: { date: '2026-06-12', venue: 'Sentrum Scene', city: 'Oslo', country: 'NO' },
+      files: [],
+    }));
+
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 5, attendance_id: 1, rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_1.jpg', filename: 'IMG_1.jpg',
+        kind: 'PHOTO', sha256: 'h5', bytes: 1234, width: 4080, height: 3072, duration_ms: null,
+        caption: null, taken_at: null, band_id: null,
+        attendance_rel: {
+          wishlist_rel: { user_id: 'user-1' },
+          concert_rel: {
+            id: 8417, concert_date: new Date('2026-06-12T19:00:00Z'), venue: 'Sentrum Scene', city: 'Oslo', country: 'NO',
+            bands: [{ band_rel: { id: 92, name: 'Gojira' } }],
+          },
+        } },
+    ]);
+    prisma.concertMedia.update = vi.fn(async ({ data }) => ({ id: 5, ...data }));
+    prisma.$transaction = vi.fn(async (fns) => Promise.all(fns.map((f) => (typeof f === 'function' ? f() : f))));
+
+    await request(app())
+      .patch('/data/concerts/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ ids: [5], band_id: 92 })
+      .expect(200);
+
+    const sidecar = JSON.parse(await readFile(join(dir, 'concert-media.json'), 'utf8'));
+    expect(sidecar.files[0]).toMatchObject({ name: 'IMG_1.jpg', band_id: 92, band_name: 'Gojira', sha256: 'h5' });
   });
 });
 
@@ -522,5 +725,39 @@ describe('DELETE /media/:id', () => {
     expect(await readdir(dir)).not.toContain('IMG_1.jpg');
     const sidecar = JSON.parse(await readFile(join(dir, 'concert-media.json'), 'utf8'));
     expect(sidecar.files).toHaveLength(0);
+  });
+
+  it('removes a video\'s poster frame along with the video', async () => {
+    // The poster is not derived from the video — there is no ffmpeg here to
+    // decode one — so it lives in the archive beside it and does not get
+    // regenerated. Left behind, it is a frame from a video that no longer
+    // exists, syncing to Drive forever with nothing to point it at.
+    const poster = await (await import('sharp')).default(
+      { create: { width: 1920, height: 1080, channels: 3, background: '#222' } }).jpeg().toBuffer();
+
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .field('band_id', '92')
+      .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
+      .attach('posters', poster, { filename: 'VID_1.mp4.webp', contentType: 'image/webp' })
+      .expect(201);
+
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    expect(await readdir(join(dir, '.posters'))).toContain('VID_1.mp4.webp');
+
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      id: 1, attendance_id: 1, filename: 'VID_1.mp4', kind: 'VIDEO',
+      rel_path: 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4',
+      attendance_rel: { wishlist_rel: { user_id: 'user-1' } },
+    }));
+    prisma.concertMedia.delete = vi.fn(async () => ({ id: 1 }));
+
+    await request(app())
+      .delete('/data/concerts/media/1')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(await readdir(join(dir, '.posters'))).not.toContain('VID_1.mp4.webp');
   });
 });

@@ -21,7 +21,7 @@ const roleCheck = require('../../middlewares/roleCheck');
 const prisma = require('../../prisma/client');
 const { fail, badRequest, notFound, forbidden, success } = require('../../utils/apiResponse');
 const {
-  showFolderRelPath, uniqueFilename, resolveArchivePath, slugSegment,
+  showFolderRelPath, uniqueFilename, resolveArchivePath, slugSegment, posterPath,
 } = require('../../utils/mediaPaths');
 const {
   emptySidecar, upsertFile, removeFile, readSidecar, writeSidecar,
@@ -334,7 +334,14 @@ router.get(
       // Scoped to the caller's own wishlist. Band rows are shared across every
       // account in this schema, so an unscoped query here would list other
       // people's shows.
-      const attendances = await prisma.concertAttendance.findMany({
+      // A concert with no confirmed date (concert_date is nullable) has no
+      // calendar day to file it under. dateOnly(null) does not throw — it
+      // slices a Unix-epoch string and returns '1970-01-01' — so a dateless
+      // show would otherwise land silently in 1970, dragging first_year down
+      // and inflating per_year into a 57-entry gap-filled series. Excluded
+      // here rather than patched in the date math, since a TBD show has
+      // nothing honest to put in a sparkline keyed by year either way.
+      const attendances = (await prisma.concertAttendance.findMany({
         where: {
           wishlist_rel: { user_id: req.user.id },
           concert_rel: { bands: { some: { band: bandId } } },
@@ -348,7 +355,7 @@ router.get(
             },
           },
         },
-      });
+      })).filter((a) => a.concert_rel.concert_date != null);
 
       const media = attendances.length
         ? await prisma.concertMedia.findMany({
@@ -364,9 +371,12 @@ router.get(
             date: dateOnly(a.concert_rel.concert_date),
             venue: a.concert_rel.venue,
             city: a.concert_rel.city,
-            // Defensive against a select that omits the bill (as the band-view
-            // query does not need it): an absent list reads as "no bands",
-            // never as a crash the caller has to work around.
+            // Belt-and-suspenders, not load-bearing: the select two lines up
+            // always asks for `bands`, and Prisma always returns a selected
+            // relation, so this can't be empty against the real database.
+            // It only guards a caller (or a test's hand-built row) that
+            // constructs this shape without it — and the rail below does
+            // need the bill, to offer the tagging picker's choices.
             bands: (a.concert_rel.bands ?? []).map((b) => b.band_rel),
           },
         })),
@@ -395,7 +405,10 @@ router.patch(
       const errors = validationResult(req);
       if (!errors.isEmpty()) return badRequest(res, 'Validation failed');
 
-      const ids = req.body.ids.map((n) => parseInt(n, 10));
+      // Deduped before the count check below: {ids:[5,5]} is one file asked
+      // for twice, not two files, and comparing against the raw array length
+      // would read the repeat as a missing row and 404 a perfectly good id.
+      const ids = [...new Set(req.body.ids.map((n) => parseInt(n, 10)))];
       const rows = await prisma.concertMedia.findMany({
         where: { id: { in: ids } },
         include: {
@@ -403,7 +416,10 @@ router.patch(
             include: {
               wishlist_rel: { select: { user_id: true } },
               concert_rel: {
-                select: { bands: { select: { band_rel: { select: { id: true, name: true } } } } },
+                select: {
+                  id: true, concert_date: true, venue: true, city: true, country: true,
+                  bands: { select: { band_rel: { select: { id: true, name: true } } } },
+                },
               },
             },
           },
@@ -433,27 +449,58 @@ router.patch(
       };
       if (!Object.keys(patch).length) return badRequest(res, 'Nothing to change');
 
+      // Postgres first here, sidecar second — the opposite order from DELETE
+      // below, and deliberately so, not an inconsistency. DELETE is
+      // irreversible: if its sidecar write failed after the file and the row
+      // were already gone, nothing could reconstruct either. A retag is not:
+      // if the sidecar write below fails after this transaction commits,
+      // Postgres says "tagged" and the sidecar still says the old value, and
+      // the next rebuild-from-sidecars simply reverts the tag to what the
+      // sidecar remembers. That is a lost edit the caller can redo by
+      // retrying the request, not a lost photo.
       await prisma.$transaction(rows.map((r) =>
         prisma.concertMedia.update({ where: { id: r.id }, data: patch })));
 
-      // The sidecar is the record of truth, so it is rewritten too, once per
-      // affected show rather than once per file.
+      const billName = (r, id) => (id == null ? null
+        : r.attendance_rel.concert_rel.bands.find((b) => b.band_rel.id === id)?.band_rel.name ?? null);
+
+      // The sidecar is the record of truth — Postgres is rebuilt from it, never
+      // the other way round — so a tag that reaches the database but not here
+      // is a tag that silently vanishes on the next rebuild. Rewritten once per
+      // affected show rather than once per file, and made from scratch (an
+      // absent sidecar file, or a sidecar with no entry yet for this filename)
+      // rather than skipped, because a skip here is exactly the kind of write
+      // that looks like it worked and was never real.
       const byDir = new Map();
       for (const r of rows) byDir.set(path.posix.dirname(r.rel_path), []);
       for (const r of rows) byDir.get(path.posix.dirname(r.rel_path)).push(r);
 
       for (const [relDir, dirRows] of byDir) {
         const absDir = resolveArchivePath(relDir);
-        let sidecar = await readSidecar(absDir);
-        if (!sidecar) continue;
+        const concert = dirRows[0].attendance_rel.concert_rel;
+        let sidecar = await readSidecar(absDir) ?? emptySidecar({
+          concertId: concert.id,
+          userId: dirRows[0].attendance_rel.wishlist_rel.user_id,
+          concert: {
+            date: dateOnly(concert.concert_date), venue: concert.venue,
+            city: concert.city, country: concert.country,
+          },
+        });
         for (const r of dirRows) {
-          const entry = sidecar.files.find((f) => f.name === r.filename);
-          if (!entry) continue;
-          const bandName = bandId == null ? null
-            : r.attendance_rel.concert_rel.bands.find((b) => b.band_rel.id === bandId)?.band_rel.name;
+          // Built from the database row when the sidecar never recorded this
+          // file: everything a fresh entry needs — checksum, dimensions,
+          // whatever tag it already carried — is already on the row that the
+          // upload route itself wrote there.
+          const entry = sidecar.files.find((f) => f.name === r.filename) ?? {
+            name: r.filename, kind: r.kind,
+            band_id: r.band_id, band_name: billName(r, r.band_id),
+            caption: r.caption ?? '', sha256: r.sha256, bytes: r.bytes,
+            width: r.width, height: r.height, duration_ms: r.duration_ms,
+            taken_at: r.taken_at,
+          };
           sidecar = upsertFile(sidecar, {
             ...entry,
-            ...(bandId !== undefined && { band_id: bandId, band_name: bandName }),
+            ...(bandId !== undefined && { band_id: bandId, band_name: billName(r, bandId) }),
             ...(req.body.caption !== undefined && { caption: req.body.caption || '' }),
           });
         }
@@ -489,6 +536,17 @@ router.delete(
         // Already gone is the outcome we wanted. Anything else is not.
         if (err.code !== 'ENOENT') throw err;
       });
+
+      // A video's poster lives beside it in the archive rather than in the
+      // derived-thumbnail cache, because there is no ffmpeg here to make
+      // another one from the video. Left behind, it is a frame from a video
+      // that no longer exists, syncing to Drive forever with nothing to point
+      // it at.
+      if (row.kind === 'VIDEO') {
+        await unlink(posterPath(row.rel_path)).catch((err) => {
+          if (err.code !== 'ENOENT') throw err;
+        });
+      }
 
       const absDir = path.dirname(absPath);
       const sidecar = await readSidecar(absDir);
