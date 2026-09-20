@@ -3,7 +3,7 @@ import request from 'supertest';
 import { mkdtemp, readFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildApp, authHeader, installFakePrisma } from '../../test/routeApp.js';
+import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 
 let root;
 
@@ -58,6 +58,15 @@ const jpeg = () => Buffer.from(
   'AAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==', 'base64');
 
 describe('POST /attendances/:id/media', () => {
+  it('exposes exactly the expected route, with auth, role check and validation in front of it', () => {
+    // The handler count is part of this on purpose: dropping `auth` or
+    // `roleCheck` while touching this file would shrink the number silently
+    // otherwise.
+    expect(routeManifest(router)).toEqual([
+      'POST /attendances/:attendanceId/media [5]',
+    ]);
+  });
+
   it('rejects an unauthenticated upload', async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')
@@ -251,5 +260,123 @@ describe('POST /attendances/:id/media', () => {
       .expect(201);
 
     expect(prisma.concertMedia.create).toHaveBeenCalledTimes(2);
+  });
+
+  it('suffixes the second of two identically-named files in the same request', async () => {
+    // Pinning this because it is easy to get backwards: `taken` has to grow as
+    // the batch is processed, not just be seeded once from what already
+    // existed before the request arrived.
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .field('band_id', '92')
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(201);
+
+    expect(prisma.concertMedia.create.mock.calls[0][0].data.filename).toBe('IMG_1.jpg');
+    expect(prisma.concertMedia.create.mock.calls[1][0].data.filename).toBe('IMG_1 (2).jpg');
+
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    const files = await readdir(dir);
+    expect(files).toContain('IMG_1.jpg');
+    expect(files).toContain('IMG_1 (2).jpg');
+  });
+
+  it('leaves the archive untouched when a file partway through the batch is unsupported', async () => {
+    // Probed directly: before the batch was validated up front, a bad third
+    // file of four still left the first two renamed into the show folder and
+    // inserted into Postgres, because the loop only discovered the bad type
+    // when it got there. Validating every file's type before the first rename
+    // is what keeps a rejected batch from partially landing.
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .field('band_id', '92')
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .attach('files', jpeg(), 'IMG_2.jpg')
+      .attach('files', Buffer.from('pdf'), { filename: 'bad.pdf', contentType: 'application/pdf' })
+      .attach('files', jpeg(), 'IMG_4.jpg')
+      .expect(400);
+
+    expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+    // The show folder is never created for a batch that is rejected outright.
+    await expect(readdir(join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira')))
+      .rejects.toThrow();
+  });
+
+  it('refuses a request whose meta field is not valid JSON, rather than 500ing on it', async () => {
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .field('band_id', '92')
+      .field('meta', '{not json')
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(400);
+
+    expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+  });
+
+  it('keeps the sidecar in step with disk when a later file in the batch fails to insert', async () => {
+    // Probed directly: forcing the second file's insert to throw used to leave
+    // its bytes renamed into the show folder and the first file's row in
+    // Postgres with no sidecar written at all, because writeSidecar only ran
+    // after the whole loop finished. A sidecar-trusting rebuild would have
+    // silently dropped the first file and never known about the second.
+    prisma.concertMedia.create
+      .mockImplementationOnce(async ({ data }) => ({ id: 1, ...data }))
+      .mockImplementationOnce(async () => { throw new Error('insert failed'); });
+
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .field('band_id', '92')
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .attach('files', jpeg(), 'IMG_2.jpg')
+      .expect(500);
+
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    const files = await readdir(dir);
+    expect(files).toContain('IMG_1.jpg');
+    expect(files).not.toContain('IMG_2.jpg');
+
+    const sidecar = JSON.parse(await readFile(join(dir, 'concert-media.json'), 'utf8'));
+    expect(sidecar.files.map((f) => f.name)).toEqual(['IMG_1.jpg']);
+  });
+
+  it('slugs a filename with characters SMB rejects before writing it', async () => {
+    // The archive share is mounted over SMB, which is stricter than ext4 about
+    // path characters. Every other path segment already goes through
+    // slugSegment; an unslugged browser filename would write cleanly in this
+    // suite's tmp dir and then fail on the real mount, taking the batch with it.
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .field('band_id', '92')
+      .attach('files', jpeg(), 'a:b?c*.jpg')
+      .expect(201);
+
+    const data = prisma.concertMedia.create.mock.calls[0][0].data;
+    expect(data.filename).toBe('a-b-c-.jpg');
+    expect(data.rel_path.endsWith('a-b-c-.jpg')).toBe(true);
+
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    expect(await readdir(dir)).toContain('a-b-c-.jpg');
+  });
+
+  it('clamps a client-supplied dimension to what a 32-bit Postgres column can hold', async () => {
+    // asInt already refused a negative or non-numeric value; this pins the
+    // missing half of that check. Without it, a value like 9e12 sails through
+    // and Postgres throws at insert time, turning a bad number into a 500 with
+    // the file already renamed onto disk.
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .field('band_id', '92')
+      .field('meta', JSON.stringify({ 'VID_1.mp4': { width: 9e12, duration_ms: 24000 } }))
+      .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
+      .expect(201);
+
+    expect(prisma.concertMedia.create.mock.calls[0][0].data.width).toBe(2147483647);
   });
 });

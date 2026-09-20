@@ -1,10 +1,11 @@
 /**
- * Photos and video from shows you went to.
+ * Upload photos and video from a show you attended.
  *
- * Two of these endpoints serve bytes and do not use the JWT middleware: an
- * <img> or <video> tag issues its own request and sends no Authorization
- * header, so those carry a signed token in the query string instead. See
- * utils/mediaTokens.js.
+ * One route: multipart files land in the archive under the caller's own
+ * subtree, get indexed in Postgres, and are recorded in the show's sidecar.
+ * No band is attached unless the caller sends one — tagging is a separate
+ * bulk sweep from a later view, because a multi-band bill can't be honestly
+ * described by one band picked before the files are even looked at.
  */
 
 const express = require('express');
@@ -18,9 +19,9 @@ const { param, validationResult } = require('express-validator');
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
 const prisma = require('../../prisma/client');
-const { fail, badRequest, notFound, forbidden } = require('../../utils/apiResponse');
+const { fail, badRequest, notFound, forbidden, success } = require('../../utils/apiResponse');
 const {
-  showFolderRelPath, uniqueFilename, resolveArchivePath,
+  showFolderRelPath, uniqueFilename, resolveArchivePath, slugSegment,
 } = require('../../utils/mediaPaths');
 const {
   emptySidecar, upsertFile, readSidecar, writeSidecar,
@@ -62,6 +63,29 @@ const dateOnly = (d) => new Date(d).toISOString().slice(0, 10);
 
 const headlinerOf = (concert) => concert.bands?.[0]?.band_rel?.name ?? '';
 
+// width/height/duration_ms are a 32-bit Postgres Int column. Bounding sign and
+// finiteness is not enough: a client-supplied 9e12 passes both checks and then
+// fails at insert time, turning a bad number into a 500 with the file already
+// renamed onto disk. Clamping here means a bad value is merely wrong, not fatal.
+const INT32_MAX = 2147483647;
+const asInt = (v) => {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.min(Math.round(n), INT32_MAX);
+};
+
+// SMB — the protocol the archive share is actually mounted over — rejects
+// several characters ext4 would allow, which is why every other path segment
+// in this archive already goes through slugSegment. A browser-supplied
+// filename is exactly as untrusted as a venue name and gets the same
+// treatment before it becomes one. The extension is kept as-is and out of the
+// slug so MAX_SEGMENT truncating a long stem can never eat into it.
+function slugFilename(originalName) {
+  const ext = path.extname(originalName);
+  const stem = originalName.slice(0, originalName.length - ext.length);
+  return `${slugSegment(stem)}${ext}`;
+}
+
 /**
  * The caller's own attendance, with everything the archive path needs.
  * Returns null rather than throwing so each route decides the status code.
@@ -100,15 +124,28 @@ router.post(
       const { row, owned } = await ownAttendance(attendanceId, req.user.id);
       if (!row) { await cleanup(); return notFound(res, 'Attendance not found'); }
       if (!owned) { await cleanup(); return forbidden(res, 'Forbidden'); }
+
       const incoming = req.files?.files ?? [];
       if (!incoming.length) { await cleanup(); return badRequest(res, 'No files uploaded'); }
 
-      // Posters are named for the video they belong to, so a batch mixing
-      // photos and video pairs them up without depending on array order.
-      const posters = new Map();
-      for (const poster of req.files?.posters ?? []) {
-        posters.set(poster.originalname.replace(/\.webp$/, ''), { buffer: await readFile(poster.path) });
-        await unlink(poster.path).catch(() => {});
+      // The whole batch is validated before the first rename or insert. A
+      // batch is all-or-nothing: if the third of four files is unsupported,
+      // the first two must never have moved into the archive or gained a
+      // Postgres row, or a retry re-uploads them as "(2)" duplicates of
+      // themselves. See task-9-report.md for the probe that found otherwise.
+      for (const file of incoming) {
+        if (!kindForMime(file.mimetype)) {
+          await cleanup();
+          return badRequest(res, `${file.originalname}: unsupported type`);
+        }
+      }
+
+      let meta;
+      try {
+        meta = JSON.parse(req.body.meta ?? '{}');
+      } catch {
+        await cleanup();
+        return badRequest(res, 'meta is not valid JSON');
       }
 
       const bandId = req.body.band_id ? parseInt(req.body.band_id, 10) : null;
@@ -118,6 +155,14 @@ router.post(
       if (bandId !== null && !onBill.has(bandId)) {
         await cleanup();
         return badRequest(res, 'That band is not on this bill');
+      }
+
+      // Posters are named for the video they belong to, so a batch mixing
+      // photos and video pairs them up without depending on array order.
+      const posters = new Map();
+      for (const poster of req.files?.posters ?? []) {
+        posters.set(poster.originalname.replace(/\.webp$/, ''), { buffer: await readFile(poster.path) });
+        await unlink(poster.path).catch(() => {});
       }
 
       const show = {
@@ -145,59 +190,62 @@ router.post(
 
       const created = [];
       const pairedPosters = [];
-      for (const file of incoming) {
-        const kind = kindForMime(file.mimetype);
-        // A file still in the batch when this one is refused would otherwise
-        // sit in MEDIA_ROOT/incoming forever: the loop stops here and nothing
-        // downstream would ever unlink it.
-        if (!kind) { await cleanup(); return badRequest(res, `${file.originalname}: unsupported type`); }
+      try {
+        for (const file of incoming) {
+          const kind = kindForMime(file.mimetype);
+          const fileMeta = meta[file.originalname] ?? {};
+          const probe = {
+            width: asInt(fileMeta.width),
+            height: asInt(fileMeta.height),
+            duration_ms: kind === 'VIDEO' ? asInt(fileMeta.duration_ms) : null,
+          };
 
-        // Dimensions and duration come from the browser, which read them off
-        // the same video element it pulled the poster frame from. There is no
-        // ffprobe here to check them against, and for a single-user archive a
-        // client that lies only misinforms itself. Parsed defensively all the
-        // same, so a malformed field cannot reach the database.
-        const meta = JSON.parse(req.body.meta ?? '{}')[file.originalname] ?? {};
-        const asInt = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.round(Number(v)) : null);
-        const probe = {
-          width: asInt(meta.width),
-          height: asInt(meta.height),
-          duration_ms: kind === 'VIDEO' ? asInt(meta.duration_ms) : null,
-        };
+          const filename = uniqueFilename([...taken], slugFilename(file.originalname));
+          taken.add(filename);
+          const absPath = path.join(absDir, filename);
+          await rename(file.path, absPath);
 
-        const filename = uniqueFilename([...taken], file.originalname);
-        taken.add(filename);
-        const absPath = path.join(absDir, filename);
-        await rename(file.path, absPath);
+          try {
+            const sha256 = await sha256File(absPath);
+            const { size } = await stat(absPath);
 
-        const sha256 = await sha256File(absPath);
-        const { size } = await stat(absPath);
+            const entry = {
+              name: filename, kind, band_id: bandId, band_name: bandId ? onBill.get(bandId) : null,
+              caption: '', sha256, bytes: size,
+              width: probe.width, height: probe.height,
+              duration_ms: probe.duration_ms, taken_at: null,
+            };
 
-        const entry = {
-          name: filename, kind, band_id: bandId, band_name: bandId ? onBill.get(bandId) : null,
-          caption: '', sha256, bytes: size,
-          width: probe.width, height: probe.height,
-          duration_ms: probe.duration_ms, taken_at: null,
-        };
-        sidecar = upsertFile(sidecar, entry);
-
-        // Paired by the name the browser sent, not the name we stored: a
-        // collision suffixes the video to 'VID_1 (2).mp4' while its poster is
-        // still keyed 'VID_1.mp4', and looking it up afterwards by the stored
-        // name would drop the poster without a word.
-        const mediaRow = await prisma.concertMedia.create({
-          data: {
-            attendance_id: attendanceId, band_id: bandId,
-            rel_path: path.posix.join(relDir, filename), filename,
-            kind, bytes: size, sha256,
-            width: probe.width, height: probe.height, duration_ms: probe.duration_ms,
-          },
-        });
-        created.push(mediaRow);
-        if (kind === 'VIDEO') pairedPosters.push([mediaRow, posters.get(file.originalname)]);
+            // Paired by the name the browser sent, not the name we stored: a
+            // collision suffixes the video to 'VID_1 (2).mp4' while its poster
+            // is still keyed 'VID_1.mp4', and looking it up afterwards by the
+            // stored name would drop the poster without a word.
+            const mediaRow = await prisma.concertMedia.create({
+              data: {
+                attendance_id: attendanceId, band_id: bandId,
+                rel_path: path.posix.join(relDir, filename), filename,
+                kind, bytes: size, sha256,
+                width: probe.width, height: probe.height, duration_ms: probe.duration_ms,
+              },
+            });
+            sidecar = upsertFile(sidecar, entry);
+            created.push(mediaRow);
+            if (kind === 'VIDEO') pairedPosters.push([mediaRow, posters.get(file.originalname)]);
+          } catch (err) {
+            // The Postgres row is what makes this file real. If inserting it
+            // fails, the bytes already renamed onto disk must not survive as
+            // an orphan with no row and no sidecar entry — exactly the drift a
+            // sidecar-trusting rebuild would never notice.
+            await unlink(absPath).catch(() => {});
+            throw err;
+          }
+        }
+      } finally {
+        // Written for whatever actually landed, even when the loop above threw
+        // partway through: disk, Postgres and the sidecar must agree at every
+        // exit, not only the one where every file made it.
+        if (created.length) await writeSidecar(absDir, sidecar);
       }
-
-      await writeSidecar(absDir, sidecar);
 
       // Posters are written before the response, not after: they arrived with
       // the request and cannot be recreated later, so losing one to a crash in
@@ -213,10 +261,11 @@ router.post(
         }
       }
 
+      success(res, 201, { created });
+
       // Photo thumbnails after the response, best effort. Twenty files should
       // not leave the browser waiting on image processing, and a missing photo
       // thumbnail is regenerated by the thumb route on first request anyway.
-      res.status(201).json({ success: true, data: { created } });
       for (const m of created.filter((r) => r.kind === 'PHOTO')) {
         ensureThumb({ absPath: resolveArchivePath(m.rel_path), kind: m.kind, sha256: m.sha256, relPath: m.rel_path })
           .catch((err) => console.error(`[media] thumbnail for ${m.id} failed`, err));
