@@ -573,8 +573,11 @@ router.delete(
  */
 async function serveMedia(req, res, which) {
   try {
+    // A plain parseInt accepts '1abc' as 1 and would serve media 1 under a
+    // path meant to 404. Not exploitable on its own — the token still has to
+    // be signed for that id — but the param should mean what it looks like.
+    if (!/^\d+$/.test(req.params.id)) return res.status(400).end();
     const mediaId = parseInt(req.params.id, 10);
-    if (!Number.isInteger(mediaId)) return res.status(400).end();
 
     const verdict = verifyMediaToken(req.query.t, { mediaId });
     if (!verdict.ok) {
@@ -592,27 +595,52 @@ async function serveMedia(req, res, which) {
     // been detached in that time.
     if (row.attendance_rel.wishlist_rel.user_id !== verdict.userId) return res.status(403).end();
 
+    // Resolved before the thumb/poster branch, and outside its try: an
+    // archive-escape refusal here is the single most important thing these
+    // routes can produce and must reach the outer catch and get logged, not
+    // be caught below and mistaken for "this video has no poster".
+    const archivePath = resolveArchivePath(row.rel_path);
+
     let absPath;
+    let sendOpts;
     if (which === 'thumb') {
       try {
         absPath = await ensureThumb({
-          absPath: resolveArchivePath(row.rel_path), kind: row.kind,
-          sha256: row.sha256, relPath: row.rel_path,
+          absPath: archivePath, kind: row.kind, sha256: row.sha256, relPath: row.rel_path,
         });
-      } catch {
+      } catch (err) {
+        if (err.code !== 'NO_POSTER') throw err;
         // A video whose poster extraction failed in the browser has none, and
         // nothing here can decode one. 404 so the grid draws its placeholder
         // rather than retrying an image that is never coming.
         return res.status(404).end();
       }
+      // A poster lives at <show>/.posters/<name>.webp. `send` defaults to
+      // dotfiles: 'ignore' and 404s a path under a dot-segment regardless of
+      // permissions, so without this every video thumb was a silent
+      // placeholder even when the poster was sitting right there on disk.
+      sendOpts = { dotfiles: 'allow' };
     } else {
-      absPath = resolveArchivePath(row.rel_path);
+      absPath = archivePath;
     }
 
     // Immutable: both paths are keyed by content that never changes in place.
     // A replaced photo is a new row with a new id.
     res.set('Cache-Control', 'private, max-age=31536000, immutable');
-    return res.sendFile(absPath);
+    return res.sendFile(absPath, sendOpts, (err) => {
+      if (!err) return;
+      // send's ENOENT carries a 404 status, and the global handler keeps an
+      // error's message for any status under 500 even in production — which
+      // would otherwise hand an absolute archive path on this container back
+      // to the browser. The caller is already the verified owner, so this is
+      // closing a filesystem-layout leak, not a data leak.
+      if (err.code === 'ENOENT') return res.status(404).end();
+      // Passing a callback here opts out of Express's own next(err) handling
+      // (see res.sendFile's source: "if (done) return done(err)"), so
+      // anything past ENOENT has to be logged and answered here, not thrown —
+      // this runs after the surrounding try/catch has already returned.
+      return fail(res, err, { context: `GET /media/:id/${which}` });
+    });
   } catch (err) {
     return fail(res, err, { context: `GET /media/:id/${which}` });
   }

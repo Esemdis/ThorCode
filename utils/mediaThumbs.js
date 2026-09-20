@@ -81,7 +81,12 @@ async function ensureThumb({ absPath, kind, sha256, relPath }) {
   if (kind === 'VIDEO') {
     const poster = posterPath(relPath);
     if (await exists(poster)) return poster;
-    throw new Error(`no poster stored for ${relPath}`);
+    // Tagged so the thumb route can tell "no poster, draw a placeholder" apart
+    // from every other failure — an archive-escape refusal must not be
+    // swallowed as this one expected case.
+    const err = new Error(`no poster stored for ${relPath}`);
+    err.code = 'NO_POSTER';
+    throw err;
   }
 
   const target = thumbPath(sha256);

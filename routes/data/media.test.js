@@ -839,4 +839,66 @@ describe('GET /media/:id/thumb', () => {
     const res = await request(app()).get(`/data/concerts/media/1/thumb?t=${t}`).expect(200);
     expect(res.headers['content-type']).toMatch(/image\/webp/);
   });
+
+  it('serves the stored poster for a video, even though it lives under a dot-directory', async () => {
+    // Posters live at <show>/.posters/<name>.webp. `send` refuses dotfiles by
+    // default, so this is the case that shipped broken: every video tile was
+    // a permanent placeholder even with a poster sitting right there on disk.
+    const poster = await (await import('sharp')).default(
+      { create: { width: 1920, height: 1080, channels: 3, background: '#222' } }).jpeg().toBuffer();
+
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .field('band_id', '92')
+      .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
+      .attach('posters', poster, { filename: 'VID_1.mp4.webp', contentType: 'image/webp' })
+      .expect(201);
+
+    const created = prisma.concertMedia.create.mock.calls[0][0].data;
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      id: 1, kind: 'VIDEO', sha256: created.sha256, filename: 'VID_1.mp4',
+      rel_path: created.rel_path,
+      attendance_rel: { wishlist_rel: { user_id: 'user-1' } },
+    }));
+
+    const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
+    const res = await request(app()).get(`/data/concerts/media/1/thumb?t=${t}`).expect(200);
+    expect(res.headers['content-type']).toMatch(/image\/webp/);
+  });
+
+  it('answers 404 for a video whose poster extraction failed in the browser', async () => {
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .field('band_id', '92')
+      .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
+      .expect(201);
+
+    const created = prisma.concertMedia.create.mock.calls[0][0].data;
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      id: 1, kind: 'VIDEO', sha256: created.sha256, filename: 'VID_1.mp4',
+      rel_path: created.rel_path,
+      attendance_rel: { wishlist_rel: { user_id: 'user-1' } },
+    }));
+
+    const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
+    await request(app()).get(`/data/concerts/media/1/thumb?t=${t}`).expect(404);
+  });
+
+  it('does not answer 404 for a row whose path escapes the archive', async () => {
+    // A no-poster video and an archive-escape refusal must never look the
+    // same to the client: one is an expected placeholder, the other is the
+    // single most important thing this route can detect. Both threw from
+    // inside the same try before this was fixed, and both came back 404.
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      id: 1, kind: 'PHOTO', sha256: 'h1', filename: 'passwd',
+      rel_path: '../../../../../../etc/passwd',
+      attendance_rel: { wishlist_rel: { user_id: 'user-1' } },
+    }));
+
+    const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
+    const res = await request(app()).get(`/data/concerts/media/1/thumb?t=${t}`);
+    expect(res.status).not.toBe(404);
+  });
 });
