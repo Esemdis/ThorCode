@@ -14,7 +14,7 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const { createReadStream } = require('node:fs');
 const { mkdir, rename, unlink, stat, readFile } = require('node:fs/promises');
-const { param, validationResult } = require('express-validator');
+const { param, body, validationResult } = require('express-validator');
 
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
@@ -24,10 +24,12 @@ const {
   showFolderRelPath, uniqueFilename, resolveArchivePath, slugSegment,
 } = require('../../utils/mediaPaths');
 const {
-  emptySidecar, upsertFile, readSidecar, writeSidecar,
+  emptySidecar, upsertFile, removeFile, readSidecar, writeSidecar,
 } = require('../../utils/mediaSidecar');
 const { kindForMime, MAX_FILE_BYTES } = require('../../utils/mediaTypes');
 const { storePoster, ensureThumb } = require('../../utils/mediaThumbs');
+const { bandMediaOverview } = require('../../utils/mediaOverview');
+const { signMediaToken, mediaUrls } = require('../../utils/mediaTokens');
 
 const router = express.Router();
 
@@ -274,6 +276,228 @@ router.post(
     } catch (err) {
       await cleanup();
       return fail(res, err, { context: 'POST /attendances/:attendanceId/media' });
+    }
+  },
+);
+
+// Signed URLs for a batch, minted once per response rather than per row: the
+// secret lookup and the HMAC are cheap, but the base URL check is not free and
+// a festival's worth of tiles would repeat it a hundred times.
+function urlMinter(userId) {
+  const base = process.env.CALLBACK_URL;
+  return (mediaId) => mediaUrls(base, mediaId, signMediaToken({ mediaId, userId }));
+}
+
+router.get(
+  '/attendances/:attendanceId/media',
+  [auth, roleCheck(['ADMIN', 'USER']), param('attendanceId').isInt()],
+  async (req, res) => {
+    try {
+      const attendanceId = parseInt(req.params.attendanceId, 10);
+      const { row, owned } = await ownAttendance(attendanceId, req.user.id);
+      if (!row) return notFound(res, 'Attendance not found');
+      if (!owned) return forbidden(res, 'Forbidden');
+
+      const mint = urlMinter(req.user.id);
+      const rows = await prisma.concertMedia.findMany({
+        where: { attendance_id: attendanceId },
+        orderBy: { id: 'asc' },
+      });
+
+      // The untagged count is the gig view's progress bar, and it is counted
+      // here rather than derived on the client because the client may be
+      // looking at a filtered subset of the files it was sent.
+      const untagged = rows.filter((m) => m.band_id === null).length;
+
+      // The bill travels with the response so the tagging picker offers exactly
+      // the artists who played that night, with no second request.
+      const bands = row.concert_rel.bands.map((b) => b.band_rel);
+
+      return success(res, 200, {
+        files: rows.map((m) => ({ ...m, ...mint(m.id) })),
+        untagged,
+        bands,
+      });
+    } catch (err) {
+      return fail(res, err, { context: 'GET /attendances/:attendanceId/media' });
+    }
+  },
+);
+
+router.get(
+  '/bands/:bandId/media',
+  [auth, roleCheck(['ADMIN', 'USER']), param('bandId').isInt()],
+  async (req, res) => {
+    try {
+      const bandId = parseInt(req.params.bandId, 10);
+
+      // Scoped to the caller's own wishlist. Band rows are shared across every
+      // account in this schema, so an unscoped query here would list other
+      // people's shows.
+      const attendances = await prisma.concertAttendance.findMany({
+        where: {
+          wishlist_rel: { user_id: req.user.id },
+          concert_rel: { bands: { some: { band: bandId } } },
+        },
+        select: {
+          id: true,
+          concert_rel: {
+            select: {
+              id: true, concert_date: true, venue: true, city: true,
+              bands: { select: { band_rel: { select: { id: true, name: true } } } },
+            },
+          },
+        },
+      });
+
+      const media = attendances.length
+        ? await prisma.concertMedia.findMany({
+            where: { band_id: bandId, attendance_id: { in: attendances.map((a) => a.id) } },
+          })
+        : [];
+
+      const payload = bandMediaOverview({
+        attendances: attendances.map((a) => ({
+          id: a.id,
+          concert: {
+            id: a.concert_rel.id,
+            date: dateOnly(a.concert_rel.concert_date),
+            venue: a.concert_rel.venue,
+            city: a.concert_rel.city,
+            // Defensive against a select that omits the bill (as the band-view
+            // query does not need it): an absent list reads as "no bands",
+            // never as a crash the caller has to work around.
+            bands: (a.concert_rel.bands ?? []).map((b) => b.band_rel),
+          },
+        })),
+        media,
+        urlFor: urlMinter(req.user.id),
+      });
+
+      return success(res, 200, payload);
+    } catch (err) {
+      return fail(res, err, { context: 'GET /bands/:bandId/media' });
+    }
+  },
+);
+
+router.patch(
+  '/media',
+  [
+    auth, roleCheck(['ADMIN', 'USER']),
+    body('ids').isArray({ min: 1, max: 200 }),
+    body('ids.*').isInt(),
+    body('band_id').optional({ nullable: true }).isInt(),
+    body('caption').optional({ nullable: true }).isString().isLength({ max: 500 }),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return badRequest(res, 'Validation failed');
+
+      const ids = req.body.ids.map((n) => parseInt(n, 10));
+      const rows = await prisma.concertMedia.findMany({
+        where: { id: { in: ids } },
+        include: {
+          attendance_rel: {
+            include: {
+              wishlist_rel: { select: { user_id: true } },
+              concert_rel: {
+                select: { bands: { select: { band_rel: { select: { id: true, name: true } } } } },
+              },
+            },
+          },
+        },
+      });
+      if (rows.length !== ids.length) return notFound(res, 'Some media not found');
+
+      // Checked for every row before anything is written. A list containing one
+      // row belonging to someone else must change nothing at all, rather than
+      // updating the caller's rows and failing partway.
+      if (rows.some((r) => r.attendance_rel.wishlist_rel.user_id !== req.user.id)) {
+        return forbidden(res, 'Forbidden');
+      }
+
+      const bandId = req.body.band_id === undefined ? undefined
+        : req.body.band_id === null ? null : parseInt(req.body.band_id, 10);
+
+      if (bandId != null) {
+        const onEveryBill = rows.every((r) =>
+          r.attendance_rel.concert_rel.bands.some((b) => b.band_rel.id === bandId));
+        if (!onEveryBill) return badRequest(res, 'That band is not on every selected show\'s bill');
+      }
+
+      const patch = {
+        ...(bandId !== undefined && { band_id: bandId }),
+        ...(req.body.caption !== undefined && { caption: req.body.caption || null }),
+      };
+      if (!Object.keys(patch).length) return badRequest(res, 'Nothing to change');
+
+      await prisma.$transaction(rows.map((r) =>
+        prisma.concertMedia.update({ where: { id: r.id }, data: patch })));
+
+      // The sidecar is the record of truth, so it is rewritten too, once per
+      // affected show rather than once per file.
+      const byDir = new Map();
+      for (const r of rows) byDir.set(path.posix.dirname(r.rel_path), []);
+      for (const r of rows) byDir.get(path.posix.dirname(r.rel_path)).push(r);
+
+      for (const [relDir, dirRows] of byDir) {
+        const absDir = resolveArchivePath(relDir);
+        let sidecar = await readSidecar(absDir);
+        if (!sidecar) continue;
+        for (const r of dirRows) {
+          const entry = sidecar.files.find((f) => f.name === r.filename);
+          if (!entry) continue;
+          const bandName = bandId == null ? null
+            : r.attendance_rel.concert_rel.bands.find((b) => b.band_rel.id === bandId)?.band_rel.name;
+          sidecar = upsertFile(sidecar, {
+            ...entry,
+            ...(bandId !== undefined && { band_id: bandId, band_name: bandName }),
+            ...(req.body.caption !== undefined && { caption: req.body.caption || '' }),
+          });
+        }
+        await writeSidecar(absDir, sidecar);
+      }
+
+      return success(res, 200, { updated: rows.length });
+    } catch (err) {
+      return fail(res, err, { context: 'PATCH /media' });
+    }
+  },
+);
+
+router.delete(
+  '/media/:id',
+  [auth, roleCheck(['ADMIN', 'USER']), param('id').isInt()],
+  async (req, res) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      const row = await prisma.concertMedia.findUnique({
+        where: { id },
+        include: { attendance_rel: { include: { wishlist_rel: { select: { user_id: true } } } } },
+      });
+      if (!row) return notFound(res, 'Media not found');
+      if (row.attendance_rel.wishlist_rel.user_id !== req.user.id) return forbidden(res, 'Forbidden');
+
+      // File, then sidecar, then row. A failure partway leaves the index
+      // pointing at something that is gone, which the rebuild script reports
+      // and repairs. The reverse order leaves a file nothing knows about, which
+      // is invisible until someone happens to run a rebuild.
+      const absPath = resolveArchivePath(row.rel_path);
+      await unlink(absPath).catch((err) => {
+        // Already gone is the outcome we wanted. Anything else is not.
+        if (err.code !== 'ENOENT') throw err;
+      });
+
+      const absDir = path.dirname(absPath);
+      const sidecar = await readSidecar(absDir);
+      if (sidecar) await writeSidecar(absDir, removeFile(sidecar, row.filename));
+
+      await prisma.concertMedia.delete({ where: { id } });
+      return success(res, 200, { deleted: true });
+    } catch (err) {
+      return fail(res, err, { context: 'DELETE /media/:id' });
     }
   },
 );

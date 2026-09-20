@@ -58,12 +58,18 @@ const jpeg = () => Buffer.from(
   'AAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==', 'base64');
 
 describe('POST /attendances/:id/media', () => {
-  it('exposes exactly the expected route, with auth, role check and validation in front of it', () => {
+  it('exposes exactly the expected routes, with auth in front of every one of them', () => {
     // The handler count is part of this on purpose: dropping `auth` or
-    // `roleCheck` while touching this file would shrink the number silently
-    // otherwise.
+    // `roleCheck` while touching this file would shrink a number silently
+    // otherwise. GET /media/:id/file and /thumb are a later task — they carry
+    // their own auth via a signed URL token rather than this middleware, so
+    // they do not belong in this router yet.
     expect(routeManifest(router)).toEqual([
       'POST /attendances/:attendanceId/media [5]',
+      'GET /attendances/:attendanceId/media [4]',
+      'GET /bands/:bandId/media [4]',
+      'PATCH /media [7]',
+      'DELETE /media/:id [4]',
     ]);
   });
 
@@ -378,5 +384,143 @@ describe('POST /attendances/:id/media', () => {
       .expect(201);
 
     expect(prisma.concertMedia.create.mock.calls[0][0].data.width).toBe(2147483647);
+  });
+});
+
+describe('GET /bands/:bandId/media', () => {
+  it('rejects an unauthenticated read', async () => {
+    await request(app()).get('/data/concerts/bands/92/media').expect(401);
+  });
+
+  it('returns the stats, the rail and the files for the caller only', async () => {
+    prisma.concertAttendance.findMany = vi.fn(async ({ where }) => {
+      // The route must scope by the caller's own wishlist. A band's shows are
+      // not global information: Band rows are shared across every account.
+      expect(where.wishlist_rel.user_id).toBe('user-1');
+      return [{ id: 1, concert_rel: { id: 8417, concert_date: new Date('2026-06-12T19:00:00Z'), venue: 'Sentrum Scene', city: 'Oslo' } }];
+    });
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 5, attendance_id: 1, band_id: 92, filename: 'IMG_1.jpg', kind: 'PHOTO',
+        caption: '', width: 4080, height: 3072, duration_ms: null, taken_at: null, sha256: 'h5' },
+    ]);
+
+    const res = await request(app())
+      .get('/data/concerts/bands/92/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(res.body.data.stats).toMatchObject({ files: 1, shows_attended: 1, shows_with_media: 1 });
+    expect(res.body.data.rail[0]).toMatchObject({ attendance_id: 1, count: 1 });
+    expect(res.body.data.files[0].thumb).toMatch(/^https:\/\/api\.example\.com\/data\/concerts\/media\/5\/thumb\?t=/);
+  });
+
+  it('returns an empty overview for a band with no attended shows', async () => {
+    prisma.concertAttendance.findMany = vi.fn(async () => []);
+    prisma.concertMedia.findMany = vi.fn(async () => []);
+    const res = await request(app())
+      .get('/data/concerts/bands/92/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+    expect(res.body.data).toMatchObject({ rail: [], files: [] });
+    expect(res.body.data.stats.files).toBe(0);
+  });
+});
+
+describe('GET /attendances/:id/media', () => {
+  it('reports how many of the show\'s files still have no band', async () => {
+    // This count is the gig view's progress bar: it ticks down as a sweep tags
+    // files, and an empty pile is the done state.
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 1, attendance_id: 1, band_id: null, filename: 'a.jpg', kind: 'PHOTO', sha256: 'h1' },
+      { id: 2, attendance_id: 1, band_id: 92, filename: 'b.jpg', kind: 'PHOTO', sha256: 'h2' },
+      { id: 3, attendance_id: 1, band_id: null, filename: 'c.jpg', kind: 'PHOTO', sha256: 'h3' },
+    ]);
+    const res = await request(app())
+      .get('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(res.body.data.untagged).toBe(2);
+    expect(res.body.data.files).toHaveLength(3);
+  });
+
+  it('sends the night\'s bill, so the tagging picker needs no second request', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => []);
+    const res = await request(app())
+      .get('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(res.body.data.bands).toEqual([{ id: 92, name: 'Gojira' }]);
+  });
+
+  it('refuses a show that is not the caller\'s', async () => {
+    await request(app())
+      .get('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'someone-else' }))
+      .expect(403);
+  });
+});
+
+describe('PATCH /media', () => {
+  it('sets the band on several files at once', async () => {
+    // The grid multi-selects, so this takes a list. One request per tile would
+    // be forty requests to fix a festival import.
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 5, attendance_id: 1, rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_1.jpg', filename: 'IMG_1.jpg',
+        attendance_rel: { wishlist_rel: { user_id: 'user-1' }, concert_rel: { bands: [{ band_rel: { id: 92, name: 'Gojira' } }] } } },
+    ]);
+    prisma.concertMedia.update = vi.fn(async ({ data }) => ({ id: 5, ...data }));
+    prisma.$transaction = vi.fn(async (fns) => Promise.all(fns.map((f) => (typeof f === 'function' ? f() : f))));
+
+    await request(app())
+      .patch('/data/concerts/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ ids: [5], band_id: 92, caption: 'stage dive' })
+      .expect(200);
+
+    expect(prisma.concertMedia.update).toHaveBeenCalled();
+  });
+
+  it('refuses to touch a file that is not the caller\'s', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 5, attendance_id: 1, rel_path: 'x/y/z.jpg', filename: 'z.jpg',
+        attendance_rel: { wishlist_rel: { user_id: 'someone-else' }, concert_rel: { bands: [] } } },
+    ]);
+    await request(app())
+      .patch('/data/concerts/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ ids: [5], caption: 'nope' })
+      .expect(403);
+  });
+});
+
+describe('DELETE /media/:id', () => {
+  it('removes the row, the sidecar entry and the file together', async () => {
+    // All three or none. A row without a file is a broken tile; a file without
+    // a row is invisible until the next rebuild.
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .field('band_id', '92')
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(201);
+
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      id: 1, attendance_id: 1, filename: 'IMG_1.jpg',
+      rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_1.jpg',
+      attendance_rel: { wishlist_rel: { user_id: 'user-1' } },
+    }));
+    prisma.concertMedia.delete = vi.fn(async () => ({ id: 1 }));
+
+    await request(app())
+      .delete('/data/concerts/media/1')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(await readdir(dir)).not.toContain('IMG_1.jpg');
+    const sidecar = JSON.parse(await readFile(join(dir, 'concert-media.json'), 'utf8'));
+    expect(sidecar.files).toHaveLength(0);
   });
 });
