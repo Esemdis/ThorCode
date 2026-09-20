@@ -21,8 +21,9 @@ const roleCheck = require('../../middlewares/roleCheck');
 const prisma = require('../../prisma/client');
 const { fail, badRequest, notFound, forbidden, success } = require('../../utils/apiResponse');
 const {
-  showFolderRelPath, uniqueFilename, resolveArchivePath, slugSegment, posterPath,
+  uniqueFilename, resolveArchivePath, slugSegment, posterPath,
 } = require('../../utils/mediaPaths');
+const { showDirForAttendance } = require('../../utils/mediaShowDir');
 const {
   emptySidecar, upsertFile, removeFile, readSidecar, writeSidecar, SIDECAR_NAME,
 } = require('../../utils/mediaSidecar');
@@ -172,7 +173,23 @@ router.post(
         city: row.concert_rel.city,
         headliner: headlinerOf(row.concert_rel),
       };
-      const relDir = showFolderRelPath(row.wishlist_rel.user_id, show);
+      // Read before the folder is chosen rather than after, because the
+      // earliest row's rel_path is what chooses it. Ordered by id so that
+      // "earliest" means something: an unordered read of an attendance whose
+      // files are already split across two folders would pick a different one
+      // from request to request and keep the split alive.
+      const existing = await prisma.concertMedia.findMany({
+        where: { attendance_id: attendanceId },
+        select: { filename: true, rel_path: true },
+        orderBy: { id: 'asc' },
+      });
+
+      const relDir = await showDirForAttendance({
+        existingRelPath: existing[0]?.rel_path ?? null,
+        userId: row.wishlist_rel.user_id,
+        concertId: row.concert_rel.id,
+        show,
+      });
       const absDir = resolveArchivePath(relDir);
       await mkdir(absDir, { recursive: true });
 
@@ -185,9 +202,6 @@ router.post(
         },
       });
 
-      const existing = await prisma.concertMedia.findMany({
-        where: { attendance_id: attendanceId }, select: { filename: true },
-      });
       // SIDECAR_NAME is seeded because the sidecar is not one of its own
       // entries, so nothing else in `taken` covers it. A client picks both the
       // filename and the MIME type of a part, so an upload named

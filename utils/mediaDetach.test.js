@@ -10,12 +10,18 @@ beforeEach(async () => {
   process.env.MEDIA_ROOT = root;
 });
 
+// Understands the two shapes detachAttendances asks for: the attendances it is
+// detaching (`in`), and the rows under those folders belonging to anyone else
+// (`notIn` plus an OR of rel_path prefixes).
 const fakePrisma = (rows) => ({
   concertMedia: {
     count: vi.fn(async ({ where }) =>
       rows.filter((r) => where.attendance_id.in.includes(r.attendance_id)).length),
-    findMany: vi.fn(async ({ where }) =>
-      rows.filter((r) => where.attendance_id.in.includes(r.attendance_id))),
+    findMany: vi.fn(async ({ where }) => rows.filter((r) => {
+      if (where.attendance_id.in) return where.attendance_id.in.includes(r.attendance_id);
+      if (where.attendance_id.notIn.includes(r.attendance_id)) return false;
+      return where.OR.some((c) => r.rel_path.startsWith(c.rel_path.startsWith));
+    })),
     deleteMany: vi.fn(async () => ({ count: rows.length })),
   },
 });
@@ -73,6 +79,24 @@ describe('detachAttendances', () => {
     const entries = await readdir(join(root, 'archive', 'u', '_detached'));
     expect(entries).toContain('show');
     expect(entries.some((e) => e.startsWith('show ('))).toBe(true);
+  });
+
+  it('refuses to move a folder holding a live attendance it was not asked to detach', async () => {
+    // Probed: with two attendances' files in one folder — which happens when a
+    // sidecar is removed by hand and the next show adopts the directory —
+    // detaching one renamed the folder into _detached with the other's
+    // photographs still inside. The surviving rows then pointed at a path that
+    // no longer existed, and the rebuild reported nothing, because
+    // collectArchive skips _detached by design.
+    await mkdir(join(root, 'archive', 'u', 'show'), { recursive: true });
+    const prisma = fakePrisma([
+      { attendance_id: 1, rel_path: 'u/show/a.jpg' },
+      { attendance_id: 2, rel_path: 'u/show/b.jpg' },
+    ]);
+
+    await expect(detachAttendances(prisma, [1])).rejects.toThrow(/attendance 2/);
+    expect(await readdir(join(root, 'archive', 'u'))).toEqual(['show']);
+    expect(prisma.concertMedia.deleteMany).not.toHaveBeenCalled();
   });
 
   it('leaves the rows alone if the move fails', async () => {

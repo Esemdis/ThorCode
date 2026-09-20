@@ -55,6 +55,30 @@ async function detachAttendances(prisma, attendanceIds, { fs = { mkdir, rename }
   // rel_path is '<user>/<show folder>/<file>'. The folder is what moves.
   const showDirs = [...new Set(rows.map((r) => path.posix.dirname(r.rel_path)))];
 
+  // This function moves folders but only owns rows, and the two are not the
+  // same set. A show folder is normally one attendance's — the upload route
+  // settles a show's directory on its first upload and suffixes a name that
+  // already belongs to another concert — but a folder whose sidecar was
+  // removed by hand is free for the next show to adopt, and then one directory
+  // holds two attendances' files. Renaming it would carry a live attendance's
+  // photographs into _detached, which collectArchive is designed never to look
+  // in: every tile a permanent broken image, and a rebuild reporting no drift
+  // at all because it cannot see the folder it would have to complain about.
+  // Refusing is loud and recoverable. Moving is silent and is not.
+  const strangers = await prisma.concertMedia.findMany({
+    where: {
+      attendance_id: { notIn: attendanceIds },
+      OR: showDirs.map((relDir) => ({ rel_path: { startsWith: `${relDir}/` } })),
+    },
+    select: { attendance_id: true, rel_path: true },
+  });
+  if (strangers.length) {
+    const { rel_path: relPath, attendance_id: attendanceId } = strangers[0];
+    throw new Error(
+      `Refusing to detach: ${relPath} belongs to attendance ${attendanceId}, which is staying`,
+    );
+  }
+
   const folders = [];
   for (const relDir of showDirs) {
     const absDir = resolveArchivePath(relDir);

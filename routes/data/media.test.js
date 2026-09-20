@@ -390,6 +390,92 @@ describe('POST /attendances/:id/media', () => {
   });
 });
 
+describe('which folder a show lands in', () => {
+  // A stateful stand-in for the table, because both of these are about what a
+  // second upload does with what the first one left behind. The fake object
+  // itself is the one installed at module scope — only its methods are
+  // replaced, for the reason at the top of this file.
+  let rows;
+  const stateful = () => {
+    rows = [];
+    prisma.concertMedia.findMany = vi.fn(async ({ where }) =>
+      rows.filter((r) => r.attendance_id === where.attendance_id));
+    prisma.concertMedia.create = vi.fn(async ({ data }) => {
+      const row = { id: rows.length + 1, ...data };
+      rows.push(row);
+      return row;
+    });
+  };
+
+  const post = (attendanceId, filename) => request(app())
+    .post(`/data/concerts/attendances/${attendanceId}/media`)
+    .set(...authHeader({ id: 'user-1' }))
+    .attach('files', jpeg(), filename);
+
+  it('keeps one night in one folder when a support act is added between two uploads', async () => {
+    // headlinerOf reads concert.bands[0] from a relation fetched with no
+    // orderBy, so adding a band to the bill changed what the same show derived
+    // to and filed its next upload in '2026-06-12 Oslo - Alcest' beside the
+    // half-full '2026-06-12 Oslo - Gojira'. The directory is settled by the
+    // first upload now and never recomputed.
+    stateful();
+    await post(1, 'A.jpg').expect(201);
+
+    prisma.concertAttendance.findUnique = vi.fn(async () => ({
+      ...attendanceRow,
+      concert_rel: {
+        ...attendanceRow.concert_rel,
+        bands: [
+          { band: 7, band_rel: { id: 7, name: 'Alcest' } },
+          ...attendanceRow.concert_rel.bands,
+        ],
+      },
+    }));
+    await post(1, 'B.jpg').expect(201);
+
+    expect(await readdir(join(root, 'archive', 'user-1')))
+      .toEqual(['2026-06-12 Oslo - Gojira']);
+  });
+
+  it('gives two shows that derive the same name a folder each, and a rebuild files them apart', async () => {
+    // Venue is deliberately not in the folder name, so a duplicate Concert row
+    // for one night — or an early and a late show — derived one folder for two
+    // attended concerts. The sidecar holds a single scalar concert_id, so the
+    // second show's files were filed under the first at write time and a
+    // rebuild reattributed them with every drift channel empty.
+    stateful();
+    const second = {
+      ...attendanceRow,
+      id: 2,
+      concert_id: 9000,
+      concert_rel: { ...attendanceRow.concert_rel, id: 9000, venue: 'Rockefeller' },
+    };
+    prisma.concertAttendance.findUnique = vi.fn(async ({ where }) =>
+      (where.id === 2 ? second : attendanceRow));
+
+    await post(1, 'A.jpg').expect(201);
+    await post(2, 'B.jpg').expect(201);
+
+    expect(await readdir(join(root, 'archive', 'user-1'))).toEqual([
+      '2026-06-12 Oslo - Gojira', '2026-06-12 Oslo - Gojira (2)',
+    ]);
+
+    const { collectArchive, planRebuild, attendanceKey } = await import('../../utils/mediaRebuild.js');
+    const { sidecars, filesOnDisk } = await collectArchive(join(root, 'archive'));
+    const plan = planRebuild({
+      sidecars,
+      filesOnDisk,
+      attendanceIds: new Map([
+        [attendanceKey('user-1', 8417), 1],
+        [attendanceKey('user-1', 9000), 2],
+      ]),
+    });
+
+    expect(plan.upserts.map((u) => [u.attendance_id, u.filename]).sort())
+      .toEqual([[1, 'A.jpg'], [2, 'B.jpg']]);
+  });
+});
+
 describe('GET /bands/:bandId/media', () => {
   it('rejects an unauthenticated read', async () => {
     await request(app()).get('/data/concerts/bands/92/media').expect(401);
