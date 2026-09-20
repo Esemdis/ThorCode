@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { attendanceKey, collectArchive, planRebuild } from './mediaRebuild.js';
+import { showFolderRelPath } from './mediaPaths.js';
 
 const sidecar = (relDir, concertId, files, userId = 'user-1') => ({
   relDir, data: { version: 1, concert_id: concertId, user_id: userId, concert: {}, files },
@@ -105,6 +106,29 @@ describe('planRebuild', () => {
     });
     expect(plan.upserts).toEqual([]);
     expect(plan.mismatchedUsers).toEqual([{ relDir: 'user-1/show', sidecar_user: 'user-2' }]);
+  });
+
+  it('indexes a user whose id the folder name had to slug, instead of calling the archive corrupt', () => {
+    // showFolderRelPath runs the id through slugSegment to make the folder, so
+    // the folder segment and the sidecar's raw user_id are only ever equal by
+    // luck. User.id is a String that merely defaults to a uuid; a federated
+    // 'auth0|...' id, a colon, a leading space all survive in the database and
+    // all get rewritten on the way to a directory name. Compared raw, every
+    // one of that user's shows read as corrupt and not one of their files was
+    // indexed — a healthy archive declared broken on restore day.
+    const uid = 'auth0|6423ff';
+    const relDir = `${showFolderRelPath(uid, { date: '2026-06-12', city: 'Oslo', headliner: 'Gojira' })}`;
+    expect(relDir.split('/')[0]).not.toBe(uid); // the premise: the folder is slugged
+
+    const plan = planRebuild({
+      sidecars: [sidecar(relDir, 8417, [entry('a.jpg')], uid)],
+      filesOnDisk: { [relDir]: ['a.jpg'] },
+      attendanceIds: new Map([[attendanceKey(uid, 8417), 1]]),
+    });
+
+    expect(plan.mismatchedUsers).toEqual([]);
+    expect(plan.upserts).toHaveLength(1);
+    expect(plan.upserts[0].attendance_id).toBe(1);
   });
 });
 

@@ -14,7 +14,7 @@
 const path = require('node:path');
 const { readdir } = require('node:fs/promises');
 const { readSidecar, SIDECAR_NAME } = require('./mediaSidecar');
-const { DETACHED_DIR } = require('./mediaPaths');
+const { DETACHED_DIR, slugSegment } = require('./mediaPaths');
 
 // user_id and concert_id together, because ConcertAttendance is
 // @@unique([wishlist_id, concert_id]): a concert has one attendance row per
@@ -74,7 +74,15 @@ function planRebuild({ sidecars, filesOnDisk, attendanceIds }) {
     // relDir is '<user_id>/<show folder>'. If the folder's owner and the
     // sidecar's own user_id disagree, the archive is internally inconsistent
     // and neither value is safe to trust for an attendance lookup.
-    if (relDir.split('/')[0] !== data.user_id) {
+    //
+    // Compared through slugSegment because that is what showFolderRelPath ran
+    // the id through to make the folder in the first place. Against the raw
+    // id this matched only by luck: User.id is a String that merely defaults
+    // to a uuid, and any id carrying a character the slug rewrites — a
+    // federated 'auth0|…', a colon, a leading space — made every one of that
+    // user's shows look corrupt and indexed none of their files, which is the
+    // worst possible day for a restore to decide the archive is broken.
+    if (slugSegment(relDir.split('/')[0]) !== slugSegment(data.user_id)) {
       mismatchedUsers.push({ relDir, sidecar_user: data.user_id });
       continue;
     }
