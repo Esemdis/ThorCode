@@ -15,12 +15,20 @@
 
 const prisma = require('../prisma/client');
 const { archiveRoot } = require('../utils/mediaPaths');
-const { attendanceKey, collectArchive, planRebuild } = require('../utils/mediaRebuild');
+const { attendanceKey, collectArchive, planRebuild, applyUpserts } = require('../utils/mediaRebuild');
 
 const dryRun = process.argv.includes('--dry-run');
 
 async function main() {
-  const { sidecars, filesOnDisk, noSidecar } = await collectArchive(archiveRoot());
+  const { sidecars, filesOnDisk, noSidecar, archiveMissing } = await collectArchive(archiveRoot());
+
+  // Said plainly rather than thrown, because the likely cause is a share that
+  // failed to mount and the operator needs to be told to look there.
+  if (archiveMissing) {
+    console.error(`no archive at ${archiveRoot()} — is the media share mounted?`);
+    process.exitCode = 1;
+    return;
+  }
 
   // wishlist_rel.user_id is what routes/data/media.js authorises byte access
   // from, so the map used to place a restore's rows has to be built from the
@@ -42,23 +50,22 @@ async function main() {
     ['file no sidecar mentions', plan.unlistedFiles],
     ['sidecar whose concert has no attendance', plan.unknownConcerts],
     ['folder owner disagrees with its own sidecar', plan.mismatchedUsers],
+    ['sidecar entry this build cannot read', plan.malformedEntries],
   ]) {
     for (const item of list) console.warn(`${label}: ${JSON.stringify(item)}`);
   }
 
+  let rejected = [];
   if (!dryRun) {
-    for (const row of plan.upserts) {
-      await prisma.concertMedia.upsert({
-        where: { attendance_id_filename: { attendance_id: row.attendance_id, filename: row.filename } },
-        create: row,
-        update: row,
-      });
-    }
-    console.log(`indexed ${plan.upserts.length} files`);
+    const written = await applyUpserts(prisma, plan.upserts);
+    rejected = written.rejected;
+    console.log(`indexed ${written.indexed} files`);
+    for (const item of rejected) console.error(`row refused by Postgres: ${JSON.stringify(item)}`);
   }
 
   const drift = noSidecar.length + plan.missingFiles.length + plan.unlistedFiles.length
-    + plan.unknownConcerts.length + plan.mismatchedUsers.length;
+    + plan.unknownConcerts.length + plan.mismatchedUsers.length + plan.malformedEntries.length
+    + rejected.length;
   process.exitCode = drift > 0 ? 1 : 0;
 }
 
