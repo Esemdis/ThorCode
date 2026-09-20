@@ -47,20 +47,34 @@ Two new variables, both required:
 
 | Variable | Value | Notes |
 |---|---|---|
-| `MEDIA_ROOT` | `/media` | The container path. Nothing works without it; `mediaRoot()` throws rather than guessing. |
+| `MEDIA_ROOT` | `/media` in `prd`, a local writable path in `dev` | The container path maps to the share; `dev` runs nodemon on a workstation where `/media` does not exist. Nothing works without it — `mediaRoot()` throws rather than guessing. |
 | `MEDIA_URL_SECRET` | 32 random bytes | Signs the URLs that serve bytes. |
 
 Set them in both Doppler configs, with **different** secrets:
 
 ```bash
-doppler secrets set MEDIA_ROOT=/media --config dev
+doppler secrets set MEDIA_ROOT=/path/to/a/local/dir --config dev
 doppler secrets set MEDIA_URL_SECRET="$(openssl rand -base64 32)" --config dev
 doppler secrets set MEDIA_ROOT=/media --config prd
 doppler secrets set MEDIA_URL_SECRET="$(openssl rand -base64 32)" --config prd
 ```
 
-Sharing one value between configs would mean a token minted in development
-opens production files.
+Two separate `openssl` calls, not one value used twice: a shared secret would
+mean a token minted in development opens production files.
+
+`MEDIA_ROOT` differs because `prd` runs in the container, where `/media` is the
+share, while `dev` is `npm run dev` — nodemon on a workstation, where `/media`
+does not exist.
+
+**The two configs share one database.** `DATABASE_URL` is byte-identical in
+`dev` and `prd`: there is one Postgres, not two. That has a consequence specific
+to this feature. A photo uploaded while running locally writes a `ConcertMedia`
+row that production reads too, pointing at a `rel_path` that exists only under
+the development `MEDIA_ROOT` — so it renders in the deployed gallery as a
+permanently broken tile, and the rebuild cannot repair it because the file
+genuinely is not in the archive. Separate `MEDIA_ROOT` values do not buy
+isolation while the index is shared. Either avoid uploading locally, or point
+`dev` at the real share, or delete those rows afterwards.
 
 `MEDIA_URL_SECRET` exists because `<img src>` and `<video src>` issue their own
 requests and cannot carry an `Authorization` header. The byte routes therefore
