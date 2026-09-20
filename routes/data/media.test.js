@@ -373,20 +373,75 @@ describe('POST /attendances/:id/media', () => {
     expect(await readdir(dir)).toContain('a-b-c-.jpg');
   });
 
-  it('clamps a client-supplied dimension to what a 32-bit Postgres column can hold', async () => {
-    // asInt already refused a negative or non-numeric value; this pins the
-    // missing half of that check. Without it, a value like 9e12 sails through
-    // and Postgres throws at insert time, turning a bad number into a 500 with
-    // the file already renamed onto disk.
+  it('stores nothing at all for a dimension too big for the column, rather than a plausible lie', async () => {
+    // asInt already refused a negative or non-numeric value; this is the
+    // missing half. A value like 9e12 sails through both checks and then fails
+    // at insert time, turning a bad number into a 500 with the file already
+    // renamed onto disk — so it must not reach Prisma.
+    //
+    // It becomes null rather than INT32_MAX because the sidecar is the record
+    // of truth. Clamped, duration_ms: 1e300 was written as 2147483647 and read
+    // back out as a genuine 24.9-day video that every consumer believed. null
+    // is what this function already returns for every other unusable value,
+    // what the schema permits, and what planRebuild round-trips.
     await request(app())
       .post('/data/concerts/attendances/1/media')
       .set(...authHeader({ id: 'user-1' }))
       .field('band_id', '92')
-      .field('meta', JSON.stringify({ 'VID_1.mp4': { width: 9e12, duration_ms: 24000 } }))
+      .field('meta', JSON.stringify({ 'VID_1.mp4': { width: 9e12, height: 1080, duration_ms: 1e300 } }))
       .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
       .expect(201);
 
-    expect(prisma.concertMedia.create.mock.calls[0][0].data.width).toBe(2147483647);
+    expect(prisma.concertMedia.create.mock.calls[0][0].data)
+      .toMatchObject({ width: null, height: 1080, duration_ms: null });
+
+    const sidecar = JSON.parse(await readFile(
+      join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira', 'concert-media.json'), 'utf8'));
+    expect(sidecar.files[0]).toMatchObject({ width: null, duration_ms: null });
+  });
+
+  it('does not overwrite a file someone put in the show folder by hand', async () => {
+    // Probed: `taken` was built from the sidecar and the DB rows and never from
+    // the directory, so a file in neither index was invisible to uniqueFilename
+    // and the rename went straight over it — 201, no suffix, no warning.
+    // Decision 1 says the folder must be usable in a file browser by someone
+    // who has never heard of this app, which makes dropping a file into it the
+    // sanctioned use, not an abuse.
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'IMG_1.jpg'), 'THE-ONLY-COPY-OF-A-PHOTOGRAPH');
+
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(201);
+
+    expect(prisma.concertMedia.create.mock.calls[0][0].data.filename).toBe('IMG_1 (2).jpg');
+    expect(await readFile(join(dir, 'IMG_1.jpg'), 'utf8')).toBe('THE-ONLY-COPY-OF-A-PHOTOGRAPH');
+  });
+
+  it('refuses a show whose date is not confirmed yet instead of filing it under 1970', async () => {
+    // Concert.concert_date is nullable and dateOnly(null) is the epoch, so
+    // these landed in '1970-01-01 Oslo - Gojira' and indexed cleanly. GET
+    // /bands/:bandId/media then filtered them straight back out — it drops
+    // null-dated attendances on purpose, because 1970 wrecks first_year and
+    // the sparkline — leaving them permanently invisible on the feature's main
+    // surface. The two routes have to make the same call.
+    prisma.concertAttendance.findUnique = vi.fn(async () => ({
+      ...attendanceRow,
+      concert_rel: { ...attendanceRow.concert_rel, concert_date: null },
+    }));
+
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(400);
+
+    expect(res.body.error).toMatch(/no confirmed date/i);
+    expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+    await expect(readdir(join(root, 'archive', 'user-1'))).rejects.toThrow();
   });
 });
 

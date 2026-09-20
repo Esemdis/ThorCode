@@ -13,7 +13,7 @@ const multer = require('multer');
 const crypto = require('node:crypto');
 const path = require('node:path');
 const { createReadStream } = require('node:fs');
-const { mkdir, rename, unlink, stat, readFile } = require('node:fs/promises');
+const { mkdir, readdir, rename, unlink, stat, readFile } = require('node:fs/promises');
 const { param, body, validationResult } = require('express-validator');
 
 const auth = require('../../auth/verifyJWT');
@@ -25,7 +25,7 @@ const {
 } = require('../../utils/mediaPaths');
 const { showDirForAttendance } = require('../../utils/mediaShowDir');
 const {
-  emptySidecar, upsertFile, removeFile, readSidecar, writeSidecar, SIDECAR_NAME,
+  emptySidecar, upsertFile, removeFile, readSidecar, writeSidecar,
 } = require('../../utils/mediaSidecar');
 const { kindForMime, MAX_FILE_BYTES } = require('../../utils/mediaTypes');
 const { storePoster, ensureThumb } = require('../../utils/mediaThumbs');
@@ -69,12 +69,19 @@ const headlinerOf = (concert) => concert.bands?.[0]?.band_rel?.name ?? '';
 // width/height/duration_ms are a 32-bit Postgres Int column. Bounding sign and
 // finiteness is not enough: a client-supplied 9e12 passes both checks and then
 // fails at insert time, turning a bad number into a 500 with the file already
-// renamed onto disk. Clamping here means a bad value is merely wrong, not fatal.
+// renamed onto disk.
+//
+// Out of range returns null rather than INT32_MAX, which is the same answer
+// this function already gives every other unusable value. Clamping served the
+// no-500 purpose equally well and cost something the archive cannot afford:
+// duration_ms: 1e300 was stored as 2147483647 and read back out of the sidecar
+// as a genuine 24.9-day video. The sidecar is the record of truth, and this
+// was the only place in the feature knowingly writing something false into it.
 const INT32_MAX = 2147483647;
 const asInt = (v) => {
   const n = Number(v);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return Math.min(Math.round(n), INT32_MAX);
+  if (!Number.isFinite(n) || n <= 0 || n > INT32_MAX) return null;
+  return Math.round(n);
 };
 
 // SMB — the protocol the archive share is actually mounted over — rejects
@@ -127,6 +134,17 @@ router.post(
       const { row, owned } = await ownAttendance(attendanceId, req.user.id);
       if (!row) { await cleanup(); return notFound(res, 'Attendance not found'); }
       if (!owned) { await cleanup(); return forbidden(res, 'Forbidden'); }
+
+      // GET /bands/:bandId/media filters null-dated attendances out on purpose:
+      // dateOnly(null) is the epoch, and a 1970 show wrecks first_year and the
+      // sparkline. The upload route has to make the same call, because without
+      // it these files landed in '1970-01-01 Oslo - Gojira', indexed cleanly,
+      // and were then permanently invisible on the feature's main surface —
+      // filed fifty-six years wrong in the record of truth.
+      if (!row.concert_rel.concert_date) {
+        await cleanup();
+        return badRequest(res, 'This show has no confirmed date yet');
+      }
 
       const incoming = req.files?.files ?? [];
       if (!incoming.length) { await cleanup(); return badRequest(res, 'No files uploaded'); }
@@ -202,17 +220,21 @@ router.post(
         },
       });
 
-      // SIDECAR_NAME is seeded because the sidecar is not one of its own
-      // entries, so nothing else in `taken` covers it. A client picks both the
-      // filename and the MIME type of a part, so an upload named
-      // concert-media.json declaring image/jpeg used to land at 201 and write
-      // its bytes straight over the record of truth. The sidecar write at the
-      // end of the batch then put valid JSON back, which meant the file that
-      // actually vanished was the user's photo, leaving a row and an entry
-      // both pointing at a path that now held JSON. Reverse the ordering and
-      // it is the archive's record of truth that becomes a JPEG.
+      // Seeded from the directory itself, not only from the two indexes. A
+      // file that is on disk but in neither of them was invisible to
+      // uniqueFilename, and the rename below then overwrote it without a word.
+      // Decision 1 says the folder must be usable in a file browser by someone
+      // who has never heard of this app, so dropping files into a show folder
+      // is the sanctioned way to use it — and is exactly what armed that.
+      //
+      // This is also why concert-media.json is no longer named here: it is
+      // always on disk, so the readdir covers it. It used to need seeding by
+      // name because a client picks both the filename and the MIME type of a
+      // part, so an upload called concert-media.json declaring image/jpeg
+      // landed at 201 and wrote its bytes straight over the record of truth.
+      const onDisk = await readdir(absDir);
       const taken = new Set([
-        SIDECAR_NAME, ...existing.map((e) => e.filename), ...sidecar.files.map((f) => f.name),
+        ...onDisk, ...existing.map((e) => e.filename), ...sidecar.files.map((f) => f.name),
       ]);
 
       const created = [];
@@ -236,6 +258,12 @@ router.post(
             const sha256 = await sha256File(absPath);
             const { size } = await stat(absPath);
 
+            // taken_at is reserved, not populated. The column, this field and
+            // planRebuild's date branch all exist for a later phase that reads
+            // EXIF; nothing writes it today, so a null here means "not read
+            // yet", never "this photo has no capture time". Reading EXIF is
+            // out of scope for this phase — only EXIF *location* is out of
+            // scope in the spec, so the field is worth keeping.
             const entry = {
               name: filename, kind, band_id: bandId, band_name: bandId ? onBill.get(bandId) : null,
               caption: '', sha256, bytes: size,
