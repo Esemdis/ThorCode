@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { mkdtemp, writeFile, access, readdir } from 'node:fs/promises';
+import { mkdtemp, writeFile, access, readdir, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import sharp from 'sharp';
 import { THUMB_WIDTH, ensureThumb, storePoster } from './mediaThumbs.js';
 import { posterPath } from './mediaPaths.js';
@@ -54,13 +54,43 @@ describe('ensureThumb for a photo', () => {
     expect(await readdir(join(root, 'cache', 'thumbs'))).toEqual(['abc.webp']);
   });
 
-  it('leaves no partial file behind when the source is not an image', async () => {
-    // A half-written thumbnail would be served forever, since the cache never
-    // re-checks a key it already has.
+  it('leaves nothing servable at the final path when the source is not an image', async () => {
+    // This does NOT exercise temp-file cleanup: sharp rejects invalid input
+    // before writing anything, so rename is never reached and no temp file
+    // ever exists here for the cleanup code to remove. What it does pin is
+    // that a failed conversion never leaves something servable at the final
+    // path — a half-written thumbnail would be served forever, since the
+    // cache never re-checks a key it already has. See "writeWebp cleanup on
+    // failure" below for a test that actually forces rename to fail.
     const junk = join(root, 'junk.jpg');
     await writeFile(junk, 'not an image');
     await expect(ensureThumb({ absPath: junk, kind: 'PHOTO', sha256: 'junk' })).rejects.toThrow();
     await expect(access(join(root, 'cache', 'thumbs', 'junk.webp'))).rejects.toThrow();
+  });
+});
+
+describe('writeWebp cleanup on failure', () => {
+  const rel = 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4';
+
+  const aFrame = () => sharp({ create: { width: 1920, height: 1080, channels: 3, background: '#7c2d5c' } })
+    .jpeg().toBuffer();
+
+  it('deletes the temp file when the rename to the final path fails', async () => {
+    // Unlike the junk-source case above, this needs sharp to succeed and a
+    // real temp file to exist before the failure hits, so rename onto an
+    // existing non-empty directory is used to force it: a file can replace a
+    // file, but never a directory, regardless of whether that directory is
+    // empty.
+    const target = posterPath(rel);
+    await mkdir(target, { recursive: true });
+    await writeFile(join(target, 'occupied'), '');
+
+    await expect(storePoster({ relPath: rel, buffer: await aFrame() })).rejects.toThrow();
+
+    // Checked by suffix rather than by exact name, since the temp name now
+    // carries a random nonce.
+    const leftovers = await readdir(dirname(target));
+    expect(leftovers.some((name) => name.endsWith('.tmp'))).toBe(false);
   });
 });
 
