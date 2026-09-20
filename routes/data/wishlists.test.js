@@ -466,6 +466,16 @@ describe('DELETE /wishlists/:id/attendance/:concertId', () => {
     expect(res.status).toBe(409);
     expect(res.body.error).toMatch(/3 photos attached/);
     expect(prisma.concertAttendance.delete).not.toHaveBeenCalled();
+    // Counted by ATTENDANCE id (42), not the concert id in the URL (99). Both
+    // are integers, both are in scope at the call site, and three of the four
+    // sites that take attendance ids have been handed a concert id at some
+    // point. Nothing here pinned it: mutating the argument to [concertId] left
+    // the whole suite green, and the live version of that mistake counts zero,
+    // lets the delete through, and hands the user a 500 from the restricting
+    // foreign key instead of this sentence.
+    expect(prisma.concertMedia.count).toHaveBeenCalledWith({
+      where: { attendance_id: { in: [42] } },
+    });
   });
 
   it('singularises the count for exactly one photo', async () => {
