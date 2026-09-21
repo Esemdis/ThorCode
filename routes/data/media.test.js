@@ -16,7 +16,19 @@ const attendanceRow = {
   concert_rel: {
     id: 8417, concert_date: new Date('2026-06-12T19:00:00Z'),
     venue: 'Sentrum Scene', city: 'Oslo', country: 'NO',
-    bands: [{ band: 92, band_rel: { id: 92, name: 'Gojira' } }],
+    // Two setlists on purpose, and they differ: `setlist` is what this band
+    // played at THIS show, `band_rel.setlist` is the most recent one we have
+    // for them anywhere. The song picker prefers the first and falls back to
+    // the second, so a fixture where they matched could not tell them apart.
+    bands: [{
+      band: 92,
+      setlist: { songs: [{ name: 'Stranded', tape: false, cover: null }] },
+      band_rel: {
+        id: 92,
+        name: 'Gojira',
+        setlist: { songs: [{ name: 'Flying Whales', tape: false, cover: null }] },
+      },
+    }],
   },
 };
 
@@ -72,7 +84,7 @@ describe('POST /attendances/:id/media', () => {
       'POST /attendances/:attendanceId/media [5]',
       'GET /attendances/:attendanceId/media [4]',
       'GET /bands/:bandId/media [4]',
-      'PATCH /media [7]',
+      'PATCH /media [8]',
       'DELETE /media/:id [4]',
       'GET /media/:id/file [1]',
       'GET /media/:id/thumb [1]',
@@ -161,7 +173,7 @@ describe('POST /attendances/:id/media', () => {
 
     const sidecar = JSON.parse(await readFile(
       join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira', 'concert-media.json'), 'utf8'));
-    expect(sidecar.files[0]).toMatchObject({ band_id: null, band_name: null });
+    expect(sidecar.files[0]).toMatchObject({ band_id: null, band_name: null, song: null });
   });
 
   it('refuses a band that is not on the bill', async () => {
@@ -645,14 +657,19 @@ describe('GET /attendances/:id/media', () => {
     expect(res.body.data.files).toHaveLength(3);
   });
 
-  it('sends the night\'s bill, so the tagging picker needs no second request', async () => {
+  it('sends the night\'s bill and both setlists, so the song picker needs no second request', async () => {
     prisma.concertMedia.findMany = vi.fn(async () => []);
     const res = await request(app())
       .get('/data/concerts/attendances/1/media')
       .set(...authHeader({ id: 'user-1' }))
       .expect(200);
 
-    expect(res.body.data.bands).toEqual([{ id: 92, name: 'Gojira' }]);
+    expect(res.body.data.bands).toEqual([{
+      id: 92,
+      name: 'Gojira',
+      setlist: { songs: [{ name: 'Stranded', tape: false, cover: null }] },
+      recent_setlist: { songs: [{ name: 'Flying Whales', tape: false, cover: null }] },
+    }]);
   });
 
   it('refuses a show that is not the caller\'s', async () => {
@@ -853,6 +870,149 @@ describe('PATCH /media', () => {
 
     const sidecar = JSON.parse(await readFile(join(dir, 'concert-media.json'), 'utf8'));
     expect(sidecar.files[0]).toMatchObject({ name: 'IMG_1.jpg', band_id: 92, band_name: 'Gojira', sha256: 'h5' });
+  });
+});
+
+describe('PATCH /media — the song a video is of', () => {
+  // The case this exists for: a video of a whole song. The band tag says who
+  // was on stage, the song tag says which three minutes of their set this is.
+  const dirFor = () => join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+
+  const videoRow = (over = {}) => ({
+    id: 5,
+    attendance_id: 1,
+    rel_path: 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4',
+    filename: 'VID_1.mp4',
+    kind: 'VIDEO',
+    sha256: 'h5',
+    bytes: 99999,
+    width: 1920,
+    height: 1080,
+    duration_ms: 214000,
+    caption: null,
+    taken_at: null,
+    band_id: 92,
+    song: null,
+    attendance_rel: {
+      wishlist_rel: { user_id: 'user-1' },
+      concert_rel: {
+        id: 8417,
+        concert_date: new Date('2026-06-12T19:00:00Z'),
+        venue: 'Sentrum Scene',
+        city: 'Oslo',
+        country: 'NO',
+        bands: [{ band_rel: { id: 92, name: 'Gojira' } }],
+      },
+    },
+    ...over,
+  });
+
+  beforeEach(async () => {
+    await mkdir(dirFor(), { recursive: true });
+    prisma.concertMedia.update = vi.fn(async ({ data }) => ({ id: 5, ...data }));
+    prisma.$transaction = vi.fn(async (fns) => Promise.all(fns.map((f) => (typeof f === 'function' ? f() : f))));
+  });
+
+  it('writes the song to Postgres and to the sidecar', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [videoRow()]);
+
+    await request(app())
+      .patch('/data/concerts/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ ids: [5], song: 'Stranded' })
+      .expect(200);
+
+    expect(prisma.concertMedia.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ song: 'Stranded' }) }),
+    );
+    const sidecar = JSON.parse(await readFile(join(dirFor(), 'concert-media.json'), 'utf8'));
+    expect(sidecar.files[0]).toMatchObject({ name: 'VID_1.mp4', song: 'Stranded' });
+  });
+
+  it('trims the song and reads an empty one as no song at all', async () => {
+    // The picker sends '' for "No song", and a name arriving with whitespace
+    // would sort and compare as a different song from the same one typed clean.
+    prisma.concertMedia.findMany = vi.fn(async () => [videoRow({ song: 'Stranded' })]);
+
+    await request(app())
+      .patch('/data/concerts/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ ids: [5], song: '   ' })
+      .expect(200);
+
+    expect(prisma.concertMedia.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ song: null }) }),
+    );
+  });
+
+  it('refuses a song on a photograph', async () => {
+    // A still is not "of" a song the way a recording of one is, and allowing
+    // it would put a song label on the hundreds of photos in a festival import.
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      videoRow({ kind: 'PHOTO', filename: 'IMG_1.jpg', rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_1.jpg' }),
+    ]);
+
+    const res = await request(app())
+      .patch('/data/concerts/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ ids: [5], song: 'Stranded' })
+      .expect(400);
+
+    // Asserted on the message, not just the status: an unrecognised `song` key
+    // already 400s as "Nothing to change", so a status-only check here passed
+    // before any of this was implemented.
+    expect(res.body.error).toMatch(/video/i);
+    expect(prisma.concertMedia.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses a song on a video with no band to hang it on', async () => {
+    // "Stranded" on a four-act festival day names nobody: the same song title
+    // can appear on two bills, and the band view is what a song is read under.
+    prisma.concertMedia.findMany = vi.fn(async () => [videoRow({ band_id: null })]);
+
+    const res = await request(app())
+      .patch('/data/concerts/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ ids: [5], song: 'Stranded' })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/band/i);
+    expect(prisma.concertMedia.update).not.toHaveBeenCalled();
+  });
+
+  it('accepts a song and the band it belongs to in one request', async () => {
+    // Tagging an untagged video is one action in the lightbox, so the band
+    // arriving in the same patch has to satisfy the has-a-band rule above.
+    prisma.concertMedia.findMany = vi.fn(async () => [videoRow({ band_id: null })]);
+
+    await request(app())
+      .patch('/data/concerts/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ ids: [5], band_id: 92, song: 'Stranded' })
+      .expect(200);
+
+    expect(prisma.concertMedia.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ band_id: 92, song: 'Stranded' }) }),
+    );
+  });
+
+  it('drops the song when the band it belonged to is cleared', async () => {
+    // Untagging the band leaves a song with no artist — the exact state the
+    // rule above refuses to create, so it must not be reachable by this route
+    // either. The sidecar is the record of truth, so it has to forget it too.
+    prisma.concertMedia.findMany = vi.fn(async () => [videoRow({ song: 'Stranded' })]);
+
+    await request(app())
+      .patch('/data/concerts/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ ids: [5], band_id: null })
+      .expect(200);
+
+    expect(prisma.concertMedia.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ band_id: null, song: null }) }),
+    );
+    const sidecar = JSON.parse(await readFile(join(dirFor(), 'concert-media.json'), 'utf8'));
+    expect(sidecar.files[0]).toMatchObject({ name: 'VID_1.mp4', song: null });
   });
 });
 

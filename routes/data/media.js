@@ -108,7 +108,18 @@ async function ownAttendance(attendanceId, userId) {
       concert_rel: {
         select: {
           id: true, concert_date: true, venue: true, city: true, country: true,
-          bands: { select: { band: true, band_rel: { select: { id: true, name: true } } } },
+          // Both setlists: `setlist` is what this band played at this show,
+          // `band_rel.setlist` the most recent one we have for them anywhere.
+          // The upload route shares this helper and needs neither, but a
+          // handful of song lists alongside a multi-megabyte upload is not a
+          // cost worth a second query to avoid.
+          bands: {
+            select: {
+              band: true,
+              setlist: true,
+              band_rel: { select: { id: true, name: true, setlist: true } },
+            },
+          },
         },
       },
     },
@@ -274,7 +285,10 @@ router.post(
             // scope in the spec, so the field is worth keeping.
             const entry = {
               name: filename, kind, band_id: bandId, band_name: bandId ? onBill.get(bandId) : null,
-              caption: '', sha256, bytes: size,
+              // Always present, always null: a fresh upload has no song, and an
+              // entry whose shape depends on when it was written is the kind
+              // of thing that makes the record of truth hard to read by hand.
+              caption: '', song: null, sha256, bytes: size,
               width: probe.width, height: probe.height,
               duration_ms: probe.duration_ms, taken_at: null,
             };
@@ -377,8 +391,19 @@ router.get(
       const untagged = rows.filter((m) => m.band_id === null).length;
 
       // The bill travels with the response so the tagging picker offers exactly
-      // the artists who played that night, with no second request.
-      const bands = row.concert_rel.bands.map((b) => b.band_rel);
+      // the artists who played that night, with no second request — and their
+      // setlists with it, for the same reason, so the song picker on a video
+      // has something to offer the moment a band is chosen.
+      //
+      // Spelled out field by field rather than spread from band_rel, which
+      // carries a `setlist` of its own: a spread would silently put the band's
+      // most recent setlist in the field meaning "what they played that night".
+      const bands = row.concert_rel.bands.map((b) => ({
+        id: b.band_rel.id,
+        name: b.band_rel.name,
+        setlist: b.setlist ?? null,
+        recent_setlist: b.band_rel.setlist ?? null,
+      }));
 
       return success(res, 200, {
         files: rows.map((m) => ({ ...m, ...mint(m.id) })),
@@ -418,7 +443,19 @@ router.get(
           concert_rel: {
             select: {
               id: true, concert_date: true, venue: true, city: true,
-              bands: { select: { band_rel: { select: { id: true, name: true } } } },
+              // Setlists for the whole bill, not just the band being viewed:
+              // the rail's lightbox can retag a file to any artist on that
+              // night's bill, and a song picker that went empty on the switch
+              // would look broken. The payload concern that forced the
+              // per-band dedup in wishlists/reads.js does not apply at this
+              // scale — that is a week of every wishlist band's concerts,
+              // this is one band's own gigs.
+              bands: {
+                select: {
+                  setlist: true,
+                  band_rel: { select: { id: true, name: true, setlist: true } },
+                },
+              },
             },
           },
         },
@@ -444,7 +481,12 @@ router.get(
             // It only guards a caller (or a test's hand-built row) that
             // constructs this shape without it — and the rail below does
             // need the bill, to offer the tagging picker's choices.
-            bands: (a.concert_rel.bands ?? []).map((b) => b.band_rel),
+            bands: (a.concert_rel.bands ?? []).map((b) => ({
+              id: b.band_rel.id,
+              name: b.band_rel.name,
+              setlist: b.setlist ?? null,
+              recent_setlist: b.band_rel.setlist ?? null,
+            })),
           },
         })),
         media,
@@ -466,6 +508,7 @@ router.patch(
     body('ids.*').isInt(),
     body('band_id').optional({ nullable: true }).isInt(),
     body('caption').optional({ nullable: true }).isString().isLength({ max: 500 }),
+    body('song').optional({ nullable: true }).isString().isLength({ max: 200 }),
   ],
   async (req, res) => {
     try {
@@ -510,9 +553,36 @@ router.patch(
         if (!onEveryBill) return badRequest(res, 'That band is not on every selected show\'s bill');
       }
 
+      // Trimmed here rather than at the picker: ' Stranded' and 'Stranded'
+      // are the same song, and a stray space would file one video away from
+      // the rest of its own take. An empty string is the picker's "No song".
+      const song = req.body.song === undefined ? undefined
+        : (req.body.song ?? '').trim() || null;
+
+      if (song != null) {
+        // A still is not "of" a song the way a recording of one is, and the
+        // alternative is a song label on every photo in a festival import.
+        if (rows.some((r) => r.kind !== 'VIDEO')) {
+          return badRequest(res, 'Only a video can be tagged with a song');
+        }
+        // A song with no artist names nobody: two bands on one bill can play
+        // a song by the same title, and the band view is where a song is read.
+        // The band may be arriving in this same request, which is the whole
+        // point — tagging an untagged video is one action in the lightbox.
+        const bandAfter = (r) => (bandId !== undefined ? bandId : r.band_id);
+        if (rows.some((r) => bandAfter(r) == null)) {
+          return badRequest(res, 'Tag the band before the song');
+        }
+      }
+
       const patch = {
         ...(bandId !== undefined && { band_id: bandId }),
         ...(req.body.caption !== undefined && { caption: req.body.caption || null }),
+        ...(song !== undefined && { song }),
+        // Clearing the band leaves a song with no artist — exactly the state
+        // the guard above refuses to create, so it must not be reachable from
+        // the other direction either.
+        ...(bandId === null && { song: null }),
       };
       if (!Object.keys(patch).length) return badRequest(res, 'Nothing to change');
 
@@ -562,7 +632,7 @@ router.patch(
             const entry = sidecar.files.find((f) => f.name === r.filename) ?? {
               name: r.filename, kind: r.kind,
               band_id: r.band_id, band_name: billName(r, r.band_id),
-              caption: r.caption ?? '', sha256: r.sha256, bytes: r.bytes,
+              caption: r.caption ?? '', song: r.song ?? null, sha256: r.sha256, bytes: r.bytes,
               width: r.width, height: r.height, duration_ms: r.duration_ms,
               taken_at: r.taken_at,
             };
@@ -570,6 +640,8 @@ router.patch(
               ...entry,
               ...(bandId !== undefined && { band_id: bandId, band_name: billName(r, bandId) }),
               ...(req.body.caption !== undefined && { caption: req.body.caption || '' }),
+              ...(song !== undefined && { song }),
+              ...(bandId === null && { song: null }),
             });
           }
           return sidecar;

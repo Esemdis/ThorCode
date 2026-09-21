@@ -247,6 +247,13 @@ model ConcertMedia {
   height        Int?
   duration_ms   Int?
   caption       String?
+  /// Which song a video is a recording of, as a plain name rather than a
+  /// reference: there is no song table to point at, setlists are JSON blobs
+  /// scraped from setlist.fm, and the name is what survives both a setlist
+  /// refetch and a rebuild of this table from the sidecars. Only ever set on
+  /// a VIDEO, and only alongside a band_id — a song title with no artist
+  /// names nobody on a festival bill.
+  song          String?
   taken_at      DateTime?
   created_at    DateTime  @default(now())
 

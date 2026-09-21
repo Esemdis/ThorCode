@@ -81,6 +81,29 @@ describe('planRebuild', () => {
     });
   });
 
+  it('carries the song a video was tagged with back out of the sidecar', () => {
+    // The sidecar is the record of truth and Postgres is rebuilt from it, so a
+    // field the rebuild does not copy is a tag that survives the backup and
+    // then quietly disappears the first time the index is rebuilt.
+    const plan = planRebuild({
+      sidecars: [sidecar('user-1/show', 8417, [entry('a.mp4', { kind: 'VIDEO', song: 'Stranded' })])],
+      filesOnDisk: { 'user-1/show': ['a.mp4'] },
+      attendanceIds: new Map([[attendanceKey('user-1', 8417), 1]]),
+    });
+    expect(plan.upserts[0]).toMatchObject({ song: 'Stranded' });
+  });
+
+  it('reads a sidecar written before songs existed as a file with no song', () => {
+    // Every entry in the archive today predates this field. An undefined here
+    // reaching Prisma is not the same as a null, so it is normalised.
+    const plan = planRebuild({
+      sidecars: [sidecar('user-1/show', 8417, [entry('a.mp4', { kind: 'VIDEO' })])],
+      filesOnDisk: { 'user-1/show': ['a.mp4'] },
+      attendanceIds: new Map([[attendanceKey('user-1', 8417), 1]]),
+    });
+    expect(plan.upserts[0].song).toBeNull();
+  });
+
   it('attaches media to the attendance row belonging to the sidecar user, not just any row for that concert', () => {
     // Two people at the same gig have two attendance rows carrying the same
     // concert_id. Keyed on the concert alone, the second overwrote the first,

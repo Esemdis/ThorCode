@@ -171,6 +171,10 @@ function planRebuild({ sidecars, filesOnDisk, attendanceIds }) {
         height: f.height ?? null,
         duration_ms: f.duration_ms ?? null,
         caption: f.caption || null,
+        // `|| null` rather than `?? null`: every sidecar written before songs
+        // existed has no key here at all, and an undefined reaching Prisma
+        // means "leave it alone" on an update rather than "no song".
+        song: f.song || null,
         taken_at: f.taken_at ? new Date(f.taken_at) : null,
       });
     }
