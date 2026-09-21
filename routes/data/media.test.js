@@ -53,6 +53,9 @@ beforeEach(async () => {
 });
 
 const app = () => buildApp(router, '/data/concerts');
+// Uploading is admin-only, so every upload here — including the ones that
+// are just setup for another route's test — signs in as one.
+const admin = { id: 'user-1', role: 'ADMIN' };
 const jpeg = () => Buffer.from(
   '/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a' +
   'HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAA' +
@@ -83,12 +86,23 @@ describe('POST /attendances/:id/media', () => {
       .expect(401);
   });
 
+  it('refuses an upload from a plain user', async () => {
+    // The archive is one person's. Everyone signed in can look, but only an
+    // admin adds to it, and the gate is here rather than in the dialog that
+    // hides the button.
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1', role: 'USER' }))
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(403);
+  });
+
   it('refuses an attendance that belongs to someone else', async () => {
     // Attendance carries the owner. Without this check, knowing an integer is
     // enough to write into another account's archive.
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'someone-else' }))
+      .set(...authHeader({ id: 'someone-else', role: 'ADMIN' }))
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(403);
   });
@@ -96,7 +110,7 @@ describe('POST /attendances/:id/media', () => {
   it('writes the file into the show folder under the caller subtree', async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(201);
@@ -108,7 +122,7 @@ describe('POST /attendances/:id/media', () => {
   it('writes a sidecar naming the concert and the band', async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(201);
@@ -122,7 +136,7 @@ describe('POST /attendances/:id/media', () => {
   it('indexes the file in Postgres with its checksum', async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(201);
@@ -139,7 +153,7 @@ describe('POST /attendances/:id/media', () => {
     // are looked at. Tagging is a separate sweep from the gig view.
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(201);
 
@@ -155,7 +169,7 @@ describe('POST /attendances/:id/media', () => {
     // and the band view quietly shows a show the user never saw them at.
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '999')
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(400);
@@ -164,7 +178,7 @@ describe('POST /attendances/:id/media', () => {
   it('refuses a file type no browser renders', async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', Buffer.from('pdf'), { filename: 'a.pdf', contentType: 'application/pdf' })
       .expect(400);
@@ -176,7 +190,7 @@ describe('POST /attendances/:id/media', () => {
 
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .field('meta', JSON.stringify({ 'VID_1.mp4': { width: 1920, height: 1080, duration_ms: 24000 } }))
       .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
@@ -190,7 +204,7 @@ describe('POST /attendances/:id/media', () => {
   it('takes duration and dimensions from the browser, since there is no ffprobe', async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .field('meta', JSON.stringify({ 'VID_1.mp4': { width: 1920, height: 1080, duration_ms: 24000 } }))
       .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
@@ -205,7 +219,7 @@ describe('POST /attendances/:id/media', () => {
     // it to protect a thumbnail, which is exactly backwards for a backup.
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
       .expect(201);
@@ -216,7 +230,7 @@ describe('POST /attendances/:id/media', () => {
   it('ignores a duration the client made up', async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .field('meta', JSON.stringify({ 'VID_1.mp4': { duration_ms: 'banana', width: -5 } }))
       .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
@@ -230,7 +244,7 @@ describe('POST /attendances/:id/media', () => {
     prisma.concertMedia.findMany.mockResolvedValue([{ filename: 'IMG_1.jpg' }]);
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(201);
@@ -248,7 +262,7 @@ describe('POST /attendances/:id/media', () => {
 
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
       .attach('posters', poster, { filename: 'VID_1.mp4.webp', contentType: 'image/webp' })
@@ -262,7 +276,7 @@ describe('POST /attendances/:id/media', () => {
   it('accepts several files in one request', async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', jpeg(), 'IMG_1.jpg')
       .attach('files', jpeg(), 'IMG_2.jpg')
@@ -277,7 +291,7 @@ describe('POST /attendances/:id/media', () => {
     // existed before the request arrived.
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', jpeg(), 'IMG_1.jpg')
       .attach('files', jpeg(), 'IMG_1.jpg')
@@ -300,7 +314,7 @@ describe('POST /attendances/:id/media', () => {
     // is what keeps a rejected batch from partially landing.
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', jpeg(), 'IMG_1.jpg')
       .attach('files', jpeg(), 'IMG_2.jpg')
@@ -317,7 +331,7 @@ describe('POST /attendances/:id/media', () => {
   it('refuses a request whose meta field is not valid JSON, rather than 500ing on it', async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .field('meta', '{not json')
       .attach('files', jpeg(), 'IMG_1.jpg')
@@ -338,7 +352,7 @@ describe('POST /attendances/:id/media', () => {
 
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', jpeg(), 'IMG_1.jpg')
       .attach('files', jpeg(), 'IMG_2.jpg')
@@ -360,7 +374,7 @@ describe('POST /attendances/:id/media', () => {
     // suite's tmp dir and then fail on the real mount, taking the batch with it.
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', jpeg(), 'a:b?c*.jpg')
       .expect(201);
@@ -386,7 +400,7 @@ describe('POST /attendances/:id/media', () => {
     // what the schema permits, and what planRebuild round-trips.
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .field('meta', JSON.stringify({ 'VID_1.mp4': { width: 9e12, height: 1080, duration_ms: 1e300 } }))
       .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
@@ -413,7 +427,7 @@ describe('POST /attendances/:id/media', () => {
 
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(201);
 
@@ -435,7 +449,7 @@ describe('POST /attendances/:id/media', () => {
 
     const res = await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(400);
 
@@ -464,7 +478,7 @@ describe('which folder a show lands in', () => {
 
   const post = (attendanceId, filename) => request(app())
     .post(`/data/concerts/attendances/${attendanceId}/media`)
-    .set(...authHeader({ id: 'user-1' }))
+    .set(...authHeader(admin))
     .attach('files', jpeg(), filename);
 
   it('keeps one night in one folder when a support act is added between two uploads', async () => {
@@ -848,7 +862,7 @@ describe('DELETE /media/:id', () => {
     // a row is invisible until the next rebuild.
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(201);
@@ -881,7 +895,7 @@ describe('DELETE /media/:id', () => {
 
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
       .attach('posters', poster, { filename: 'VID_1.mp4.webp', contentType: 'image/webp' })
@@ -910,7 +924,7 @@ describe('GET /media/:id/file', () => {
   const uploadOne = async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(201);
@@ -964,7 +978,7 @@ describe('GET /media/:id/thumb', () => {
     // this. It is also what lets the upload skip thumbnails on failure.
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(201);
@@ -990,7 +1004,7 @@ describe('GET /media/:id/thumb', () => {
 
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
       .attach('posters', poster, { filename: 'VID_1.mp4.webp', contentType: 'image/webp' })
@@ -1011,7 +1025,7 @@ describe('GET /media/:id/thumb', () => {
   it('answers 404 for a video whose poster extraction failed in the browser', async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .field('band_id', '92')
       .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
       .expect(201);
@@ -1142,13 +1156,13 @@ describe('an upload that collides with the archive\'s own bookkeeping', () => {
     // pointing at it; a different ordering loses the sidecar instead.
     const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
     await request(app()).post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(201);
     prisma.concertMedia.findMany = vi.fn(async () => [{ filename: 'IMG_1.jpg' }]);
 
     await request(app()).post('/data/concerts/attendances/1/media')
-      .set(...authHeader({ id: 'user-1' }))
+      .set(...authHeader(admin))
       .attach('files', jpeg(), { filename: 'concert-media.json', contentType: 'image/jpeg' })
       .expect(201);
 

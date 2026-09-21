@@ -117,9 +117,12 @@ async function ownAttendance(attendanceId, userId) {
   return { row, owned: row.wishlist_rel.user_id === userId };
 }
 
+// Admin-only. Everyone signed in can look at the archive; only an admin adds
+// to it. Enforced here and not merely by hiding the button, because the dialog
+// is a convenience and this is the lock.
 router.post(
   '/attendances/:attendanceId/media',
-  [auth, roleCheck(['ADMIN', 'USER']), param('attendanceId').isInt()],
+  [auth, roleCheck(['ADMIN']), param('attendanceId').isInt()],
   upload.fields([{ name: 'files', maxCount: 50 }, { name: 'posters', maxCount: 50 }]),
   async (req, res) => {
     // req.files is keyed by field once upload.fields is used, so both lists
