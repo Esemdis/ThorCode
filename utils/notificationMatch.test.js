@@ -20,6 +20,17 @@ const sub = (userId, bandId, cityId) => ({
   user_id: userId,
   band_id: bandId,
   city_id: cityId,
+  tour_query: null,
+  venue_query: null,
+  user_rel: { id: userId, email: `${userId}@example.com` },
+});
+
+const tourSub = (userId, tourQuery, venueQuery = null) => ({
+  user_id: userId,
+  band_id: null,
+  city_id: null,
+  tour_query: tourQuery,
+  venue_query: venueQuery,
   user_rel: { id: userId, email: `${userId}@example.com` },
 });
 
@@ -87,6 +98,54 @@ describe('subscriptionMatches', () => {
     // null to null would otherwise match every unresolved concert.
     expect(subscriptionMatches(sub('u1', null, null), concert(1, null, [5]), [5], follows(5))).toBe(false);
     expect(subscriptionMatches(sub('u1', 5, null), concert(2, null, [5]), [5], follows(5))).toBe(true);
+  });
+
+  it('matches a tour watch against the event name, wherever it plays', () => {
+    const s = tourSub('u1', 'Copenhell');
+    expect(subscriptionMatches(s, concert(1, 12, [5], { name: 'Copenhell 2027' }), [5], follows())).toBe(true);
+    expect(subscriptionMatches(s, concert(2, 99, [5], { name: 'Copenhell 2027' }), [5], follows())).toBe(true);
+    expect(subscriptionMatches(s, concert(3, 12, [5], { name: 'Roskilde Festival' }), [5], follows())).toBe(false);
+  });
+
+  it('matches a tour watch regardless of who is on the bill', () => {
+    // The point of the kind. A festival is announced long before its lineup, so
+    // a watch that waited for a known band would fire months late or not at all.
+    const s = tourSub('u1', 'Copenhell');
+    expect(subscriptionMatches(s, concert(1, 12, [], { name: 'Copenhell 2027' }), [], follows())).toBe(true);
+    expect(subscriptionMatches(s, concert(2, 12, [6], { name: 'Copenhell 2027' }), [6], follows(5))).toBe(true);
+  });
+
+  it('ignores case, because the event name is scraped text nobody normalises', () => {
+    expect(
+      subscriptionMatches(tourSub('u1', 'copenhell'), concert(1, 12, [5], { name: 'COPENHELL 2027' }), [5], follows()),
+    ).toBe(true);
+  });
+
+  it('narrows a tour watch to the venue when one is given', () => {
+    const s = tourSub('u1', 'Copenhell', 'Refshaleøen');
+    expect(
+      subscriptionMatches(s, concert(1, 12, [5], { name: 'Copenhell 2027', venue: 'Refshaleøen' }), [5], follows()),
+    ).toBe(true);
+    expect(
+      subscriptionMatches(s, concert(2, 12, [5], { name: 'Copenhell 2027', venue: 'Vega' }), [5], follows()),
+    ).toBe(false);
+  });
+
+  it('matches nothing for a tour watch when the concert has no event name', () => {
+    // Plenty of rows carry a null name, and a missing haystack must miss rather
+    // than throw on the digest's behalf.
+    expect(subscriptionMatches(tourSub('u1', 'Copenhell'), concert(1, 12, [5], { name: null }), [5], follows())).toBe(false);
+  });
+
+  it('matches nothing for a venue-narrowed tour watch when the venue is missing', () => {
+    expect(
+      subscriptionMatches(
+        tourSub('u1', 'Copenhell', 'Refshaleøen'),
+        concert(1, 12, [5], { name: 'Copenhell 2027', venue: null }),
+        [5],
+        follows(),
+      ),
+    ).toBe(false);
   });
 });
 

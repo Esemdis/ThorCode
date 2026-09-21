@@ -33,7 +33,8 @@ router.get(
   }
 );
 
-// POST /notifications/subscriptions — watch a band, a city, or a band-in-a-city combo
+// POST /notifications/subscriptions — watch a band, a city, a band-in-a-city
+// combo, or a tour/festival by name (optionally narrowed to a venue)
 router.post(
   "/notifications/subscriptions",
   [
@@ -41,6 +42,14 @@ router.post(
     roleCheck(["ADMIN", "USER"]),
     body("band_id").optional({ nullable: true }).isInt().withMessage("band_id must be an integer"),
     body("city_id").optional({ nullable: true }).isInt().withMessage("city_id must be an integer"),
+    // Two characters minimum on both: these are matched as substrings, so a
+    // single letter is a subscription to very nearly everything. trim() runs
+    // before isLength and rewrites req.body, so a blank box is rejected here
+    // rather than stored as "" and matched against every concert there is.
+    body("tour_query").optional({ nullable: true }).isString().trim().isLength({ min: 2 })
+      .withMessage("tour_query must be at least 2 characters"),
+    body("venue_query").optional({ nullable: true }).isString().trim().isLength({ min: 2 })
+      .withMessage("venue_query must be at least 2 characters"),
   ],
   rateLimit,
   async (req, res) => {
@@ -49,9 +58,20 @@ router.post(
 
     const bandId = req.body.band_id != null ? parseInt(req.body.band_id, 10) : null;
     const cityId = req.body.city_id != null ? parseInt(req.body.city_id, 10) : null;
+    const tourQuery = req.body.tour_query ?? null;
+    const venueQuery = req.body.venue_query ?? null;
 
-    if (bandId == null && cityId == null) {
-      return res.status(400).json({ error: "Provide at least one of band_id or city_id" });
+    if (bandId == null && cityId == null && tourQuery == null) {
+      return res.status(400).json({ error: "Provide at least one of band_id, city_id or tour_query" });
+    }
+    // The two shapes stay apart. subscriptionMatches answers a tour watch from
+    // the event name alone, so a band or city sent alongside would be accepted
+    // here and then silently ignored at match time.
+    if (tourQuery != null && (bandId != null || cityId != null)) {
+      return res.status(400).json({ error: "tour_query cannot be combined with band_id or city_id" });
+    }
+    if (venueQuery != null && tourQuery == null) {
+      return res.status(400).json({ error: "venue_query only narrows a tour_query watch" });
     }
 
     try {
@@ -65,12 +85,18 @@ router.post(
       }
 
       const existing = await prisma.notificationSubscription.findFirst({
-        where: { user_id: req.user.id, band_id: bandId, city_id: cityId },
+        where: {
+          user_id: req.user.id,
+          band_id: bandId,
+          city_id: cityId,
+          tour_query: tourQuery,
+          venue_query: venueQuery,
+        },
       });
       if (existing) return res.status(409).json({ error: "You already have this subscription" });
 
       const subscription = await prisma.notificationSubscription.create({
-        data: { user_id: req.user.id, band_id: bandId, city_id: cityId },
+        data: { user_id: req.user.id, band_id: bandId, city_id: cityId, tour_query: tourQuery, venue_query: venueQuery },
         include: {
           band_rel: { select: { id: true, name: true } },
           city_rel: { select: { id: true, name: true, country: true } },

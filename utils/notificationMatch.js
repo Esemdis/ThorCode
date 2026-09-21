@@ -8,7 +8,19 @@
  * side gained a subscription kind.
  */
 
+// Case-insensitive containment, the only honest comparison against `name` and
+// `venue`: both are scraped strings nobody normalises, and the same festival
+// arrives as "Copenhell", "COPENHELL 2027" or "Copenhell 2027 - Day 1"
+// depending on the source. A substring hit is a hint, which is why the UI says
+// so rather than promising the watch cannot miss.
+function containsInsensitive(haystack, needle) {
+  if (typeof haystack !== "string" || typeof needle !== "string") return false;
+  return haystack.toLowerCase().includes(needle.toLowerCase());
+}
+
 // Which subscription kinds match a given concert:
+// - tour set              -> an event whose name contains it, optionally
+//                            narrowed to a venue whose name contains venue_query
 // - band + city both set  -> that band, playing that exact city
 // - band only             -> that band, any city
 // - city only             -> a band the subscriber follows, playing that city
@@ -24,6 +36,17 @@
 // a second user signing up turned every city watch into a feed of other
 // people's artists.
 function subscriptionMatches(sub, concert, bandIds, followedBandIds) {
+  // Deliberately before the band and city branches, and deliberately not
+  // combined with them: a tour watch is about the event, not the bill. A
+  // festival is announced with a date and a venue and no lineup at all, so
+  // anything requiring a known band would fire months late or never. The POST
+  // route keeps the kinds apart, so a row with both is malformed rather than a
+  // combination this has to define.
+  if (sub.tour_query != null) {
+    if (!containsInsensitive(concert.name, sub.tour_query)) return false;
+    if (sub.venue_query != null) return containsInsensitive(concert.venue, sub.venue_query);
+    return true;
+  }
   if (sub.band_id != null && sub.city_id != null) {
     return bandIds.includes(sub.band_id) && concert.city_id === sub.city_id;
   }
@@ -37,7 +60,7 @@ function subscriptionMatches(sub, concert, bandIds, followedBandIds) {
     // several on a single concert row.
     return bandIds.some((id) => followedBandIds.has(id));
   }
-  // Both null. The column pair allows it even though the POST route rejects it,
+  // Nothing set at all. The columns allow it even though the POST route rejects it,
   // and a row written by hand or by a future backfill must not become a
   // wildcard that forwards the whole database to whoever owns it.
   return false;
