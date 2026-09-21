@@ -5,7 +5,7 @@ import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../te
 const model = () => ({
   findMany: vi.fn(), findUnique: vi.fn(), findFirst: vi.fn(), count: vi.fn(),
   create: vi.fn(), createMany: vi.fn(), update: vi.fn(), updateMany: vi.fn(),
-  delete: vi.fn(), deleteMany: vi.fn(), upsert: vi.fn(),
+  delete: vi.fn(), deleteMany: vi.fn(), upsert: vi.fn(), groupBy: vi.fn(),
 });
 
 // Seeded before the router is imported — see installFakePrisma for why this is
@@ -439,6 +439,50 @@ describe('POST /wishlists/notify subscription delivery', () => {
 
     expect(prisma.concert.findMany).not.toHaveBeenCalled();
     expect(received.filter((r) => r.path === '/theirs')).toHaveLength(1);
+  });
+});
+
+describe('GET /wishlists/:id/attendance', () => {
+  const WISHLIST = { id: 7, user_id: 'user-1', bands: [] };
+
+  const attendanceRow = (id) => ({
+    id,
+    created_at: new Date('2026-01-01'),
+    concert_rel: {
+      id: id * 10, event_id: `e${id}`, name: null, venue: 'Vega', city: 'Copenhagen',
+      country: 'DK', concert_date: new Date('2026-01-01'), url: null, festival: false,
+      metadata: null, source: 'songkick', latitude: null, longitude: null,
+      on_sale: false, sold_out: false, price_min: null, price_max: null,
+      price_currency: null, weather: null, bands: [],
+    },
+  });
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue(WISHLIST);
+  });
+
+  it('flags a show that has media attached, and leaves the others unflagged', async () => {
+    prisma.concertAttendance.findMany.mockResolvedValue([attendanceRow(1), attendanceRow(2)]);
+    // groupBy, not the raw rows: this is the same shape countMediaForAttendances
+    // uses to decide whether a show has any media, just grouped per attendance
+    // instead of summed across all of them.
+    prisma.concertMedia.groupBy.mockResolvedValue([{ attendance_id: 1, _count: 3 }]);
+
+    const res = await request(app).get('/wishlists/7/attendance').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body.attendance.find((a) => a.attendance_id === 1).has_photos).toBe(true);
+    expect(res.body.attendance.find((a) => a.attendance_id === 2).has_photos).toBe(false);
+  });
+
+  it('skips the media lookup entirely when there is no attendance', async () => {
+    prisma.concertAttendance.findMany.mockResolvedValue([]);
+
+    const res = await request(app).get('/wishlists/7/attendance').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body.attendance).toEqual([]);
+    expect(prisma.concertMedia.groupBy).not.toHaveBeenCalled();
   });
 });
 

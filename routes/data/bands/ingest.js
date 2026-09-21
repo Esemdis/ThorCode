@@ -184,8 +184,9 @@ router.post(
               }),
             );
             const bandIds = dbBands.filter(Boolean).map((b) => b.id);
+            const bandNames = dbBands.filter(Boolean).map((b) => b.name);
 
-            const { isDuplicate, existingConcert } = await checkDuplicateConcert({ concert, bandIds, tx });
+            const { isDuplicate, existingConcert } = await checkDuplicateConcert({ concert, bandIds, bandNames, tx });
 
             if (isDuplicate) {
               duplicateConcerts.push({

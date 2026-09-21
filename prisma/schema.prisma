@@ -594,10 +594,13 @@ model TripReview {
   trip_id               Int      @unique
   culture_rating        Int?
   culture_note          String?  @db.Text
+  culture_photos        String[] @default([])
   food_rating           Int?
   food_note             String?  @db.Text
+  food_photos           String[] @default([])
   fun_rating            Int?
   fun_note              String?  @db.Text
+  fun_photos            String[] @default([])
   missing_gear_item_ids Int[]
   missing_note          String?  @db.Text
   comment               String?  @db.Text

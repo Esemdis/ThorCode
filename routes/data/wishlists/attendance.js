@@ -9,13 +9,13 @@
 const express = require("express");
 const router = express.Router();
 const { validationResult, param, body } = require("express-validator");
-const axios = require("axios");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
 const { storesRealInstant } = require("../../../utils/ics");
 const { conflict } = require("../../../utils/apiResponse");
 const { countMediaForAttendances } = require("../../../utils/mediaDetach");
+const { enrichConcertBands } = require("../../../utils/setlistEnrich");
 
 // GET /wishlists/:id/attendance — all attended/going concerts for this wishlist
 router.get(
@@ -78,9 +78,23 @@ router.get(
         },
       });
 
+      // Grouped rather than countMediaForAttendances' summed total: the History
+      // view needs to know which shows have photos, not how many there are in
+      // aggregate across the whole page.
+      const attendanceIds = records.map((r) => r.id);
+      const mediaCounts = attendanceIds.length
+        ? await prisma.concertMedia.groupBy({
+            by: ["attendance_id"],
+            where: { attendance_id: { in: attendanceIds } },
+            _count: true,
+          })
+        : [];
+      const attendanceIdsWithPhotos = new Set(mediaCounts.map((m) => m.attendance_id));
+
       const result = records.map((r) => ({
         attendance_id: r.id,
         created_at: r.created_at,
+        has_photos: attendanceIdsWithPhotos.has(r.id),
         concert: {
           ...r.concert_rel,
           source: undefined,
@@ -132,7 +146,7 @@ router.post(
 
       const concert = await prisma.concert.findUnique({
         where: { id: concertId },
-        select: { id: true, concert_date: true, bands: { select: { band: true } } },
+        select: { id: true, concert_date: true, venue: true, city: true, bands: { select: { band: true } } },
       });
       if (!concert) return res.status(404).json({ error: "Concert not found" });
 
@@ -143,6 +157,21 @@ router.post(
       });
 
       res.json({ attendance_id: attendance.id });
+
+      // Background: a concert reached via the ordinary "mark attended" button
+      // — as opposed to the from-setlist import below — has never had its
+      // per-band setlists resolved. Without this, a show scraped from
+      // Bandsintown/Songkick and later marked attended sits in "Attended"
+      // with no setlist forever, even once Setlist.fm has one, because
+      // nothing else ever links this concert to it. concert_date is a wall
+      // clock wearing a UTC label (see date-handling notes), so its UTC
+      // getters are the venue's own date, which is what Setlist.fm's search
+      // expects in dd-MM-yyyy form.
+      if (concert.concert_date) {
+        const d = new Date(concert.concert_date);
+        const eventDate = `${String(d.getUTCDate()).padStart(2, "0")}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${d.getUTCFullYear()}`;
+        enrichConcertBands(concertId, eventDate, concert.venue, concert.city).catch(() => {});
+      }
     } catch (error) {
       console.error("Error adding attendance:", error);
       return res.status(500).json({ error: "Internal server error" });
@@ -325,51 +354,5 @@ router.post(
     }
   }
 );
-
-async function enrichConcertBands(concertId, date, venue, city) {
-  if (!process.env.SETLIST_API_KEY) return;
-  try {
-    const res = await axios.get("https://api.setlist.fm/rest/1.0/search/setlists", {
-      headers: { "x-api-key": process.env.SETLIST_API_KEY, Accept: "application/json" },
-      params: { date, venueName: venue, cityName: city, p: 1 },
-      timeout: 15000,
-    });
-    const setlists = res.data?.setlist ?? [];
-    const mbids = [...new Set(setlists.map((s) => s.artist?.mbid).filter(Boolean))];
-    if (!mbids.length) return;
-
-    const bands = await prisma.band.findMany({
-      where: { MBID: { in: mbids } },
-      select: { id: true, MBID: true },
-    });
-
-    // Build mbid -> songs map from search results
-    const mbidSongs = new Map();
-    for (const s of setlists) {
-      const mbid = s.artist?.mbid;
-      if (!mbid || mbidSongs.has(mbid)) continue;
-      const songs = (s.sets?.set ?? []).flatMap((set) =>
-        (set.song ?? []).map((song) => ({
-          name: song.name || '',
-          cover: song.cover?.name ?? null,
-          tape: song.tape ?? false,
-        })),
-      );
-      if (songs.length) mbidSongs.set(mbid, songs);
-    }
-
-    for (const band of bands) {
-      const songs = mbidSongs.get(band.MBID);
-      const setlistData = songs ? { songs } : undefined;
-      await prisma.concertBandReference.upsert({
-        where: { concert_band: { concert: concertId, band: band.id } },
-        create: { concert: concertId, band: band.id, setlist: setlistData },
-        update: { ...(setlistData ? { setlist: setlistData } : {}) },
-      });
-    }
-  } catch (e) {
-    console.error("[enrichConcertBands] Error:", e.message);
-  }
-}
 
 module.exports = router;

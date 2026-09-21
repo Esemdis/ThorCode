@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { haversineKm, stringSimilarity, venueContains, deduplicateByCoords, deduplicateConcerts, checkDuplicateConcert } from './concertDedup.js';
+import { describe, it, expect, vi } from 'vitest';
+import { haversineKm, stringSimilarity, venueContains, detectFestivalCluster, deduplicateByCoords, deduplicateConcerts, checkDuplicateConcert } from './concertDedup.js';
 
 describe('haversineKm', () => {
   it('is 0 for the same point', () => {
@@ -45,6 +45,115 @@ describe('venueContains', () => {
 
   it('is false for unrelated venue names', () => {
     expect(venueContains('Zenith De Nancy', 'Wacken Festivalgelaende')).toBe(false);
+  });
+});
+
+describe('detectFestivalCluster', () => {
+  // Bandsintown scrapes a festival as one page per artist, so no single
+  // incoming row's own bill is ever big enough on its own — the signal only
+  // shows up once you look at every stored row sharing the event name.
+  const stageRow = (id, band, over = {}) => ({
+    id,
+    name: 'Graspop Metal Meeting 2025',
+    city: 'Dessel',
+    concert_date: new Date('2025-06-20T00:00:00Z'),
+    bands: [{ band }],
+    ...over,
+  });
+
+  it('is false when nothing nearby shares the event name', () => {
+    const incoming = { name: 'grandson @ Graspop Metal Meeting 2025', city: 'Dessel', concert_date: '2025-06-20T00:00:00Z' };
+    const { isFestival, matches } = detectFestivalCluster(incoming, [1], []);
+    expect(isFestival).toBe(false);
+    expect(matches).toEqual([]);
+  });
+
+  it('is false when the incoming concert has no name to cluster by', () => {
+    const incoming = { city: 'Dessel', concert_date: '2025-06-20T00:00:00Z' };
+    const { isFestival } = detectFestivalCluster(incoming, [1], [stageRow(1, 2)]);
+    expect(isFestival).toBe(false);
+  });
+
+  it('is true once the matched rows span more than one calendar day', () => {
+    const incoming = { name: 'Slipknot @ Graspop Metal Meeting 2025', city: 'Dessel', concert_date: '2025-06-21T00:00:00Z' };
+    const matches = [stageRow(1, 2, { concert_date: new Date('2025-06-20T00:00:00Z') })];
+    const { isFestival } = detectFestivalCluster(incoming, [3], matches);
+    expect(isFestival).toBe(true);
+  });
+
+  it('is true once the bands across the matched rows add up past five, same day', () => {
+    const incoming = { name: 'Poppy @ Graspop Metal Meeting 2025', city: 'Dessel', concert_date: '2025-06-20T00:00:00Z' };
+    const matches = [1, 2, 3, 4].map((id) => stageRow(id, id + 10));
+    const { isFestival } = detectFestivalCluster(incoming, [99], matches);
+    // 4 matched bands + the incoming band = 5.
+    expect(isFestival).toBe(true);
+  });
+
+  it('is false when the bill stays small and confined to one day', () => {
+    const incoming = { name: 'Nordic Noise 2026', venue: 'Amager Bio', city: 'Copenhagen', concert_date: '2026-06-01T00:00:00Z' };
+    const matches = [{ id: 1, name: 'Nordic Noise 2026', venue: 'Amager Bio', city: 'Copenhagen', concert_date: new Date('2026-06-01T00:00:00Z'), bands: [{ band: 2 }] }];
+    const { isFestival } = detectFestivalCluster(incoming, [1], matches);
+    expect(isFestival).toBe(false);
+  });
+
+  // The regression that made the venue check necessary: normalizeEventName
+  // strips the artist prefix, so a band's second night in the same room
+  // reduced to the identical "fallan" as its first and read as a two-day
+  // festival — merging two concerts the rest of this file works to keep apart.
+  it('does not read a band\'s second night at one venue as a festival', () => {
+    const incoming = { name: 'THROWN @ Fållan', venue: 'Fållan', city: 'Johanneshov', concert_date: '2026-11-28T19:00:00Z' };
+    const matches = [{ id: 1, name: 'THROWN @ Fållan', venue: 'Fållan', city: 'Johanneshov', concert_date: new Date('2026-11-27T19:00:00Z'), bands: [{ band: 93 }] }];
+    const { isFestival, matches: kept } = detectFestivalCluster(incoming, [93], matches);
+    expect(kept).toEqual([]);
+    expect(isFestival).toBe(false);
+  });
+
+  // The other side of that check: an artist-centric listing whose "@" leads
+  // to the festival rather than the field it is held on is exactly the row
+  // the scraper's own bill-length rule cannot flag, and must survive.
+  it('still clusters an artist-centric listing named for the festival', () => {
+    const incoming = { name: 'Slipknot @ Graspop Metal Meeting 2025', venue: 'Festivalterrein Stenehei', city: 'Dessel', concert_date: '2025-06-21T00:00:00Z' };
+    const matches = [stageRow(1, 2, { venue: 'South Stage', name: 'Poppy @ Graspop Metal Meeting 2025' })];
+    const { isFestival } = detectFestivalCluster(incoming, [3], matches);
+    expect(isFestival).toBe(true);
+  });
+
+  // Found by running the backfill against real rows: an event named for the
+  // band itself carries no "@" at all, so the venue check above never saw it,
+  // and two Leeds dates a week apart read as a two-day festival.
+  it('does not read a band playing one city twice as a festival', () => {
+    const bandRow = (id, day, venue) => ({
+      id, name: 'Citizen', venue, city: 'Leeds',
+      concert_date: new Date(day),
+      bands: [{ band: id, band_rel: { name: 'Citizen' } }],
+    });
+    const incoming = { name: 'Citizen', venue: 'Stylus', city: 'Leeds', concert_date: '2026-10-25T00:00:00Z' };
+    const { isFestival, matches } = detectFestivalCluster(
+      incoming, [7], [bandRow(1, '2026-10-21T00:00:00Z', 'Project House')], ['Citizen'],
+    );
+    expect(matches).toEqual([]);
+    expect(isFestival).toBe(false);
+  });
+
+  // The same shape from the other direction: the incoming row is not named
+  // after its own act, but the stored one is, so it must not be clustered in.
+  it('ignores a stored row titled after its own act', () => {
+    const incoming = { name: 'Rock The Lakes 2026', venue: 'Rock The Lakes Festival', city: 'Cudrefin', concert_date: '2026-08-16T00:00:00Z' };
+    const stored = {
+      id: 1, name: 'A$AP Rocky', venue: 'Atlas Arena', city: 'Cudrefin',
+      concert_date: new Date('2026-08-14T00:00:00Z'),
+      bands: [{ band: 5, band_rel: { name: 'A$AP Rocky' } }],
+    };
+    const { matches } = detectFestivalCluster(incoming, [3], [stored], ['Imminence']);
+    expect(matches).toEqual([]);
+  });
+
+  it('leaves out a same-named show in a different city', () => {
+    const incoming = { name: 'Graspop Metal Meeting 2025', city: 'Dessel', concert_date: '2025-06-20T00:00:00Z' };
+    const matches = [stageRow(1, 2, { city: 'Copenhagen' })];
+    const { isFestival, matches: kept } = detectFestivalCluster(incoming, [3], matches);
+    expect(kept).toEqual([]);
+    expect(isFestival).toBe(false);
   });
 });
 
@@ -286,6 +395,66 @@ describe('checkDuplicateConcert and a second night at the same venue', () => {
       tx: txWith([existing({ festival: true, name: 'Resurrection Fest 2026', venue: 'Campo de Fútbol Celeiro' })]),
     });
     expect(isDuplicate).toBe(true);
+  });
+});
+
+describe('checkDuplicateConcert upgrading a festival flag it can only see from outside', () => {
+  // The stage rows arrive flagged festival: false — Bandsintown's per-band
+  // page lists too few acts for the scraper's own rule to fire — so the flag
+  // has to be corrected from what the surrounding rows add up to, and written
+  // back to those rows too, since none of them can ever work it out alone.
+  const txWith = (rows) => {
+    const updateMany = vi.fn(async () => ({}));
+    return {
+      tx: {
+        concert: { findMany: async () => rows, update: async () => ({}), updateMany },
+        concertBandReference: { findMany: async () => [], createMany: async () => ({}) },
+      },
+      updateMany,
+    };
+  };
+
+  const dayOne = {
+    id: 1,
+    venue: 'South Stage',
+    city: 'Dessel',
+    concert_date: new Date('2025-06-20T00:00:00Z'),
+    name: 'Poppy @ Graspop Metal Meeting 2025',
+    source: 'bandsintown',
+    festival: false,
+    bands: [{ band: 2 }],
+  };
+
+  const dayTwo = {
+    venue: 'Jupiler Stage',
+    city: 'Dessel',
+    concert_date: '2025-06-21T00:00:00Z',
+    name: 'Slipknot @ Graspop Metal Meeting 2025',
+    source: 'bandsintown',
+    festival: false,
+  };
+
+  it('flags the incoming concert once the days under one event name add up', async () => {
+    const concert = { ...dayTwo };
+    const { tx } = txWith([dayOne]);
+    await checkDuplicateConcert({ concert, bandIds: [3], tx });
+    expect(concert.festival).toBe(true);
+  });
+
+  it('writes the flag back to the stored rows that could not see it either', async () => {
+    const { tx, updateMany } = txWith([dayOne]);
+    await checkDuplicateConcert({ concert: { ...dayTwo }, bandIds: [3], tx });
+    expect(updateMany).toHaveBeenCalledWith({ where: { id: { in: [1] } }, data: { festival: true } });
+  });
+
+  it('leaves an ordinary two-night run alone', async () => {
+    const concert = { venue: 'Fållan', city: 'Johanneshov', concert_date: '2026-11-28T19:00:00Z', name: 'THROWN @ Fållan', source: 'bandsintown', festival: false };
+    const { tx, updateMany } = txWith([{
+      id: 9, venue: 'Fållan', city: 'Johanneshov', concert_date: new Date('2026-11-27T19:00:00Z'), name: 'THROWN @ Fållan', source: 'bandsintown', festival: false, bands: [{ band: 93 }],
+    }]);
+    await checkDuplicateConcert({ concert, bandIds: [93], tx });
+    expect(concert.festival).toBe(false);
+    expect(updateMany).not.toHaveBeenCalled();
   });
 });
 

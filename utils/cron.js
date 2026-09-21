@@ -2,6 +2,7 @@ const cron = require("node-cron");
 const { runNotificationDigest } = require("./concertNotifyDigest");
 const { backfillSpotifyIds, warmBandImages } = require("./bandSpotifyMatch");
 const { backfillSourceUrls } = require("./bandSourceUrlBackfill");
+const { backfillSetlists } = require("./setlistBackfill");
 const prisma = require("../prisma/client");
 
 // Default: once a day at 08:00 server time.
@@ -21,6 +22,14 @@ const SPOTIFY_BACKFILL_LIMIT = 200;
 // target — most runs, once the backlog is cleared, touch far fewer bands.
 const SOURCE_URL_BACKFILL_CRON = process.env.SOURCE_URL_BACKFILL_CRON || "0 5 * * *";
 const SOURCE_URL_BACKFILL_LIMIT = 100;
+
+// Re-tries Setlist.fm enrichment for attended shows still missing a setlist.
+// Off the other backfills' hour. The common case is a show marked attended
+// while still upcoming (Going and Attended are the same table, split by
+// date), so the one attempt at attend time runs before Setlist.fm has
+// anything — this is what actually catches it up once the show has happened.
+const SETLIST_BACKFILL_CRON = process.env.SETLIST_BACKFILL_CRON || "0 6 * * *";
+const SETLIST_BACKFILL_LIMIT = 50;
 
 /**
  * Clean up expired email verification codes
@@ -85,6 +94,17 @@ function startCronJobs() {
       }
     } catch (err) {
       console.error("[cron] Source URL backfill failed:", err);
+    }
+  });
+
+  cron.schedule(SETLIST_BACKFILL_CRON, async () => {
+    try {
+      const { checked, updated } = await backfillSetlists({ limit: SETLIST_BACKFILL_LIMIT });
+      if (checked > 0) {
+        console.log(`[cron] Setlist backfill: checked ${checked}, updated ${updated}.`);
+      }
+    } catch (err) {
+      console.error("[cron] Setlist backfill failed:", err);
     }
   });
 }

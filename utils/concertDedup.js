@@ -1,3 +1,5 @@
+const { canonicalBandName } = require('./lineupNames');
+
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ─── Primitive helpers ────────────────────────────────────────────────────────
@@ -68,6 +70,79 @@ function stringSimilarity(a, b) {
   return (2 * matches) / (ba.length + bb.length);
 }
 
+/**
+ * Whether a concert's event name, read together with every other stored
+ * concert nearby that shares it, is a festival — even when the scraper's own
+ * single-page guess (bill length on the one event it saw) says no.
+ *
+ * Bandsintown scrapes a festival as one page per artist, so a stage-specific
+ * "Artist @ Graspop Metal Meeting" page usually lists just that one act;
+ * len(lineup) > 6 never fires for it even though the event is unmistakably a
+ * festival, and neither does anything else about that one row. This instead
+ * looks across every already-stored show sharing the event name: together
+ * spanning more than one calendar day, or the bands across them adding up
+ * past five, is what no single artist-centric listing can show on its own.
+ *
+ * @param {object} concert - the incoming concert (name, concert_date, city, coords)
+ * @param {number[]} bandIds - the incoming concert's resolved band ids
+ * @param {object[]} candidates - other stored concerts already fetched for this
+ *   date window, each carrying its bands' names as `bands[].band_rel.name`
+ * @param {string[]} bandNames - the incoming concert's own band names
+ * @returns {{ isFestival: boolean, matches: object[] }} matches are the
+ *   candidates sharing the event name — the caller upgrades their stored
+ *   festival flag too when isFestival is true, since they are the other
+ *   rows a single-page scrape could never have flagged on their own.
+ */
+function detectFestivalCluster(concert, bandIds, candidates, bandNames = []) {
+  // The scraper's own fallback name is literally "<band> @ <venue>", so what
+  // marks a label with no real event behind it is the part after the "@"
+  // being the venue itself. Excluding those is what keeps this signal honest:
+  // normalizeEventName strips the artist prefix, so two unrelated tour stops
+  // at one room on different nights — the very case isSeparateNight below
+  // exists to keep apart — would otherwise normalize to the same string and
+  // read as a single multi-day festival. "Slipknot @ Graspop Metal Meeting
+  // 2025" survives it, because what follows the "@" is the festival, not the
+  // field it is held on. A "<band> at <venue>" name is dropped outright; that
+  // costs the signal a real festival named like "Live at Leeds", which the
+  // scraper's own bill-length rule can still catch, and a false negative here
+  // only leaves rows split, where a false positive would merge two genuinely
+  // different concerts into one row.
+  const eventName = (row, ownBandNames) => {
+    if (!row.name || / at /i.test(row.name)) return null;
+    const after = row.name.replace(/^[^@]+@\s*/i, '').trim();
+    if (!after) return null;
+    if (row.venue && (stringSimilarity(after, row.venue) >= 0.7 || venueContains(after, row.venue))) return null;
+    // Named for a band on its own bill — "Citizen", "A$AP Rocky" — is an
+    // artist's show titled after the artist, not an event. Without this the
+    // two-day rule fired for any band playing a city twice in a week, which
+    // is a tour, and the rows would have been merged into one festival day.
+    // A real festival is never called after one of the acts on it.
+    const canonical = canonicalBandName(after);
+    if (canonical && ownBandNames.some((n) => canonicalBandName(n) === canonical)) return null;
+    return after;
+  };
+
+  const incomingName = eventName(concert, bandNames);
+  if (!incomingName) return { isFestival: false, matches: [] };
+  const normIncoming = normalizeEventName(incomingName);
+  if (normIncoming.length < 6) return { isFestival: false, matches: [] };
+
+  const matches = candidates.filter((c) => {
+    const candidateName = eventName(c, (c.bands ?? []).map((b) => b.band_rel?.name).filter(Boolean));
+    if (!candidateName) return false;
+    if (stringSimilarity(normIncoming, normalizeEventName(candidateName)) < 0.8) return false;
+    return sameArea(concert, c) || (concert.city && c.city && stringSimilarity(concert.city, c.city) >= 0.7);
+  });
+
+  const days = new Set([
+    toUtcDay(concert.concert_date).toISOString(),
+    ...matches.map((c) => toUtcDay(c.concert_date).toISOString()),
+  ]);
+  const bandSet = new Set([...bandIds, ...matches.flatMap((c) => c.bands.map((b) => b.band))]);
+
+  return { isFestival: days.size >= 2 || bandSet.size >= 5, matches };
+}
+
 // ─── Insert-time deduplication (DB) ──────────────────────────────────────────
 
 /**
@@ -119,13 +194,12 @@ function deduplicateByCoords(concerts) {
  * 3. Venue fuzzy match — venue similarity ≥ 70%, within date window
  * 4. City fuzzy match fallback — city similarity ≥ 70%, within date window
  */
-async function checkDuplicateConcert({ concert, bandIds, tx }) {
+async function checkDuplicateConcert({ concert, bandIds, bandNames = [], tx }) {
   let existingConcert = null;
 
   if (concert.concert_date) {
     const dayStart = toUtcDay(concert.concert_date);
     const oneDayMs = 24 * 60 * 60 * 1000;
-    const incomingIsMultiBand = concert.festival || bandIds.length >= 3;
 
     const candidates = await tx.concert.findMany({
       where: {
@@ -134,8 +208,26 @@ async function checkDuplicateConcert({ concert, bandIds, tx }) {
           lte: new Date(dayStart.getTime() + 7 * oneDayMs),
         },
       },
-      include: { bands: true },
+      // Band names ride along for detectFestivalCluster, which has to know
+      // whether a row is named after one of its own acts.
+      include: { bands: { include: { band_rel: { select: { name: true } } } } },
     });
+
+    // Multi-day / big-bill signal, independent of which candidate (if any)
+    // this concert ends up merging into below — see detectFestivalCluster's
+    // own comment for why a single scraped page can't tell this on its own.
+    // Computed before incomingIsMultiBand so an upgrade here also widens this
+    // insert's own duplicate-matching windows further down.
+    const { isFestival, matches: nameCluster } = detectFestivalCluster(concert, bandIds, candidates, bandNames);
+    if (isFestival) {
+      concert.festival = true;
+      const staleIds = nameCluster.filter((c) => !c.festival).map((c) => c.id);
+      if (staleIds.length) {
+        await tx.concert.updateMany({ where: { id: { in: staleIds } }, data: { festival: true } });
+      }
+    }
+
+    const incomingIsMultiBand = concert.festival || bandIds.length >= 3;
 
     const diffDays = (c) => Math.abs(toUtcDay(c.concert_date).getTime() - dayStart.getTime()) / oneDayMs;
     const isMultiBand = (c) => c.festival || c.bands.length >= 3;
@@ -453,6 +545,7 @@ module.exports = {
   haversineKm,
   stringSimilarity,
   venueContains,
+  detectFestivalCluster,
   // Insert-time
   deduplicateByCoords,
   checkDuplicateConcert,

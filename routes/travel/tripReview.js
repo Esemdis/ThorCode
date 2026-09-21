@@ -22,15 +22,28 @@ router.get("/", async (req, res) => {
   }
 });
 
+// A category photo is a data URL the client already compressed client-side,
+// so the only thing worth guarding here is the slot count, not the payload shape.
+const MAX_CATEGORY_PHOTOS = 3;
+const photosField = (name) =>
+  body(name)
+    .optional()
+    .isArray({ max: MAX_CATEGORY_PHOTOS })
+    .withMessage(`${name} takes at most ${MAX_CATEGORY_PHOTOS} photos`);
+
 // POST /travel/trips/:tripId/trip-review — create/update the trip-level review.
-// Body: { culture_rating?, culture_note?, food_rating?, food_note?, fun_rating?,
-//         fun_note?, missing_gear_item_ids?, missing_note?, comment? }
+// Body: { culture_rating?, culture_note?, culture_photos?, food_rating?, food_note?,
+//         food_photos?, fun_rating?, fun_note?, fun_photos?, missing_gear_item_ids?,
+//         missing_note?, comment? }
 router.post(
   "/",
   [
     body("culture_rating").optional({ nullable: true }).isInt({ min: 1, max: 5 }),
     body("food_rating").optional({ nullable: true }).isInt({ min: 1, max: 5 }),
     body("fun_rating").optional({ nullable: true }).isInt({ min: 1, max: 5 }),
+    photosField("culture_photos"),
+    photosField("food_photos"),
+    photosField("fun_photos"),
     body("missing_gear_item_ids").optional().isArray(),
   ],
   async (req, res) => {
@@ -38,17 +51,22 @@ router.post(
     if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
     const {
-      culture_rating, culture_note, food_rating, food_note,
-      fun_rating, fun_note, missing_gear_item_ids, missing_note, comment,
+      culture_rating, culture_note, culture_photos, food_rating, food_note, food_photos,
+      fun_rating, fun_note, fun_photos, missing_gear_item_ids, missing_note, comment,
     } = req.body;
+
+    const photosOf = (arr) => (Array.isArray(arr) ? arr.filter((p) => typeof p === "string") : []);
 
     const data = {
       culture_rating: culture_rating != null ? parseInt(culture_rating) : null,
       culture_note: culture_note?.trim() || null,
+      culture_photos: photosOf(culture_photos),
       food_rating: food_rating != null ? parseInt(food_rating) : null,
       food_note: food_note?.trim() || null,
+      food_photos: photosOf(food_photos),
       fun_rating: fun_rating != null ? parseInt(fun_rating) : null,
       fun_note: fun_note?.trim() || null,
+      fun_photos: photosOf(fun_photos),
       missing_gear_item_ids: Array.isArray(missing_gear_item_ids)
         ? missing_gear_item_ids.map((id) => parseInt(id)).filter((id) => !Number.isNaN(id))
         : [],
