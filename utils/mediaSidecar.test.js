@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   SIDECAR_NAME, SIDECAR_VERSION, emptySidecar, upsertFile, removeFile,
-  readSidecar, writeSidecar,
+  readSidecar, writeSidecar, updateSidecar,
 } from './mediaSidecar.js';
 
 const concert = { date: '2026-06-12', venue: 'Sentrum Scene', city: 'Oslo', country: 'NO' };
@@ -105,5 +105,70 @@ describe('readSidecar and writeSidecar', () => {
     const dir = await tmpShowDir();
     await writeFile(join(dir, SIDECAR_NAME), JSON.stringify({ version: 99, files: [] }));
     await expect(readSidecar(dir)).rejects.toThrow(/version 99/);
+  });
+});
+
+describe('updateSidecar under concurrent writers', () => {
+  const threeFiles = () => ['a.jpg', 'b.jpg', 'c.jpg'].reduce(
+    (acc, name) => upsertFile(acc, { ...entry, name }),
+    emptySidecar({ concertId: 1, userId: 'u', concert }),
+  );
+
+  it('does not collide on the temp file when two writes land together', async () => {
+    // Deleting eleven files from one show fires eleven parallel requests, and
+    // six of them came back with this from production:
+    //   ENOENT: rename '.../.concert-media.json.tmp' -> '.../concert-media.json'
+    // Every writer used the one temp name, so the first rename moved it out
+    // from under the rest.
+    const dir = await tmpShowDir();
+    await writeSidecar(dir, threeFiles());
+    const results = await Promise.allSettled([
+      updateSidecar(dir, (s) => removeFile(s, 'a.jpg')),
+      updateSidecar(dir, (s) => removeFile(s, 'b.jpg')),
+    ]);
+    expect(results.map((r) => r.status)).toEqual(['fulfilled', 'fulfilled']);
+  });
+
+  it('keeps both removals when two deletes of one show overlap', async () => {
+    // The half that unique temp names alone would not fix, and the more
+    // dangerous half: both writers read the file before either wrote, so the
+    // last one to write silently reverted the other. In production the
+    // request that reported success had its own change discarded and then
+    // deleted its database row anyway.
+    const dir = await tmpShowDir();
+    await writeSidecar(dir, threeFiles());
+    await Promise.all([
+      updateSidecar(dir, (s) => removeFile(s, 'a.jpg')),
+      updateSidecar(dir, (s) => removeFile(s, 'b.jpg')),
+    ]);
+    expect((await readSidecar(dir)).files.map((f) => f.name)).toEqual(['c.jpg']);
+  });
+
+  it('leaves no temp file behind in the archive', async () => {
+    // Whatever is in the show folder is backed up to Drive verbatim.
+    const dir = await tmpShowDir();
+    await writeSidecar(dir, threeFiles());
+    await Promise.all([
+      updateSidecar(dir, (s) => removeFile(s, 'a.jpg')),
+      updateSidecar(dir, (s) => removeFile(s, 'b.jpg')),
+    ]);
+    expect((await readdir(dir)).filter((f) => f.includes('tmp'))).toEqual([]);
+  });
+
+  it('does not wedge the folder when one update throws', async () => {
+    // A queue chained on success only would leave every later write to this
+    // show waiting on a promise that never settles.
+    const dir = await tmpShowDir();
+    await writeSidecar(dir, threeFiles());
+    await expect(updateSidecar(dir, () => { throw new Error('boom'); })).rejects.toThrow('boom');
+    await updateSidecar(dir, (s) => removeFile(s, 'a.jpg'));
+    expect((await readSidecar(dir)).files.map((f) => f.name)).toEqual(['b.jpg', 'c.jpg']);
+  });
+
+  it('writes nothing when the mutator returns null', async () => {
+    // A show with no sidecar at all: the delete route has nothing to rewrite.
+    const dir = await tmpShowDir();
+    await updateSidecar(dir, () => null);
+    expect(await readSidecar(dir)).toBeNull();
   });
 });

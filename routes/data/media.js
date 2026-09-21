@@ -25,7 +25,7 @@ const {
 } = require('../../utils/mediaPaths');
 const { showDirForAttendance } = require('../../utils/mediaShowDir');
 const {
-  emptySidecar, upsertFile, removeFile, readSidecar, writeSidecar,
+  emptySidecar, upsertFile, removeFile, readSidecar, updateSidecar,
 } = require('../../utils/mediaSidecar');
 const { kindForMime, MAX_FILE_BYTES } = require('../../utils/mediaTypes');
 const { storePoster, ensureThumb } = require('../../utils/mediaThumbs');
@@ -211,14 +211,18 @@ router.post(
       const absDir = resolveArchivePath(relDir);
       await mkdir(absDir, { recursive: true });
 
-      let sidecar = (await readSidecar(absDir)) ?? emptySidecar({
+      const sidecarSeed = {
         concertId: row.concert_rel.id,
         userId: row.wishlist_rel.user_id,
         concert: {
           date: show.date, venue: row.concert_rel.venue,
           city: row.concert_rel.city, country: row.concert_rel.country,
         },
-      });
+      };
+      // Read here only to seed `taken` below. The entries this request adds go
+      // onto a fresh read inside updateSidecar, because a second upload to the
+      // same show can land between these two points.
+      const sidecar = (await readSidecar(absDir)) ?? emptySidecar(sidecarSeed);
 
       // Seeded from the directory itself, not only from the two indexes. A
       // file that is on disk but in neither of them was invisible to
@@ -238,6 +242,7 @@ router.post(
       ]);
 
       const created = [];
+      const added = [];
       const pairedPosters = [];
       try {
         for (const file of incoming) {
@@ -283,7 +288,7 @@ router.post(
                 width: probe.width, height: probe.height, duration_ms: probe.duration_ms,
               },
             });
-            sidecar = upsertFile(sidecar, entry);
+            added.push(entry);
             created.push(mediaRow);
             if (kind === 'VIDEO') pairedPosters.push([mediaRow, posters.get(file.originalname)]);
           } catch (err) {
@@ -299,7 +304,13 @@ router.post(
         // Written for whatever actually landed, even when the loop above threw
         // partway through: disk, Postgres and the sidecar must agree at every
         // exit, not only the one where every file made it.
-        if (created.length) await writeSidecar(absDir, sidecar);
+        if (added.length) {
+          await updateSidecar(absDir, (current) => {
+            let next = current ?? emptySidecar(sidecarSeed);
+            for (const e of added) next = upsertFile(next, e);
+            return next;
+          });
+        }
       }
 
       // Posters are written before the response, not after: they arrived with
@@ -531,33 +542,35 @@ router.patch(
       for (const [relDir, dirRows] of byDir) {
         const absDir = resolveArchivePath(relDir);
         const concert = dirRows[0].attendance_rel.concert_rel;
-        let sidecar = await readSidecar(absDir) ?? emptySidecar({
-          concertId: concert.id,
-          userId: dirRows[0].attendance_rel.wishlist_rel.user_id,
-          concert: {
-            date: dateOnly(concert.concert_date), venue: concert.venue,
-            city: concert.city, country: concert.country,
-          },
-        });
-        for (const r of dirRows) {
-          // Built from the database row when the sidecar never recorded this
-          // file: everything a fresh entry needs — checksum, dimensions,
-          // whatever tag it already carried — is already on the row that the
-          // upload route itself wrote there.
-          const entry = sidecar.files.find((f) => f.name === r.filename) ?? {
-            name: r.filename, kind: r.kind,
-            band_id: r.band_id, band_name: billName(r, r.band_id),
-            caption: r.caption ?? '', sha256: r.sha256, bytes: r.bytes,
-            width: r.width, height: r.height, duration_ms: r.duration_ms,
-            taken_at: r.taken_at,
-          };
-          sidecar = upsertFile(sidecar, {
-            ...entry,
-            ...(bandId !== undefined && { band_id: bandId, band_name: billName(r, bandId) }),
-            ...(req.body.caption !== undefined && { caption: req.body.caption || '' }),
+        await updateSidecar(absDir, (current) => {
+          let sidecar = current ?? emptySidecar({
+            concertId: concert.id,
+            userId: dirRows[0].attendance_rel.wishlist_rel.user_id,
+            concert: {
+              date: dateOnly(concert.concert_date), venue: concert.venue,
+              city: concert.city, country: concert.country,
+            },
           });
-        }
-        await writeSidecar(absDir, sidecar);
+          for (const r of dirRows) {
+            // Built from the database row when the sidecar never recorded this
+            // file: everything a fresh entry needs — checksum, dimensions,
+            // whatever tag it already carried — is already on the row that the
+            // upload route itself wrote there.
+            const entry = sidecar.files.find((f) => f.name === r.filename) ?? {
+              name: r.filename, kind: r.kind,
+              band_id: r.band_id, band_name: billName(r, r.band_id),
+              caption: r.caption ?? '', sha256: r.sha256, bytes: r.bytes,
+              width: r.width, height: r.height, duration_ms: r.duration_ms,
+              taken_at: r.taken_at,
+            };
+            sidecar = upsertFile(sidecar, {
+              ...entry,
+              ...(bandId !== undefined && { band_id: bandId, band_name: billName(r, bandId) }),
+              ...(req.body.caption !== undefined && { caption: req.body.caption || '' }),
+            });
+          }
+          return sidecar;
+        });
       }
 
       return success(res, 200, { updated: rows.length });
@@ -602,8 +615,7 @@ router.delete(
       }
 
       const absDir = path.dirname(absPath);
-      const sidecar = await readSidecar(absDir);
-      if (sidecar) await writeSidecar(absDir, removeFile(sidecar, row.filename));
+      await updateSidecar(absDir, (sidecar) => (sidecar ? removeFile(sidecar, row.filename) : null));
 
       await prisma.concertMedia.delete({ where: { id } });
       return success(res, 200, { deleted: true });
