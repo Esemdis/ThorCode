@@ -3,6 +3,7 @@ import request from 'supertest';
 import { mkdtemp, mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 import { signMediaToken } from '../../utils/mediaTokens.js';
 
@@ -68,7 +69,12 @@ const app = () => buildApp(router, '/data/concerts');
 // Uploading is admin-only, so every upload here — including the ones that
 // are just setup for another route's test — signs in as one.
 const admin = { id: 'user-1', role: 'ADMIN' };
-const jpeg = () => Buffer.from(
+// `seed` makes the bytes differ while the file stays a valid JPEG — trailing
+// bytes after the end-of-image marker are ignored, and nothing on the server
+// decodes these anyway. Needed since uploads are deduplicated by checksum:
+// a test about two files has to use two files, not the same one twice.
+const jpeg = (seed = '') => Buffer.concat([baseJpeg, Buffer.from(seed)]);
+const baseJpeg = Buffer.from(
   '/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a' +
   'HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAA' +
   'AAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==', 'base64');
@@ -290,8 +296,8 @@ describe('POST /attendances/:id/media', () => {
       .post('/data/concerts/attendances/1/media')
       .set(...authHeader(admin))
       .field('band_id', '92')
-      .attach('files', jpeg(), 'IMG_1.jpg')
-      .attach('files', jpeg(), 'IMG_2.jpg')
+      .attach('files', jpeg('a'), 'IMG_1.jpg')
+      .attach('files', jpeg('b'), 'IMG_2.jpg')
       .expect(201);
 
     expect(prisma.concertMedia.create).toHaveBeenCalledTimes(2);
@@ -305,8 +311,11 @@ describe('POST /attendances/:id/media', () => {
       .post('/data/concerts/attendances/1/media')
       .set(...authHeader(admin))
       .field('band_id', '92')
-      .attach('files', jpeg(), 'IMG_1.jpg')
-      .attach('files', jpeg(), 'IMG_1.jpg')
+      // Two different photographs that happen to share a name, which is
+      // what two phones both writing IMG_0001.jpg looks like. Identical bytes
+      // would be deduplicated instead, which is a different test.
+      .attach('files', jpeg('a'), 'IMG_1.jpg')
+      .attach('files', jpeg('b'), 'IMG_1.jpg')
       .expect(201);
 
     expect(prisma.concertMedia.create.mock.calls[0][0].data.filename).toBe('IMG_1.jpg');
@@ -366,8 +375,8 @@ describe('POST /attendances/:id/media', () => {
       .post('/data/concerts/attendances/1/media')
       .set(...authHeader(admin))
       .field('band_id', '92')
-      .attach('files', jpeg(), 'IMG_1.jpg')
-      .attach('files', jpeg(), 'IMG_2.jpg')
+      .attach('files', jpeg('a'), 'IMG_1.jpg')
+      .attach('files', jpeg('b'), 'IMG_2.jpg')
       .expect(500);
 
     const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
@@ -468,6 +477,84 @@ describe('POST /attendances/:id/media', () => {
     expect(res.body.error).toMatch(/no confirmed date/i);
     expect(prisma.concertMedia.create).not.toHaveBeenCalled();
     await expect(readdir(join(root, 'archive', 'user-1'))).rejects.toThrow();
+  });
+});
+
+describe('the same file uploaded twice', () => {
+  // The checksum has always been computed and stored, and until now was only
+  // ever used as a thumbnail cache key. Nothing compared it, so a second
+  // upload of a photograph already in the archive was stored again under
+  // "IMG_1 (2).jpg" — a second copy on disk, a second row, a second sidecar
+  // entry and a second file synced to Drive, with nothing said about it.
+  const sha = (buf) => createHash('sha256').update(buf).digest('hex');
+
+  it('refuses bytes the show already has instead of storing them again', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { filename: 'IMG_first.jpg', rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_first.jpg', sha256: sha(jpeg()) },
+    ]);
+
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .attach('files', jpeg(), 'IMG_again.jpg')
+      .expect(201);
+
+    expect(res.body.data.created).toHaveLength(0);
+    expect(res.body.data.duplicates).toEqual(['IMG_again.jpg']);
+    expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+  });
+
+  it('leaves no bytes behind in the show folder when it refuses one', async () => {
+    // The temp file has to go too. A skipped upload that still wrote into the
+    // archive would be found by the next rebuild as a file no sidecar
+    // mentions — drift created by the very check meant to prevent it.
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { filename: 'IMG_first.jpg', rel_path: 'x', sha256: sha(jpeg()) },
+    ]);
+
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .attach('files', jpeg(), 'IMG_again.jpg')
+      .expect(201);
+
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    const present = await readdir(dir).catch(() => []);
+    expect(present).not.toContain('IMG_again.jpg');
+    expect(await readdir(join(root, 'incoming')).catch(() => [])).toEqual([]);
+  });
+
+  it('takes the same bytes under two names in one batch only once', async () => {
+    // The client dedupes on name and size, so the same photograph re-exported
+    // under a different name arrives here as two parts of one request. The
+    // database has nothing to compare against yet for the second one.
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .attach('files', jpeg(), 'IMG_1_copy.jpg')
+      .expect(201);
+
+    expect(res.body.data.created).toHaveLength(1);
+    expect(res.body.data.duplicates).toEqual(['IMG_1_copy.jpg']);
+  });
+
+  it('still takes a genuinely different file of the same name', async () => {
+    // Name collisions are not duplicates. Two phones both write IMG_0001.jpg,
+    // and the suffixing that already handles that must not be mistaken for
+    // this.
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { filename: 'IMG_1.jpg', rel_path: 'x', sha256: 'a-different-file-entirely' },
+    ]);
+
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(201);
+
+    expect(res.body.data.created).toHaveLength(1);
+    expect(res.body.data.duplicates).toEqual([]);
   });
 });
 

@@ -220,7 +220,7 @@ router.post(
       // from request to request and keep the split alive.
       const existing = await prisma.concertMedia.findMany({
         where: { attendance_id: attendanceId },
-        select: { filename: true, rel_path: true },
+        select: { filename: true, rel_path: true, sha256: true },
         orderBy: { id: 'asc' },
       });
 
@@ -265,7 +265,20 @@ router.post(
 
       const created = [];
       const added = [];
+      const duplicates = [];
       const pairedPosters = [];
+
+      // The checksums this show already holds. Every upload has always
+      // computed one and stored it, but nothing ever compared them, so a
+      // second upload of a photograph already in the archive was filed again
+      // as "IMG_1 (2).jpg" — a second copy on disk, a second row, a second
+      // sidecar entry and a second file synced to Drive, silently.
+      //
+      // Scoped to this show, not the whole archive: one photograph cannot
+      // honestly belong to two nights, and a global check would refuse a file
+      // on the grounds that it exists somewhere the caller may not even be
+      // able to see.
+      const knownHashes = new Set(existing.map((e) => e.sha256).filter(Boolean));
       try {
         for (const file of incoming) {
           const kind = kindForMime(file.mimetype);
@@ -276,13 +289,33 @@ router.post(
             duration_ms: kind === 'VIDEO' ? asInt(fileMeta.duration_ms) : null,
           };
 
+          // Hashed off the temp file, before anything is moved into the show
+          // folder. Hashing after the rename — which is what this did, for
+          // the thumbnail key — means a duplicate has already been written
+          // into the archive by the time it is recognised as one.
+          const sha256 = await sha256File(file.path);
+          if (knownHashes.has(sha256)) {
+            // Named, not dropped quietly. And the temp file goes with it: a
+            // skipped upload that still left bytes anywhere would surface in
+            // the next rebuild as a file no sidecar mentions, which is drift
+            // manufactured by the check meant to prevent it.
+            await unlink(file.path).catch(() => {});
+            duplicates.push(file.originalname);
+            continue;
+          }
+          // Added before the row is written, so the same bytes arriving twice
+          // under two names in ONE request are caught too — the database has
+          // nothing to compare the second against yet. The client dedupes on
+          // name and size, so a photograph re-exported under a new name
+          // reaches here as two parts of one upload.
+          knownHashes.add(sha256);
+
           const filename = uniqueFilename([...taken], slugFilename(file.originalname));
           taken.add(filename);
           const absPath = path.join(absDir, filename);
           await rename(file.path, absPath);
 
           try {
-            const sha256 = await sha256File(absPath);
             const { size } = await stat(absPath);
 
             // taken_at is reserved, not populated. The column, this field and
@@ -352,7 +385,7 @@ router.post(
         }
       }
 
-      success(res, 201, { created });
+      success(res, 201, { created, duplicates });
 
       // Photo thumbnails after the response, best effort. Twenty files should
       // not leave the browser waiting on image processing, and a missing photo
