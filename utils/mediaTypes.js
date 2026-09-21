@@ -10,7 +10,22 @@
 // A long clip off a phone, with room to spare. Large enough that the cap is
 // never hit by accident, small enough that one bad request cannot fill the
 // share.
-const MAX_FILE_BYTES = 500 * 1024 * 1024;
+//
+// Raised from 500 MB, which a full-set recording off a modern phone passes
+// without trying: 4K60 runs around 400 MB a minute. Two gigabytes is double
+// the largest file the archive has had to take so far, so the cap is a
+// backstop rather than something to plan around.
+//
+// This is not the only limit in the path. Whatever proxies the API has its own
+// body cap, and it is the lower of the two that decides — see the note on
+// LIMIT_FILE_SIZE in utils/uploadErrors.js.
+const MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024;
+
+// One drag-and-drop of a whole night's photographs, and a ceiling on how much
+// one request can ask the disk for. Lives here rather than inline in the route
+// so the number the uploader enforces and the number the refusal quotes cannot
+// drift apart.
+const MAX_FILES_PER_REQUEST = 50;
 
 const MIME_KINDS = new Map([
   ['image/jpeg', 'PHOTO'],
@@ -33,4 +48,4 @@ function kindForMime(mime) {
   return MIME_KINDS.get(normalised) ?? null;
 }
 
-module.exports = { MAX_FILE_BYTES, kindForMime };
+module.exports = { MAX_FILE_BYTES, MAX_FILES_PER_REQUEST, kindForMime };

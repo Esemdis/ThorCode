@@ -81,7 +81,7 @@ describe('POST /attendances/:id/media', () => {
     // their own auth via a signed URL token instead of this middleware, so
     // their count is 1: just the handler, no `auth` or `roleCheck` in front.
     expect(routeManifest(router)).toEqual([
-      'POST /attendances/:attendanceId/media [5]',
+      'POST /attendances/:attendanceId/media [6]',
       'GET /attendances/:attendanceId/media [4]',
       'GET /bands/:bandId/media [4]',
       'PATCH /media [8]',

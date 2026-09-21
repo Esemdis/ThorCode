@@ -27,7 +27,8 @@ const { showDirForAttendance } = require('../../utils/mediaShowDir');
 const {
   emptySidecar, upsertFile, removeFile, readSidecar, updateSidecar,
 } = require('../../utils/mediaSidecar');
-const { kindForMime, MAX_FILE_BYTES } = require('../../utils/mediaTypes');
+const { kindForMime, MAX_FILE_BYTES, MAX_FILES_PER_REQUEST } = require('../../utils/mediaTypes');
+const { uploadErrors } = require('../../utils/uploadErrors');
 const { storePoster, ensureThumb } = require('../../utils/mediaThumbs');
 const { bandMediaOverview } = require('../../utils/mediaOverview');
 const { signMediaToken, verifyMediaToken, mediaUrls } = require('../../utils/mediaTokens');
@@ -134,7 +135,14 @@ async function ownAttendance(attendanceId, userId) {
 router.post(
   '/attendances/:attendanceId/media',
   [auth, roleCheck(['ADMIN']), param('attendanceId').isInt()],
-  upload.fields([{ name: 'files', maxCount: 50 }, { name: 'posters', maxCount: 50 }]),
+  upload.fields([
+    { name: 'files', maxCount: MAX_FILES_PER_REQUEST },
+    { name: 'posters', maxCount: MAX_FILES_PER_REQUEST },
+  ]),
+  // Sits between the uploader and the handler because that is the only place
+  // it can: multer refuses a file by calling next(err), which skips the
+  // handler's own try/catch entirely.
+  uploadErrors,
   async (req, res) => {
     // req.files is keyed by field once upload.fields is used, so both lists
     // have to be swept on failure or a rejected batch leaks its temp files.

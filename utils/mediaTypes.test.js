@@ -36,7 +36,9 @@ describe('kindForMime', () => {
 });
 
 describe('MAX_FILE_BYTES', () => {
-  it('is 500 MB, which is a long clip and not a mistake', () => {
-    expect(MAX_FILE_BYTES).toBe(500 * 1024 * 1024);
+  it('is 2 GB, which is a long clip and not a mistake', () => {
+    // 4K60 off a phone runs around 400 MB a minute, so a full-set recording
+    // went past the 500 MB this replaced without trying.
+    expect(MAX_FILE_BYTES).toBe(2 * 1024 * 1024 * 1024);
   });
 });
