@@ -145,6 +145,15 @@ router.post(
     { name: 'files', maxCount: MAX_FILES_PER_REQUEST },
     { name: 'posters', maxCount: MAX_FILES_PER_REQUEST },
   ]),
+  // After multer, not with the middleware above: this is a multipart request,
+  // so there is no req.body to validate until the uploader has parsed it. Run
+  // in front, the check silently passed on an empty body every time.
+  //
+  // It has to be a number before the bill check sees it. The client sent the
+  // string "null" for a support act with no Band row — truthy, so it was
+  // appended — and parseInt made it NaN, which is on no bill, so a malformed
+  // field came back as a confident answer about the band.
+  body('band_id').optional({ nullable: true, checkFalsy: true }).isInt(),
   // Sits between the uploader and the handler because that is the only place
   // it can: multer refuses a file by calling next(err), which skips the
   // handler's own try/catch entirely.

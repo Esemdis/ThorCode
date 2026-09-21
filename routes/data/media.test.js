@@ -87,7 +87,7 @@ describe('POST /attendances/:id/media', () => {
     // their own auth via a signed URL token instead of this middleware, so
     // their count is 1: just the handler, no `auth` or `roleCheck` in front.
     expect(routeManifest(router)).toEqual([
-      'POST /attendances/:attendanceId/media [6]',
+      'POST /attendances/:attendanceId/media [7]',
       'GET /attendances/:attendanceId/media [4]',
       'GET /bands/:bandId/media [4]',
       'POST /attendances/:attendanceId/lineup [5]',
@@ -478,6 +478,45 @@ describe('POST /attendances/:id/media', () => {
     expect(res.body.error).toMatch(/no confirmed date/i);
     expect(prisma.concertMedia.create).not.toHaveBeenCalled();
     await expect(readdir(join(root, 'archive', 'user-1'))).rejects.toThrow();
+  });
+});
+
+describe('an upload carrying a band_id that is not a band id', () => {
+  it('refuses a non-numeric band_id as the bad request it is', async () => {
+    // The client sent the string "null" for a support act with no Band row:
+    // truthy, so it was appended, then parseInt'd to NaN here. NaN is on no
+    // bill, so it came back as "That band is not on this bill" — an answer
+    // about the band that was nothing to do with what went wrong.
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', 'null')
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(400);
+
+    expect(res.body.error).toMatch(/validation/i);
+    expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+  });
+
+  it('leaves no temp file behind when it refuses one', async () => {
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', 'null')
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(400);
+
+    expect(await readdir(join(root, 'incoming')).catch(() => [])).toEqual([]);
+  });
+
+  it('still takes an upload with no band at all', async () => {
+    // The common case: uploading is deliberately untagged, and the sweep in
+    // the gig view is where a band gets chosen.
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(201);
   });
 });
 
