@@ -90,6 +90,7 @@ describe('POST /attendances/:id/media', () => {
       'POST /attendances/:attendanceId/media [6]',
       'GET /attendances/:attendanceId/media [4]',
       'GET /bands/:bandId/media [4]',
+      'POST /attendances/:attendanceId/lineup [5]',
       'PATCH /media [8]',
       'DELETE /media/:id [4]',
       'GET /media/:id/file [1]',
@@ -480,6 +481,118 @@ describe('POST /attendances/:id/media', () => {
   });
 });
 
+describe('POST /attendances/:id/lineup', () => {
+  // Linking a support act to a concert so photographs can be tagged to them.
+  // ConcertMedia.band_id is a foreign key, so an act that exists only as a
+  // string in the scraped lineup has nothing to point at until this runs.
+  const withLineup = (names) => ({
+    ...attendanceRow,
+    concert_rel: { ...attendanceRow.concert_rel, metadata: JSON.stringify(names) },
+  });
+
+  beforeEach(() => {
+    prisma.band = {
+      findMany: vi.fn(async () => []),
+      create: vi.fn(async ({ data }) => ({ id: 501, ...data })),
+    };
+    prisma.concertBandReference = {
+      findUnique: vi.fn(async () => null),
+      create: vi.fn(async ({ data }) => ({ id: 900, ...data })),
+    };
+    prisma.concertAttendance.findUnique = vi.fn(async () => withLineup(['Gojira', 'Svalbard']));
+  });
+
+  it('creates the band and puts it on that concert\'s bill', async () => {
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/lineup')
+      .set(...authHeader(admin))
+      .send({ name: 'Svalbard' })
+      .expect(201);
+
+    expect(prisma.band.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ name: 'Svalbard' }),
+    }));
+    expect(prisma.concertBandReference.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ concert: 8417, band: 501 }),
+    }));
+    expect(res.body.data).toMatchObject({ band: { id: 501, name: 'Svalbard' }, created: true });
+  });
+
+  it('reuses a band that already exists rather than making a second row', async () => {
+    // Band.name is unique and the table is shared by every account, so a
+    // second "Svalbard" is not merely untidy — it is a row that cannot be
+    // written. Matched canonically, the same comparison enrich-lineup uses.
+    prisma.band.findMany = vi.fn(async () => [{ id: 44, name: 'Svalbard' }]);
+    prisma.concertAttendance.findUnique = vi.fn(async () => withLineup(['Svalbard (UK)']));
+
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/lineup')
+      .set(...authHeader(admin))
+      .send({ name: 'Svalbard (UK)' })
+      .expect(201);
+
+    expect(prisma.band.create).not.toHaveBeenCalled();
+    expect(res.body.data).toMatchObject({ band: { id: 44 }, created: false });
+  });
+
+  it('refuses a name the scraper never said played that night', async () => {
+    // Without this, one account could put any band on any concert's bill —
+    // and the bill is shared with everyone else who attended, feeds their
+    // bands-seen counts, and decides what the map shows.
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/lineup')
+      .set(...authHeader(admin))
+      .send({ name: 'Metallica' })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/lineup/i);
+    expect(prisma.band.create).not.toHaveBeenCalled();
+  });
+
+  it('says so without linking twice when the act is already on the bill', async () => {
+    prisma.band.findMany = vi.fn(async () => [{ id: 92, name: 'Gojira' }]);
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/lineup')
+      .set(...authHeader(admin))
+      .send({ name: 'Gojira' })
+      .expect(201);
+
+    expect(prisma.concertBandReference.create).not.toHaveBeenCalled();
+    expect(res.body.data).toMatchObject({ band: { id: 92 }, created: false });
+  });
+
+  it('is admin-only, because the bill it changes is everyone\'s', async () => {
+    await request(app())
+      .post('/data/concerts/attendances/1/lineup')
+      .set(...authHeader({ id: 'user-1', role: 'USER' }))
+      .send({ name: 'Svalbard' })
+      .expect(403);
+  });
+
+  it('refuses a show that is not the caller\'s', async () => {
+    await request(app())
+      .post('/data/concerts/attendances/1/lineup')
+      .set(...authHeader({ id: 'someone-else', role: 'ADMIN' }))
+      .send({ name: 'Svalbard' })
+      .expect(403);
+  });
+
+  it('stores the cleaned name, not the scraper\'s spelling of it', async () => {
+    // "Counterparts266K Followers" would become a permanent row in a table
+    // every account shares.
+    prisma.concertAttendance.findUnique = vi.fn(async () => withLineup(['Counterparts266K Followers']));
+    await request(app())
+      .post('/data/concerts/attendances/1/lineup')
+      .set(...authHeader(admin))
+      .send({ name: 'Counterparts266K Followers' })
+      .expect(201);
+
+    expect(prisma.band.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ name: 'Counterparts' }),
+    }));
+  });
+});
+
 describe('the same file uploaded twice', () => {
   // The checksum has always been computed and stored, and until now was only
   // ever used as a thumbnail cache key. Nothing compared it, so a second
@@ -756,7 +869,32 @@ describe('GET /attendances/:id/media', () => {
       name: 'Gojira',
       setlist: { songs: [{ name: 'Stranded', tape: false, cover: null }] },
       recent_setlist: { songs: [{ name: 'Flying Whales', tape: false, cover: null }] },
+      // `linked` is how the client tells an act it can tag straight away from
+      // one that needs a Band row created first.
+      linked: true,
     }]);
+  });
+
+  it('sends the support acts too, so the bill is the whole bill', async () => {
+    // On a festival most of the lineup has no Band row at all — support acts
+    // nobody has wishlisted live only in the scraped metadata. The gig view is
+    // the only place that says who played a night you went to.
+    prisma.concertMedia.findMany = vi.fn(async () => []);
+    prisma.concertAttendance.findUnique = vi.fn(async () => ({
+      ...attendanceRow,
+      concert_rel: {
+        ...attendanceRow.concert_rel,
+        metadata: JSON.stringify(['Gojira', 'Svalbard']),
+      },
+    }));
+
+    const res = await request(app())
+      .get('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(res.body.data.bands.map((b) => b.name)).toEqual(['Gojira', 'Svalbard']);
+    expect(res.body.data.bands[1]).toMatchObject({ id: null, linked: false });
   });
 
   it('refuses a show that is not the caller\'s', async () => {

@@ -31,6 +31,8 @@ const { kindForMime, MAX_FILE_BYTES, MAX_FILES_PER_REQUEST } = require('../../ut
 const { uploadErrors } = require('../../utils/uploadErrors');
 const { storePoster, ensureThumb } = require('../../utils/mediaThumbs');
 const { bandMediaOverview } = require('../../utils/mediaOverview');
+const { billForConcert } = require('../../utils/concertBill');
+const { canonicalBandName } = require('../../utils/lineupNames');
 const { signMediaToken, verifyMediaToken, mediaUrls } = require('../../utils/mediaTokens');
 
 const router = express.Router();
@@ -109,6 +111,10 @@ async function ownAttendance(attendanceId, userId) {
       concert_rel: {
         select: {
           id: true, concert_date: true, venue: true, city: true, country: true,
+          // The scraped lineup. Support acts nobody has ever wishlisted live
+          // only here, as plain strings, and on a festival that is most of
+          // the bill.
+          metadata: true,
           // Both setlists: `setlist` is what this band played at this show,
           // `band_rel.setlist` the most recent one we have for them anywhere.
           // The upload route shares this helper and needs neither, but a
@@ -439,12 +445,15 @@ router.get(
       // Spelled out field by field rather than spread from band_rel, which
       // carries a `setlist` of its own: a spread would silently put the band's
       // most recent setlist in the field meaning "what they played that night".
-      const bands = row.concert_rel.bands.map((b) => ({
-        id: b.band_rel.id,
-        name: b.band_rel.name,
-        setlist: b.setlist ?? null,
-        recent_setlist: b.band_rel.setlist ?? null,
-      }));
+      const bands = billForConcert({
+        bands: row.concert_rel.bands.map((b) => ({
+          id: b.band_rel.id,
+          name: b.band_rel.name,
+          setlist: b.setlist ?? null,
+          recent_setlist: b.band_rel.setlist ?? null,
+        })),
+        metadata: row.concert_rel.metadata,
+      });
 
       return success(res, 200, {
         files: rows.map((m) => ({ ...m, ...mint(m.id) })),
@@ -537,6 +546,84 @@ router.get(
       return success(res, 200, payload);
     } catch (err) {
       return fail(res, err, { context: 'GET /bands/:bandId/media' });
+    }
+  },
+);
+
+/**
+ * Put a support act on a concert's bill so photographs can be tagged to them.
+ *
+ * ConcertMedia.band_id is a foreign key, so an act that exists only as a
+ * string in the scraped lineup has nothing to point at. This creates the row
+ * it needs — and that is why it is a separate, deliberate call rather than
+ * something the tagging routes do quietly on the way past.
+ *
+ * Band is ONE table shared by every account. A row created here exists for
+ * everyone, and the ConcertBandReference puts the act on that night's bill for
+ * everyone else who attended, feeding their bands-seen counts. Two guards
+ * follow from that: admin only, and only a name the scraper actually recorded
+ * for this concert — otherwise one account could put any band on any bill.
+ */
+router.post(
+  '/attendances/:attendanceId/lineup',
+  [
+    auth, roleCheck(['ADMIN']),
+    param('attendanceId').isInt(),
+    body('name').isString().isLength({ min: 1, max: 200 }),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return badRequest(res, 'Validation failed');
+
+      const attendanceId = parseInt(req.params.attendanceId, 10);
+      const { row, owned } = await ownAttendance(attendanceId, req.user.id);
+      if (!row) return notFound(res, 'Attendance not found');
+      if (!owned) return forbidden(res, 'Forbidden');
+
+      const key = canonicalBandName(req.body.name);
+      if (!key) return badRequest(res, 'That is not a name');
+
+      const bill = billForConcert({
+        bands: row.concert_rel.bands.map((b) => ({ id: b.band_rel.id, name: b.band_rel.name })),
+        metadata: row.concert_rel.metadata,
+      });
+      const entry = bill.find((b) => canonicalBandName(b.name) === key);
+      if (!entry) return badRequest(res, "That name is not on this show's scraped lineup");
+
+      // Already has a row and is already on this bill. Answered as success
+      // rather than as a conflict: the caller asked for a state that holds.
+      if (entry.linked) {
+        return success(res, 201, { band: { id: entry.id, name: entry.name }, created: false });
+      }
+
+      // Matched canonically against every band, the same comparison
+      // enrich-lineup uses. Band.name is unique, so a second "Svalbard" is not
+      // untidy but unwritable — and "Svalbard (UK)" off the scraper would be
+      // exactly that attempt.
+      const all = await prisma.band.findMany({ select: { id: true, name: true } });
+      let band = all.find((b) => canonicalBandName(b.name) === key);
+      let created = false;
+      if (!band) {
+        // entry.name, not req.body.name: the bill has already had the
+        // scraper's "Counterparts266K Followers" cleaned off it, and this row
+        // is permanent and shared.
+        band = await prisma.band.create({ data: { name: entry.name, created_at: new Date() } });
+        created = true;
+      }
+
+      const link = await prisma.concertBandReference.findUnique({
+        where: { concert_band: { concert: row.concert_rel.id, band: band.id } },
+      });
+      if (!link) {
+        await prisma.concertBandReference.create({
+          data: { concert: row.concert_rel.id, band: band.id },
+        });
+      }
+
+      return success(res, 201, { band: { id: band.id, name: band.name }, created });
+    } catch (err) {
+      return fail(res, err, { context: 'POST /attendances/:attendanceId/lineup' });
     }
   },
 );
