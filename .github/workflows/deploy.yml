@@ -10,7 +10,29 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Runs before the image is built, and the build waits on it. Until this
+  # existed, a push to main built and pushed :latest unconditionally and
+  # Watchtower deployed it within the poll interval — so a red suite reached
+  # production without anything having to go wrong twice.
+  #
+  # No database is needed: Prisma is faked through test/routeApp.js and every
+  # route test drives supertest against an in-process app.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # In step with the Dockerfile. The npm that writes package-lock.json
+          # has to be the npm that reads it here, for the same reason the
+          # Dockerfile pins node 24 and says so at length.
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx vitest run
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
