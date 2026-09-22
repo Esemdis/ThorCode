@@ -140,7 +140,22 @@ router.patch("/:id/entries/:gearItemId", [param("id").isInt(), param("gearItemId
 
   const data = {};
   if (req.body.worn !== undefined) data.worn = Boolean(req.body.worn);
-  if (req.body.bag_id !== undefined) data.bag_id = req.body.bag_id != null ? parseInt(req.body.bag_id, 10) : null;
+  if (req.body.bag_id !== undefined) {
+    if (req.body.bag_id === null || req.body.bag_id === '') {
+      data.bag_id = null;
+    } else if (!/^\d+$/.test(String(req.body.bag_id))) {
+      return res.status(400).json({ error: "Invalid bag id" });
+    } else {
+      const bagId = Number(req.body.bag_id);
+      if (!Number.isSafeInteger(bagId) || bagId < 1) return res.status(400).json({ error: "Invalid bag id" });
+      const bag = await prisma.gearItem.findFirst({
+        where: { id: bagId, user_id: req.user.id },
+        select: { id: true },
+      });
+      if (!bag) return res.status(404).json({ error: "Bag not found" });
+      data.bag_id = bagId;
+    }
+  }
 
   try {
     // "this entry, and only if its loadout is mine" — one statement.

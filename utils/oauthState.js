@@ -23,15 +23,17 @@ const DEFAULT_TTL_S = 600;
 /**
  * Mint a state value for an OAuth flow.
  *
- * @param {{ user: string, purpose: string, ttlSeconds?: number }} params -
+ * @param {{ user: string, purpose: string, ttlSeconds?: number, [claim: string]: unknown }} params -
  *   `purpose` names the flow, e.g. 'spotify_oauth'. It is checked on the way
  *   back: without it a user's ordinary session token would verify here and
  *   could be handed in as state.
  * @returns {string}
  */
-function signOAuthState({ user, purpose, ttlSeconds = DEFAULT_TTL_S }) {
+function signOAuthState({ user, purpose, ttlSeconds = DEFAULT_TTL_S, ...claims }) {
   if (!user || !purpose) throw new Error('OAuth state needs a user and a purpose');
-  return jwt.sign({ user, purpose }, process.env.JWT_SECRET, { expiresIn: ttlSeconds });
+  // A provider-specific claim can bind the state to one request token. Put the
+  // identity claims last so callers can never overwrite the flow's purpose.
+  return jwt.sign({ ...claims, user, purpose }, process.env.JWT_SECRET, { expiresIn: ttlSeconds });
 }
 
 /**
@@ -40,7 +42,7 @@ function signOAuthState({ user, purpose, ttlSeconds = DEFAULT_TTL_S }) {
  *
  * @param {unknown} state
  * @param {string} purpose
- * @returns {{ user: string }|null}
+ * @returns {{ user: string, [claim: string]: unknown }|null}
  */
 function verifyOAuthState(state, purpose) {
   if (typeof state !== 'string' || !state) return null;
@@ -48,7 +50,10 @@ function verifyOAuthState(state, purpose) {
     const decoded = jwt.verify(state, process.env.JWT_SECRET);
     if (decoded?.purpose !== purpose) return null;
     if (!decoded?.user) return null;
-    return { user: decoded.user };
+    // Do not return JWT bookkeeping claims to route code. Everything else was
+    // explicitly put into the signed state by the initiating OAuth route.
+    const { user, purpose: _purpose, iat: _iat, exp: _exp, nbf: _nbf, ...claims } = decoded;
+    return { user, ...claims };
   } catch {
     return null;
   }

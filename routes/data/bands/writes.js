@@ -26,6 +26,33 @@ const rateLimit = rateLimiter({
     'Too many requests to the Ticketmaster data route, please try again later.',
 });
 
+// A wishlist id arriving in a request body is a claim, not a fact. Wishlist
+// .user_id is unique — one wishlist per account — and ids are sequential
+// autoincrement ints, so an unchecked id here let any signed-in caller count
+// up from 1 and plant a band on every account in the system. That is not only
+// an edit to someone else's list: utils/wishlists/notify.js fans a wishlist
+// band's new concerts out to that wishlist's Discord webhook, so the injected
+// band starts posting into a stranger's channel.
+//
+// Returns the parsed id when it is the caller's, or null when there is
+// nothing to link. Throws nothing — callers answer 403 themselves, so the
+// refusal reads the same from both routes.
+async function ownWishlistId(raw, userId) {
+  if (raw === undefined || raw === null || raw === '') return { id: null, owned: true };
+  // parseInt('3anything', 10) is 3. An id has to be the whole positive integer
+  // the caller supplied, otherwise an invalid reference could silently attach
+  // a global band to a real wishlist.
+  const text = String(raw);
+  if (!/^\d+$/.test(text)) return { id: null, owned: false, invalid: true };
+  const id = Number(text);
+  if (!Number.isSafeInteger(id) || id < 1) return { id: null, owned: false, invalid: true };
+  const wishlist = await prisma.wishlist.findFirst({
+    where: { id, user_id: userId },
+    select: { id: true },
+  });
+  return { id, owned: Boolean(wishlist) };
+}
+
 router.post(
   '/bands/:bandId/sync-concerts',
   rateLimit,
@@ -239,6 +266,13 @@ router.post(
 
       const { name, wishlistId } = req.body;
 
+      // Checked before the band is created, not after: a refusal that had
+      // already written a global Band row would leave that row behind on
+      // every rejected attempt.
+      const { id: wid, owned, invalid } = await ownWishlistId(wishlistId, req.user.id);
+      if (invalid) return res.status(400).json({ error: 'wishlistId must be a positive integer' });
+      if (!owned) return res.status(403).json({ error: 'That wishlist is not yours' });
+
       if (!name) {
         return res.status(400).json({ error: "'name' must be provided" });
       }
@@ -295,10 +329,10 @@ router.post(
       });
 
       // Add to wishlist if provided
-      if (wishlistId) {
+      if (wid !== null) {
         await prisma.wishlistBandReference.create({
           data: {
-            wishlist_id: wishlistId,
+            wishlist_id: wid,
             band_id: newBand.id,
           },
         });
@@ -370,6 +404,12 @@ router.post('/bands/quick-add', auth, async (req, res) => {
     const validTiers = ['LOVE', 'LIKE', 'FOLLOW'];
     const resolvedTier = validTiers.includes(tier) ? tier : 'FOLLOW';
 
+    // Check this before looking up or creating the globally shared Band row.
+    // A rejected request must not leave a globally visible band behind.
+    const { id: wid, owned, invalid } = await ownWishlistId(wishlistId, req.user.id);
+    if (invalid) return res.status(400).json({ error: 'wishlistId must be a positive integer' });
+    if (!owned) return res.status(403).json({ error: 'That wishlist is not yours' });
+
     // Check for existing band by MBID or name
     const existing = await prisma.band.findFirst({
       where: mbid ? { MBID: mbid } : { name: name.trim() },
@@ -392,15 +432,12 @@ router.post('/bands/quick-add', auth, async (req, res) => {
     }
 
     // Add to wishlist if provided (skip if already there)
-    if (wishlistId) {
-      const wid = parseInt(wishlistId, 10);
-      if (!Number.isNaN(wid)) {
-        await prisma.wishlistBandReference.upsert({
-          where: { band_wishlist: { band_id: band.id, wishlist_id: wid } },
-          create: { band_id: band.id, wishlist_id: wid, tier: resolvedTier },
-          update: {},
-        });
-      }
+    if (wid !== null) {
+      await prisma.wishlistBandReference.upsert({
+        where: { band_wishlist: { band_id: band.id, wishlist_id: wid } },
+        create: { band_id: band.id, wishlist_id: wid, tier: resolvedTier },
+        update: {},
+      });
     }
 
     return res.status(201).json({ band });

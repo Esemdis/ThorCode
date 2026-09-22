@@ -16,7 +16,10 @@ const prisma = require('../prisma/client');
 const signJWT = require('../auth/signJWT');
 const { sendEmailVerificationCode } = require('../utils/mail');
 const { validateEmail } = require('../utils/validation/email');
-const { emailRateLimiter } = require('../utils/emailRateLimiter');
+const {
+  emailRequestRateLimiter,
+  emailVerificationRateLimiter,
+} = require('../utils/emailRateLimiter');
 const response = require('../utils/apiResponse');
 
 // Defaults to 5 requests per 15 minutes per IP
@@ -330,7 +333,7 @@ router.get(
  * @throws {409} Email already in use or pending verification
  * @throws {500} Server error
  */
-router.post('/email/request-change', auth, emailRateLimiter, upload.none(), async (req, res) => {
+router.post('/email/request-change', auth, emailRequestRateLimiter, upload.none(), async (req, res) => {
   try {
     const userId = req.user.id;
     const { newEmail } = req.body;
@@ -408,7 +411,7 @@ router.post('/email/request-change', auth, emailRateLimiter, upload.none(), asyn
  * @throws {403} Code does not belong to user
  * @throws {500} Server error
  */
-router.post('/email/verify-code', auth, emailRateLimiter, upload.none(), async (req, res) => {
+router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.none(), async (req, res) => {
   try {
     const userId = req.user.id;
     const { code } = req.body;

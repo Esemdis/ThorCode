@@ -99,12 +99,17 @@ const EXPECTED_ROUTES = [
   'POST /bands/:bandId/reconcile [3]',
   'POST /bands [6]',
   'POST /bands/quick-add [2]',
-  'GET /bands/:bandId/upcoming [1]',
+  // auth + artistLookupRateLimit + handler. This route used to be reachable
+  // with no token at all, and it calls matchBandToSpotify — a write plus a
+  // Spotify quota burn — so it was an unauthenticated, unmetered proxy.
+  'GET /bands/:bandId/upcoming [3]',
   'GET /bands/:bandId/related [2]',
   'POST /bands/:bandId/refresh-urls [3]',
   'PATCH /bands/:bandId [5]',
   'DELETE /bands/:bandId [3]',
-  'GET /bands/artist-search [1]',
+  // Same treatment as /upcoming below, and for the same reason: it reaches
+  // Last.fm and Spotify on the caller's behalf.
+  'GET /bands/artist-search [3]',
   'POST /bands/sync-spotify-ids [3]',
   'POST /bands/sync-photos [3]',
   'POST /bands/sync-all [3]',
@@ -123,6 +128,73 @@ const EXPECTED_ROUTES = [
 describe('the routing surface', () => {
   it('registers exactly the routes it did before, in the same order', () => {
     expect(routeManifest(router)).toEqual(EXPECTED_ROUTES);
+  });
+});
+
+describe('adding a band to a wishlist that is not yours', () => {
+  // wishlistId arrived in the request body and went straight into
+  // wishlist_id. Wishlist.user_id is unique — one wishlist per account — and
+  // ids are sequential autoincrement ints, so counting up from 1 planted a
+  // band on every account in the system. utils/wishlists/notify.js then fans
+  // that band's new concerts out to the victim's Discord webhook.
+  beforeEach(() => {
+    prisma.band.findFirst = vi.fn(async () => ({ id: 92, name: 'Gojira' }));
+    prisma.wishlist.findFirst = vi.fn(async () => null);
+    prisma.wishlistBandReference.upsert = vi.fn(async () => ({}));
+    prisma.wishlistBandReference.create = vi.fn(async () => ({}));
+  });
+
+  it('refuses quick-add against a stranger\'s wishlist', async () => {
+    const res = await request(app)
+      .post('/bands/quick-add')
+      .set(...authHeader({ id: 'user-1', role: 'USER' }))
+      .send({ name: 'Gojira', wishlistId: 3, tier: 'LOVE' });
+
+    expect(res.status).toBe(403);
+    expect(prisma.wishlistBandReference.upsert).not.toHaveBeenCalled();
+  });
+
+  it('refuses the full create route against a stranger\'s wishlist too', async () => {
+    const res = await request(app)
+      .post('/bands')
+      .set(...authHeader({ id: 'user-1', role: 'USER' }))
+      .send({ name: 'Gojira', wishlistId: 3 });
+
+    expect(res.status).toBe(403);
+    expect(prisma.wishlistBandReference.create).not.toHaveBeenCalled();
+  });
+
+  it('checks the wishlist against the caller, not merely that it exists', async () => {
+    await request(app)
+      .post('/bands/quick-add')
+      .set(...authHeader({ id: 'user-1', role: 'USER' }))
+      .send({ name: 'Gojira', wishlistId: 3 });
+
+    expect(prisma.wishlist.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: 3, user_id: 'user-1' }),
+    }));
+  });
+
+  it('still adds to your own wishlist', async () => {
+    prisma.wishlist.findFirst = vi.fn(async () => ({ id: 3 }));
+
+    const res = await request(app)
+      .post('/bands/quick-add')
+      .set(...authHeader({ id: 'user-1', role: 'USER' }))
+      .send({ name: 'Gojira', wishlistId: 3, tier: 'LOVE' });
+
+    expect(res.status).toBe(201);
+    expect(prisma.wishlistBandReference.upsert).toHaveBeenCalled();
+  });
+
+  it('still creates a band when no wishlist is named at all', async () => {
+    const res = await request(app)
+      .post('/bands/quick-add')
+      .set(...authHeader({ id: 'user-1', role: 'USER' }))
+      .send({ name: 'Gojira' });
+
+    expect(res.status).toBe(201);
+    expect(prisma.wishlist.findFirst).not.toHaveBeenCalled();
   });
 });
 
@@ -168,9 +240,16 @@ describe('the handlers actually run', () => {
     expect(res.status).toBe(200);
   });
 
-  it('serves one band\'s upcoming shows', async () => {
-    const res = await request(app).get('/bands/1/upcoming');
+  it('serves one band\'s upcoming shows to a signed-in caller', async () => {
+    const res = await request(app).get('/bands/1/upcoming').set(...authHeader({ id: 'user-1' }));
     expect(res.status).toBe(200);
+  });
+
+  it('turns away an unauthenticated caller, who would otherwise spend our Spotify quota', async () => {
+    // The handler calls matchBandToSpotify, which writes to the band row and
+    // burns a third-party request. Open to the world that is a free proxy.
+    const res = await request(app).get('/bands/1/upcoming');
+    expect(res.status).toBe(401);
   });
 });
 

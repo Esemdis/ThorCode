@@ -6,6 +6,7 @@ function rateLimiter({
   message = 'Too many requests, please try again later.',
   windowMs = 1 * 60 * 1000, // 1 minute
   max = 10,                 // requests per window, per IP
+  keyGenerator,
 } = {}) {
   return rateLimit({
     windowMs,
@@ -15,6 +16,7 @@ function rateLimiter({
     // can back off deliberately instead of discovering the ceiling by hitting
     // it. Additive: the legacy X-RateLimit-* headers still go out too.
     standardHeaders: true,
+    ...(keyGenerator && { keyGenerator }),
   });
 }
 

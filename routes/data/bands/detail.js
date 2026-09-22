@@ -23,17 +23,27 @@ const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
 const { setCache, getCache } = require('../../../utils/cache');
+const { rateLimiter } = require('../../../utils/rateLimiter');
 
 // Last.fm has no batch endpoint, so enriching a row costs a request. Three is
 // what fits on screen without scrolling the dropdown.
 const LASTFM_ROWS = 3;
+
+// Both endpoints below can trigger paid/limited third-party lookups. They are
+// normal signed-in UI operations, but must not be a public proxy to Spotify or
+// Last.fm.
+const artistLookupRateLimit = rateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: 'Too many artist lookups. Please try again later.',
+});
 
 // Bound to the module's cache and Spotify client once, so no route has to
 // remember which three functions resolveArtistImages needs.
 const bandImageDeps = { getCache, setCache, getArtists };
 
 // Get all upcoming concerts for a specific band
-router.get('/bands/:bandId/upcoming', async (req, res) => {
+router.get('/bands/:bandId/upcoming', auth, artistLookupRateLimit, async (req, res) => {
   try {
     const bandId = parseInt(req.params.bandId, 10);
     if (Number.isNaN(bandId)) {
@@ -383,7 +393,7 @@ router.delete(
  * Genres and listener counts are Last.fm's — Spotify gives a Development Mode
  * app neither, on any endpoint.
  */
-router.get('/bands/artist-search', async (req, res) => {
+router.get('/bands/artist-search', auth, artistLookupRateLimit, async (req, res) => {
   try {
     const { q } = req.query;
     if (!q || q.trim().length < 2) return res.json([]);

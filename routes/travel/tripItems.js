@@ -113,6 +113,22 @@ router.patch("/:itemId", param("itemId").isInt(), async (req, res) => {
   if (worn !== undefined) data.worn = Boolean(worn);
 
   try {
+    // The same ownership check POST does seventy lines above, which this had
+    // not. The update answers with `include: { gear_item_rel: true }`, so an
+    // unchecked id here did not merely link a stranger's gear — it returned
+    // the whole row, `photo` (a base64 data URL of the item) included. Gear
+    // ids are sequential, so walking them read out every account's kit.
+    //
+    // Only when an id is actually being set: null is "unlink", which owns
+    // nothing, and routing it through this would 404 every detach.
+    if (data.gear_item_id != null) {
+      const gear = await prisma.gearItem.findFirst({
+        where: { id: data.gear_item_id, user_id: req.user.id },
+        select: { id: true },
+      });
+      if (!gear) return res.status(404).json({ error: "Gear item not found" });
+    }
+
     const item = await prisma.tripItem.update({
       where: { id: parseInt(req.params.itemId, 10), trip_id: req.tripId },
       data,

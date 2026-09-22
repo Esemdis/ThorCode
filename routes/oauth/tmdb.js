@@ -10,11 +10,24 @@ const rateLimit = rateLimiter({
 });
 
 const auth = require("../../auth/verifyJWT");
-const { cacheData, getCachedData } = require("../../utils/cache");
+const { signOAuthState, verifyOAuthState } = require('../../utils/oauthState');
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const callbackUrl = process.env.CALLBACK_URL + "/oauth/tmdb/callback";
 
-router.get("/", auth, async (req, res) => {
+const STATE_PURPOSE = 'tmdb_oauth';
+
+function done(res, params) {
+  const base = process.env.CONCERT_MAP_URL?.replace(/\/+$/, '');
+  if (!base) {
+    const ok = params.tmdb === 'connected';
+    return res
+      .status(ok ? 200 : 400)
+      .send(`<p>${ok ? 'TMDB connected. You can close this tab.' : `TMDB connection failed: ${params.reason}`}</p>`);
+  }
+  return res.redirect(`${base}/?${new URLSearchParams(params)}`);
+}
+
+router.get("/", auth, rateLimit, async (req, res) => {
   try {
     const userId = req.user.id;
     // Prisma: fetch user by id
@@ -34,9 +47,13 @@ router.get("/", auth, async (req, res) => {
     );
     const requestToken = data.request_token;
 
-    const state = await cacheData({
-      prefix: "tmdb_oauth",
-      data: `${requestToken}&user=${req.user.id}`,
+    // The browser returns from TMDB without our Authorization header. State
+    // therefore carries a short-lived, signed binding between this account and
+    // the exact request token that TMDB must return.
+    const state = signOAuthState({
+      user: req.user.id,
+      purpose: STATE_PURPOSE,
+      requestToken,
     });
     // Redirect user to TMDb for authentication
     const redirectUrl = `https://www.themoviedb.org/authenticate/${requestToken}?redirect_to=${encodeURIComponent(
@@ -52,23 +69,19 @@ router.get("/", auth, async (req, res) => {
   }
 });
 
-router.get("/callback", rateLimit, auth, async (req, res) => {
+router.get("/callback", rateLimit, async (req, res) => {
   try {
     const { request_token } = req.query;
-    const userId = req.user.id;
     const state = req.query.state;
     if (!request_token) {
-      return res.status(400).json({ error: "Missing request_token" });
+      return done(res, { tmdb: 'failed', reason: 'missing_request_token' });
     }
 
-    const validToken = await getCachedData({
-      key: state,
-    });
-
-    // Validate the user and request_token
-    if (!validToken) {
-      return res.status(400).json({ error: "Invalid request_token" });
+    const stored = verifyOAuthState(state, STATE_PURPOSE);
+    if (!stored || stored.requestToken !== request_token) {
+      return done(res, { tmdb: 'failed', reason: 'invalid_state' });
     }
+    const userId = stored.user;
 
     // Exchange request_token for session_id
     const { data } = await axios.post(
@@ -111,13 +124,15 @@ router.get("/callback", rateLimit, auth, async (req, res) => {
         .status(500)
         .json({ error: "Failed to upsert TMDb OAuth data" });
     }
-    res.json({ session_id: sessionId, tmdb_user_id: tmdbUserId });
+    // Session ids are credentials. Keep them server-side in OAuth and return
+    // the browser to the app with only the connection outcome.
+    return done(res, { tmdb: 'connected' });
   } catch (error) {
     console.error(
       "Error exchanging TMDb token:",
       error?.response?.data || error.message
     );
-    res.status(500).json({ error: "Failed to exchange TMDb token" });
+    return done(res, { tmdb: 'failed', reason: 'exchange_failed' });
   }
 });
 
