@@ -43,7 +43,7 @@ async function freeDetachedPath(detachedDir, folderName) {
  * says they are is recoverable by running the rebuild script. Deleting it after
  * a half-finished move is not.
  */
-async function detachAttendances(prisma, attendanceIds, { fs = { mkdir, rename } } = {}) {
+async function detachAttendances(prisma, attendanceIds, { fs = { mkdir, rename }, moved = [] } = {}) {
   if (!attendanceIds.length) return { detached: 0, folders: [] };
 
   const rows = await prisma.concertMedia.findMany({
@@ -88,6 +88,12 @@ async function detachAttendances(prisma, attendanceIds, { fs = { mkdir, rename }
     await fs.mkdir(detachedDir, { recursive: true });
     const target = await freeDetachedPath(detachedDir, folderName);
     await fs.rename(absDir, target);
+    // Recorded as it happens, into an array the CALLER owns, because the
+    // moment this matters is the moment nothing is returned: a throw here or
+    // a failed statement later in the caller's transaction both discard the
+    // return value, and the renames already done are exactly what has to be
+    // reversed. See undoDetach.
+    moved.push({ from: absDir, to: target });
     folders.push(target);
   }
 
@@ -95,4 +101,64 @@ async function detachAttendances(prisma, attendanceIds, { fs = { mkdir, rename }
   return { detached: rows.length, folders };
 }
 
-module.exports = { countMediaForAttendances, detachAttendances };
+/**
+ * Put back what a detach moved, after the transaction around it failed.
+ *
+ * Every caller runs detachAttendances inside an interactive transaction, and
+ * deliberately so: a failed delete rolls the ConcertMedia deletion back, which
+ * is the recoverable direction. Except that it was not actually recovered.
+ * The renames are not transactional, so the rows came back pointing at folders
+ * now sitting in _detached — every tile in that show a broken image — and
+ * nothing said so, because collectArchive skips _detached by design and the
+ * rebuild therefore reports no drift at all. Silent and permanent, from a
+ * transaction that reported itself as safely rolled back.
+ *
+ * Reverse insertion order: a second folder that collided in _detached was
+ * suffixed '(2)' because the first had taken the plain name, and unwinding
+ * forwards would move the first home and then leave the suffixed one behind.
+ *
+ * Returns what it could not move rather than throwing. The caller is already
+ * unwinding a failure and has its own error to rethrow; a throw here would
+ * replace the cause with a symptom. Clears the list so a retry of the same
+ * caller cannot move anything twice.
+ */
+async function undoDetach(moved, { fs = { rename } } = {}) {
+  const failed = [];
+  for (const { from, to } of [...moved].reverse()) {
+    try {
+      await fs.rename(to, from);
+    } catch (err) {
+      failed.push({ from, to, message: err.message });
+    }
+  }
+  moved.length = 0;
+  return failed;
+}
+
+/**
+ * Run a transaction that detaches show folders, and unwind the folders if it
+ * fails.
+ *
+ * All three callers had the same shape and the same hole in it, so the pairing
+ * of detach and undo lives here rather than being re-remembered at each site.
+ * `run` receives the transaction client and the array to pass detachAttendances
+ * as `moved`.
+ */
+async function withDetach(prisma, run, options) {
+  const moved = [];
+  try {
+    return await prisma.$transaction((tx) => run(tx, moved), options);
+  } catch (err) {
+    const failed = await undoDetach(moved);
+    // Loud, because this is the case nothing else can see: the rows are back,
+    // the folders are not, and the rebuild does not look in _detached.
+    if (failed.length) {
+      console.error('[media] could not put detached folders back after a failed transaction', failed);
+    }
+    throw err;
+  }
+}
+
+module.exports = {
+  countMediaForAttendances, detachAttendances, undoDetach, withDetach,
+};

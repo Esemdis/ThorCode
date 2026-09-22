@@ -18,7 +18,7 @@ const { relevantArtists } = require('../../../utils/artistSearch');
 const { resolveArtistImages } = require('../../../utils/bandImages');
 const { matchBandToSpotify, backfillSpotifyIds } = require('../../../utils/bandSpotifyMatch');
 const { findSourceUrls } = require('../../../utils/bandSourceUrls');
-const { detachAttendances } = require('../../../utils/mediaDetach');
+const { detachAttendances, withDetach } = require('../../../utils/mediaDetach');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
@@ -317,7 +317,10 @@ router.delete(
       // 30s, not the 5s default: detachAttendances below renames a folder per
       // orphaned show on an SMB-mounted share, and a band with several
       // orphaned concerts can outrun the default before the last rename lands.
-      const result = await prisma.$transaction(async (tx) => {
+      // withDetach, not $transaction: the folder renames inside are the one
+      // part of this that Postgres cannot roll back, and a rollback that
+      // leaves them in _detached is invisible to the rebuild.
+      const result = await withDetach(prisma, async (tx, moved) => {
         const wishlistRefsDeleted = await tx.wishlistBandReference.deleteMany({
           where: { band_id: bandId },
         });
@@ -358,7 +361,7 @@ router.delete(
               where: { concert_id: { in: orphanConcertIds } },
               select: { id: true },
             });
-            await detachAttendances(tx, doomed.map((a) => a.id));
+            await detachAttendances(tx, doomed.map((a) => a.id), { moved });
             await tx.concertAttendance.deleteMany({ where: { concert_id: { in: orphanConcertIds } } });
             await tx.concert.deleteMany({ where: { id: { in: orphanConcertIds } } });
           }

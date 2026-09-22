@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mkdtemp, mkdir, writeFile, readdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { countMediaForAttendances, detachAttendances } from './mediaDetach.js';
+import { countMediaForAttendances, detachAttendances, undoDetach } from './mediaDetach.js';
 
 let root;
 beforeEach(async () => {
@@ -105,5 +105,87 @@ describe('detachAttendances', () => {
     const prisma = fakePrisma([{ attendance_id: 1, rel_path: 'u/missing/a.jpg' }]);
     await expect(detachAttendances(prisma, [1])).rejects.toThrow();
     expect(prisma.concertMedia.deleteMany).not.toHaveBeenCalled();
+  });
+});
+
+// The folder renames are the one part of a detach Postgres cannot roll back.
+// Every caller runs detachAttendances inside an interactive transaction, so a
+// statement failing after it returns restores the ConcertMedia rows while the
+// folders stay in _detached — every rel_path pointing at nothing. It is silent
+// too: collectArchive skips _detached by design, so the rebuild reports no
+// drift at all. These cover putting the folders back.
+describe('undoDetach', () => {
+  const showDir = () => join(root, 'archive', 'u', 'show');
+
+  it('records where each folder came from, so a caller can reverse it', async () => {
+    await mkdir(showDir(), { recursive: true });
+    const prisma = fakePrisma([{ attendance_id: 1, rel_path: 'u/show/a.jpg' }]);
+
+    const moved = [];
+    await detachAttendances(prisma, [1], { moved });
+
+    expect(moved).toEqual([{
+      from: showDir(),
+      to: join(root, 'archive', 'u', '_detached', 'show'),
+    }]);
+  });
+
+  it('puts the folder back where the detach found it', async () => {
+    await mkdir(showDir(), { recursive: true });
+    await writeFile(join(showDir(), 'a.jpg'), 'x');
+    const prisma = fakePrisma([{ attendance_id: 1, rel_path: 'u/show/a.jpg' }]);
+
+    const moved = [];
+    await detachAttendances(prisma, [1], { moved });
+    expect(await undoDetach(moved)).toEqual([]);
+
+    expect(await readdir(showDir())).toContain('a.jpg');
+    expect(await readdir(join(root, 'archive', 'u', '_detached'))).toEqual([]);
+  });
+
+  it('empties the list it was given, so a second call cannot move them again', async () => {
+    await mkdir(showDir(), { recursive: true });
+    const prisma = fakePrisma([{ attendance_id: 1, rel_path: 'u/show/a.jpg' }]);
+    const moved = [];
+    await detachAttendances(prisma, [1], { moved });
+
+    await undoDetach(moved);
+    expect(moved).toEqual([]);
+    // The second call is a no-op rather than a rename of a folder that is
+    // already home — which, with a suffixed name, would move the wrong one.
+    expect(await undoDetach(moved)).toEqual([]);
+    expect(await readdir(showDir())).toEqual([]);
+  });
+
+  it('reports what it could not put back rather than throwing over it', async () => {
+    // The caller is already unwinding a failed transaction and has its own
+    // error to rethrow. A throw here would replace the cause with a symptom.
+    const failed = await undoDetach([{ from: join(root, 'nope', 'show'), to: join(root, 'also-nope') }]);
+    expect(failed).toHaveLength(1);
+    expect(failed[0].to).toBe(join(root, 'also-nope'));
+  });
+
+  it('reverses a partly-finished detach, including the move that suffixed', async () => {
+    // Two folders, the second of which collides in _detached and so lands as
+    // 'show (2)'. Undoing in insertion order would rename 'show' back first
+    // and then find 'show (2)' still sitting there — reverse order is what
+    // makes the pair unwind cleanly.
+    await mkdir(join(root, 'archive', 'u', 'a', 'show'), { recursive: true });
+    await mkdir(join(root, 'archive', 'u', '_detached'), { recursive: true });
+    const prisma = fakePrisma([
+      { attendance_id: 1, rel_path: 'u/show/a.jpg' },
+      { attendance_id: 1, rel_path: 'u/a/show/b.jpg' },
+    ]);
+    await mkdir(join(root, 'archive', 'u', 'show'), { recursive: true });
+
+    const moved = [];
+    await detachAttendances(prisma, [1], { moved });
+    expect(moved).toHaveLength(2);
+
+    expect(await undoDetach(moved)).toEqual([]);
+    expect(await readdir(join(root, 'archive', 'u', '_detached'))).toEqual([]);
+    expect(await readdir(join(root, 'archive', 'u'))).toEqual(
+      expect.arrayContaining(['show', 'a', '_detached']),
+    );
   });
 });

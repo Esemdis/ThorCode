@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
+import { mkdtemp, mkdir, writeFile, readdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 
 // Seeded before the router is imported — see installFakePrisma for why this
@@ -292,6 +295,57 @@ describe('DELETE /concerts/:concertId', () => {
     const mediaCallOrder = prisma.concertMedia.findMany.mock.invocationCallOrder[0];
     const deleteCallOrder = prisma.concertAttendance.deleteMany.mock.invocationCallOrder[0];
     expect(mediaCallOrder).toBeLessThan(deleteCallOrder);
+  });
+});
+
+// The folder renames a detach performs are the one part of these transactions
+// Postgres cannot roll back. The rows coming back while the folders stay in
+// _detached is the worst of the three outcomes and was the silent one: the
+// rebuild skips _detached by design, so it reports no drift at all.
+describe('DELETE /concerts/:concertId — when the delete fails after the folders moved', () => {
+  let root;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'detach-route-'));
+    process.env.MEDIA_ROOT = root;
+    const show = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    await mkdir(show, { recursive: true });
+    await writeFile(join(show, 'a.jpg'), 'x');
+
+    prisma.concert.findUnique.mockResolvedValue({ id: 55 });
+    prisma.concertAttendance.findMany.mockResolvedValue([{ id: 501 }]);
+    // Two shapes: the rows being detached, then the strangers check.
+    prisma.concertMedia.findMany.mockImplementation(async ({ where }) => (
+      where.attendance_id.in
+        ? [{ rel_path: 'user-1/2026-06-12 Oslo - Gojira/a.jpg' }]
+        : []
+    ));
+    prisma.concertMedia.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.concertBandReference.deleteMany.mockResolvedValue({ count: 0 });
+    prisma.concertAttendance.deleteMany.mockResolvedValue({ count: 1 });
+  });
+
+  it('puts the show folder back where it was', async () => {
+    prisma.concert.delete.mockRejectedValue(new Error('deadlock detected'));
+
+    const res = await request(app).delete('/concerts/55').set(...authHeader({ role: 'ADMIN' }));
+    expect(res.status).toBeGreaterThanOrEqual(500);
+
+    const show = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    expect(await readdir(show)).toContain('a.jpg');
+    expect(await readdir(join(root, 'archive', 'user-1', '_detached'))).toEqual([]);
+  });
+
+  it('leaves the folder detached when the delete succeeds, which is the whole point', async () => {
+    // The undo must be reachable only from the failure path. A compensating
+    // action that also fires on success would undo the feature.
+    prisma.concert.delete.mockResolvedValue({ id: 55 });
+
+    const res = await request(app).delete('/concerts/55').set(...authHeader({ role: 'ADMIN' }));
+    expect(res.status).toBe(200);
+
+    expect(await readdir(join(root, 'archive', 'user-1', '_detached')))
+      .toContain('2026-06-12 Oslo - Gojira');
   });
 });
 

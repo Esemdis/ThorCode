@@ -16,7 +16,7 @@ const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
 const { Prisma } = require('@prisma/client');
-const { detachAttendances } = require('../../../utils/mediaDetach');
+const { detachAttendances, withDetach } = require('../../../utils/mediaDetach');
 
 /**
  * Match unsearched bands to Spotify artists, so the overview has photos before
@@ -213,12 +213,17 @@ router.delete('/concerts/:concertId', auth, roleCheck(['ADMIN']), async (req, re
   //
   // 30s, not the 5s default: the work inside includes a folder rename per
   // attendee's worth of media on an SMB-mounted share.
-  await prisma.$transaction(async (tx) => {
+  // withDetach, not $transaction: the folder renames inside are the one part
+  // of this that Postgres cannot roll back. A failure after the detach
+  // restored the media rows and left their folders in _detached — every
+  // rel_path pointing at nothing, and no drift reported, because the rebuild
+  // skips _detached by design.
+  await withDetach(prisma, async (tx, moved) => {
     const doomed = await tx.concertAttendance.findMany({
       where: { concert_id: concertId },
       select: { id: true },
     });
-    await detachAttendances(tx, doomed.map((a) => a.id));
+    await detachAttendances(tx, doomed.map((a) => a.id), { moved });
     await tx.concertBandReference.deleteMany({ where: { concert: concertId } });
     await tx.concertAttendance.deleteMany({ where: { concert_id: concertId } });
     await tx.concert.delete({ where: { id: concertId } });
