@@ -9,6 +9,7 @@ import {
   concertPerformers,
   unresolvedBillNames,
   formatConcertDay,
+  coverCredits,
 } from './setlistPlaylist.js';
 
 /** A ConcertBandReference row as the concert query returns it. */
@@ -309,5 +310,28 @@ describe('playlistDescription', () => {
     const description = playlistDescription({ venue: 'Fållan' }, tracks);
     expect(description).toContain('as it was played');
     expect(description).toContain('THROWN at Fållan');
+  });
+});
+
+describe('coverCredits', () => {
+  it('names the band that played a cover and the artist it was credited to', () => {
+    // The whole point of the feature: Orthodox playing "Prison Song" puts a
+    // System of a Down track in the playlist, and without this line nothing in
+    // the app says where it came from.
+    const tracks = buildPlaylistTracks([
+      ref('Orthodox', [song('Head on a Spike'), song('Prison Song', { cover: 'System of a Down' })]),
+    ]);
+    expect(coverCredits(tracks)).toEqual([
+      { title: 'Prison Song', band: 'Orthodox', artist: 'System of a Down' },
+    ]);
+  });
+
+  it('is empty for a bill where every band played its own songs', () => {
+    const tracks = buildPlaylistTracks([ref('THROWN', [song('On the Verge')])]);
+    expect(coverCredits(tracks)).toEqual([]);
+  });
+
+  it('survives being handed nothing', () => {
+    expect(coverCredits(undefined)).toEqual([]);
   });
 });

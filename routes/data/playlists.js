@@ -11,7 +11,7 @@ const auth = require('../../auth/verifyJWT');
 const { rateLimiter } = require('../../utils/rateLimiter');
 const {
   buildPlaylistTracks, concertPerformers, unresolvedBillNames,
-  playlistName, playlistDescription,
+  playlistName, playlistDescription, coverCredits,
 } = require('../../utils/setlistPlaylist');
 const { fetchSetlistsForNames } = require('../../utils/externalSetlists');
 const {
@@ -119,6 +119,12 @@ router.post('/:concertId/playlist', auth, rateLimit, async (req, res) => {
       missed,
       predicted: tracks.some((t) => t.predicted),
       bands: [...new Set(tracks.map((t) => t.band))],
+      // Covers are searched for under the artist who wrote them, so the
+      // playlist can hold a band that is not on the bill and `bands` will not
+      // mention it. Sent for every cover, not only the resolved ones: an
+      // unresolved one is already sitting in `missed` under the same
+      // unexplained artist name.
+      covers: coverCredits(tracks),
     });
   } catch (error) {
     // Not connected, or a refresh token the user has revoked. Either way the fix

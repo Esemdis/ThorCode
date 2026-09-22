@@ -223,6 +223,24 @@ function buildPlaylistTracks(bandRefs, { maxTracks = DEFAULT_MAX_TRACKS } = {}) 
 }
 
 /**
+ * The covers among a set of tracks, as `{ title, band, artist }`.
+ *
+ * A cover is searched for under the artist who wrote it, so an Orthodox set
+ * puts a System of a Down recording in the playlist. Nothing else in the
+ * response mentions that artist — `bands` and the description are both built
+ * from the performing band — so the track reads as something that wandered in
+ * from another concert. This is what lets the caller say whose cover it was.
+ *
+ * @param {object[]} tracks - Output of buildPlaylistTracks.
+ * @returns {{ title: string, band: string, artist: string }[]}
+ */
+function coverCredits(tracks) {
+  return (Array.isArray(tracks) ? tracks : [])
+    .filter((t) => t?.isCover)
+    .map(({ title, band, artist }) => ({ title, band, artist }));
+}
+
+/**
  * Search strings for one track, most precise first.
  *
  * The field-scoped form is what usually lands it. The loose form is the fallback
@@ -326,6 +344,7 @@ module.exports = {
   concertPerformers,
   unresolvedBillNames,
   buildPlaylistTracks,
+  coverCredits,
   setlistForRef,
   pickBestTrack,
   comparable,
