@@ -85,7 +85,7 @@ describe('writeWebp cleanup on failure', () => {
     await mkdir(target, { recursive: true });
     await writeFile(join(target, 'occupied'), '');
 
-    await expect(storePoster({ relPath: rel, buffer: await aFrame() })).rejects.toThrow();
+    await expect(storePoster({ relPath: rel, source: await aFrame() })).rejects.toThrow();
 
     // Checked by suffix rather than by exact name, since the temp name now
     // carries a random nonce.
@@ -103,7 +103,7 @@ describe('storePoster', () => {
   it('writes the poster beside the video, in the archive', async () => {
     // Not in the cache. The browser produced this frame because the server
     // cannot decode video, so deleting it means it is gone.
-    const out = await storePoster({ relPath: rel, buffer: await aFrame() });
+    const out = await storePoster({ relPath: rel, source: await aFrame() });
     expect(out).toBe(posterPath(rel));
     await expect(access(out)).resolves.toBeUndefined();
   });
@@ -111,19 +111,28 @@ describe('storePoster', () => {
   it('downscales the frame the browser sent to the grid width', async () => {
     // The canvas hands over a full-resolution frame. Storing 1920px of it would
     // put more bytes in the backup than the thumbnail it is for.
-    const out = await storePoster({ relPath: rel, buffer: await aFrame() });
+    const out = await storePoster({ relPath: rel, source: await aFrame() });
     expect((await sharp(out).metadata()).width).toBe(THUMB_WIDTH);
   });
 
   it('creates the dotted posters folder on first use', async () => {
-    await storePoster({ relPath: rel, buffer: await aFrame() });
+    await storePoster({ relPath: rel, source: await aFrame() });
     expect(await readdir(join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira')))
       .toContain('.posters');
   });
 
   it('rejects something that is not an image rather than writing it', async () => {
-    await expect(storePoster({ relPath: rel, buffer: Buffer.from('not an image') }))
+    await expect(storePoster({ relPath: rel, source: Buffer.from('not an image') }))
       .rejects.toThrow();
+  });
+
+  it('takes a path as readily as a buffer, so a batch never sits in the heap', async () => {
+    // The upload route hands over multer's temp path. Reading each poster into
+    // memory first put a whole batch there at once, ahead of any write.
+    const temp = join(root, 'a-frame.webp');
+    await writeFile(temp, await aFrame());
+    const out = await storePoster({ relPath: rel, source: temp });
+    expect((await sharp(out).metadata()).width).toBe(THUMB_WIDTH);
   });
 });
 
@@ -133,7 +142,7 @@ describe('ensureThumb for a video', () => {
   it('returns the stored poster rather than trying to decode the video', async () => {
     const buffer = await sharp({ create: { width: 1920, height: 1080, channels: 3, background: '#111' } })
       .jpeg().toBuffer();
-    await storePoster({ relPath: rel, buffer });
+    await storePoster({ relPath: rel, source: buffer });
     const out = await ensureThumb({ absPath: '/unused', kind: 'VIDEO', sha256: 'v1', relPath: rel });
     expect(out).toBe(posterPath(rel));
   });

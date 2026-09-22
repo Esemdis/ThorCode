@@ -64,9 +64,12 @@ async function writeWebp(bufferOrPath, target) {
  * The canvas hands over a full-resolution frame, so it is downscaled here
  * rather than stored as-is: at 1920 wide it would put more bytes into the
  * backup than the thumbnail it exists to be.
+ *
+ * `source` is a Buffer or a path, whichever the caller has. The upload route
+ * passes a path so a batch of posters never lands in the heap at once.
  */
-async function storePoster({ relPath, buffer }) {
-  return writeWebp(buffer, posterPath(relPath));
+async function storePoster({ relPath, source }) {
+  return writeWebp(source, posterPath(relPath));
 }
 
 /**

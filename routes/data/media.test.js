@@ -220,6 +220,43 @@ describe('POST /attendances/:id/media', () => {
     expect(await readdir(join(dir, '.posters'))).toContain('VID_1.mp4.webp');
   });
 
+  it('leaves no poster temp file behind after storing one', async () => {
+    // Posters were read into the heap and unlinked at parse time, all of them
+    // at once, before the first byte was written anywhere. Streaming from the
+    // temp path instead means the file has to outlive the parse, so the
+    // sweep that removes it afterwards is now load-bearing.
+    const poster = await (await import('sharp')).default(
+      { create: { width: 1920, height: 1080, channels: 3, background: '#222' } }).webp().toBuffer();
+
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('meta', JSON.stringify({ 'VID_1.mp4': { width: 1920, height: 1080, duration_ms: 24000 } }))
+      .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
+      .attach('posters', poster, { filename: 'VID_1.mp4.webp', contentType: 'image/webp' })
+      .expect(201);
+
+    expect(await readdir(join(root, 'incoming')).catch(() => [])).toEqual([]);
+  });
+
+  it('ignores a poster that is not a webp frame, and stores the video anyway', async () => {
+    // The posters field is the one upload field with no type gate on it. A
+    // poster that is not an image costs a placeholder tile; refusing the
+    // whole batch would cost the recording it came with.
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('meta', JSON.stringify({ 'VID_1.mp4': { width: 1920, height: 1080, duration_ms: 24000 } }))
+      .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
+      .attach('posters', Buffer.from('%PDF-1.4 not a frame'), { filename: 'VID_1.mp4.webp', contentType: 'application/pdf' })
+      .expect(201);
+
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    expect(await readdir(dir)).toContain('VID_1.mp4');
+    expect(await readdir(join(dir, '.posters')).catch(() => [])).toEqual([]);
+    expect(await readdir(join(root, 'incoming')).catch(() => [])).toEqual([]);
+  });
+
   it('takes duration and dimensions from the browser, since there is no ffprobe', async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')

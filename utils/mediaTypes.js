@@ -33,6 +33,17 @@ const MAX_FILE_BYTES = 2147483647;
 // drift apart.
 const MAX_FILES_PER_REQUEST = 50;
 
+// A poster is one frame the upload dialog drew on a canvas and encoded, so it
+// is an image at roughly thumbnail scale and never anything near a video.
+//
+// It needs its own cap because the posters field shares the route's multer
+// fileSize limit, which is MAX_FILE_BYTES — sized for a full-set recording.
+// Posters are the one thing the upload route does not stream: sharp has to
+// read the frame to downscale it, so fifty posters at the video limit is a
+// heap the container does not have. Eight megabytes is far more than a canvas
+// frame needs and still small enough that a full batch is bounded.
+const MAX_POSTER_BYTES = 8 * 1024 * 1024;
+
 const MIME_KINDS = new Map([
   ['image/jpeg', 'PHOTO'],
   ['image/png', 'PHOTO'],
@@ -54,4 +65,29 @@ function kindForMime(mime) {
   return MIME_KINDS.get(normalised) ?? null;
 }
 
-module.exports = { MAX_FILE_BYTES, MAX_FILES_PER_REQUEST, kindForMime };
+/**
+ * Why a poster upload should be turned away, or null to accept it.
+ *
+ * Posters deliberately skip kindForMime: they never become a ConcertMedia row,
+ * and a poster that cannot be decoded costs a placeholder tile rather than the
+ * recording it arrived with. But skipping that gate entirely left the posters
+ * field as the only one in the route accepting arbitrary bytes at the video
+ * size limit, which then had to be decoded to find that out.
+ *
+ * Returns a reason rather than a boolean so the caller can log which poster it
+ * dropped and why — a silently missing thumbnail is otherwise unexplainable.
+ */
+function posterProblem({ mimetype, size } = {}) {
+  const normalised = String(mimetype ?? '').split(';')[0].trim().toLowerCase();
+  if (normalised !== 'image/webp') {
+    return `expected image/webp, got ${normalised || 'nothing'}`;
+  }
+  if (size > MAX_POSTER_BYTES) {
+    return `larger than the ${Math.round(MAX_POSTER_BYTES / 1024 / 1024)} MB poster limit`;
+  }
+  return null;
+}
+
+module.exports = {
+  MAX_FILE_BYTES, MAX_POSTER_BYTES, MAX_FILES_PER_REQUEST, kindForMime, posterProblem,
+};

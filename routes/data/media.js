@@ -27,7 +27,9 @@ const { showDirForAttendance } = require('../../utils/mediaShowDir');
 const {
   emptySidecar, upsertFile, removeFile, readSidecar, updateSidecar,
 } = require('../../utils/mediaSidecar');
-const { kindForMime, MAX_FILE_BYTES, MAX_FILES_PER_REQUEST } = require('../../utils/mediaTypes');
+const {
+  kindForMime, posterProblem, MAX_FILE_BYTES, MAX_FILES_PER_REQUEST,
+} = require('../../utils/mediaTypes');
 const { uploadErrors } = require('../../utils/uploadErrors');
 const { storePoster, ensureThumb } = require('../../utils/mediaThumbs');
 const { bandMediaOverview } = require('../../utils/mediaOverview');
@@ -221,10 +223,24 @@ router.post(
 
       // Posters are named for the video they belong to, so a batch mixing
       // photos and video pairs them up without depending on array order.
+      //
+      // The temp path is kept, not the bytes. Reading every poster here put
+      // the whole batch in the heap at once, before a single file had been
+      // written anywhere — the one place this route abandoned the streaming
+      // rule its disk storage exists to enforce. sharp takes a path as
+      // happily as a Buffer, so the frames stay on disk until the one that
+      // needs decoding is decoded.
       const posters = new Map();
       for (const poster of req.files?.posters ?? []) {
-        posters.set(poster.originalname.replace(/\.webp$/, ''), { buffer: await readFile(poster.path) });
-        await unlink(poster.path).catch(() => {});
+        const problem = posterProblem(poster);
+        if (problem) {
+          // Not fatal, and deliberately so: the video is the thing worth
+          // keeping. Logged because a tile that silently draws a placeholder
+          // is otherwise impossible to explain.
+          console.error(`[media] poster ${poster.originalname} ignored: ${problem}`);
+          continue;
+        }
+        posters.set(poster.originalname.replace(/\.webp$/, ''), { source: poster.path });
       }
 
       const show = {
@@ -412,15 +428,23 @@ router.post(
       // Posters are written before the response, not after: they arrived with
       // the request and cannot be recreated later, so losing one to a crash in
       // a background task would lose it for good.
-      for (const [m, poster] of pairedPosters) {
-        if (!poster) continue;
-        try {
-          await storePoster({ relPath: m.rel_path, buffer: poster.buffer });
-        } catch (err) {
-          // A bad frame is not worth failing the upload the video already
-          // survived. The grid draws a placeholder for a video with no poster.
-          console.error(`[media] poster for ${m.filename} rejected`, err);
+      try {
+        for (const [m, poster] of pairedPosters) {
+          if (!poster) continue;
+          try {
+            await storePoster({ relPath: m.rel_path, source: poster.source });
+          } catch (err) {
+            // A bad frame is not worth failing the upload the video already
+            // survived. The grid draws a placeholder for a video with no poster.
+            console.error(`[media] poster for ${m.filename} rejected`, err);
+          }
         }
+      } finally {
+        // Every poster, not just the paired ones: an ignored or unmatched
+        // poster is still a temp file, and now that the bytes are no longer
+        // read at parse time this sweep is the only thing removing them.
+        await Promise.all((req.files?.posters ?? [])
+          .map((f) => unlink(f.path).catch(() => {})));
       }
 
       success(res, 201, { created, duplicates });

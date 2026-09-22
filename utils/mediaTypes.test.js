@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { MAX_FILE_BYTES, kindForMime } from './mediaTypes.js';
+import {
+  MAX_FILE_BYTES, MAX_POSTER_BYTES, kindForMime, posterProblem,
+} from './mediaTypes.js';
 
 describe('kindForMime', () => {
   it('recognises the formats a Pixel produces', () => {
@@ -49,5 +51,31 @@ describe('MAX_FILE_BYTES', () => {
     // insert with "value out of range for type integer", which unlinks the
     // bytes and 500s after several minutes of upload.
     expect(MAX_FILE_BYTES).toBeLessThanOrEqual(2147483647);
+  });
+});
+
+describe('posterProblem', () => {
+  it('accepts the webp frame the upload dialog draws', () => {
+    expect(posterProblem({ mimetype: 'image/webp', size: 40_000 })).toBeNull();
+  });
+
+  it('ignores parameters and case the way kindForMime does', () => {
+    expect(posterProblem({ mimetype: 'IMAGE/WEBP; charset=binary', size: 10 })).toBeNull();
+  });
+
+  it('refuses anything that is not a webp', () => {
+    // The posters field skips kindForMime, because a poster never becomes a
+    // row and a bad one costs a placeholder rather than the upload. That left
+    // it as the one field in the route where arbitrary bytes reached sharp.
+    expect(posterProblem({ mimetype: 'video/mp4', size: 40_000 })).toMatch(/image\/webp/);
+    expect(posterProblem({ mimetype: undefined, size: 10 })).toMatch(/image\/webp/);
+  });
+
+  it('holds a poster to its own cap, far below a video\'s', () => {
+    // Posters shared MAX_FILE_BYTES, which is sized for a full-set recording.
+    // A poster is one canvas frame, so fifty of them at the video limit was
+    // 100 GB the route would have tried to hold at once.
+    expect(posterProblem({ mimetype: 'image/webp', size: MAX_POSTER_BYTES + 1 })).toMatch(/limit/);
+    expect(MAX_POSTER_BYTES).toBeLessThan(MAX_FILE_BYTES / 100);
   });
 });
