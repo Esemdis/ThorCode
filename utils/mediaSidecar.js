@@ -11,6 +11,7 @@
 const { readFile, writeFile, rename, unlink } = require('node:fs/promises');
 const { randomBytes } = require('node:crypto');
 const path = require('node:path');
+const { serialise } = require('./serialQueue');
 
 const SIDECAR_NAME = 'concert-media.json';
 const SIDECAR_VERSION = 1;
@@ -99,28 +100,21 @@ async function writeSidecar(showDirAbs, sidecar) {
  * same time (the rebuild script, say) is still outside it; those are run by
  * hand, not concurrently with a sweep.
  *
+ * The queue itself now lives in utils/serialQueue.js, because the upload route
+ * needed the same thing for a different resource. The key is prefixed so the
+ * two key spaces cannot collide — `serialise` is not reentrant, and the upload
+ * route calls this while holding its own lock.
+ *
  * @param {string} showDirAbs
  * @param {(sidecar: object|null) => object|null} mutate - returning null writes nothing
  */
-const tails = new Map();
-
 async function updateSidecar(showDirAbs, mutate) {
-  // Chained off the previous holder settling either way. Chaining on success
-  // alone would let one failed write wedge every later write to that show.
-  const prev = tails.get(showDirAbs) ?? Promise.resolve();
-  const result = prev.then(() => {}, () => {}).then(async () => {
+  return serialise(`sidecar:${showDirAbs}`, async () => {
     const current = await readSidecar(showDirAbs);
     const next = await mutate(current);
     if (next) await writeSidecar(showDirAbs, next);
     return next;
   });
-
-  const tail = result.then(() => {}, () => {});
-  tails.set(showDirAbs, tail);
-  // Dropped once this is the last write for the folder, so a long-running
-  // process does not accumulate an entry per show it has ever touched.
-  tail.then(() => { if (tails.get(showDirAbs) === tail) tails.delete(showDirAbs); });
-  return result;
 }
 
 module.exports = {

@@ -632,6 +632,42 @@ describe('POST /attendances/:id/lineup', () => {
   });
 });
 
+describe('two uploads racing into one show', () => {
+  it('keeps both files when they arrive at the same time under the same name', async () => {
+    // The filename was chosen from a snapshot — existing rows, readdir, the
+    // sidecar — read with no lock, and the rename onto it is an unconditional
+    // overwrite. Two requests that both read before either wrote picked the
+    // same name; the second replaced the first's bytes, then failed its
+    // insert on @@unique([attendance_id, filename]) and unlinked the file it
+    // had just written over. Result: no bytes on disk, a row and a sidecar
+    // entry both claiming the photograph exists, and the first client told
+    // 201. This is the retrying-client case, which a flaky home connection
+    // produces on its own.
+    const seen = [];
+    prisma.concertMedia.create = vi.fn(async ({ data }) => {
+      // Widen the window the same way a real insert does, and record which
+      // name each request settled on.
+      await new Promise((r) => setTimeout(r, 15));
+      seen.push(data.filename);
+      return { id: seen.length, ...data };
+    });
+
+    const send = (seed) => request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .attach('files', jpeg(seed), 'IMG_1.jpg');
+
+    const [a, b] = await Promise.all([send('a'), send('b')]);
+    expect([a.status, b.status]).toEqual([201, 201]);
+
+    // Two distinct names, and both sets of bytes still on disk.
+    expect(new Set(seen).size).toBe(2);
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    const onDisk = (await readdir(dir)).filter((n) => n.endsWith('.jpg'));
+    expect(onDisk).toHaveLength(2);
+  });
+});
+
 describe('the same file uploaded twice', () => {
   // The checksum has always been computed and stored, and until now was only
   // ever used as a thumbnail cache key. Nothing compared it, so a second

@@ -33,6 +33,7 @@ const { storePoster, ensureThumb } = require('../../utils/mediaThumbs');
 const { bandMediaOverview } = require('../../utils/mediaOverview');
 const { billForConcert } = require('../../utils/concertBill');
 const { canonicalBandName } = require('../../utils/lineupNames');
+const { acquire } = require('../../utils/serialQueue');
 const { signMediaToken, verifyMediaToken, mediaUrls } = require('../../utils/mediaTokens');
 
 const router = express.Router();
@@ -163,6 +164,9 @@ router.post(
     // have to be swept on failure or a rejected batch leaks its temp files.
     const allTemp = () => [...(req.files?.files ?? []), ...(req.files?.posters ?? [])];
     const cleanup = () => Promise.all(allTemp().map((f) => unlink(f.path).catch(() => {})));
+    // Declared out here so the finally below can release it whichever way the
+    // handler leaves.
+    let releaseShow = null;
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) { await cleanup(); return badRequest(res, 'Validation failed'); }
@@ -233,6 +237,25 @@ router.post(
       // "earliest" means something: an unordered read of an attendance whose
       // files are already split across two folders would pick a different one
       // from request to request and keep the split alive.
+      // Everything from here to the sidecar write is one critical section per
+      // show. The filename is chosen from a snapshot — existing rows, readdir
+      // and the sidecar — and the rename onto it is an unconditional
+      // overwrite, so two requests that both read before either wrote picked
+      // the same name: the second replaced the first's bytes, then failed its
+      // insert on @@unique([attendance_id, filename]) and unlinked the file it
+      // had just written over. No bytes on disk, a row and a sidecar entry
+      // both claiming the photograph exists, and the first client told 201.
+      //
+      // Not hypothetical: a retrying client on a flaky home connection
+      // produces exactly two concurrent calls for one file, which is the case
+      // utils/mediaThumbs.js already names. The checksum dedup cannot help —
+      // it reads the same stale snapshot.
+      //
+      // Cheap to hold: multer has already received every byte by the time this
+      // handler runs, so what is serialised is hashing and bookkeeping, not
+      // the upload itself.
+      releaseShow = await acquire(`attendance:${attendanceId}`);
+
       const existing = await prisma.concertMedia.findMany({
         where: { attendance_id: attendanceId },
         select: { filename: true, rel_path: true, sha256: true },
@@ -413,6 +436,10 @@ router.post(
     } catch (err) {
       await cleanup();
       return fail(res, err, { context: 'POST /attendances/:attendanceId/media' });
+    } finally {
+      // Must run on every path. A lock that is taken and not handed back
+      // wedges that show's uploads for the life of the process.
+      if (releaseShow) releaseShow();
     }
   },
 );
