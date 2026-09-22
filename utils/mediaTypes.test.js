@@ -36,9 +36,18 @@ describe('kindForMime', () => {
 });
 
 describe('MAX_FILE_BYTES', () => {
-  it('is 2 GB, which is a long clip and not a mistake', () => {
+  it('is a long clip and not a mistake', () => {
     // 4K60 off a phone runs around 400 MB a minute, so a full-set recording
     // went past the 500 MB this replaced without trying.
-    expect(MAX_FILE_BYTES).toBe(2 * 1024 * 1024 * 1024);
+    expect(MAX_FILE_BYTES).toBeGreaterThan(1.9 * 1024 * 1024 * 1024);
+  });
+
+  it('fits in the Int column that stores it', () => {
+    // ConcertMedia.bytes is an Int. A round 2 GiB is INT32_MAX + 1, and
+    // busboy only fires `limit` when a file EXCEEDS fileSize — so a file of
+    // exactly that size was accepted, uploaded in full, and then failed the
+    // insert with "value out of range for type integer", which unlinks the
+    // bytes and 500s after several minutes of upload.
+    expect(MAX_FILE_BYTES).toBeLessThanOrEqual(2147483647);
   });
 });

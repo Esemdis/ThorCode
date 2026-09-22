@@ -39,6 +39,13 @@ async function collectArchive(rootAbs) {
   const sidecars = [];
   const filesOnDisk = {};
   const noSidecar = [];
+  // Shows whose sidecar exists but cannot be read: malformed JSON, or a
+  // version this build does not understand. Collected rather than thrown,
+  // because the sidecar is meant to be edited by hand and restore day is the
+  // only day this runs — one trailing comma used to take the whole rebuild
+  // down, indexing nothing at all and naming no directory, since JSON.parse's
+  // message does not carry the filename.
+  const unreadableSidecars = [];
 
   // An archive root that is not there is an ordinary state, not a crash: the
   // rebuild may be running before the first upload, or — the case that
@@ -51,7 +58,7 @@ async function collectArchive(rootAbs) {
     users = await dirsIn(rootAbs);
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
-    return { sidecars, filesOnDisk, noSidecar, archiveMissing: true };
+    return { sidecars, filesOnDisk, noSidecar, unreadableSidecars, archiveMissing: true };
   }
 
   for (const user of users) {
@@ -62,7 +69,17 @@ async function collectArchive(rootAbs) {
 
       const relDir = path.posix.join(user, show);
       const absDir = path.join(rootAbs, user, show);
-      const data = await readSidecar(absDir);
+      let data;
+      try {
+        data = await readSidecar(absDir);
+      } catch (err) {
+        // Reported against the directory, and the walk carries on. A show
+        // nobody can read is drift the operator has to see, not a reason to
+        // leave the other two hundred unindexed.
+        unreadableSidecars.push({ relDir, reason: err.message });
+        filesOnDisk[relDir] = (await filesIn(absDir)).filter((n) => !n.startsWith('.'));
+        continue;
+      }
       // Dotfiles are never media: .concert-media.json.tmp is a write in
       // progress, and .posters holds video poster frames the sidecar doesn't
       // list by design. Counting either as drift would be noise on every run.
@@ -76,7 +93,7 @@ async function collectArchive(rootAbs) {
     }
   }
 
-  return { sidecars, filesOnDisk, noSidecar, archiveMissing: false };
+  return { sidecars, filesOnDisk, noSidecar, unreadableSidecars, archiveMissing: false };
 }
 
 /**

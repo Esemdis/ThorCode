@@ -20,7 +20,9 @@ const { attendanceKey, collectArchive, planRebuild, applyUpserts } = require('..
 const dryRun = process.argv.includes('--dry-run');
 
 async function main() {
-  const { sidecars, filesOnDisk, noSidecar, archiveMissing } = await collectArchive(archiveRoot());
+  const {
+    sidecars, filesOnDisk, noSidecar, unreadableSidecars, archiveMissing,
+  } = await collectArchive(archiveRoot());
 
   // Said plainly rather than thrown, because the likely cause is a share that
   // failed to mount and the operator needs to be told to look there.
@@ -45,6 +47,12 @@ async function main() {
 
   console.log(`${sidecars.length} shows, ${plan.upserts.length} files to index`);
   for (const dir of noSidecar) console.warn(`show with files but no sidecar: ${dir}`);
+  // Named individually rather than counted: the operator has to open this
+  // exact file and fix it, and the parser's own message says only what is
+  // wrong, never where.
+  for (const s of unreadableSidecars) {
+    console.error(`sidecar that cannot be read: ${s.relDir} — ${s.reason}`);
+  }
   for (const [label, list] of [
     ['sidecar entry with no file', plan.missingFiles],
     ['file no sidecar mentions', plan.unlistedFiles],
@@ -63,7 +71,8 @@ async function main() {
     for (const item of rejected) console.error(`row refused by Postgres: ${JSON.stringify(item)}`);
   }
 
-  const drift = noSidecar.length + plan.missingFiles.length + plan.unlistedFiles.length
+  const drift = noSidecar.length + unreadableSidecars.length
+    + plan.missingFiles.length + plan.unlistedFiles.length
     + plan.unknownConcerts.length + plan.mismatchedUsers.length + plan.malformedEntries.length
     + rejected.length;
   process.exitCode = drift > 0 ? 1 : 0;

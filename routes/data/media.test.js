@@ -1396,6 +1396,27 @@ describe('GET /media/:id/file', () => {
   });
 });
 
+describe('a byte route answering 404', () => {
+  it('does not tell the browser to cache the miss for a year', async () => {
+    // Cache-Control was set before res.sendFile, so it was still on the
+    // response when the ENOENT callback answered 404. The share dropping or
+    // remounting late after a container restart made every tile the user
+    // looked at 404 — and immutable for twelve months, so they stayed broken
+    // after the share came back. Only a hard reload could fix it.
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      id: 5, rel_path: 'user-1/show/gone.jpg', kind: 'PHOTO', sha256: 'h5',
+      attendance_rel: { wishlist_rel: { user_id: 'user-1' } },
+    }));
+
+    const token = signMediaToken({ mediaId: 5, userId: 'user-1' });
+    const res = await request(app())
+      .get(`/data/concerts/media/5/file?t=${encodeURIComponent(token)}`)
+      .expect(404);
+
+    expect(res.headers['cache-control'] ?? '').not.toMatch(/immutable/);
+  });
+});
+
 describe('GET /media/:id/thumb', () => {
   it('generates the thumbnail on a cache miss rather than 404ing', async () => {
     // The cache directory is safe to delete at any time precisely because of

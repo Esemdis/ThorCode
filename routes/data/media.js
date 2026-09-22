@@ -919,7 +919,16 @@ async function serveMedia(req, res, which) {
       // would otherwise hand an absolute archive path on this container back
       // to the browser. The caller is already the verified owner, so this is
       // closing a filesystem-layout leak, not a data leak.
-      if (err.code === 'ENOENT') return res.status(404).end();
+      if (err.code === 'ENOENT') {
+        // The immutable Cache-Control below is set before sendFile runs, so
+        // without this it is still on the response when this 404 goes out —
+        // and the browser is told to remember the miss for a year. The
+        // condition that produces it is usually transient (a share that
+        // dropped, or mounted late after a restart), so every tile looked at
+        // during the outage stayed broken long after it ended.
+        res.removeHeader('Cache-Control');
+        return res.status(404).end();
+      }
       // Passing a callback here opts out of Express's own next(err) handling
       // (see res.sendFile's source: "if (done) return done(err)"), so
       // anything past ENOENT has to be logged and answered here, not thrown —

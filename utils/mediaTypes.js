@@ -19,7 +19,13 @@
 // This is not the only limit in the path. Whatever proxies the API has its own
 // body cap, and it is the lower of the two that decides — see the note on
 // LIMIT_FILE_SIZE in utils/uploadErrors.js.
-const MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024;
+//
+// INT32_MAX exactly, one byte under a round 2 GiB, because ConcertMedia.bytes
+// is an Int column. Busboy fires `limit` only when a file EXCEEDS fileSize, so
+// a cap of 2147483648 accepted a file of exactly that size — which is
+// INT32_MAX + 1 — and the insert then failed with "value out of range for
+// type integer" after the whole upload had already been received.
+const MAX_FILE_BYTES = 2147483647;
 
 // One drag-and-drop of a whole night's photographs, and a ceiling on how much
 // one request can ask the disk for. Lives here rather than inline in the route

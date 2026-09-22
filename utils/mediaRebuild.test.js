@@ -305,3 +305,71 @@ describe('applyUpserts', () => {
     ]);
   });
 });
+
+describe('collectArchive meeting a sidecar it cannot read', () => {
+  // The sidecar is meant to be edited by hand — the design says the folder
+  // must be usable by someone who has never heard of this app. A trailing
+  // comma in one show's concert-media.json threw a SyntaxError out of the
+  // walk, out of main(), and the restore indexed NOTHING: not the broken
+  // show, not the two hundred good ones. The message names no directory,
+  // because JSON.parse's does not.
+  //
+  // This is the same failure entryProblem was written to eliminate one level
+  // down. A malformed entry is reported per entry; a malformed file took the
+  // whole run with it.
+  let root;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'rebuild-corrupt-'));
+  });
+
+  const showWith = async (user, show, sidecarText, files = []) => {
+    const dir = join(root, user, show);
+    await mkdir(dir, { recursive: true });
+    if (sidecarText !== null) await writeFile(join(dir, 'concert-media.json'), sidecarText);
+    for (const f of files) await writeFile(join(dir, f), 'x');
+  };
+
+  it('reports the unreadable show and still indexes every other one', async () => {
+    await showWith('user-1', 'broken', '{ "version": 1, "files": [ , ] }', ['a.jpg']);
+    await showWith('user-1', 'good', JSON.stringify({
+      version: 1, concert_id: 8417, user_id: 'user-1', concert: {},
+      files: [{
+        name: 'b.jpg', kind: 'PHOTO', band_id: 92, band_name: 'Gojira', caption: '',
+        sha256: 'h-b', bytes: 10, width: 1, height: 1, duration_ms: null, taken_at: null,
+      }],
+    }), ['b.jpg']);
+
+    const out = await collectArchive(root);
+
+    expect(out.sidecars.map((s) => s.relDir)).toEqual(['user-1/good']);
+    expect(out.unreadableSidecars).toHaveLength(1);
+    expect(out.unreadableSidecars[0].relDir).toBe('user-1/broken');
+    expect(out.unreadableSidecars[0].reason).toBeTruthy();
+  });
+
+  it('names the directory, which the parser error does not', async () => {
+    await showWith('user-1', 'broken', 'not json at all', ['a.jpg']);
+    const out = await collectArchive(root);
+    expect(out.unreadableSidecars[0]).toMatchObject({ relDir: 'user-1/broken' });
+  });
+
+  it('reports a sidecar written by a newer build rather than dying on it', async () => {
+    // readSidecar throws deliberately on a version it does not understand,
+    // for a good reason — writing rows from a half-understood shape is worse
+    // than refusing. That refusal still must not take the other shows down.
+    await showWith('user-1', 'future', JSON.stringify({ version: 99, files: [] }), ['a.jpg']);
+    const out = await collectArchive(root);
+    expect(out.unreadableSidecars[0].relDir).toBe('user-1/future');
+    expect(out.unreadableSidecars[0].reason).toMatch(/version/i);
+  });
+
+  it('does not call a show with no sidecar at all unreadable', async () => {
+    // That is a different state with its own list: files present, nothing
+    // describing them.
+    await showWith('user-1', 'bare', null, ['a.jpg']);
+    const out = await collectArchive(root);
+    expect(out.unreadableSidecars).toEqual([]);
+    expect(out.noSidecar).toEqual(['user-1/bare']);
+  });
+});
