@@ -24,6 +24,7 @@ const {
   uniqueFilename, resolveArchivePath, slugSegment, posterPath,
 } = require('../../utils/mediaPaths');
 const { showDirForAttendance } = require('../../utils/mediaShowDir');
+const { capturedAtFor } = require('../../utils/mediaCapture');
 const {
   emptySidecar, upsertFile, removeFile, readSidecar, updateSidecar,
 } = require('../../utils/mediaSidecar');
@@ -341,6 +342,7 @@ router.post(
             width: asInt(fileMeta.width),
             height: asInt(fileMeta.height),
             duration_ms: kind === 'VIDEO' ? asInt(fileMeta.duration_ms) : null,
+            captured_at: capturedAtFor(fileMeta.captured_at, kind, row.concert_rel.concert_date),
           };
 
           // Hashed off the temp file, before anything is moved into the show
@@ -372,12 +374,11 @@ router.post(
           try {
             const { size } = await stat(absPath);
 
-            // taken_at is reserved, not populated. The column, this field and
-            // planRebuild's date branch all exist for a later phase that reads
-            // EXIF; nothing writes it today, so a null here means "not read
-            // yet", never "this photo has no capture time". Reading EXIF is
-            // out of scope for this phase — only EXIF *location* is out of
-            // scope in the spec, so the field is worth keeping.
+            // Read from the MP4 container by the browser, which is also where
+            // the poster and duration come from. Videos only: a still takes no
+            // song, so it needs no place in the running order, and reading
+            // EXIF off photographs remains its own later phase — a null on a
+            // photo still means "not read yet".
             const entry = {
               name: filename, kind, band_id: bandId, band_name: bandId ? onBill.get(bandId) : null,
               // Always present, always null: a fresh upload has no song, and an
@@ -385,7 +386,7 @@ router.post(
               // of thing that makes the record of truth hard to read by hand.
               caption: '', song: null, sha256, bytes: size,
               width: probe.width, height: probe.height,
-              duration_ms: probe.duration_ms, taken_at: null,
+              duration_ms: probe.duration_ms, taken_at: probe.captured_at,
             };
 
             // Paired by the name the browser sent, not the name we stored: a
@@ -398,6 +399,7 @@ router.post(
                 rel_path: path.posix.join(relDir, filename), filename,
                 kind, bytes: size, sha256,
                 width: probe.width, height: probe.height, duration_ms: probe.duration_ms,
+                taken_at: probe.captured_at ? new Date(probe.captured_at) : null,
               },
             });
             added.push(entry);

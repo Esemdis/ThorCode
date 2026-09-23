@@ -283,6 +283,68 @@ describe('POST /attendances/:id/media', () => {
     expect(prisma.concertMedia.create).toHaveBeenCalled();
   });
 
+  it('stores the capture time a video arrived with', async () => {
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', '92')
+      .field('meta', JSON.stringify({
+        'VID_1.mp4': { width: 1920, height: 1080, duration_ms: 82_536, captured_at: '2026-06-12T19:54:41.000Z' },
+      }))
+      .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
+      .expect(201);
+
+    expect(prisma.concertMedia.create.mock.calls[0][0].data)
+      .toMatchObject({ taken_at: new Date('2026-06-12T19:54:41.000Z') });
+  });
+
+  it('refuses to store a capture time from a different week', async () => {
+    // The client is the source of this value, so the check runs again here. A
+    // time that contradicts its own show would misplace every other clip that
+    // night relative to it, not only itself.
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', '92')
+      .field('meta', JSON.stringify({ 'VID_1.mp4': { captured_at: '2026-09-20T13:57:16.000Z' } }))
+      .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
+      .expect(201);
+
+    expect(prisma.concertMedia.create.mock.calls[0][0].data).toMatchObject({ taken_at: null });
+  });
+
+  it('writes the capture time into the sidecar as well as the row', async () => {
+    // The sidecar is the record of truth a rebuild reads back, so a time that
+    // reached only the database would vanish the next time the archive was
+    // rebuilt from disk.
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', '92')
+      .field('meta', JSON.stringify({ 'VID_1.mp4': { captured_at: '2026-06-12T19:54:41.000Z' } }))
+      .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
+      .expect(201);
+
+    const sidecar = JSON.parse(await readFile(
+      join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira', 'concert-media.json'), 'utf8'));
+    expect(sidecar.files.find((f) => f.name === 'VID_1.mp4').taken_at)
+      .toBe('2026-06-12T19:54:41.000Z');
+  });
+
+  it('stores no capture time on a photograph', async () => {
+    // Only a video takes a song. Reading stills' EXIF is its own later phase
+    // and a client-sent time must not half-start it.
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', '92')
+      .field('meta', JSON.stringify({ 'IMG_1.jpg': { captured_at: '2026-06-12T19:54:41.000Z' } }))
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(201);
+
+    expect(prisma.concertMedia.create.mock.calls[0][0].data).toMatchObject({ taken_at: null });
+  });
+
   it('ignores a duration the client made up', async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')
