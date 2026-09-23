@@ -224,6 +224,10 @@ router.get(
           concert_rel: {
             select: {
               id: true,
+              // When it was inserted, which is what "new since your last
+              // visit" is measured against — so the client can say how long
+              // ago each announcement landed rather than only that it did.
+              created_at: true,
               name: true,
               city: true,
               country: true,
