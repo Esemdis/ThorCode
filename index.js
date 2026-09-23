@@ -16,6 +16,7 @@ app.use("/data/concerts", require("./routes/data/ticketmaster"))
 app.use("/data/concerts", require("./routes/data/notifications"))
 app.use("/data/concerts", require("./routes/data/playlists"))
 app.use("/data/concerts", require("./routes/data/media"))
+app.use("/data/concerts", require("./routes/data/health"))
 app.use("/data/cities", require("./routes/data/cities"))
 app.use("/data/tmdb", require("./routes/data/tmdb"));
 app.use("/oauth/tmdb", require("./routes/oauth/tmdb"));
