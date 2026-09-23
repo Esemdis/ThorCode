@@ -129,6 +129,7 @@ model Concert {
   price_currency    String?
   sold_out          Boolean?               @default(false)
   reachable         String?
+  setlist_checked_at DateTime?
   city_id           Int?
   city_rel          City?                  @relation(fields: [city_id], references: [id])
   bands             ConcertBandReference[] @relation("ConcertBands")

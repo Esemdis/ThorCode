@@ -23,20 +23,26 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const SEARCH_SPACING_MS = 1100;
 
 /**
- * @param {{ limit?: number }} [options]
+ * @param {{ limit?: number, enrich?: Function, gapMs?: number }} [options] - `enrich` is
+ *   injectable for tests.
  * @returns {Promise<{ checked: number, updated: number }>}
  */
-async function backfillSetlists({ limit = 50 } = {}) {
+async function backfillSetlists({ limit = 50, enrich = enrichConcertBands, gapMs = SEARCH_SPACING_MS } = {}) {
   const concerts = await prisma.concert.findMany({
     where: {
       concert_date: { lt: new Date() },
       attendances: { some: {} },
-      bands: { some: { setlist: { equals: Prisma.DbNull } } },
+      // Only a band with an MBID can ever be matched, so a show whose only
+      // gap is a band without one would be fetched every day for nothing.
+      bands: { some: { setlist: { equals: Prisma.DbNull }, band_rel: { MBID: { not: null } } } },
     },
     select: { id: true, concert_date: true, venue: true, city: true },
-    // Recently attended shows first: a show nobody has looked at in years is
-    // less likely to gain a setlist than one from last month.
-    orderBy: { concert_date: "desc" },
+    // Never-checked first, then least recently checked. Ordering by date alone
+    // meant the fifty newest shows still missing a setlist — often because a
+    // support act simply has none on setlist.fm — were retried every day and
+    // every older show behind them was never reached. Among equals, recent
+    // shows first: they are the likeliest to have gained a setlist.
+    orderBy: [{ setlist_checked_at: { sort: "asc", nulls: "first" } }, { concert_date: "desc" }],
     take: limit,
   });
 
@@ -46,9 +52,10 @@ async function backfillSetlists({ limit = 50 } = {}) {
     // same derivation the route uses when it first tries this at attend time.
     const d = new Date(concert.concert_date);
     const date = `${String(d.getUTCDate()).padStart(2, "0")}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${d.getUTCFullYear()}`;
-    const { updated: bandsUpdated } = await enrichConcertBands(concert.id, date, concert.venue, concert.city);
+    const { updated: bandsUpdated } = await enrich(concert.id, date, concert.venue, concert.city);
     if (bandsUpdated > 0) updated += 1;
-    await sleep(SEARCH_SPACING_MS);
+    await prisma.concert.update({ where: { id: concert.id }, data: { setlist_checked_at: new Date() } });
+    if (gapMs) await sleep(gapMs);
   }
 
   return { checked: concerts.length, updated };
