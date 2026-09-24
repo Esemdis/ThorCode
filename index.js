@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require('cors');
 const dotenv = require("dotenv").config();
 const { startCronJobs } = require("./utils/cron");
+const { archiveStatus, archiveWarning } = require("./utils/mediaHealth");
 const app = express();
 const port = process.env.PORT || 4000;
 
@@ -59,7 +60,13 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
-app.listen(port, () => {
+app.listen(port, async () => {
   console.log(`Example app listening on port ${port}`);
   startCronJobs();
+  // Said once, at the only moment anyone is reading this log on purpose. Not
+  // fatal: this process also serves the travel app, and an SMB share that is
+  // slow to come back after a host reboot is a normal morning — exiting would
+  // turn a degraded gallery into an outage of everything.
+  const warning = archiveWarning(await archiveStatus());
+  if (warning) console.warn(warning);
 });

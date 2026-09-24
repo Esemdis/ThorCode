@@ -20,6 +20,7 @@ const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
 const { rateLimiter } = require("../../utils/rateLimiter");
+const { archiveStatus } = require("../../utils/mediaHealth");
 
 const rateLimit = rateLimiter({
   message: "Too many requests to the health route, please try again later.",
@@ -116,6 +117,13 @@ router.get(
         }),
       ]);
 
+      // Not a queue like everything else here, and deliberately included
+      // anyway: a share that dropped produces no symptom of its own. The
+      // listings keep working because they never touch disk, and the only
+      // evidence is a gallery of images that will not load. This is the one
+      // place an admin already looks.
+      const archive = await archiveStatus();
+
       res.json({
         checked_at: now.toISOString(),
         bands: {
@@ -141,6 +149,7 @@ router.get(
           never_checked: setlistNeverChecked,
           checked_today: setlistCheckedToday,
         },
+        archive,
       });
     } catch (error) {
       console.error("Error building health counts:", error);
