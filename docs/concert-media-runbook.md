@@ -217,6 +217,32 @@ Record today's archive size when you first set this up, and when the job starts
 failing on quota, let it fail loudly. A backup that silently copies most of the
 archive is worse than one that stops, because it reports success.
 
+## Finding rows whose file is gone
+
+The rebuild above walks the archive and asks what the index is missing. This asks
+the opposite question — which indexed rows have no file behind them — which is
+the one to ask when tiles are blank:
+
+```bash
+doppler run -- node scripts/find-missing-media.js          # grouped by show
+doppler run -- node scripts/find-missing-media.js --json    # same, machine-readable
+```
+
+It reports only, and it exits non-zero when it finds any. It refuses to run at
+all when the archive is unreadable or empty, because with the share unmounted
+every row in the index is "missing" and a report of four thousand orphans is the
+wrong answer to the question you actually have.
+
+Each show is labelled with the one thing that decides what to do about it:
+
+- **show folder is not in this archive** — those files were never here. This is
+  the shared-database case below: uploaded under the other `MEDIA_ROOT`, so the
+  bytes have to be copied across, sidecar and `.posters/` included. A rebuild
+  cannot invent them.
+- **folder is here, these files are not** — drift inside an archive this
+  deployment owns. That is what the rebuild reconciles, because the sidecar
+  beside them still says what should be there.
+
 ## Rebuilding the index
 
 ```bash
@@ -285,8 +311,11 @@ first time, and after any change to the share or the proxy.
 | Symptom | Look here first |
 |---|---|
 | Every upload fails, videos especially | `client_max_body_size` on the proxy |
-| App will not start | `MEDIA_ROOT` unset — it throws rather than guessing |
-| Every image 404s or 401s | `MEDIA_URL_SECRET` differs from the one that signed the URLs |
+| App will not start | `MEDIA_ROOT` unset at boot — `mediaRoot()` throws rather than guessing |
+| App starts, lists load, but **every** photo and video is blank | Check `archive` in `GET /data/concerts/health` first — it says whether the share is readable and how many owner folders are in it. `MEDIA_ROOT` unset or wrong gives 500s (`mediaRoot()` throws on *use*, not at boot, so listings keep working); a share that **dropped** leaves an empty directory and gives 404s instead. The startup log warns about both. |
+| Tiles 404 while the share is mounted and populated | The row and the file disagree. Both configs share one Postgres with different `MEDIA_ROOT`s, so a file uploaded under one is a permanently broken tile under the other — check the row's `rel_path` against each archive before reaching for the rebuild |
+| Every image 404s or 401s | `MEDIA_URL_SECRET` differs from the one that signed the URLs. The route logs `[media] refused <id>: <reason>`, and the reason names it: `unconfigured`, `signature`, `expired` |
+| Images blank with nothing in the API log at all | The browser never sent the request. `CALLBACK_URL` points somewhere unreachable, or it is `http://` on an `https://` page and is dropped as mixed content |
 | Video tiles are permanent placeholders | `.posters/` missing — check it reached Drive, and that the browser extracted a frame at upload |
 | Photos visible on the share, absent in the app | Run the rebuild with `--dry-run`; expect them under "file no sidecar mentions" |
 | `incoming/` is growing | Temp files from aborted uploads. Safe to delete anything in there older than a day. |
