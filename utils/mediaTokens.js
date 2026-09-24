@@ -108,6 +108,23 @@ function verifyMediaToken(token, { mediaId, secret, now } = {}) {
 function mediaUrls(baseUrl, mediaId, token) {
   if (!baseUrl) throw new Error('No public base URL configured (CALLBACK_URL)');
   const base = String(baseUrl).replace(/\/+$/, '');
+
+  // Absolute, and over http(s). A value like `api.example.com` is an
+  // ordinary-looking mistake that produces a RELATIVE url: the browser resolves
+  // it against the frontend's origin, every tile asks a host that serves no
+  // media, and nothing reaches this API to appear in its log. The failure is
+  // then indistinguishable from an empty archive, forty tiles at a time.
+  // Throwing costs one loud 500 on the listing instead.
+  let parsed;
+  try {
+    parsed = new URL(base);
+  } catch {
+    throw new Error(`Public base URL (CALLBACK_URL) is not absolute: ${base}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`Public base URL (CALLBACK_URL) is not http or https: ${base}`);
+  }
+
   const id = encodeURIComponent(mediaId);
   const q = `?t=${encodeURIComponent(token)}`;
   return {

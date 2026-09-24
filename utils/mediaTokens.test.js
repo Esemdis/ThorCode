@@ -146,4 +146,25 @@ describe('mediaUrls', () => {
     // Netlify frontend then cannot load.
     expect(() => mediaUrls('', 7, 'tok')).toThrow();
   });
+
+  it('refuses a base URL with no scheme, rather than emitting a relative one', () => {
+    // The failure this prevents is invisible where it lands: `api.example.com`
+    // produces a relative url, the browser resolves it against the FRONTEND's
+    // origin, every tile asks a host that serves no media, and nothing reaches
+    // this API to be logged. One loud 500 on the listing is the cheaper answer.
+    expect(() => mediaUrls('api.example.com', 7, 'tok')).toThrow(/not absolute/i);
+  });
+
+  it('refuses a base URL a browser cannot fetch from', () => {
+    expect(() => mediaUrls('ftp://api.example.com', 7, 'tok')).toThrow(/http or https/i);
+  });
+
+  it('names the offending value, because that is what makes it fixable', () => {
+    expect(() => mediaUrls('api.example.com', 7, 'tok')).toThrow(/api\.example\.com/);
+  });
+
+  it('still accepts a plain http base, for a local API', () => {
+    expect(mediaUrls('http://localhost:4000', 7, 'tok').thumb)
+      .toBe('http://localhost:4000/data/concerts/media/7/thumb?t=tok');
+  });
 });
