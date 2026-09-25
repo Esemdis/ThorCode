@@ -28,13 +28,14 @@ RUN apt-get update -y \
 
 WORKDIR /app
 
-# No npm install at all. This service imports five of the API's own utils and
+# No npm install at all. This service imports seven of the API's own utils and
 # nothing from node_modules — it walks a share and spawns ffmpeg — so the image
 # stays ffmpeg plus Node with no dependency tree to keep patched. The list is the
 # real require closure, traced rather than guessed: mediaSidecar pulls in
 # serialQueue, which is easy to miss and fails only at runtime in the container.
 COPY utils/mediaPaths.js utils/mediaSidecar.js utils/serialQueue.js \
-     utils/mediaHealth.js utils/renditionPlan.js ./utils/
+     utils/mediaHealth.js utils/renditionPlan.js utils/mediaClips.js \
+     utils/mediaRenditions.js ./utils/
 COPY services/rendition/index.js ./services/rendition/
 
 # Unprivileged: it needs to read and write the share and nothing else. Make sure

@@ -38,6 +38,10 @@ function thumbCacheRoot() {
   return path.join(mediaRoot(), CACHE_DIR, 'thumbs');
 }
 
+function clipCacheRoot() {
+  return path.join(mediaRoot(), CACHE_DIR, 'clips');
+}
+
 /**
  * One path component, made safe without being made ugly.
  *
@@ -148,7 +152,7 @@ function webRenditionPath(absOriginal) {
 
 module.exports = {
   ARCHIVE_DIR, CACHE_DIR, DETACHED_DIR, MAX_SEGMENT, POSTERS_DIR, WEB_DIR,
-  archiveRoot, thumbCacheRoot, slugSegment, showFolderName,
+  archiveRoot, thumbCacheRoot, clipCacheRoot, slugSegment, showFolderName,
   showFolderRelPath, uniqueFilename, resolveArchivePath, thumbPath, posterPath,
   webRenditionPath,
 };

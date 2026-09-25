@@ -13,6 +13,12 @@
  * API serves that for playback and the original for download, so the archive
  * copy is never touched or replaced.
  *
+ * It also cuts shared moments: a share link to part of a clip is a request file
+ * the API writes into cache/clips, and this cuts that stretch into its own mp4
+ * beside it (see utils/mediaClips.js). Someone is waiting on those with the
+ * share panel open, so the clip queue is checked every few seconds and ahead of
+ * each rendition, where the archive walk runs only every INTERVAL.
+ *
  * It is a separate service for one reason: ffmpeg is roughly 250 MB, and the API
  * image also serves the travel app and is pulled on every Watchtower check. The
  * decoder belongs where the decoding happens.
@@ -33,16 +39,20 @@
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const {
-  readdir, mkdir, rename, unlink, stat, writeFile,
+  access, readdir, readFile, mkdir, rename, unlink, stat, writeFile,
 } = require('node:fs/promises');
 
-const { archiveRoot, DETACHED_DIR, WEB_DIR } = require('../../utils/mediaPaths');
+const {
+  archiveRoot, clipCacheRoot, resolveArchivePath, DETACHED_DIR, WEB_DIR,
+} = require('../../utils/mediaPaths');
 const { archiveStatus } = require('../../utils/mediaHealth');
 const { readSidecar } = require('../../utils/mediaSidecar');
 const {
   ffmpegArgs, probeArgs, parseProbe, targetSize,
   pendingInShow, isAbandonedPart, partNameFor, FAILED_SUFFIX,
 } = require('../../utils/renditionPlan');
+const { playableFor } = require('../../utils/mediaRenditions');
+const { clipFiles, parseClipRequest, planClips } = require('../../utils/mediaClips');
 
 const args = process.argv.slice(2);
 const once = args.includes('--once');
@@ -63,6 +73,7 @@ const VCODEC = process.env.RENDITION_VCODEC || 'libx264';
 // and would reject x264's names outright.
 const PRESET = process.env.RENDITION_PRESET || null;
 const INTERVAL = Number(process.env.RENDITION_INTERVAL_SECONDS || 300);
+const CLIP_POLL = Number(process.env.RENDITION_CLIP_POLL_SECONDS || 5);
 
 const log = (...m) => console.log(`[rendition] ${m.join(' ')}`);
 const warn = (...m) => console.warn(`[rendition] ${m.join(' ')}`);
@@ -71,6 +82,8 @@ const dirsIn = async (abs) => (await readdir(abs, { withFileTypes: true }))
   .filter((e) => e.isDirectory()).map((e) => e.name);
 
 const filesIn = async (abs) => readdir(abs).catch(() => []);
+
+const exists = (p) => access(p).then(() => true, () => false);
 
 const mb = (n) => (n == null ? '?' : `${Math.round(n / 1e6)} MB`);
 
@@ -214,7 +227,82 @@ async function tidy(show) {
   }
 }
 
+/**
+ * Cut one shared moment into cache/clips.
+ *
+ * From the viewing copy when there is one: already 1080p SDR H.264, so a
+ * twenty-second moment costs seconds rather than a 4K HEVC decode and a tone
+ * map. It is also the file the moment was picked in — the lightbox plays /play
+ * — so the times in the request are on its timeline.
+ */
+async function cutClip(job) {
+  const files = clipFiles(job.id);
+  const range = `${job.start_ms / 1000}s–${job.end_ms == null ? 'end' : `${job.end_ms / 1000}s`}`;
+  const started = Date.now();
+  try {
+    const { absPath: input } = await playableFor(resolveArchivePath(job.rel_path), 'VIDEO');
+    const source = await probe(input);
+    if (!source) throw new Error('ffprobe found no usable video stream');
+    await runFfmpeg(ffmpegArgs({
+      input,
+      output: files.part,
+      source,
+      height: HEIGHT,
+      crf: CRF,
+      maxrateMbps: MAXRATE,
+      vcodec: VCODEC,
+      preset: PRESET,
+      startMs: job.start_ms,
+      durationMs: job.end_ms == null ? null : job.end_ms - job.start_ms,
+    }));
+  } catch (err) {
+    await unlink(files.part).catch(() => {});
+    // As with a rendition: a cut we stopped is unfinished, not broken.
+    if (stopping) throw err;
+    await writeFile(files.failed, `${err.message}\n`).catch(() => {});
+    warn(`clip ${job.id} (${job.rel_path} ${range}): ${err.message}`);
+    return;
+  }
+
+  await rename(files.part, files.output);
+  // Revoked mid-cut. The API deleted the request, and could not delete an
+  // output that did not exist yet, so it falls to this side.
+  if (!(await exists(files.request))) {
+    await unlink(files.output).catch(() => {});
+    log(`clip ${job.id}: revoked while it was being cut, discarded`);
+    return;
+  }
+  log(`clip ${job.id} (${job.rel_path} ${range}): cut in ${Math.round((Date.now() - started) / 1000)}s`);
+}
+
+/** Sweep dead clips, then cut any that are waiting. Cheap when there are none. */
+async function clips() {
+  const root = clipCacheRoot();
+  const names = await filesIn(root);
+  if (!names.length) return;
+
+  const requests = new Map();
+  for (const name of names.filter((n) => /^\d+\.json$/.test(n))) {
+    // Gone between the listing and the read means revoked just now, which the
+    // plan then treats the same as unreadable: sweep what is left of it.
+    const text = await readFile(path.join(root, name), 'utf8').catch(() => null);
+    requests.set(name, text == null ? null : parseClipRequest(name, text));
+  }
+  const { jobs, sweep } = planClips(names, requests, new Date());
+
+  if (dryRun) {
+    for (const job of jobs) log(`would cut clip ${job.id} from ${job.rel_path}`);
+    return;
+  }
+  for (const name of sweep) await unlink(path.join(root, name)).catch(() => {});
+  for (const job of jobs) {
+    if (stopping) return;
+    await cutClip(job);
+  }
+}
+
 async function pass() {
+  await clips();
   const shows = await showDirs();
   let pending = 0;
   let done = 0;
@@ -246,6 +334,10 @@ async function pass() {
         log(`would encode ${show.label}/${job.name} (${mb(job.bytes)})`);
         continue;
       }
+      // A waiting clip goes first, so a backlog of renditions after a big
+      // upload delays a share by one encode at most rather than the whole pile.
+      await clips();
+      if (stopping) break;
       // Strictly one at a time. This shares a box with the API and the array;
       // two concurrent 4K transcodes would make the app it exists to improve
       // slower than it was.
@@ -280,20 +372,28 @@ async function main() {
     process.exitCode = 1;
     return;
   }
-  log(`archive ${archiveRoot()}, ${VCODEC} at ${HEIGHT}p, quality ${CRF}, ceiling ${MAXRATE} Mbit/s`);
+  log(`archive ${archiveRoot()}, ${VCODEC} at ${HEIGHT}p, quality ${CRF}, ceiling ${MAXRATE} Mbit/s,`
+    + ` clips checked every ${CLIP_POLL}s`);
 
   if (dryRun || once) { await pass(); return; }
 
+  const sleep = (ms) => new Promise((resolve) => {
+    const timer = setTimeout(() => { wake = null; resolve(); }, ms);
+    wake = () => { clearTimeout(timer); wake = null; resolve(); };
+  });
+
   // A loop rather than a cron entry: an encode runs for minutes and overlapping
-  // runs would fight for the same CPU and the same .part path. Sleeping between
-  // passes means there is only ever one.
+  // runs would fight for the same CPU and the same .part path. Everything runs
+  // on this one loop, so there is only ever one encode or cut at a time.
   while (!stopping) {
     await pass();
-    if (stopping) break;
-    await new Promise((resolve) => {
-      const timer = setTimeout(() => { wake = null; resolve(); }, INTERVAL * 1000);
-      wake = () => { clearTimeout(timer); wake = null; resolve(); };
-    });
+    // Between archive walks only the clip queue is watched, and often: a clip
+    // has someone waiting on it and a rendition does not.
+    const due = Date.now() + INTERVAL * 1000;
+    while (!stopping && Date.now() < due) {
+      await sleep(Math.min(CLIP_POLL * 1000, due - Date.now()));
+      if (!stopping) await clips();
+    }
   }
   log('stopped');
 }

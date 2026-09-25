@@ -78,6 +78,13 @@ const admin = { id: 'user-1', role: 'ADMIN' };
 // decodes these anyway. Needed since uploads are deduplicated by checksum:
 // a test about two files has to use two files, not the same one twice.
 const jpeg = (seed = '') => Buffer.concat([baseJpeg, Buffer.from(seed)]);
+// A video is not text to superagent, so it leaves res.text undefined. The tests
+// that compare a video's bytes read them through this instead.
+const bytesOf = (req) => req.buffer(true).parse((res, done) => {
+  const chunks = [];
+  res.on('data', (c) => chunks.push(c));
+  res.on('end', () => done(null, Buffer.concat(chunks).toString()));
+});
 const baseJpeg = Buffer.from(
   '/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a' +
   'HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAA' +
@@ -101,7 +108,7 @@ describe('POST /attendances/:id/media', () => {
       'POST /attendances/:attendanceId/lineup [5]',
       'PATCH /media [8]',
       'DELETE /media/:id [4]',
-      'POST /media/:id/share [4]',
+      'POST /media/:id/share [6]',
       'DELETE /media/:id/share [4]',
       'GET /media/:id/file [1]',
       'GET /media/:id/play [1]',
@@ -1849,8 +1856,8 @@ describe('GET /media/:id/play', () => {
     // Which is what happened before renditions existed at all. A missing one is
     // an ordinary state, not a failure.
     await uploadClip();
-    const res = await request(app()).get(`/data/concerts/media/1/play?t=${tok()}`).expect(200);
-    expect(res.text).toBe('original bytes');
+    const res = await bytesOf(request(app()).get(`/data/concerts/media/1/play?t=${tok()}`)).expect(200);
+    expect(res.body).toBe('original bytes');
   });
 
   it('serves the rendition once one is there', async () => {
@@ -1858,8 +1865,11 @@ describe('GET /media/:id/play', () => {
     await mkdir(join(dir, '.web'), { recursive: true });
     await writeFile(join(dir, '.web', 'VID_1.mp4.mp4'), 'rendition bytes');
 
-    const res = await request(app()).get(`/data/concerts/media/1/play?t=${tok()}`).expect(200);
-    expect(res.text).toBe('rendition bytes');
+    const res = await bytesOf(request(app()).get(`/data/concerts/media/1/play?t=${tok()}`)).expect(200);
+    expect(res.body).toBe('rendition bytes');
+    // Not mime-types' application/mp4, which a browser tab opened straight on
+    // a share link can offer as a download instead of playing.
+    expect(res.headers['content-type']).toMatch(/^video\/mp4/);
   });
 
   it('leaves /file on the archive master, so a download is never the rendition', async () => {
@@ -1868,8 +1878,8 @@ describe('GET /media/:id/play', () => {
     await mkdir(join(dir, '.web'), { recursive: true });
     await writeFile(join(dir, '.web', 'VID_1.mp4.mp4'), 'rendition bytes');
 
-    const res = await request(app()).get(`/data/concerts/media/1/file?t=${tok()}`).expect(200);
-    expect(res.text).toBe('original bytes');
+    const res = await bytesOf(request(app()).get(`/data/concerts/media/1/file?t=${tok()}`)).expect(200);
+    expect(res.body).toBe('original bytes');
   });
 
   it('does not let the browser keep the original for a year', async () => {
@@ -2138,12 +2148,19 @@ describe('sharing one file by public link', () => {
     links = [];
     prisma.concertMedia.findUnique = vi.fn(async () => owned);
     prisma.mediaShareLink = {
+      // Matches on the range as the real query does: `start_ms: null` in a
+      // Prisma where is IS NULL, so a whole-file link and a moment never meet.
       findFirst: vi.fn(async ({ where }) => links
         .filter((l) => l.media_id === where.media_id && l.revoked_at === null
-          && l.expires_at > where.expires_at.gt)
+          && l.expires_at > where.expires_at.gt
+          && l.start_ms === where.start_ms && l.end_ms === where.end_ms)
         .sort((a, b) => b.created_at - a.created_at)[0] ?? null),
+      findMany: vi.fn(async ({ where }) => links
+        .filter((l) => l.media_id === where.media_id && l.revoked_at === null)),
       create: vi.fn(async ({ data }) => {
-        const link = { id: links.length + 1, created_at: new Date(), revoked_at: null, ...data };
+        const link = {
+          id: links.length + 1, created_at: new Date(), revoked_at: null, start_ms: null, end_ms: null, ...data,
+        };
         links.push(link);
         return link;
       }),
@@ -2258,8 +2275,8 @@ describe('sharing one file by public link', () => {
       await writeFile(join(dir, '.web', 'VID_1.mp4.mp4'), 'rendition bytes');
       const token = tokenOf(await share().expect(200));
 
-      const res = await request(app()).get(`/data/concerts/media/share/${token}`).expect(200);
-      expect(res.text).toBe('rendition bytes');
+      const res = await bytesOf(request(app()).get(`/data/concerts/media/share/${token}`)).expect(200);
+      expect(res.body).toBe('rendition bytes');
     });
 
     it('tells the browser not to keep a copy, so a revoke is not undone by its cache', async () => {
@@ -2299,6 +2316,126 @@ describe('sharing one file by public link', () => {
       prisma.concertMedia.findUnique = vi.fn(async () => null);
 
       await request(app()).get(`/data/concerts/media/share/${token}`).expect(404);
+    });
+  });
+
+  describe('a moment of a video', () => {
+    const clipRow = {
+      ...owned, kind: 'VIDEO', filename: 'VID_1.mp4', duration_ms: 240_000,
+      rel_path: 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4',
+    };
+    const clipsDir = () => join(root, 'cache', 'clips');
+    const shareMoment = (range) => request(app())
+      .post('/data/concerts/media/1/share')
+      .set(...authHeader(user))
+      .send(range);
+    const open = (token) => request(app()).get(`/data/concerts/media/share/${token}`);
+
+    beforeEach(() => {
+      prisma.concertMedia.findUnique = vi.fn(async () => clipRow);
+    });
+
+    it('asks the rendition service to cut it, and says it is on its way', async () => {
+      const res = await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200);
+
+      expect(res.body.data).toMatchObject({ start_ms: 83_000, end_ms: 101_000, status: 'preparing' });
+      const id = links.at(-1).id;
+      const written = JSON.parse(await readFile(join(clipsDir(), `${id}.json`), 'utf8'));
+      expect(written).toMatchObject({
+        id, rel_path: clipRow.rel_path, start_ms: 83_000, end_ms: 101_000,
+      });
+    });
+
+    it('names the cut by the link\'s id and never writes its token to disk', async () => {
+      // The token is the credential; the cache is a directory anyone on the
+      // box can list.
+      const res = await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200);
+      const token = tokenOf(res);
+
+      const names = await readdir(clipsDir());
+      const contents = await Promise.all(names.map((n) => readFile(join(clipsDir(), n), 'utf8')));
+      expect([...names, ...contents].join('\n')).not.toContain(token);
+    });
+
+    it('hands back the same link for the same moment, and a new one for another', async () => {
+      const first = await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200);
+      const again = await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200);
+      const other = await shareMoment({ start_ms: 150_000, end_ms: 160_000 }).expect(200);
+      const whole = await share().expect(200);
+
+      expect(tokenOf(again)).toBe(tokenOf(first));
+      expect(new Set([first, other, whole].map(tokenOf)).size).toBe(3);
+      expect(whole.body.data).toMatchObject({ start_ms: null, end_ms: null, status: 'ready' });
+    });
+
+    it('reports the moment ready once the service has cut it', async () => {
+      await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200);
+      await writeFile(join(clipsDir(), `${links.at(-1).id}.mp4`), 'clip bytes');
+
+      const res = await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200);
+      expect(res.body.data.status).toBe('ready');
+    });
+
+    it('refuses a moment of a photograph', async () => {
+      prisma.concertMedia.findUnique = vi.fn(async () => owned);
+      const res = await shareMoment({ start_ms: 0, end_ms: 5000 }).expect(400);
+      expect(res.body.error).toMatch(/only a video/i);
+      expect(prisma.mediaShareLink.create).not.toHaveBeenCalled();
+    });
+
+    it('refuses a moment shorter than a second, or times that are not whole milliseconds', async () => {
+      await shareMoment({ start_ms: 5000, end_ms: 5400 }).expect(400);
+      await shareMoment({ start_ms: 1.5, end_ms: 5000 }).expect(400);
+      await shareMoment({ start_ms: -1, end_ms: 5000 }).expect(400);
+      expect(prisma.mediaShareLink.create).not.toHaveBeenCalled();
+    });
+
+    it('tells a recipient who is early to wait, without pretending the page is the clip', async () => {
+      const token = tokenOf(await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200));
+
+      const res = await open(token).expect(503);
+      expect(res.headers['retry-after']).toBe('5');
+      expect(res.headers['cache-control']).toBe('private, no-store');
+      expect(res.headers['content-type']).toMatch(/text\/html/);
+      expect(res.text).toMatch(/still being prepared/);
+    });
+
+    it('serves the cut, not the whole video, once it exists', async () => {
+      const token = tokenOf(await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200));
+      await writeFile(join(clipsDir(), `${links.at(-1).id}.mp4`), 'just the moment');
+
+      const res = await bytesOf(open(token)).expect(200);
+      expect(res.body).toBe('just the moment');
+      expect(res.headers['content-type']).toMatch(/video\/mp4/);
+      expect(res.headers['cache-control']).toBe('private, no-store');
+    });
+
+    it('answers 404 for a moment ffmpeg refused, rather than a page promising it', async () => {
+      const token = tokenOf(await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200));
+      await writeFile(join(clipsDir(), `${links.at(-1).id}.mp4.failed`), 'ffprobe exited 1');
+
+      await open(token).expect(404);
+    });
+
+    it('asks for the cut again when cache/ has been cleared out from under it', async () => {
+      const token = tokenOf(await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200));
+      const { rm } = await import('node:fs/promises');
+      await rm(join(root, 'cache'), { recursive: true, force: true });
+
+      await open(token).expect(503);
+      expect(await readdir(clipsDir())).toEqual([`${links.at(-1).id}.json`]);
+    });
+
+    it('stops every link to the video on revoke, and deletes the cuts', async () => {
+      const token = tokenOf(await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200));
+      await writeFile(join(clipsDir(), `${links.at(-1).id}.mp4`), 'just the moment');
+      const whole = tokenOf(await share().expect(200));
+
+      await revoke().expect(204);
+
+      await open(token).expect(404);
+      await open(whole).expect(404);
+      expect(await readdir(clipsDir())).toEqual([]);
     });
   });
 });

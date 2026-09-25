@@ -47,6 +47,9 @@ const {
   generateShareToken, shareExpiry, shareUrl, isActiveShareLink,
 } = require('../../utils/mediaShareToken');
 const { rateLimiter } = require('../../utils/rateLimiter');
+const {
+  clipFiles, isClip, normaliseRange, prepareClip, removeClip,
+} = require('../../utils/mediaClips');
 
 const router = express.Router();
 
@@ -1092,35 +1095,55 @@ async function ownedMediaForShare(req, res) {
 }
 
 /**
- * Get-or-create the public link to one file.
+ * Get-or-create the public link to one file, or to one moment of a video.
  *
- * Idempotent: while a link is live, asking again hands back that same link
- * rather than minting a second one, so a file never has two URLs out in the
- * world at once and there is no need for a separate "what is my link" GET.
+ * Idempotent per range: while a link to the same stretch of the same file is
+ * live, asking again hands back that link rather than minting a second — which
+ * is also how the lightbox polls a moment that is still being cut. A different
+ * moment of the same video is a different link, so several can be out at once.
+ *
+ * A moment is cut by the rendition service, so its link reports `preparing`
+ * until the clip exists. The whole file is always `ready`.
  */
 router.post(
   '/media/:id/share',
-  [auth, roleCheck(['ADMIN', 'USER']), param('id').isInt()],
+  [
+    auth, roleCheck(['ADMIN', 'USER']), param('id').isInt(),
+    body('start_ms').optional({ nullable: true }).isInt({ min: 0, max: INT32_MAX }).toInt(),
+    body('end_ms').optional({ nullable: true }).isInt({ min: 1, max: INT32_MAX }).toInt(),
+  ],
   async (req, res) => {
     try {
-      if (!validationResult(req).isEmpty()) return badRequest(res, 'Invalid media id');
+      if (!validationResult(req).isEmpty()) return badRequest(res, 'Validation failed');
       const media = await ownedMediaForShare(req, res);
       if (!media) return undefined;
 
+      const asked = { start_ms: req.body?.start_ms ?? null, end_ms: req.body?.end_ms ?? null };
+      if ((asked.start_ms != null || asked.end_ms != null) && media.kind !== 'VIDEO') {
+        return badRequest(res, 'Only a video can be shared as a moment');
+      }
+      const { range, error } = normaliseRange(asked, { durationMs: media.duration_ms });
+      if (error) return badRequest(res, error);
+
       const now = new Date();
       let link = await prisma.mediaShareLink.findFirst({
-        where: { media_id: media.id, revoked_at: null, expires_at: { gt: now } },
+        where: { media_id: media.id, revoked_at: null, expires_at: { gt: now }, ...range },
         orderBy: { created_at: 'desc' },
       });
       if (!link) {
         link = await prisma.mediaShareLink.create({
-          data: { media_id: media.id, token: generateShareToken(), expires_at: shareExpiry(now) },
+          data: {
+            media_id: media.id, token: generateShareToken(), expires_at: shareExpiry(now), ...range,
+          },
         });
       }
 
       return success(res, 200, {
         url: shareUrl(process.env.CALLBACK_URL, link.token),
         expires_at: link.expires_at,
+        start_ms: link.start_ms ?? null,
+        end_ms: link.end_ms ?? null,
+        status: isClip(link) ? await prepareClip(link, media) : 'ready',
       });
     } catch (err) {
       return fail(res, err, { context: 'POST /media/:id/share' });
@@ -1128,8 +1151,8 @@ router.post(
   },
 );
 
-// Revokes every live link to the file. updateMany rather than one row by id,
-// so revoking a file with nothing live is a quiet no-op instead of a 404.
+// Revokes every live link to the file, moments included, and deletes their
+// clips. Nothing live is a quiet no-op rather than a 404.
 router.delete(
   '/media/:id/share',
   [auth, roleCheck(['ADMIN', 'USER']), param('id').isInt()],
@@ -1139,10 +1162,18 @@ router.delete(
       const media = await ownedMediaForShare(req, res);
       if (!media) return undefined;
 
+      const live = await prisma.mediaShareLink.findMany({
+        where: { media_id: media.id, revoked_at: null },
+        select: { id: true, start_ms: true, end_ms: true },
+      });
       await prisma.mediaShareLink.updateMany({
         where: { media_id: media.id, revoked_at: null },
         data: { revoked_at: new Date() },
       });
+      // After the revoke, so a failure here leaves disk to the service's sweep
+      // and never leaves a link working. A clip mid-cut is caught by the
+      // service, which finds its request gone.
+      for (const link of live.filter(isClip)) await removeClip(link.id);
       return res.status(204).end();
     } catch (err) {
       return fail(res, err, { context: 'DELETE /media/:id/share' });
@@ -1236,6 +1267,28 @@ async function sendMediaBytes(res, row, which, context, { cacheControl } = {}) {
     absPath = archivePath;
   }
 
+  // Immutable: these paths are keyed by content that never changes in place.
+  // A replaced photo is a new row with a new id.
+  //
+  // Except one case. /play serves the original until the rendition service
+  // reaches that clip, and then serves the rendition from the same URL — so
+  // telling the browser to keep the original for a year would hide the
+  // rendition behind a cache entry nothing can invalidate. Five minutes keeps
+  // a scroll cheap and lets the better copy arrive.
+  res.set('Cache-Control', cacheControl ?? (servingOriginalForPlayback
+    ? 'private, max-age=300'
+    : 'private, max-age=31536000, immutable'));
+  return sendFileSafely(res, absPath, context);
+}
+
+/**
+ * res.sendFile, with the error handling every byte route here needs. Separate
+ * from sendMediaBytes because a shared moment is not a row's file at all — it
+ * is a cut in the cache — and needs exactly the same care.
+ *
+ * The caller sets Cache-Control first.
+ */
+function sendFileSafely(res, absPath, context) {
   // `send` defaults to dotfiles: 'ignore' and 404s a path with a dot segment
   // regardless of permissions. A poster lives at <show>/.posters/<name>.webp,
   // so without this every video thumb was a silent placeholder even with the
@@ -1248,17 +1301,13 @@ async function sendMediaBytes(res, row, which, context, { cacheControl } = {}) {
   // deploys whose mount happens to sit under a hidden directory.
   const sendOpts = { dotfiles: 'allow' };
 
-  // Immutable: these paths are keyed by content that never changes in place.
-  // A replaced photo is a new row with a new id.
-  //
-  // Except one case. /play serves the original until the rendition service
-  // reaches that clip, and then serves the rendition from the same URL — so
-  // telling the browser to keep the original for a year would hide the
-  // rendition behind a cache entry nothing can invalidate. Five minutes keeps
-  // a scroll cheap and lets the better copy arrive.
-  res.set('Cache-Control', cacheControl ?? (servingOriginalForPlayback
-    ? 'private, max-age=300'
-    : 'private, max-age=31536000, immutable'));
+  // mime-types 3 answers application/mp4 for .mp4, and send takes its word. A
+  // <video> plays that regardless, but a share link opened straight in a
+  // browser tab can be offered as a download instead of played. Every .mp4
+  // here is a video — renditions, cut moments, phone originals — and send
+  // keeps a type that is already set.
+  if (absPath.endsWith('.mp4')) res.type('video/mp4');
+
   return res.sendFile(absPath, sendOpts, (err) => {
     if (!err) return;
     // send's ENOENT carries a 404 status, and the global handler keeps an
@@ -1267,7 +1316,7 @@ async function sendMediaBytes(res, row, which, context, { cacheControl } = {}) {
     // to the browser. The caller is already authorized for this file, so this
     // is closing a filesystem-layout leak, not a data leak.
     if (err.code === 'ENOENT') {
-      // The immutable Cache-Control below is set before sendFile runs, so
+      // An immutable Cache-Control is set before sendFile runs, so
       // without this it is still on the response when this 404 goes out —
       // and the browser is told to remember the miss for a year. The
       // condition that produces it is usually transient (a share that
@@ -1318,6 +1367,9 @@ router.get('/media/:id/thumb', (req, res) => serveMedia(req, res, 'thumb'));
  * link has to just work when a browser is pointed straight at it, and a 4K
  * HEVC master does not.
  *
+ * A moment of a video is its own cut, made by the rendition service; until it
+ * exists the link answers a page that says so and reloads itself.
+ *
  * no-store, not the byte routes' year-long immutable: the link is meant to
  * stop working, and a cached copy would keep opening in the recipient's
  * browser after it had been revoked.
@@ -1328,6 +1380,18 @@ const shareLimiter = rateLimiter({
   max: 300,
 });
 
+const SHARE_CONTEXT = 'GET /media/share/:token';
+
+// For a recipient who opens a moment before it has been cut. Few will — the
+// owner sees "preparing" and usually waits — so this only has to be honest and
+// come back on its own. 503 with Retry-After rather than 200, so nothing
+// mistakes the page for the clip.
+const PREPARING_PAGE = '<!doctype html><meta charset="utf-8">'
+  + '<meta name="viewport" content="width=device-width, initial-scale=1">'
+  + '<meta http-equiv="refresh" content="5"><title>Almost ready</title>'
+  + '<p style="font:16px/1.5 system-ui,sans-serif;margin:2rem">'
+  + 'This clip is still being prepared. The page will reload by itself in a few seconds.</p>';
+
 async function servePublicShare(req, res) {
   try {
     const link = await prisma.mediaShareLink.findUnique({ where: { token: req.params.token } });
@@ -1336,11 +1400,20 @@ async function servePublicShare(req, res) {
     const row = await prisma.concertMedia.findUnique({ where: { id: link.media_id } });
     if (!row) return res.status(404).end();
 
-    return await sendMediaBytes(res, row, 'play', 'GET /media/share/:token', {
-      cacheControl: 'private, no-store',
-    });
+    if (!isClip(link)) {
+      return await sendMediaBytes(res, row, 'play', SHARE_CONTEXT, { cacheControl: 'private, no-store' });
+    }
+
+    const status = await prepareClip(link, row);
+    res.set('Cache-Control', 'private, no-store');
+    if (status === 'ready') return sendFileSafely(res, clipFiles(link.id).output, SHARE_CONTEXT);
+    // A cut ffmpeg refused will not succeed on a reload, so not the page that
+    // promises one.
+    if (status === 'failed') return res.status(404).end();
+    res.set('Retry-After', '5');
+    return res.status(503).type('html').send(PREPARING_PAGE);
   } catch (err) {
-    return fail(res, err, { context: 'GET /media/share/:token' });
+    return fail(res, err, { context: SHARE_CONTEXT });
   }
 }
 

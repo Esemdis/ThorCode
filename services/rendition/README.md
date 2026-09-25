@@ -125,6 +125,7 @@ unbounded x264 run will take every core it can find.
 | `RENDITION_MAXRATE_MBPS` | `8` | A ceiling as well as a target: CRF alone lets a grainy crowd shot pass the original's own bitrate. |
 | `RENDITION_PRESET` | per encoder | `veryfast` for x264, `p5` for NVENC. Left unset by default because the two do not share preset names — `veryfast` would be rejected by NVENC outright. |
 | `RENDITION_INTERVAL_SECONDS` | `300` | Sleep between passes. |
+| `RENDITION_CLIP_POLL_SECONDS` | `5` | How often the shared-moment queue is checked between passes. Someone is usually waiting on a moment with the share panel open. |
 | `FFMPEG_PATH` | `ffmpeg` | If it is somewhere unusual. |
 | `FFPROBE_PATH` | `ffprobe` | Same. |
 
@@ -149,3 +150,26 @@ unbounded x264 run will take every core it can find.
 - **`.web` is disposable.** Deleting it costs only the CPU to rebuild it. It is
   invisible to the rebuild script and to drift detection, which ignore
   dot-directories.
+
+## Shared moments
+
+A share link can point at part of a video instead of all of it. The API writes
+`$MEDIA_ROOT/cache/clips/<link id>.json` (which file, which stretch, when the
+link expires). This service cuts that stretch to `<link id>.mp4` beside it, with
+the same encoder and settings as a rendition, from the `.web` rendition when
+there is one, which makes a short moment a few seconds' work rather than a 4K
+decode. See `utils/mediaClips.js`.
+
+- **Checked often, and first.** The queue is read every
+  `RENDITION_CLIP_POLL_SECONDS` between passes and again before each rendition,
+  so a backlog after a big upload delays a share by one encode at most.
+- **In `cache/`, not the archive.** A moment lives twelve hours and belongs to a
+  link rather than a show. It is never copied offsite, and deleting `cache/`
+  is still safe: the API writes the request again the next time the link is
+  asked about.
+- **Named by link id, never by token.** The token is the credential.
+- **Cleaned up here.** Expired links, requests the API revoked, and cuts that
+  finished after their link was revoked are all deleted on the next check.
+- **Refusals are not retried**, since the queue is polled every few seconds.
+  Stopping the share and sharing again gives the moment a new link and a new
+  attempt.

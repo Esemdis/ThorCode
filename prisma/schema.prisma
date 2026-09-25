@@ -287,6 +287,12 @@ model MediaShareLink {
   created_at DateTime  @default(now())
   expires_at DateTime
   revoked_at DateTime?
+  /// A moment of a video rather than the whole file: milliseconds into the
+  /// clip. Both null is the whole file; a null end runs to the end. The cut
+  /// itself is a file in cache/clips named by this row's id — see
+  /// utils/mediaClips.js.
+  start_ms   Int?
+  end_ms     Int?
 
   media_rel ConcertMedia @relation("MediaShareLinks", fields: [media_id], references: [id], onDelete: Cascade)
 

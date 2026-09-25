@@ -217,8 +217,9 @@ function encoderArgs({ vcodec, crf, maxrateMbps, preset }) {
  */
 function ffmpegArgs({
   input, output, source, height = 1080, crf = 21, maxrateMbps = 8,
-  vcodec = 'libx264', preset = null,
+  vcodec = 'libx264', preset = null, startMs = null, durationMs = null,
 }) {
+  const seconds = (ms) => (ms / 1000).toFixed(3);
   return [
     // Never read stdin: under a service manager there is none, and ffmpeg
     // treating a closed stdin as a keypress has ended runs early before.
@@ -226,7 +227,13 @@ function ffmpegArgs({
     '-hide_banner',
     '-loglevel', 'error',
     ...hwaccelArgs(vcodec),
+    // A shared moment. Before -i, so ffmpeg seeks the input rather than
+    // decoding and discarding everything up to the start — and since this
+    // re-encodes, input seeking is still frame-accurate rather than snapping
+    // to the keyframe before it.
+    ...(startMs ? ['-ss', seconds(startMs)] : []),
     '-i', input,
+    ...(durationMs != null ? ['-t', seconds(durationMs)] : []),
     '-vf', filterChain(source, { height, vcodec }),
     ...encoderArgs({ vcodec, crf, maxrateMbps, preset }),
     '-c:a', 'aac',

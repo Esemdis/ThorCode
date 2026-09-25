@@ -21,7 +21,8 @@ $MEDIA_ROOT/
             concert-media.json      what the database is a copy of
             .posters/VID_0031.mp4.webp
             .web/VID_0031.mp4.mp4   1080p H.264 viewing copy. Delete at any time.
-    cache/            derived photo thumbnails. Delete at any time.
+    cache/            derived photo thumbnails, and shared moments cut from
+                      videos (cache/clips). Delete at any time.
     incoming/         multer's scratch space during an upload.
 ```
 

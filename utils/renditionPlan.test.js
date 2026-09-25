@@ -234,6 +234,29 @@ describe('ffmpegArgs', () => {
     expect(cpu()).toContain('-nostdin');
   });
 
+  it('seeks the input before opening it when cutting a moment', () => {
+    // Before -i, so ffmpeg jumps to the start instead of decoding and throwing
+    // away every frame up to it — minutes of 4K for a moment late in a set.
+    const argv = ffmpegArgs({
+      input: 'i', output: 'o', source: probed(), startMs: 83_250, durationMs: 18_000,
+    });
+    expect(arg(argv, '-ss')).toBe('83.250');
+    expect(argv.indexOf('-ss')).toBeLessThan(argv.indexOf('-i'));
+    expect(arg(argv, '-t')).toBe('18.000');
+    expect(argv.indexOf('-t')).toBeGreaterThan(argv.indexOf('-i'));
+  });
+
+  it('runs a moment with no end to the end of the video', () => {
+    const argv = ffmpegArgs({ input: 'i', output: 'o', source: probed(), startMs: 5000 });
+    expect(argv).toContain('-ss');
+    expect(argv).not.toContain('-t');
+  });
+
+  it('adds neither when encoding a whole rendition', () => {
+    expect(cpu()).not.toContain('-ss');
+    expect(cpu()).not.toContain('-t');
+  });
+
   it('keeps the audio as AAC', () => {
     expect(arg(cpu(), '-c:a')).toBe('aac');
   });
