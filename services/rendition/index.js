@@ -40,7 +40,8 @@ const { archiveRoot, DETACHED_DIR, WEB_DIR } = require('../../utils/mediaPaths')
 const { archiveStatus } = require('../../utils/mediaHealth');
 const { readSidecar } = require('../../utils/mediaSidecar');
 const {
-  ffmpegArgs, pendingInShow, isAbandonedPart, partNameFor, FAILED_SUFFIX,
+  ffmpegArgs, probeArgs, parseProbe, targetSize,
+  pendingInShow, isAbandonedPart, partNameFor, FAILED_SUFFIX,
 } = require('../../utils/renditionPlan');
 
 const args = process.argv.slice(2);
@@ -49,14 +50,18 @@ const dryRun = args.includes('--dry-run');
 const retry = args.includes('--retry');
 
 const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
+const FFPROBE = process.env.FFPROBE_PATH || 'ffprobe';
 const HEIGHT = Number(process.env.RENDITION_HEIGHT || 1080);
 const CRF = Number(process.env.RENDITION_CRF || 21);
 const MAXRATE = Number(process.env.RENDITION_MAXRATE_MBPS || 8);
-// Overridable because a box with a GPU should use it: h264_nvenc, h264_qsv or
-// h264_vaapi turn hours of 4K into minutes. libx264 is the default because it is
-// the one encoder every build of ffmpeg has.
+// Overridable because a box with a GPU should use it. h264_nvenc moves the HEVC
+// decode onto NVDEC and the encode onto NVENC, which on these 4K clips is most
+// of the work. libx264 is the default because it is the one encoder every build
+// of ffmpeg has.
 const VCODEC = process.env.RENDITION_VCODEC || 'libx264';
-const PRESET = process.env.RENDITION_PRESET || 'veryfast';
+// Left unset so each encoder gets its own default: NVENC's presets are p1..p7
+// and would reject x264's names outright.
+const PRESET = process.env.RENDITION_PRESET || null;
 const INTERVAL = Number(process.env.RENDITION_INTERVAL_SECONDS || 300);
 
 const log = (...m) => console.log(`[rendition] ${m.join(' ')}`);
@@ -104,24 +109,41 @@ async function showDirs() {
   return found;
 }
 
-/** Run ffmpeg once. Resolves on success, rejects with stderr on failure. */
-function runFfmpeg(ffArgs) {
+/** Run a child process, resolving with its stdout. Rejects with its stderr. */
+function run(bin, argv, { wantStdout = false } = {}) {
   return new Promise((resolve, reject) => {
-    child = spawn(FFMPEG, ffArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+    child = spawn(bin, argv, { stdio: ['ignore', wantStdout ? 'pipe' : 'ignore', 'pipe'] });
+    let out = '';
     let stderr = '';
+    if (wantStdout) child.stdout.on('data', (d) => { out += d.toString(); });
     // Bounded: a failing encode can produce megabytes of the same line, and the
     // first part is what says why.
     child.stderr.on('data', (d) => { if (stderr.length < 4000) stderr += d.toString(); });
     child.on('error', (err) => { child = null; reject(err); });
     child.on('close', (code, signal) => {
       child = null;
-      if (code === 0) return resolve();
+      if (code === 0) return resolve(out);
       return reject(new Error(signal
-        ? `ffmpeg killed by ${signal}`
-        : `ffmpeg exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' / ') || 'no output'}`));
+        ? `${path.basename(bin)} killed by ${signal}`
+        : `${path.basename(bin)} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' / ') || 'no output'}`));
     });
   });
 }
+
+/**
+ * What the clip actually is: size, bit depth and colour.
+ *
+ * Asked per file rather than taken from the sidecar, because the sidecar's
+ * width and height are nullable and its colour is not recorded at all — and
+ * colour is what decides the entire filter chain. These clips are HLG BT.2020,
+ * which has to be tone-mapped or the rendition comes out washed-out and grey.
+ */
+async function probe(input) {
+  return parseProbe(await run(FFPROBE, probeArgs(input), { wantStdout: true }));
+}
+
+/** Run ffmpeg once. Resolves on success, rejects with stderr on failure. */
+const runFfmpeg = (ffArgs) => run(FFMPEG, ffArgs);
 
 /**
  * Encode one clip into its show's `.web`.
@@ -139,9 +161,20 @@ async function encode(show, job) {
 
   const started = Date.now();
   try {
+    const source = await probe(input);
+    // Refused rather than guessed at. Without dimensions there is no scale to
+    // ask for, and inventing one would mean a rendition at the wrong size or an
+    // encode that fails several minutes in.
+    if (!source) throw new Error('ffprobe found no usable video stream');
+
+    const size = targetSize(source, HEIGHT);
+    log(`${show.label}/${job.name}: ${source.width}x${source.height}`
+      + `${source.hdr ? ` ${source.transfer} HDR` : ''} → ${size.width}x${size.height}`);
+
     await runFfmpeg(ffmpegArgs({
       input,
       output: part,
+      source,
       height: HEIGHT,
       crf: CRF,
       maxrateMbps: MAXRATE,
@@ -247,7 +280,7 @@ async function main() {
     process.exitCode = 1;
     return;
   }
-  log(`archive ${archiveRoot()}, ${VCODEC} at ${HEIGHT}p, crf ${CRF}, ceiling ${MAXRATE} Mbit/s`);
+  log(`archive ${archiveRoot()}, ${VCODEC} at ${HEIGHT}p, quality ${CRF}, ceiling ${MAXRATE} Mbit/s`);
 
   if (dryRun || once) { await pass(); return; }
 
