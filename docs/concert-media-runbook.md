@@ -217,6 +217,47 @@ Record today's archive size when you first set this up, and when the job starts
 failing on quota, let it fail loudly. A backup that silently copies most of the
 archive is worse than one that stops, because it reports success.
 
+## Capture times, and the order a night is shown in
+
+The gallery shows a night in the order it happened, not the order it was
+uploaded: `GET /attendances/:id/media` sorts on `taken_at`, nulls last, with the
+row id as the tiebreak. An unknown time is not the same as a late one, so files
+without one keep upload order among themselves and sit after everything that can
+be placed.
+
+The two kinds get their time by different roads, and neither is
+`File.lastModified` — that was measured on a gig pulled out of Google Photos and
+turned out to be the download time, reordered by the parallel download, so it
+fails as an absolute time and as a relative one.
+
+| Kind | Read by | From |
+|---|---|---|
+| Video | the uploading browser | the MP4 `mvhd` box (`concert-map/src/utils/videoCapturedAt.js`) |
+| Photo | this server, at upload | EXIF `DateTimeOriginal` + `OffsetTimeOriginal` (`utils/exifCapturedAt.js`) |
+
+Both pass `capturedAtFor`, which refuses anything more than 48 hours from the
+show — a camera whose clock was never set writes a plausible-looking date years
+away, and believed it would drag that file to one end of every gallery.
+
+`DateTimeOriginal` is local wall-clock with no zone in it, so
+`OffsetTimeOriginal` is applied when the camera wrote one. When it did not, the
+stamp is read as UTC and may be out by the venue's offset. That is a constant
+shift per device per night, so it never reorders that camera's own photographs —
+it can only misplace them against another device's.
+
+Photographs stored before any of this have no time and sort last. Their EXIF is
+still inside the files, so it can be read back:
+
+```bash
+doppler run -- node scripts/backfill-media-taken-at.js --dry-run   # reports, writes nothing
+doppler run -- node scripts/backfill-media-taken-at.js             # writes
+```
+
+It writes the sidecar as well as the row, and that is the point rather than a
+courtesy: a time written only to Postgres is one the next rebuild discards.
+Videos are not covered — there is no decoder in this image, the same reason
+posters cannot be regenerated here.
+
 ## Finding rows whose file is gone
 
 The rebuild above walks the archive and asks what the index is missing. This asks

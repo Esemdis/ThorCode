@@ -14,6 +14,15 @@
  *
  * Kept in step with `isPlausibleCapture` in concert-map's
  * `src/utils/videoCapturedAt.js`. Two repos, one rule.
+ *
+ * Photographs are accepted as well as videos now, but the two arrive by
+ * different roads and only one of them is the browser's. A clip's time is read
+ * out of its MP4 container by the uploading browser; a still's is read out of
+ * its own EXIF, here on the server (`utils/exifCapturedAt.js`), because
+ * `File.lastModified` was measured on a gig pulled from Google Photos and
+ * turned out to be the download time — reordered by the parallel download, so
+ * wrong as an absolute time and as a relative one. The guard below is the same
+ * either way: a time that contradicts its own show is not believed.
  */
 const PLAUSIBLE_WINDOW_MS = 48 * 60 * 60 * 1000;
 
@@ -24,7 +33,7 @@ const PLAUSIBLE_WINDOW_MS = 48 * 60 * 60 * 1000;
  * @returns {string|null} An ISO instant safe to store, or null.
  */
 function capturedAtFor(iso, kind, concertDate) {
-  if (kind !== 'VIDEO') return null;
+  if (kind !== 'VIDEO' && kind !== 'PHOTO') return null;
   if (typeof iso !== 'string' || !iso) return null;
   if (!concertDate) return null;
 

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 import { signMediaToken } from '../../utils/mediaTokens.js';
+import { buildExif, jpegWithExif } from '../../test/exifFixture.js';
 
 let root;
 
@@ -331,15 +332,74 @@ describe('POST /attendances/:id/media', () => {
       .toBe('2026-06-12T19:54:41.000Z');
   });
 
-  it('stores no capture time on a photograph', async () => {
-    // Only a video takes a song. Reading stills' EXIF is its own later phase
-    // and a client-sent time must not half-start it.
+  it('believes a photograph about itself and not the browser about it', async () => {
+    // The only capture time a browser could offer for a still is
+    // File.lastModified, and that was measured on a gig out of Google Photos:
+    // it was the download time, and the parallel download had reordered it. So
+    // a client-sent time is still ignored here — the EXIF inside the file is
+    // what counts, and this JPEG carries none.
     await request(app())
       .post('/data/concerts/attendances/1/media')
       .set(...authHeader(admin))
       .field('band_id', '92')
       .field('meta', JSON.stringify({ 'IMG_1.jpg': { captured_at: '2026-06-12T19:54:41.000Z' } }))
       .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(201);
+
+    expect(prisma.concertMedia.create.mock.calls[0][0].data).toMatchObject({ taken_at: null });
+  });
+
+  it('reads a photograph\'s capture time out of its own EXIF', async () => {
+    // End to end through real sharp: a real JPEG with a real APP1 segment. The
+    // stamp is local wall-clock at +02:00 and has to come back as UTC, which is
+    // the whole difficulty — stored naively it would be two hours early, and
+    // two hours inside a three-hour concert sorts an encore ahead of the opener.
+    const withExif = jpegWithExif(jpeg(), buildExif({
+      original: '2026:06:12 21:38:28', offset: '+02:00',
+    }));
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', '92')
+      .attach('files', withExif, 'IMG_2.jpg')
+      .expect(201);
+
+    expect(prisma.concertMedia.create.mock.calls[0][0].data.taken_at)
+      .toEqual(new Date('2026-06-12T19:38:28.000Z'));
+  });
+
+  it('writes a photograph\'s capture time into the sidecar too', async () => {
+    // The sidecar is the record of truth and the rebuild reads it back, so a
+    // time that lands only in Postgres is a time the next rebuild discards.
+    const withExif = jpegWithExif(jpeg(), buildExif({
+      original: '2026:06:12 21:38:28', offset: '+02:00',
+    }));
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', '92')
+      .attach('files', withExif, 'IMG_3.jpg')
+      .expect(201);
+
+    const sidecar = JSON.parse(await readFile(
+      join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira', 'concert-media.json'), 'utf8',
+    ));
+    expect(sidecar.files.find((f) => f.name === 'IMG_3.jpg').taken_at)
+      .toBe('2026-06-12T19:38:28.000Z');
+  });
+
+  it('refuses an EXIF stamp that contradicts its own show', async () => {
+    // A camera whose clock was never set writes a plausible-looking date years
+    // away. Believed, it would drag that photograph to one end of every gallery
+    // it appears in.
+    const wrongClock = jpegWithExif(jpeg(), buildExif({
+      original: '2019:01:01 12:00:00', offset: '+02:00',
+    }));
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', '92')
+      .attach('files', wrongClock, 'IMG_4.jpg')
       .expect(201);
 
     expect(prisma.concertMedia.create.mock.calls[0][0].data).toMatchObject({ taken_at: null });
@@ -1029,6 +1089,27 @@ describe('GET /attendances/:id/media', () => {
 
     expect(res.body.data.untagged).toBe(2);
     expect(res.body.data.files).toHaveLength(3);
+  });
+
+  it('asks for the night in the order it happened, not the order it was uploaded', async () => {
+    // Ordered in Postgres rather than on the client because everything
+    // downstream inherits it: the grid, the shift-click range, and the clips the
+    // lightbox reasons about to guess which song a video is of.
+    //
+    // Nulls last, and there will be some — a photograph whose EXIF carried no
+    // stamp, a clip whose container had none, and everything uploaded before
+    // either was read. An unknown time is not the same as a late one, so they
+    // keep upload order among themselves and sit after everything placeable.
+    prisma.concertMedia.findMany = vi.fn(async () => []);
+    await request(app())
+      .get('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(prisma.concertMedia.findMany.mock.calls[0][0].orderBy).toEqual([
+      { taken_at: { sort: 'asc', nulls: 'last' } },
+      { id: 'asc' },
+    ]);
   });
 
   it('sends the night\'s bill and both setlists, so the song picker needs no second request', async () => {

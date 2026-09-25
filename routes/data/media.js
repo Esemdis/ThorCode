@@ -25,6 +25,7 @@ const {
 } = require('../../utils/mediaPaths');
 const { showDirForAttendance } = require('../../utils/mediaShowDir');
 const { capturedAtFor } = require('../../utils/mediaCapture');
+const { exifCapturedAtOfFile } = require('../../utils/exifCapturedAt');
 const {
   emptySidecar, upsertFile, removeFile, readSidecar, updateSidecar,
 } = require('../../utils/mediaSidecar');
@@ -338,11 +339,21 @@ router.post(
         for (const file of incoming) {
           const kind = kindForMime(file.mimetype);
           const fileMeta = meta[file.originalname] ?? {};
+          // Two roads to one fact. A clip's time is read out of its MP4
+          // container by the uploading browser, which is also where its poster
+          // and duration come from. A photograph's is read out of its own EXIF
+          // here, off the temp file multer has already written — never from
+          // what the browser claims, because the only thing the browser could
+          // offer for a still is `File.lastModified`, and that was measured on
+          // a gig out of Google Photos and found to be the download time.
+          const claimedAt = kind === 'VIDEO'
+            ? fileMeta.captured_at
+            : (await exifCapturedAtOfFile(file.path))?.iso ?? null;
           const probe = {
             width: asInt(fileMeta.width),
             height: asInt(fileMeta.height),
             duration_ms: kind === 'VIDEO' ? asInt(fileMeta.duration_ms) : null,
-            captured_at: capturedAtFor(fileMeta.captured_at, kind, row.concert_rel.concert_date),
+            captured_at: capturedAtFor(claimedAt, kind, row.concert_rel.concert_date),
           };
 
           // Hashed off the temp file, before anything is moved into the show
@@ -491,7 +502,20 @@ router.get(
       const mint = urlMinter(req.user.id);
       const rows = await prisma.concertMedia.findMany({
         where: { attendance_id: attendanceId },
-        orderBy: { id: 'asc' },
+        // The night in the order it happened, not the order it was uploaded.
+        // Ordered here rather than on the client because everything downstream
+        // inherits it: the grid, the shift-click range, and the clips the
+        // lightbox reasons about to guess which song it is looking at.
+        //
+        // Nulls last, and there will be some: a photograph whose EXIF has no
+        // capture time, a clip whose container had none, and every file
+        // uploaded before either was read. They keep upload order among
+        // themselves and sit after everything that can be placed, which is the
+        // honest arrangement — an unknown time is not the same as a late one.
+        orderBy: [
+          { taken_at: { sort: 'asc', nulls: 'last' } },
+          { id: 'asc' },
+        ],
       });
 
       // The untagged count is the gig view's progress bar, and it is counted

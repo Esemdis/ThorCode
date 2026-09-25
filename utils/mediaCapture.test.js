@@ -25,10 +25,23 @@ describe('capturedAtFor', () => {
       .toBeNull();
   });
 
-  it('never stores a capture time on a photo', () => {
-    // Only a video takes a song, so only a video needs the ordering. Reading
-    // EXIF off stills is a separate phase and this must not half-start it.
+  it('stores a capture time on a photo now that one can be read', () => {
+    // This used to refuse stills outright, because only a video takes a song
+    // and only a song needed the ordering. The gallery needs it too — it shows
+    // a night in the order it happened — and a still's time comes off its own
+    // EXIF in utils/exifCapturedAt.js. The guard here is the same either way.
     expect(capturedAtFor('2026-09-03T20:40:51.000Z', 'PHOTO', new Date('2026-09-03T18:00:00Z')))
+      .toBe('2026-09-03T20:40:51.000Z');
+  });
+
+  it('holds a photo to the same window as a clip', () => {
+    // A stamp that contradicts its own show is not believed whatever it is on.
+    expect(capturedAtFor('2019-01-01T12:00:00.000Z', 'PHOTO', new Date('2026-09-03T18:00:00Z')))
+      .toBeNull();
+  });
+
+  it('still refuses a kind it does not know', () => {
+    expect(capturedAtFor('2026-09-03T20:40:51.000Z', 'AUDIO', new Date('2026-09-03T18:00:00Z')))
       .toBeNull();
   });
 
