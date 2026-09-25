@@ -99,7 +99,7 @@ function verifyMediaToken(token, { mediaId, secret, now } = {}) {
 }
 
 /**
- * The two absolute URLs for one media row.
+ * The absolute URLs for one media row.
  *
  * Built from the configured public base URL and never from the incoming
  * request: behind a proxy the request host is whatever the proxy passes along,
@@ -130,6 +130,10 @@ function mediaUrls(baseUrl, mediaId, token) {
   return {
     file: `${base}${MEDIA_PATH}/${id}/file${q}`,
     thumb: `${base}${MEDIA_PATH}/${id}/thumb${q}`,
+    // What a <video> should point at. `file` is the archive master and stays
+    // the download; `play` is the same bytes until a rendition exists, and the
+    // viewing copy afterwards, without the client having to know which.
+    play: `${base}${MEDIA_PATH}/${id}/play${q}`,
   };
 }
 

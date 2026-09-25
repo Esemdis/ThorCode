@@ -14,6 +14,7 @@ const ARCHIVE_DIR = 'archive';
 const CACHE_DIR = 'cache';
 const DETACHED_DIR = '_detached';
 const POSTERS_DIR = '.posters';
+const WEB_DIR = '.web';
 
 // Long enough for any real venue or band, short enough that a nested path stays
 // well inside the 255-byte per-component limit with a suffix added.
@@ -126,8 +127,28 @@ function posterPath(relPath) {
   return path.join(path.dirname(abs), POSTERS_DIR, `${path.basename(abs)}.webp`);
 }
 
+/**
+ * Where a video's web rendition lives.
+ *
+ * Beside the original like a poster, and hidden for the same reason: the show
+ * folder should still read as the night's photographs in a file browser.
+ *
+ * Derived and therefore disposable — deleting `.web` costs only the CPU to make
+ * it again, which is why it is not the archive copy and never replaces one.
+ *
+ * Named `<whole filename>.mp4`, so a 4K clip becomes `PXL_1.mp4.mp4`. The
+ * doubled extension is deliberate and matches posterPath: uniqueFilename only
+ * guarantees the FULL name is unique in a folder, so `clip.mov` and `clip.mp4`
+ * can both be there, and keying on the stem alone would have one overwrite the
+ * other's rendition.
+ */
+function webRenditionPath(absOriginal) {
+  return path.join(path.dirname(absOriginal), WEB_DIR, `${path.basename(absOriginal)}.mp4`);
+}
+
 module.exports = {
-  ARCHIVE_DIR, CACHE_DIR, DETACHED_DIR, MAX_SEGMENT, POSTERS_DIR,
+  ARCHIVE_DIR, CACHE_DIR, DETACHED_DIR, MAX_SEGMENT, POSTERS_DIR, WEB_DIR,
   archiveRoot, thumbCacheRoot, slugSegment, showFolderName,
   showFolderRelPath, uniqueFilename, resolveArchivePath, thumbPath, posterPath,
+  webRenditionPath,
 };

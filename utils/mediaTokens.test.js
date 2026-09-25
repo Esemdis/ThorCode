@@ -133,6 +133,9 @@ describe('mediaUrls', () => {
     expect(mediaUrls('https://api.example.com', 7, 'tok')).toEqual({
       file: 'https://api.example.com/data/concerts/media/7/file?t=tok',
       thumb: 'https://api.example.com/data/concerts/media/7/thumb?t=tok',
+      // The viewing copy. One token covers all three: it is signed over the
+      // media id and the user, not the route.
+      play: 'https://api.example.com/data/concerts/media/7/play?t=tok',
     });
   });
 

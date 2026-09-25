@@ -87,6 +87,8 @@ describe('POST /attendances/:id/media', () => {
     // otherwise. GET /media/:id/file and /thumb are the exception — they carry
     // their own auth via a signed URL token instead of this middleware, so
     // their count is 1: just the handler, no `auth` or `roleCheck` in front.
+    // /play is the same: it is what a <video> points at, and an element sends
+    // no Authorization header.
     expect(routeManifest(router)).toEqual([
       'POST /attendances/:attendanceId/media [7]',
       'GET /attendances/:attendanceId/media [4]',
@@ -95,6 +97,7 @@ describe('POST /attendances/:id/media', () => {
       'PATCH /media [8]',
       'DELETE /media/:id [4]',
       'GET /media/:id/file [1]',
+      'GET /media/:id/play [1]',
       'GET /media/:id/thumb [1]',
     ]);
   });
@@ -1630,6 +1633,100 @@ describe('a byte route answering 404', () => {
       .expect(404);
 
     expect(res.headers['cache-control'] ?? '').not.toMatch(/immutable/);
+  });
+});
+
+describe('GET /media/:id/play', () => {
+  // The archive holds phone originals and they are not viewing copies: one
+  // night's clips measured 43 Mbit/s of 4K HEVC, a gigabyte for three and a
+  // half minutes, which no browser streams over a home connection and which
+  // Firefox cannot decode at all. A rendition service writes `.web/<name>.mp4`
+  // beside the original, and existence is the entire record of it — no column,
+  // no sidecar entry, nothing that can fall out of step.
+  const uploadClip = async () => {
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .attach('files', Buffer.from('original bytes'), 'VID_1.mp4')
+      .expect(201);
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      id: 1, kind: 'VIDEO', sha256: 'h1', filename: 'VID_1.mp4',
+      rel_path: 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4',
+      attendance_rel: { wishlist_rel: { user_id: 'user-1' } },
+    }));
+    return join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+  };
+
+  const tok = () => signMediaToken({ mediaId: 1, userId: 'user-1' });
+
+  it('serves the original when no rendition has been made yet', async () => {
+    // Which is what happened before renditions existed at all. A missing one is
+    // an ordinary state, not a failure.
+    await uploadClip();
+    const res = await request(app()).get(`/data/concerts/media/1/play?t=${tok()}`).expect(200);
+    expect(res.text).toBe('original bytes');
+  });
+
+  it('serves the rendition once one is there', async () => {
+    const dir = await uploadClip();
+    await mkdir(join(dir, '.web'), { recursive: true });
+    await writeFile(join(dir, '.web', 'VID_1.mp4.mp4'), 'rendition bytes');
+
+    const res = await request(app()).get(`/data/concerts/media/1/play?t=${tok()}`).expect(200);
+    expect(res.text).toBe('rendition bytes');
+  });
+
+  it('leaves /file on the archive master, so a download is never the rendition', async () => {
+    // The whole premise of the archive is that the original is what is kept.
+    const dir = await uploadClip();
+    await mkdir(join(dir, '.web'), { recursive: true });
+    await writeFile(join(dir, '.web', 'VID_1.mp4.mp4'), 'rendition bytes');
+
+    const res = await request(app()).get(`/data/concerts/media/1/file?t=${tok()}`).expect(200);
+    expect(res.text).toBe('original bytes');
+  });
+
+  it('does not let the browser keep the original for a year', async () => {
+    // /play answers from the same URL before and after the service reaches a
+    // clip, so an immutable original would hide the rendition behind a cache
+    // entry nothing can invalidate.
+    await uploadClip();
+    const res = await request(app()).get(`/data/concerts/media/1/play?t=${tok()}`).expect(200);
+    expect(res.headers['cache-control']).toBe('private, max-age=300');
+  });
+
+  it('marks a rendition immutable, there being nothing left to supersede it', async () => {
+    const dir = await uploadClip();
+    await mkdir(join(dir, '.web'), { recursive: true });
+    await writeFile(join(dir, '.web', 'VID_1.mp4.mp4'), 'rendition bytes');
+
+    const res = await request(app()).get(`/data/concerts/media/1/play?t=${tok()}`).expect(200);
+    expect(res.headers['cache-control']).toMatch(/immutable/);
+  });
+
+  it('never looks for a rendition of a photograph', async () => {
+    await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(201);
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      id: 1, kind: 'PHOTO', sha256: 'h1', filename: 'IMG_1.jpg',
+      rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_1.jpg',
+      attendance_rel: { wishlist_rel: { user_id: 'user-1' } },
+    }));
+
+    const res = await request(app()).get(`/data/concerts/media/1/play?t=${tok()}`).expect(200);
+    expect(res.headers['content-type']).toMatch(/image\/jpeg/);
+    // And it is cached as hard as /file is: a photograph has no better copy
+    // coming.
+    expect(res.headers['cache-control']).toMatch(/immutable/);
+  });
+
+  it('carries its own auth and refuses a token for another file', async () => {
+    await uploadClip();
+    const t = signMediaToken({ mediaId: 999, userId: 'user-1' });
+    await request(app()).get(`/data/concerts/media/1/play?t=${t}`).expect(401);
   });
 });
 

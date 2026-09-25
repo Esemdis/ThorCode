@@ -34,6 +34,7 @@ const {
 } = require('../../utils/mediaTypes');
 const { uploadErrors } = require('../../utils/uploadErrors');
 const { storePoster, ensureThumb } = require('../../utils/mediaThumbs');
+const { playableFor } = require('../../utils/mediaRenditions');
 const { bandMediaOverview } = require('../../utils/mediaOverview');
 const { billForConcert } = require('../../utils/concertBill');
 const { canonicalBandName } = require('../../utils/lineupNames');
@@ -956,7 +957,15 @@ async function serveMedia(req, res, which) {
     const archivePath = resolveArchivePath(row.rel_path);
 
     let absPath;
-    if (which === 'thumb') {
+    // A rendition that appears later must not be masked by a year-old cached
+    // original, so `immutable` is only claimed once there is nothing left to
+    // supersede. See the Cache-Control below.
+    let servingOriginalForPlayback = false;
+    if (which === 'play') {
+      const chosen = await playableFor(archivePath, row.kind);
+      absPath = chosen.absPath;
+      servingOriginalForPlayback = !chosen.rendition && row.kind === 'VIDEO';
+    } else if (which === 'thumb') {
       try {
         absPath = await ensureThumb({
           absPath: archivePath, kind: row.kind, sha256: row.sha256, relPath: row.rel_path,
@@ -986,9 +995,17 @@ async function serveMedia(req, res, which) {
     // deploys whose mount happens to sit under a hidden directory.
     const sendOpts = { dotfiles: 'allow' };
 
-    // Immutable: both paths are keyed by content that never changes in place.
+    // Immutable: these paths are keyed by content that never changes in place.
     // A replaced photo is a new row with a new id.
-    res.set('Cache-Control', 'private, max-age=31536000, immutable');
+    //
+    // Except one case. /play serves the original until the rendition service
+    // reaches that clip, and then serves the rendition from the same URL — so
+    // telling the browser to keep the original for a year would hide the
+    // rendition behind a cache entry nothing can invalidate. Five minutes keeps
+    // a scroll cheap and lets the better copy arrive.
+    res.set('Cache-Control', servingOriginalForPlayback
+      ? 'private, max-age=300'
+      : 'private, max-age=31536000, immutable');
     return res.sendFile(absPath, sendOpts, (err) => {
       if (!err) return;
       // send's ENOENT carries a 404 status, and the global handler keeps an
@@ -1034,6 +1051,9 @@ async function serveMedia(req, res, which) {
 }
 
 router.get('/media/:id/file', (req, res) => serveMedia(req, res, 'file'));
+// The viewing copy: the web rendition when one has been made, the original
+// until then. Separate from /file so a download always gets the master.
+router.get('/media/:id/play', (req, res) => serveMedia(req, res, 'play'));
 router.get('/media/:id/thumb', (req, res) => serveMedia(req, res, 'thumb'));
 
 module.exports = router;

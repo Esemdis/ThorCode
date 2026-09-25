@@ -20,6 +20,7 @@ $MEDIA_ROOT/
             VID_0031.mp4
             concert-media.json      what the database is a copy of
             .posters/VID_0031.mp4.webp
+            .web/VID_0031.mp4.mp4   1080p H.264 viewing copy. Delete at any time.
     cache/            derived photo thumbnails. Delete at any time.
     incoming/         multer's scratch space during an upload.
 ```
@@ -33,6 +34,15 @@ names its concert, its owner, and for each file the band, the caption, the
 checksum and the dimensions. `scripts/rebuild-media-index.js` reconstructs the
 database from those files alone. That is what lets you treat the share as the
 thing being protected and the application as replaceable.
+
+`.web/` holds viewing copies and is disposable, despite living inside
+`archive/`. It is in there rather than in `cache/` because it is keyed by the
+clip's filename and has to travel with the show folder — a show moved to
+`_detached` and restored later keeps its renditions, and a rebuild does not have
+to know they exist. Both dot-directories are invisible to the rebuild and to
+drift detection, which ignore anything starting with a dot. Excluding `.web`
+from the offsite copy is reasonable and saves the most space of anything here;
+excluding `.posters` is not, for the reason below.
 
 Video posters are the exception to "derived data is disposable". There is no
 ffmpeg in this image — deliberately, it would add roughly 250 MB to an image
@@ -256,6 +266,59 @@ for real.
 A restored concert keeps only what the sidecar knew: date, venue, city, country.
 `event_id`, the source urls and the coordinates went with the old row and are not
 inventable — the enrich passes fill those in again.
+
+## Video renditions, and why playback was slow
+
+The archive holds phone originals and they are not viewing copies. Measured on
+the share, one night:
+
+```
+PXL_20260624_204209998.mp4   1182 MB   222.9s   42.4 Mbit/s   hvc1
+PXL_20260624_200428424.mp4   1048 MB   193.2s   43.4 Mbit/s   hvc1
+28 videos  ·  9.26 GB for the gig
+```
+
+Three separate problems in those numbers:
+
+- **HEVC** (`hvc1`). Firefox decodes none of it; Chrome only with hardware
+  support. This is what the lightbox's "most likely HEVC" message is about.
+- **43 Mbit/s sustained**, which no home connection streams.
+- The phone writes the `moov` index at the **end** of the file, so a player has
+  to range-request the tail of a gigabyte before it can start. That was most of
+  what made playback feel slow to *begin*.
+
+None of that is fixable in the API. `services/rendition/` is a separate
+container — ffmpeg plus a walker over the share — that writes
+`.web/<name>.mp4` beside each clip: 1080p H.264, AAC, index at the front, about
+6 Mbit/s. That 1182 MB clip becomes roughly 170 MB.
+
+It needs `MEDIA_ROOT` and ffmpeg and nothing else: no `DATABASE_URL`, no
+Doppler token, no network. It finds its work by reading the sidecars and records
+a finished rendition by the file existing, so it cannot corrupt the index and
+holds no secret to leak. Kill it mid-encode and the `.part` file goes with it.
+
+`services/rendition/README.md` has the settings and the `docker run`. The one
+worth knowing: `RENDITION_VCODEC=h264_nvenc` (or `_qsv`, `_vaapi`) turns hours
+of 4K into minutes if this box has a GPU to spend, and needs a base image with
+that encoder built in.
+
+Two routes serve a video, and the difference matters:
+
+| Route | Serves | Cache-Control |
+|---|---|---|
+| `/media/:id/play` | the rendition if there is one, else the original | 5 minutes while it is still the original, `immutable` once it is the rendition |
+| `/media/:id/file` | always the archive master | `immutable` |
+
+The five minutes is not an oversight. `/play` answers from the same URL before
+and after the service reaches a clip, so telling the browser to keep the
+original for a year would hide the rendition behind a cache entry nothing can
+invalidate.
+
+To find out whether a clip has one: look for `.web/<name>.mp4` in its show
+folder. To force a re-encode: delete it. To see what is pending without writing
+anything, `--dry-run`. A clip ffmpeg refuses gets a `.failed` file holding the
+error and is not retried until `--retry`, because otherwise every pass would
+spend itself on the same broken file and never reach the rest.
 
 ## Capture times, and the order a night is shown in
 
