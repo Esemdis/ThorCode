@@ -198,6 +198,15 @@ rclone check /mnt/user/concert-media/archive gdrive:concert-media --checksum
 A backup nobody has ever read is a hypothesis. This is the line that turns it
 into a fact.
 
+### A file in two show folders in Drive
+
+Tagging a photograph with an act from another stage of the same festival day
+moves it into that act's show folder, with its poster and web rendition (see
+`utils/mediaRehome.js`). The nightly `copy` adds it at the new path and never
+removes the old one, so between that night and the next weekly `sync` Drive
+holds it in both folders. That is expected, not drift: the weekly `sync` moves
+the stale copy to `concert-media-trash`.
+
 ### Confirm the posters actually go
 
 `.posters/` is a dotted directory, and the poster frames inside it are the one

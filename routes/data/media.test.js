@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import { mkdtemp, mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 import { signMediaToken } from '../../utils/mediaTokens.js';
@@ -62,6 +62,9 @@ beforeEach(async () => {
   // this object and reads `.create`/`.findMany` off it at call time, so replacing
   // the methods here reaches it; replacing the object would not.
   prisma.concertAttendance.findUnique = vi.fn(async () => attendanceRow);
+  // Reset like the rest: a test that sets this and a later one that relies on
+  // it being empty would otherwise pass or fail by file order.
+  prisma.concertAttendance.findMany = vi.fn(async () => []);
   prisma.concertMedia.findMany = vi.fn(async () => []);
   prisma.concertMedia.create = vi.fn(async ({ data }) => ({ id: 1, ...data }));
 });
@@ -1353,6 +1356,184 @@ describe('PATCH /media', () => {
 
     const sidecar = JSON.parse(await readFile(join(dir, 'concert-media.json'), 'utf8'));
     expect(sidecar.files[0]).toMatchObject({ name: 'IMG_1.jpg', band_id: 92, band_name: 'Gojira', sha256: 'h5' });
+  });
+});
+
+describe('PATCH /media — an act from another stage that day', () => {
+  // Graspop is stored as one concert row per act. The night's photographs were
+  // uploaded with no band, so they sit on the WARGASM row; Dayseeker played the
+  // same day, in the same city, on a row of its own. Tagging one of them as
+  // Dayseeker used to be refused ("other show") — it now moves the file into
+  // Dayseeker's show, which is where picking Dayseeker at upload would have
+  // put it, and where the band view looks.
+  const day = new Date('2025-06-22T00:00:00Z');
+  const wargasmShow = {
+    id: 900, concert_date: day, venue: 'Main Stage', city: 'Dessel', country: 'BE',
+    bands: [{ band_rel: { id: 125, name: 'WARGASM' } }],
+  };
+  const dayseekerHome = (over = {}) => ({
+    id: 41,
+    concert_rel: {
+      id: 901, concert_date: day, venue: 'Jupiler Stage', city: 'Dessel', country: 'BE',
+      bands: [{ band_rel: { id: 501, name: 'Dayseeker' } }],
+      ...over,
+    },
+  });
+  const srcRel = 'user-1/2025-06-22 Dessel - WARGASM';
+  const srcDir = () => join(root, 'archive', srcRel);
+  const row = (over = {}) => ({
+    id: 5, attendance_id: 40, rel_path: `${srcRel}/IMG_1.jpg`, filename: 'IMG_1.jpg',
+    kind: 'PHOTO', sha256: 'h5', bytes: 5, width: null, height: null, duration_ms: null,
+    caption: null, song: null, taken_at: null, band_id: null,
+    attendance_rel: { wishlist_rel: { user_id: 'user-1' }, concert_rel: wargasmShow },
+    ...over,
+  });
+
+  // The file on disk, and a sidecar that records it with a caption edited by
+  // hand — which must travel with it rather than be rebuilt from the row.
+  const seed = async (files = [row()]) => {
+    await mkdir(srcDir(), { recursive: true });
+    for (const f of files) await writeFile(join(root, 'archive', f.rel_path), `bytes-${f.id}`);
+    await writeFile(join(srcDir(), 'concert-media.json'), JSON.stringify({
+      version: 1, concert_id: 900, user_id: 'user-1',
+      concert: { date: '2025-06-22', venue: 'Main Stage', city: 'Dessel', country: 'BE' },
+      files: files.map((f) => ({ name: f.filename, kind: f.kind, band_id: null, band_name: null, caption: 'hand-edited', song: null, sha256: f.sha256 })),
+    }));
+  };
+
+  const mockDb = ({ rows = [row()], inHome = [], homes = [dayseekerHome()] } = {}) => {
+    prisma.concertMedia.findMany = vi.fn(async ({ where }) => (where.id ? rows : inHome));
+    prisma.concertAttendance.findMany = vi.fn(async () => homes);
+    prisma.concertMedia.update = vi.fn(async ({ where, data }) => ({ id: where.id, ...data }));
+    prisma.$transaction = vi.fn(async (ops) => Promise.all(ops));
+  };
+
+  const tag = (body) => request(app())
+    .patch('/data/concerts/media')
+    .set(...authHeader({ id: 'user-1' }))
+    .send(body);
+
+  const exists = (p) => readFile(p).then(() => true, () => false);
+  const sidecarAt = async (absDir) => JSON.parse(await readFile(join(absDir, 'concert-media.json'), 'utf8'));
+
+  it('moves the photo into the act\'s own show and tags it there', async () => {
+    await seed();
+    mockDb();
+
+    const res = await tag({ ids: [5], band_id: 501 }).expect(200);
+    expect(res.body.data).toMatchObject({ updated: 1, moved: 1 });
+
+    const { data } = prisma.concertMedia.update.mock.calls[0][0];
+    expect(data).toMatchObject({ band_id: 501, attendance_id: 41, filename: 'IMG_1.jpg' });
+    expect(await readFile(join(root, 'archive', data.rel_path), 'utf8')).toBe('bytes-5');
+    expect(await exists(join(srcDir(), 'IMG_1.jpg'))).toBe(false);
+
+    // The destination's sidecar names Dayseeker's concert, files the entry
+    // under Dayseeker from its own bill, and kept the hand-edited caption.
+    const dest = await sidecarAt(join(root, 'archive', dirname(data.rel_path)));
+    expect(dest).toMatchObject({ concert_id: 901, user_id: 'user-1' });
+    expect(dest.files).toEqual([expect.objectContaining({
+      name: 'IMG_1.jpg', band_id: 501, band_name: 'Dayseeker', caption: 'hand-edited',
+    })]);
+    // And the show it left no longer claims it.
+    expect((await sidecarAt(srcDir())).files).toEqual([]);
+  });
+
+  it('moves only the files whose own show lacks the act', async () => {
+    const own = row({
+      id: 6, attendance_id: 41, rel_path: 'user-1/2025-06-22 Dessel - Dayseeker/IMG_2.jpg', filename: 'IMG_2.jpg',
+      sha256: 'h6', attendance_rel: { wishlist_rel: { user_id: 'user-1' }, concert_rel: dayseekerHome().concert_rel },
+    });
+    await seed();
+    await mkdir(join(root, 'archive', 'user-1/2025-06-22 Dessel - Dayseeker'), { recursive: true });
+    await writeFile(join(root, 'archive', own.rel_path), 'bytes-6');
+    mockDb({ rows: [row(), own], inHome: [{ filename: 'IMG_2.jpg', rel_path: own.rel_path, sha256: 'h6' }] });
+
+    const res = await tag({ ids: [5, 6], band_id: 501 }).expect(200);
+    expect(res.body.data).toMatchObject({ updated: 2, moved: 1 });
+
+    const byId = Object.fromEntries(prisma.concertMedia.update.mock.calls.map(([c]) => [c.where.id, c.data]));
+    expect(byId[6]).toEqual({ band_id: 501 });
+    expect(byId[5]).toMatchObject({ attendance_id: 41, rel_path: 'user-1/2025-06-22 Dessel - Dayseeker/IMG_1.jpg' });
+  });
+
+  it('carries a video\'s poster and web rendition with it', async () => {
+    // Nothing on this server can make another poster, so one left behind is
+    // lost; the rendition is only CPU, but minutes of it for a big clip.
+    const clip = row({ kind: 'VIDEO', rel_path: `${srcRel}/VID_1.mp4`, filename: 'VID_1.mp4' });
+    await seed([clip]);
+    await mkdir(join(srcDir(), '.posters'), { recursive: true });
+    await mkdir(join(srcDir(), '.web'), { recursive: true });
+    await writeFile(join(srcDir(), '.posters', 'VID_1.mp4.webp'), 'poster');
+    await writeFile(join(srcDir(), '.web', 'VID_1.mp4.mp4'), 'rendition');
+    mockDb({ rows: [clip] });
+
+    await tag({ ids: [5], band_id: 501 }).expect(200);
+
+    const destDir = join(root, 'archive', dirname(prisma.concertMedia.update.mock.calls[0][0].data.rel_path));
+    expect(await readFile(join(destDir, '.posters', 'VID_1.mp4.webp'), 'utf8')).toBe('poster');
+    expect(await readFile(join(destDir, '.web', 'VID_1.mp4.mp4'), 'utf8')).toBe('rendition');
+    expect(await exists(join(srcDir(), '.posters', 'VID_1.mp4.webp'))).toBe(false);
+    expect(await exists(join(srcDir(), '.web', 'VID_1.mp4.mp4'))).toBe(false);
+  });
+
+  it('picks a free name when the act\'s show already has a file called that', async () => {
+    const destRel = 'user-1/2025-06-22 Dessel - Dayseeker';
+    await seed();
+    await mkdir(join(root, 'archive', destRel), { recursive: true });
+    await writeFile(join(root, 'archive', destRel, 'IMG_1.jpg'), 'theirs');
+    mockDb({ inHome: [{ filename: 'IMG_1.jpg', rel_path: `${destRel}/IMG_1.jpg`, sha256: 'different' }] });
+
+    await tag({ ids: [5], band_id: 501 }).expect(200);
+
+    const { data } = prisma.concertMedia.update.mock.calls[0][0];
+    expect(data.filename).toBe('IMG_1 (2).jpg');
+    expect(await readFile(join(root, 'archive', destRel, 'IMG_1.jpg'), 'utf8')).toBe('theirs');
+    expect(await readFile(join(root, 'archive', destRel, 'IMG_1 (2).jpg'), 'utf8')).toBe('bytes-5');
+  });
+
+  it('moves nothing when that show already holds the same photograph', async () => {
+    // Uploaded to both rows. Moving it would put two copies in one night.
+    await seed();
+    mockDb({ inHome: [{ filename: 'other-name.jpg', rel_path: 'user-1/x/other-name.jpg', sha256: 'h5' }] });
+
+    const res = await tag({ ids: [5], band_id: 501 }).expect(409);
+    expect(res.body.message ?? res.body.error).toMatch(/IMG_1\.jpg/);
+    expect(await exists(join(srcDir(), 'IMG_1.jpg'))).toBe(true);
+    expect(prisma.concertMedia.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses an act that played no show of yours that day in that city', async () => {
+    await seed();
+    mockDb({ homes: [dayseekerHome({ concert_date: new Date('2025-06-21T00:00:00Z') }), dayseekerHome({ city: 'Antwerp' })] });
+
+    await tag({ ids: [5], band_id: 501 }).expect(400);
+    expect(await exists(join(srcDir(), 'IMG_1.jpg'))).toBe(true);
+    expect(prisma.concertMedia.update).not.toHaveBeenCalled();
+  });
+
+  it('puts the file and both sidecars back when the database write fails', async () => {
+    await seed();
+    mockDb();
+    prisma.$transaction = vi.fn(async () => { throw new Error('connection reset'); });
+
+    await tag({ ids: [5], band_id: 501 }).expect(500);
+
+    expect(await readFile(join(srcDir(), 'IMG_1.jpg'), 'utf8')).toBe('bytes-5');
+    expect((await sidecarAt(srcDir())).files).toEqual([expect.objectContaining({ name: 'IMG_1.jpg', caption: 'hand-edited' })]);
+    const destDir = join(root, 'archive', 'user-1', (await readdir(join(root, 'archive', 'user-1')))
+      .find((d) => d.includes('Dayseeker')));
+    expect(await exists(join(destDir, 'IMG_1.jpg'))).toBe(false);
+    expect((await sidecarAt(destDir)).files).toEqual([]);
+  });
+
+  it('says so when the archive no longer has the file, and moves nothing', async () => {
+    await seed([]);
+    mockDb();
+
+    const res = await tag({ ids: [5], band_id: 501 }).expect(409);
+    expect(res.body.message ?? res.body.error).toMatch(/no longer in the archive/);
+    expect(prisma.concertMedia.update).not.toHaveBeenCalled();
   });
 });
 

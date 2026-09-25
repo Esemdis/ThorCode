@@ -19,7 +19,9 @@ const { param, body, validationResult } = require('express-validator');
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
 const prisma = require('../../prisma/client');
-const { fail, badRequest, notFound, forbidden, success } = require('../../utils/apiResponse');
+const {
+  fail, badRequest, notFound, forbidden, conflict, success,
+} = require('../../utils/apiResponse');
 const {
   uniqueFilename, resolveArchivePath, slugSegment, posterPath,
 } = require('../../utils/mediaPaths');
@@ -39,6 +41,7 @@ const { bandMediaOverview } = require('../../utils/mediaOverview');
 const { billForConcert } = require('../../utils/concertBill');
 const { canonicalBandName } = require('../../utils/lineupNames');
 const { acquire } = require('../../utils/serialQueue');
+const { festivalSibling, moveFileBytes, undoRenames } = require('../../utils/mediaRehome');
 const { signMediaToken, verifyMediaToken, mediaUrls } = require('../../utils/mediaTokens');
 
 const router = express.Router();
@@ -762,10 +765,37 @@ router.patch(
       const bandId = req.body.band_id === undefined ? undefined
         : req.body.band_id === null ? null : parseInt(req.body.band_id, 10);
 
+      // Where each file lives once this is done: its own show, unless the band
+      // is not on that show's bill — then the caller's show on the same day in
+      // the same city that has the band, which on a festival day is the stage
+      // the act played. Moved rather than refused; see utils/mediaRehome.js.
+      const homes = new Map();
       if (bandId != null) {
-        const onEveryBill = rows.every((r) =>
-          r.attendance_rel.concert_rel.bands.some((b) => b.band_rel.id === bandId));
-        if (!onEveryBill) return badRequest(res, 'That band is not on every selected show\'s bill');
+        const strays = rows.filter((r) =>
+          !r.attendance_rel.concert_rel.bands.some((b) => b.band_rel.id === bandId));
+        if (strays.length) {
+          const candidates = await prisma.concertAttendance.findMany({
+            where: {
+              wishlist_rel: { user_id: req.user.id },
+              concert_rel: { bands: { some: { band: bandId } } },
+            },
+            select: {
+              id: true,
+              concert_rel: {
+                select: {
+                  id: true, concert_date: true, venue: true, city: true, country: true,
+                  bands: { select: { band_rel: { select: { id: true, name: true } } } },
+                },
+              },
+            },
+          });
+          for (const r of strays) {
+            const home = festivalSibling(r.attendance_rel.concert_rel, candidates);
+            // Every file answered before anything moves, like ownership above.
+            if (!home) return badRequest(res, 'That band is not on the bill of any show you saw that day');
+            homes.set(r.id, home);
+          }
+        }
       }
 
       // Trimmed here rather than at the picker: ' Stranded' and 'Stranded'
@@ -801,20 +831,170 @@ router.patch(
       };
       if (!Object.keys(patch).length) return badRequest(res, 'Nothing to change');
 
-      // Postgres first here, sidecar second — the opposite order from DELETE
-      // below, and deliberately so, not an inconsistency. DELETE is
-      // irreversible: if its sidecar write failed after the file and the row
-      // were already gone, nothing could reconstruct either. A retag is not:
-      // if the sidecar write below fails after this transaction commits,
-      // Postgres says "tagged" and the sidecar still says the old value, and
-      // the next rebuild-from-sidecars simply reverts the tag to what the
-      // sidecar remembers. That is a lost edit the caller can redo by
-      // retrying the request, not a lost photo.
-      await prisma.$transaction(rows.map((r) =>
-        prisma.concertMedia.update({ where: { id: r.id }, data: patch })));
+      const billName = (concert, id) => (id == null ? null
+        : concert.bands.find((b) => b.band_rel.id === id)?.band_rel.name ?? null);
+      // Built from the database row when the sidecar never recorded this file:
+      // everything a fresh entry needs — checksum, dimensions, whatever tag it
+      // already carried — is already on the row that the upload route wrote.
+      const entryFor = (r, recorded) => recorded ?? {
+        name: r.filename, kind: r.kind,
+        band_id: r.band_id, band_name: billName(r.attendance_rel.concert_rel, r.band_id),
+        caption: r.caption ?? '', song: r.song ?? null, sha256: r.sha256, bytes: r.bytes,
+        width: r.width, height: r.height, duration_ms: r.duration_ms,
+        taken_at: r.taken_at,
+      };
+      // The band's name comes from the bill of the show the file ends up in.
+      const changed = (entry, concert) => ({
+        ...entry,
+        ...(bandId !== undefined && { band_id: bandId, band_name: billName(concert, bandId) }),
+        ...(req.body.caption !== undefined && { caption: req.body.caption || '' }),
+        ...(song !== undefined && { song }),
+        ...(bandId === null && { song: null }),
+      });
+      const sidecarSeed = (concert, userId) => ({
+        concertId: concert.id,
+        userId,
+        concert: {
+          date: dateOnly(concert.concert_date), venue: concert.venue,
+          city: concert.city, country: concert.country,
+        },
+      });
 
-      const billName = (r, id) => (id == null ? null
-        : r.attendance_rel.concert_rel.bands.find((b) => b.band_rel.id === id)?.band_rel.name ?? null);
+      const moving = rows.filter((r) => homes.has(r.id));
+      const staying = rows.filter((r) => !homes.has(r.id));
+
+      // A move is the one part of a tag that touches the disk, and the one part
+      // that is not a single transaction. Each step records how to put itself
+      // back, and a failure anywhere up to the database write runs them newest
+      // first, so the request stays all-or-nothing.
+      const undo = [];
+      const releases = [];
+      const placed = new Map();
+      try {
+        if (moving.length) {
+          const homeIds = [...new Set(moving.map((r) => homes.get(r.id).id))].sort((a, b) => a - b);
+          // The lock the upload route takes, since both choose free filenames
+          // in a show. Taken in id order, so two requests moving into the same
+          // two shows cannot each hold one and wait on the other.
+          for (const id of homeIds) releases.push(await acquire(`attendance:${id}`));
+
+          // Planned in full before a single byte moves, so a refusal leaves the
+          // archive exactly as it was.
+          const plans = [];
+          for (const homeId of homeIds) {
+            const group = moving.filter((r) => homes.get(r.id).id === homeId);
+            const concert = homes.get(group[0].id).concert_rel;
+            const existing = await prisma.concertMedia.findMany({
+              where: { attendance_id: homeId },
+              select: { filename: true, rel_path: true, sha256: true },
+              orderBy: { id: 'asc' },
+            });
+            // The same photograph already in that show, from an upload to both
+            // rows. Moving it would put two copies in one night, which the
+            // upload route refuses for the same reason — so name them and move
+            // nothing.
+            const held = new Set(existing.map((e) => e.sha256).filter(Boolean));
+            const clashes = [];
+            for (const r of group) {
+              if (r.sha256 && held.has(r.sha256)) clashes.push(r.filename);
+              else if (r.sha256) held.add(r.sha256);
+            }
+            if (clashes.length) return conflict(res, `Already in that show: ${clashes.join(', ')}`);
+
+            const relDir = await showDirForAttendance({
+              existingRelPath: existing[0]?.rel_path ?? null,
+              userId: req.user.id,
+              concertId: concert.id,
+              show: { date: dateOnly(concert.concert_date), city: concert.city, headliner: headlinerOf(concert) },
+            });
+            const absDir = resolveArchivePath(relDir);
+            // Not created yet: a refusal for a later show must not leave an
+            // empty folder behind for this one.
+            const onDisk = await readdir(absDir).catch((err) => {
+              if (err.code === 'ENOENT') return [];
+              throw err;
+            });
+            const recorded = await readSidecar(absDir);
+            const taken = new Set([
+              ...onDisk, ...existing.map((e) => e.filename), ...(recorded?.files ?? []).map((f) => f.name),
+            ]);
+            const files = group.map((r) => {
+              const filename = uniqueFilename([...taken], r.filename);
+              taken.add(filename);
+              return { r, filename, relPath: path.posix.join(relDir, filename) };
+            });
+            plans.push({ homeId, concert, absDir, files });
+          }
+
+          // Read before anything moves, so each file's entry travels with it
+          // instead of being rebuilt from the row — nothing the sidecar knew
+          // about it, a caption edited by hand say, is lost on the way.
+          const sources = new Map();
+          for (const r of moving) {
+            const dir = path.posix.dirname(r.rel_path);
+            if (!sources.has(dir)) sources.set(dir, await readSidecar(resolveArchivePath(dir)));
+          }
+
+          for (const plan of plans) {
+            await mkdir(plan.absDir, { recursive: true });
+            for (const f of plan.files) {
+              const renames = await moveFileBytes({ fromRelPath: f.r.rel_path, toRelPath: f.relPath, kind: f.r.kind });
+              undo.push(() => undoRenames(renames));
+              placed.set(f.r.id, { attendance_id: plan.homeId, rel_path: f.relPath, filename: f.filename });
+            }
+          }
+
+          // The destination's sidecar before the source's: a crash between the
+          // two leaves a file both claim, which a rebuild reports, rather than
+          // one neither does, which nothing would.
+          for (const plan of plans) {
+            await updateSidecar(plan.absDir, (current) => {
+              let next = current ?? emptySidecar(sidecarSeed(plan.concert, req.user.id));
+              for (const f of plan.files) {
+                const recorded = sources.get(path.posix.dirname(f.r.rel_path))?.files
+                  .find((e) => e.name === f.r.filename);
+                next = upsertFile(next, { ...changed(entryFor(f.r, recorded), plan.concert), name: f.filename });
+              }
+              return next;
+            });
+            undo.push(() => updateSidecar(plan.absDir, (current) => (current
+              ? plan.files.reduce((sc, f) => removeFile(sc, f.filename), current) : null)));
+          }
+          for (const dir of sources.keys()) {
+            const names = moving.filter((r) => path.posix.dirname(r.rel_path) === dir).map((r) => r.filename);
+            let removed = [];
+            await updateSidecar(resolveArchivePath(dir), (current) => {
+              if (!current) return null;
+              removed = current.files.filter((e) => names.includes(e.name));
+              return names.reduce((sc, name) => removeFile(sc, name), current);
+            });
+            undo.push(() => updateSidecar(resolveArchivePath(dir), (current) => (current
+              ? removed.reduce((sc, e) => upsertFile(sc, e), current) : null)));
+          }
+        }
+
+        // Postgres first for a file that stays put, sidecar second — the
+        // opposite order from DELETE below, and deliberately so. DELETE is
+        // irreversible: if its sidecar write failed after the file and the row
+        // were already gone, nothing could reconstruct either. A retag is not:
+        // if the sidecar write below fails after this transaction commits, the
+        // next rebuild-from-sidecars simply reverts the tag to what the sidecar
+        // remembers — a lost edit the caller can redo, not a lost photo.
+        //
+        // A moved file is the other way round, because its sidecar entries
+        // are already written by now. If this transaction fails, the undo
+        // steps put the file and both sidecars back, rather than leaving the
+        // index pointing at the folder the file has just left.
+        await prisma.$transaction(rows.map((r) =>
+          prisma.concertMedia.update({ where: { id: r.id }, data: { ...patch, ...placed.get(r.id) } })));
+      } catch (err) {
+        for (const step of undo.reverse()) {
+          await step().catch((e) => console.error('[media] could not undo part of a move', e));
+        }
+        throw err;
+      } finally {
+        for (const release of releases) release();
+      }
 
       // The sidecar is the record of truth — Postgres is rebuilt from it, never
       // the other way round — so a tag that reaches the database but not here
@@ -824,47 +1004,27 @@ router.patch(
       // rather than skipped, because a skip here is exactly the kind of write
       // that looks like it worked and was never real.
       const byDir = new Map();
-      for (const r of rows) byDir.set(path.posix.dirname(r.rel_path), []);
-      for (const r of rows) byDir.get(path.posix.dirname(r.rel_path)).push(r);
+      for (const r of staying) byDir.set(path.posix.dirname(r.rel_path), []);
+      for (const r of staying) byDir.get(path.posix.dirname(r.rel_path)).push(r);
 
       for (const [relDir, dirRows] of byDir) {
-        const absDir = resolveArchivePath(relDir);
         const concert = dirRows[0].attendance_rel.concert_rel;
-        await updateSidecar(absDir, (current) => {
-          let sidecar = current ?? emptySidecar({
-            concertId: concert.id,
-            userId: dirRows[0].attendance_rel.wishlist_rel.user_id,
-            concert: {
-              date: dateOnly(concert.concert_date), venue: concert.venue,
-              city: concert.city, country: concert.country,
-            },
-          });
+        await updateSidecar(resolveArchivePath(relDir), (current) => {
+          let sidecar = current
+            ?? emptySidecar(sidecarSeed(concert, dirRows[0].attendance_rel.wishlist_rel.user_id));
           for (const r of dirRows) {
-            // Built from the database row when the sidecar never recorded this
-            // file: everything a fresh entry needs — checksum, dimensions,
-            // whatever tag it already carried — is already on the row that the
-            // upload route itself wrote there.
-            const entry = sidecar.files.find((f) => f.name === r.filename) ?? {
-              name: r.filename, kind: r.kind,
-              band_id: r.band_id, band_name: billName(r, r.band_id),
-              caption: r.caption ?? '', song: r.song ?? null, sha256: r.sha256, bytes: r.bytes,
-              width: r.width, height: r.height, duration_ms: r.duration_ms,
-              taken_at: r.taken_at,
-            };
-            sidecar = upsertFile(sidecar, {
-              ...entry,
-              ...(bandId !== undefined && { band_id: bandId, band_name: billName(r, bandId) }),
-              ...(req.body.caption !== undefined && { caption: req.body.caption || '' }),
-              ...(song !== undefined && { song }),
-              ...(bandId === null && { song: null }),
-            });
+            const recorded = sidecar.files.find((f) => f.name === r.filename);
+            sidecar = upsertFile(sidecar, changed(entryFor(r, recorded), concert));
           }
           return sidecar;
         });
       }
 
-      return success(res, 200, { updated: rows.length });
+      return success(res, 200, { updated: rows.length, moved: placed.size });
     } catch (err) {
+      // The archive lost a file the index still has. Said as what it is, not
+      // as "Something went wrong": a rebuild is what repairs it.
+      if (err.code === 'MISSING_SOURCE') return conflict(res, err.message);
       return fail(res, err, { context: 'PATCH /media' });
     }
   },
