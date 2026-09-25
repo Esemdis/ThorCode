@@ -217,6 +217,46 @@ Record today's archive size when you first set this up, and when the job starts
 failing on quota, let it fail loudly. A backup that silently copies most of the
 archive is worse than one that stops, because it reports success.
 
+## When a show disappears from the app but not from the share
+
+`detachAttendances` moves a show folder to `_detached` and drops its index rows.
+That is how the bytes survive a concert going away, and it is deliberate — but
+it leaves the gallery empty with nothing on screen to say why, and the rebuild
+cannot help: it skips `_detached` by design, because the sidecar in there names a
+`concert_id` that no longer exists.
+
+Three routes can trigger it. An admin deleting a concert is an instruction and
+detaching is the answer to it. The other two are **orphan sweeps** after a band
+is deleted or reconciled, and those now refuse to touch a concert anybody
+attended — `sweepableConcertIds` in `utils/mediaDetach.js` requires
+`attendances: { none: {} }` as well as `bands: { none: {} }`.
+
+That rule was missing, and its absence cost a gig: deleting a band unlinked it
+from every concert and swept whatever was left band-less, with no date filter and
+no thought for attendance, so a night someone had been to and uploaded
+photographs to was swept as debris. A band-less attended concert is a slightly
+poorer record — its lineup falls back to the scraped metadata — and that is a far
+smaller loss than the night itself.
+
+To put back anything already in `_detached`:
+
+```bash
+doppler run -- node scripts/restore-detached-media.js --dry-run
+doppler run -- node scripts/restore-detached-media.js
+doppler run -- node scripts/restore-detached-media.js --only "2026-06-12 Oslo - Gojira"
+```
+
+It reads each detached sidecar, recreates the concert and attendance it names,
+moves the folder back, and rewrites the sidecar to point at the new concert id —
+the old id is gone and ids are not reusable. It does not write `ConcertMedia`
+rows: that is `rebuild-media-index.js`'s job and the tested path for it, so
+finish with a `--dry-run` of the rebuild, check it reports the files, then run it
+for real.
+
+A restored concert keeps only what the sidecar knew: date, venue, city, country.
+`event_id`, the source urls and the coordinates went with the old row and are not
+inventable — the enrich passes fill those in again.
+
 ## Capture times, and the order a night is shown in
 
 The gallery shows a night in the order it happened, not the order it was

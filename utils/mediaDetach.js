@@ -22,6 +22,49 @@ async function countMediaForAttendances(prisma, attendanceIds) {
   return prisma.concertMedia.count({ where: { attendance_id: { in: attendanceIds } } });
 }
 
+/**
+ * Which of these concerts a cleanup sweep may actually delete.
+ *
+ * A concert with no bands left is an orphan and gets swept. A concert someone
+ * ATTENDED is not an orphan whatever its bands say — it is a record of a night
+ * that happened, and the bands on it are a detail of that record rather than
+ * the reason it exists.
+ *
+ * This is the rule that was missing. Deleting a band unlinks it from every
+ * concert and then sweeps whatever is left band-less, with no date filter and
+ * no thought for attendance — so a gig someone had been to, and had uploaded a
+ * night's photographs to, was swept as debris. The bytes survived, because
+ * `detachAttendances` moves the folder to `_detached` rather than deleting it,
+ * but the attendance, the concert and every ConcertMedia row went, and the
+ * gallery was empty with nothing on screen to say why. The rebuild cannot put
+ * it back either: it skips `_detached` by design, and the sidecar in there names
+ * a concert_id that no longer exists.
+ *
+ * A band-less attended concert is a slightly poorer record — its lineup shows
+ * only what the scraped metadata remembers. That is a far smaller loss than the
+ * night itself, and the next enrich pass can put a lineup back.
+ *
+ * Deliberately NOT applied to an admin deleting one concert on purpose. That is
+ * an instruction rather than a side effect, and `detachAttendances` preserving
+ * the bytes is the documented answer to it.
+ *
+ * @param {object} prisma - client or transaction
+ * @param {number[]} concertIds - candidates, already narrowed to the sweep's scope
+ * @returns {Promise<number[]>} the subset safe to delete
+ */
+async function sweepableConcertIds(prisma, concertIds) {
+  if (!concertIds.length) return [];
+  const rows = await prisma.concert.findMany({
+    where: {
+      id: { in: concertIds },
+      bands: { none: {} },
+      attendances: { none: {} },
+    },
+    select: { id: true },
+  });
+  return rows.map((c) => c.id);
+}
+
 const exists = (p) => access(p).then(() => true, () => false);
 
 // Never overwrite. A repeated detach of a rebuilt row would otherwise destroy
@@ -160,5 +203,5 @@ async function withDetach(prisma, run, options) {
 }
 
 module.exports = {
-  countMediaForAttendances, detachAttendances, undoDetach, withDetach,
+  countMediaForAttendances, sweepableConcertIds, detachAttendances, undoDetach, withDetach,
 };

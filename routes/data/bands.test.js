@@ -376,6 +376,34 @@ describe('DELETE /bands/:bandId', () => {
       select: { rel_path: true },
     });
   });
+
+  it('only sweeps concerts nobody attended', async () => {
+    // The sweep used to ask for band-less concerts and nothing else, so a gig
+    // someone had been to was swept as debris the moment deleting a band left it
+    // without one — the attendance, the concert and every media row gone, the
+    // folder in _detached, and the rebuild unable to put it back because it
+    // skips _detached and that sidecar names a concert_id that no longer exists.
+    await request(app).delete('/bands/9').set(...authHeader({ role: 'ADMIN' }));
+
+    expect(prisma.concert.findMany).toHaveBeenCalledWith({
+      where: { id: { in: [700] }, bands: { none: {} }, attendances: { none: {} } },
+      select: { id: true },
+    });
+  });
+
+  it('leaves an attended gig and its photographs entirely alone', async () => {
+    // What the query above buys: nothing is detached, nothing is deleted, and
+    // the night survives band-less rather than not at all.
+    prisma.concert.findMany.mockResolvedValue([]);
+
+    const res = await request(app).delete('/bands/9').set(...authHeader({ role: 'ADMIN' }));
+
+    expect(res.status).toBe(200);
+    expect(prisma.concertMedia.findMany).not.toHaveBeenCalled();
+    expect(prisma.concertMedia.deleteMany).not.toHaveBeenCalled();
+    expect(prisma.concertAttendance.deleteMany).not.toHaveBeenCalled();
+    expect(prisma.concert.deleteMany).not.toHaveBeenCalled();
+  });
 });
 
 describe('POST /bands/:bandId/reconcile', () => {

@@ -14,7 +14,7 @@ const { error: sendError } = require('../../../utils/apiResponse');
 const { haversineKm, stringSimilarity, venueContains, deduplicateByCoords } = require('../../../utils/concertDedup');
 const { findSourceUrls } = require('../../../utils/bandSourceUrls');
 const { backlinkBandToConcerts } = require('../../../utils/bandBacklink');
-const { detachAttendances, withDetach } = require('../../../utils/mediaDetach');
+const { detachAttendances, withDetach, sweepableConcertIds } = require('../../../utils/mediaDetach');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const { rateLimiter } = require('../../../utils/rateLimiter');
@@ -205,12 +205,12 @@ router.post(
     // them in _detached is invisible to the rebuild.
     await withDetach(prisma, async (tx, moved) => {
       await tx.concertBandReference.deleteMany({ where: { concert: { in: staleIds }, band: bandId } });
-      const orphans = await tx.concert.findMany({
-        where: { id: { in: staleIds }, bands: { none: {} } },
-        select: { id: true },
-      });
-      if (orphans.length > 0) {
-        const orphanIds = orphans.map((c) => c.id);
+      // Band-less AND unattended. This pass only looks at future concerts, so a
+      // gig already been to is out of its scope anyway — but the rule belongs
+      // here too rather than resting on that filter, because a show marked
+      // Going can have photographs uploaded to it just as easily.
+      const orphanIds = await sweepableConcertIds(tx, staleIds);
+      if (orphanIds.length > 0) {
         // Detach before the attendance rows go, or the restricting foreign key
         // fails the whole transaction. See utils/mediaDetach.js for why the
         // key restricts rather than cascades. Passed tx, not prisma: a

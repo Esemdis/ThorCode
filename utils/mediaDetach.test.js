@@ -2,7 +2,9 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mkdtemp, mkdir, writeFile, readdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { countMediaForAttendances, detachAttendances, undoDetach } from './mediaDetach.js';
+import {
+  countMediaForAttendances, sweepableConcertIds, detachAttendances, undoDetach,
+} from './mediaDetach.js';
 
 let root;
 beforeEach(async () => {
@@ -34,6 +36,73 @@ describe('countMediaForAttendances', () => {
 
   it('is zero for attendances with nothing attached', async () => {
     expect(await countMediaForAttendances(fakePrisma([]), [1])).toBe(0);
+  });
+});
+
+/**
+ * Concerts with the two facts the sweep decides on. The fake applies the same
+ * relation filters Prisma would, so a query that drops one of them shows up here
+ * as a concert being swept that should not have been.
+ */
+const fakeConcerts = (concerts) => ({
+  concert: {
+    findMany: vi.fn(async ({ where }) => concerts.filter((c) => {
+      if (!where.id.in.includes(c.id)) return false;
+      if (where.bands?.none && c.bands > 0) return false;
+      if (where.attendances?.none && c.attendances > 0) return false;
+      return true;
+    }).map((c) => ({ id: c.id }))),
+  },
+});
+
+describe('sweepableConcertIds', () => {
+  it('sweeps a concert nobody attended once its last band is gone', async () => {
+    const prisma = fakeConcerts([{ id: 10, bands: 0, attendances: 0 }]);
+    expect(await sweepableConcertIds(prisma, [10])).toEqual([10]);
+  });
+
+  it('spares a concert someone attended, however few bands are left on it', async () => {
+    // The bug this exists to stop: deleting a band unlinked it from every
+    // concert and then swept whatever was left band-less, with no thought for
+    // attendance. A gig someone had been to — and uploaded a night's
+    // photographs to — was swept as debris, and the rebuild could not put it
+    // back because it skips _detached and the sidecar there names a concert_id
+    // that no longer exists.
+    const prisma = fakeConcerts([{ id: 10, bands: 0, attendances: 1 }]);
+    expect(await sweepableConcertIds(prisma, [10])).toEqual([]);
+  });
+
+  it('spares a concert that still has bands', async () => {
+    const prisma = fakeConcerts([{ id: 10, bands: 2, attendances: 0 }]);
+    expect(await sweepableConcertIds(prisma, [10])).toEqual([]);
+  });
+
+  it('keeps the two rules together in one query', async () => {
+    // Asserted on the query itself as well as its result: a fake can be made to
+    // agree with a filter that is not there, and both halves of this rule have
+    // to reach Postgres.
+    const prisma = fakeConcerts([]);
+    await sweepableConcertIds(prisma, [10, 11]);
+    expect(prisma.concert.findMany.mock.calls[0][0].where).toMatchObject({
+      id: { in: [10, 11] },
+      bands: { none: {} },
+      attendances: { none: {} },
+    });
+  });
+
+  it('sorts the attended from the unattended in one pass', async () => {
+    const prisma = fakeConcerts([
+      { id: 10, bands: 0, attendances: 0 },
+      { id: 11, bands: 0, attendances: 3 },
+      { id: 12, bands: 0, attendances: 0 },
+    ]);
+    expect(await sweepableConcertIds(prisma, [10, 11, 12])).toEqual([10, 12]);
+  });
+
+  it('asks nothing when there are no candidates', async () => {
+    const prisma = fakeConcerts([]);
+    expect(await sweepableConcertIds(prisma, [])).toEqual([]);
+    expect(prisma.concert.findMany).not.toHaveBeenCalled();
   });
 });
 

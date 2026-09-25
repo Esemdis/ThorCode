@@ -18,7 +18,7 @@ const { relevantArtists } = require('../../../utils/artistSearch');
 const { resolveArtistImages } = require('../../../utils/bandImages');
 const { matchBandToSpotify, backfillSpotifyIds } = require('../../../utils/bandSpotifyMatch');
 const { findSourceUrls } = require('../../../utils/bandSourceUrls');
-const { detachAttendances, withDetach } = require('../../../utils/mediaDetach');
+const { detachAttendances, withDetach, sweepableConcertIds } = require('../../../utils/mediaDetach');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
@@ -334,15 +334,13 @@ router.delete(
 
         let orphanConcertIds = [];
         if (concertIds.length) {
-          // Find concerts that now have zero bands
-          const orphans = await tx.concert.findMany({
-            where: {
-              id: { in: concertIds },
-              bands: { none: {} },
-            },
-            select: { id: true },
-          });
-          orphanConcertIds = orphans.map((c) => c.id);
+          // Concerts that now have zero bands AND that nobody attended. The
+          // attendance half of that rule lives in sweepableConcertIds and is
+          // there because it was missing: deleting a band swept a gig someone
+          // had been to and had uploaded a night's photographs to, taking the
+          // attendance, the concert and every media row with it. See that
+          // function for why the rebuild could not put it back.
+          orphanConcertIds = await sweepableConcertIds(tx, concertIds);
           if (orphanConcertIds.length) {
             // Detach before the attendance rows go, or the restricting foreign
             // key fails the whole transaction. See utils/mediaDetach.js for why
