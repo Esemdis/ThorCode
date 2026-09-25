@@ -91,7 +91,9 @@ describe('POST /attendances/:id/media', () => {
     // their own auth via a signed URL token instead of this middleware, so
     // their count is 1: just the handler, no `auth` or `roleCheck` in front.
     // /play is the same: it is what a <video> points at, and an element sends
-    // no Authorization header.
+    // no Authorization header. GET /media/share/:token is public by design —
+    // the token in its path is the credential — so its 2 is the rate limiter
+    // and the handler.
     expect(routeManifest(router)).toEqual([
       'POST /attendances/:attendanceId/media [7]',
       'GET /attendances/:attendanceId/media [4]',
@@ -99,9 +101,12 @@ describe('POST /attendances/:id/media', () => {
       'POST /attendances/:attendanceId/lineup [5]',
       'PATCH /media [8]',
       'DELETE /media/:id [4]',
+      'POST /media/:id/share [4]',
+      'DELETE /media/:id/share [4]',
       'GET /media/:id/file [1]',
       'GET /media/:id/play [1]',
       'GET /media/:id/thumb [1]',
+      'GET /media/share/:token [2]',
     ]);
   });
 
@@ -2114,5 +2119,186 @@ describe('an upload that collides with the archive\'s own bookkeeping', () => {
     // And the uploaded bytes are still a JPEG, at the name the row claims.
     const bytes = await readFile(join(dir, 'concert-media (2).json'));
     expect(bytes.slice(0, 3)).toEqual(Buffer.from([0xff, 0xd8, 0xff]));
+  });
+});
+
+describe('sharing one file by public link', () => {
+  // A stateful stand-in for the MediaShareLink table: every behaviour here is
+  // about what one call leaves behind for the next — the same link handed back
+  // twice, a revoke that kills it, a reshare that mints a fresh one.
+  let links;
+  const owned = {
+    id: 1, kind: 'PHOTO', sha256: 'h1', filename: 'IMG_1.jpg',
+    rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_1.jpg',
+    attendance_rel: { wishlist_rel: { user_id: 'user-1' } },
+  };
+  const user = { id: 'user-1', role: 'USER' };
+
+  beforeEach(() => {
+    links = [];
+    prisma.concertMedia.findUnique = vi.fn(async () => owned);
+    prisma.mediaShareLink = {
+      findFirst: vi.fn(async ({ where }) => links
+        .filter((l) => l.media_id === where.media_id && l.revoked_at === null
+          && l.expires_at > where.expires_at.gt)
+        .sort((a, b) => b.created_at - a.created_at)[0] ?? null),
+      create: vi.fn(async ({ data }) => {
+        const link = { id: links.length + 1, created_at: new Date(), revoked_at: null, ...data };
+        links.push(link);
+        return link;
+      }),
+      updateMany: vi.fn(async ({ where, data }) => {
+        const hit = links.filter((l) => l.media_id === where.media_id && l.revoked_at === null);
+        hit.forEach((l) => Object.assign(l, data));
+        return { count: hit.length };
+      }),
+      findUnique: vi.fn(async ({ where }) => links.find((l) => l.token === where.token) ?? null),
+    };
+  });
+
+  const share = (as = user) => request(app())
+    .post('/data/concerts/media/1/share')
+    .set(...authHeader(as));
+  const revoke = (as = user) => request(app())
+    .delete('/data/concerts/media/1/share')
+    .set(...authHeader(as));
+  const tokenOf = (res) => res.body.data.url.split('/').pop();
+
+  describe('POST /media/:id/share', () => {
+    it('refuses an unauthenticated caller', async () => {
+      await request(app()).post('/data/concerts/media/1/share').expect(401);
+    });
+
+    it('refuses a file that belongs to someone else', async () => {
+      await share({ id: 'someone-else', role: 'USER' }).expect(403);
+      expect(prisma.mediaShareLink.create).not.toHaveBeenCalled();
+    });
+
+    it('answers 404 for a file that does not exist', async () => {
+      prisma.concertMedia.findUnique = vi.fn(async () => null);
+      await share().expect(404);
+    });
+
+    it('lets a plain user share their own file, with a link that lasts 12 hours', async () => {
+      // Tagging and deleting are open to every signed-in user; only uploading
+      // is admin-only. Sharing belongs with the former.
+      const before = Date.now();
+      const res = await share().expect(200);
+
+      expect(res.body.data.url).toMatch(/^https:\/\/api\.example\.com\/data\/concerts\/media\/share\/[A-Za-z0-9_-]{32}$/);
+      const ttl = new Date(res.body.data.expires_at).getTime() - before;
+      expect(ttl).toBeGreaterThan(12 * 60 * 60 * 1000 - 5000);
+      expect(ttl).toBeLessThanOrEqual(12 * 60 * 60 * 1000 + 5000);
+    });
+
+    it('hands back the same link while it is live, rather than minting a second', async () => {
+      const first = await share().expect(200);
+      const second = await share().expect(200);
+
+      expect(second.body.data.url).toBe(first.body.data.url);
+      expect(prisma.mediaShareLink.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('mints a fresh link after the last one was revoked', async () => {
+      const first = await share().expect(200);
+      await revoke().expect(204);
+      const second = await share().expect(200);
+
+      expect(tokenOf(second)).not.toBe(tokenOf(first));
+    });
+  });
+
+  describe('DELETE /media/:id/share', () => {
+    it('refuses an unauthenticated caller', async () => {
+      await request(app()).delete('/data/concerts/media/1/share').expect(401);
+    });
+
+    it('refuses a file that belongs to someone else, and revokes nothing', async () => {
+      await share().expect(200);
+      await revoke({ id: 'someone-else', role: 'USER' }).expect(403);
+      expect(prisma.mediaShareLink.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('is a quiet no-op when there is nothing live to revoke', async () => {
+      await revoke().expect(204);
+      await revoke().expect(204);
+    });
+  });
+
+  describe('GET /media/share/:token', () => {
+    const uploadPhoto = () => request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(201);
+
+    it('serves the photo to a request with no Authorization header at all', async () => {
+      // The whole point: the recipient has no account.
+      await uploadPhoto();
+      const token = tokenOf(await share().expect(200));
+
+      const res = await request(app()).get(`/data/concerts/media/share/${token}`).expect(200);
+      expect(res.headers['content-type']).toMatch(/image\/jpeg/);
+    });
+
+    it('serves a video\'s web rendition rather than the archive master', async () => {
+      // A browser pointed straight at the link has to be able to play it, and
+      // a 4K HEVC original is exactly what Firefox cannot.
+      await request(app())
+        .post('/data/concerts/attendances/1/media')
+        .set(...authHeader(admin))
+        .attach('files', Buffer.from('original bytes'), 'VID_1.mp4')
+        .expect(201);
+      prisma.concertMedia.findUnique = vi.fn(async () => ({
+        ...owned, kind: 'VIDEO', filename: 'VID_1.mp4',
+        rel_path: 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4',
+      }));
+      const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+      await mkdir(join(dir, '.web'), { recursive: true });
+      await writeFile(join(dir, '.web', 'VID_1.mp4.mp4'), 'rendition bytes');
+      const token = tokenOf(await share().expect(200));
+
+      const res = await request(app()).get(`/data/concerts/media/share/${token}`).expect(200);
+      expect(res.text).toBe('rendition bytes');
+    });
+
+    it('tells the browser not to keep a copy, so a revoke is not undone by its cache', async () => {
+      await uploadPhoto();
+      const token = tokenOf(await share().expect(200));
+
+      const res = await request(app()).get(`/data/concerts/media/share/${token}`).expect(200);
+      expect(res.headers['cache-control']).toBe('private, no-store');
+    });
+
+    it('answers 404 for a token that was never issued', async () => {
+      await request(app()).get('/data/concerts/media/share/not-a-real-token').expect(404);
+    });
+
+    it('answers 404, not 403, once the link has been revoked', async () => {
+      // A 403 would confirm the token had once been real.
+      await uploadPhoto();
+      const token = tokenOf(await share().expect(200));
+      await revoke().expect(204);
+
+      await request(app()).get(`/data/concerts/media/share/${token}`).expect(404);
+    });
+
+    it('answers 404 once the link has expired, with no revoke needed', async () => {
+      await uploadPhoto();
+      links.push({
+        id: 99, media_id: 1, token: 'expired-token', created_at: new Date(Date.now() - 13 * 3600e3),
+        expires_at: new Date(Date.now() - 3600e3), revoked_at: null,
+      });
+
+      await request(app()).get('/data/concerts/media/share/expired-token').expect(404);
+    });
+
+    it('answers 404 when the file behind a live link has since been deleted', async () => {
+      await uploadPhoto();
+      const token = tokenOf(await share().expect(200));
+      prisma.concertMedia.findUnique = vi.fn(async () => null);
+
+      await request(app()).get(`/data/concerts/media/share/${token}`).expect(404);
+    });
   });
 });

@@ -43,6 +43,10 @@ const { canonicalBandName } = require('../../utils/lineupNames');
 const { acquire } = require('../../utils/serialQueue');
 const { festivalSibling, moveFileBytes, undoRenames } = require('../../utils/mediaRehome');
 const { signMediaToken, verifyMediaToken, mediaUrls } = require('../../utils/mediaTokens');
+const {
+  generateShareToken, shareExpiry, shareUrl, isActiveShareLink,
+} = require('../../utils/mediaShareToken');
+const { rateLimiter } = require('../../utils/rateLimiter');
 
 const router = express.Router();
 
@@ -1075,6 +1079,77 @@ router.delete(
   },
 );
 
+// Answers the response itself and returns null when the caller may not share
+// this file, so both share routes stop at the same place for the same reasons.
+async function ownedMediaForShare(req, res) {
+  const row = await prisma.concertMedia.findUnique({
+    where: { id: parseInt(req.params.id, 10) },
+    include: { attendance_rel: { include: { wishlist_rel: { select: { user_id: true } } } } },
+  });
+  if (!row) { notFound(res, 'Media not found'); return null; }
+  if (row.attendance_rel.wishlist_rel.user_id !== req.user.id) { forbidden(res, 'Forbidden'); return null; }
+  return row;
+}
+
+/**
+ * Get-or-create the public link to one file.
+ *
+ * Idempotent: while a link is live, asking again hands back that same link
+ * rather than minting a second one, so a file never has two URLs out in the
+ * world at once and there is no need for a separate "what is my link" GET.
+ */
+router.post(
+  '/media/:id/share',
+  [auth, roleCheck(['ADMIN', 'USER']), param('id').isInt()],
+  async (req, res) => {
+    try {
+      if (!validationResult(req).isEmpty()) return badRequest(res, 'Invalid media id');
+      const media = await ownedMediaForShare(req, res);
+      if (!media) return undefined;
+
+      const now = new Date();
+      let link = await prisma.mediaShareLink.findFirst({
+        where: { media_id: media.id, revoked_at: null, expires_at: { gt: now } },
+        orderBy: { created_at: 'desc' },
+      });
+      if (!link) {
+        link = await prisma.mediaShareLink.create({
+          data: { media_id: media.id, token: generateShareToken(), expires_at: shareExpiry(now) },
+        });
+      }
+
+      return success(res, 200, {
+        url: shareUrl(process.env.CALLBACK_URL, link.token),
+        expires_at: link.expires_at,
+      });
+    } catch (err) {
+      return fail(res, err, { context: 'POST /media/:id/share' });
+    }
+  },
+);
+
+// Revokes every live link to the file. updateMany rather than one row by id,
+// so revoking a file with nothing live is a quiet no-op instead of a 404.
+router.delete(
+  '/media/:id/share',
+  [auth, roleCheck(['ADMIN', 'USER']), param('id').isInt()],
+  async (req, res) => {
+    try {
+      if (!validationResult(req).isEmpty()) return badRequest(res, 'Invalid media id');
+      const media = await ownedMediaForShare(req, res);
+      if (!media) return undefined;
+
+      await prisma.mediaShareLink.updateMany({
+        where: { media_id: media.id, revoked_at: null },
+        data: { revoked_at: new Date() },
+      });
+      return res.status(204).end();
+    } catch (err) {
+      return fail(res, err, { context: 'DELETE /media/:id/share' });
+    }
+  },
+);
+
 /**
  * The two routes that serve bytes.
  *
@@ -1110,104 +1185,119 @@ async function serveMedia(req, res, which) {
     // been detached in that time.
     if (row.attendance_rel.wishlist_rel.user_id !== verdict.userId) return res.status(403).end();
 
-    // Resolved before the thumb/poster branch, and outside its try: an
-    // archive-escape refusal here is the single most important thing these
-    // routes can produce and must reach the outer catch and get logged, not
-    // be caught below and mistaken for "this video has no poster".
-    const archivePath = resolveArchivePath(row.rel_path);
-
-    let absPath;
-    // A rendition that appears later must not be masked by a year-old cached
-    // original, so `immutable` is only claimed once there is nothing left to
-    // supersede. See the Cache-Control below.
-    let servingOriginalForPlayback = false;
-    if (which === 'play') {
-      const chosen = await playableFor(archivePath, row.kind);
-      absPath = chosen.absPath;
-      servingOriginalForPlayback = !chosen.rendition && row.kind === 'VIDEO';
-    } else if (which === 'thumb') {
-      try {
-        absPath = await ensureThumb({
-          absPath: archivePath, kind: row.kind, sha256: row.sha256, relPath: row.rel_path,
-        });
-      } catch (err) {
-        if (err.code !== 'NO_POSTER' && err.code !== 'NO_SOURCE') throw err;
-        // A video whose poster extraction failed in the browser has none, and
-        // nothing here can decode one. NO_SOURCE is the same answer for a
-        // photo whose original is gone, which is what the file route already
-        // says about the same row. 404 so the grid draws its placeholder
-        // rather than retrying an image that is never coming.
-        return res.status(404).end();
-      }
-    } else {
-      absPath = archivePath;
-    }
-
-    // `send` defaults to dotfiles: 'ignore' and 404s a path with a dot segment
-    // regardless of permissions. A poster lives at <show>/.posters/<name>.webp,
-    // so without this every video thumb was a silent placeholder even with the
-    // poster sitting right there on disk. It applies to the file route too,
-    // and for a reason that has nothing to do with posters: with no `root`
-    // option set, send tests every segment of the ABSOLUTE path, so a single
-    // dot directory anywhere in MEDIA_ROOT turns every download in the archive
-    // into a 404. resolveArchivePath has already confined the path by this
-    // point, so send's dotfile heuristic guards nothing here and only breaks
-    // deploys whose mount happens to sit under a hidden directory.
-    const sendOpts = { dotfiles: 'allow' };
-
-    // Immutable: these paths are keyed by content that never changes in place.
-    // A replaced photo is a new row with a new id.
-    //
-    // Except one case. /play serves the original until the rendition service
-    // reaches that clip, and then serves the rendition from the same URL — so
-    // telling the browser to keep the original for a year would hide the
-    // rendition behind a cache entry nothing can invalidate. Five minutes keeps
-    // a scroll cheap and lets the better copy arrive.
-    res.set('Cache-Control', servingOriginalForPlayback
-      ? 'private, max-age=300'
-      : 'private, max-age=31536000, immutable');
-    return res.sendFile(absPath, sendOpts, (err) => {
-      if (!err) return;
-      // send's ENOENT carries a 404 status, and the global handler keeps an
-      // error's message for any status under 500 even in production — which
-      // would otherwise hand an absolute archive path on this container back
-      // to the browser. The caller is already the verified owner, so this is
-      // closing a filesystem-layout leak, not a data leak.
-      if (err.code === 'ENOENT') {
-        // The immutable Cache-Control below is set before sendFile runs, so
-        // without this it is still on the response when this 404 goes out —
-        // and the browser is told to remember the miss for a year. The
-        // condition that produces it is usually transient (a share that
-        // dropped, or mounted late after a restart), so every tile looked at
-        // during the outage stayed broken long after it ended.
-        res.removeHeader('Cache-Control');
-        return res.status(404).end();
-      }
-      // Passing a callback here opts out of Express's own next(err) handling
-      // (see res.sendFile's source: "if (done) return done(err)"), so
-      // anything past ENOENT has to be logged and answered here, not thrown —
-      // this runs after the surrounding try/catch has already returned.
-      //
-      // Opting out also loses the res.headersSent guard that Express's default
-      // error handler applies, and that is the half that bites. Every error
-      // send reports mid-body arrives after the headers: the common one is a
-      // client that closed the tab or seeked in a video, which send reports as
-      // "Request aborted". Calling fail() there tried to write a second
-      // response, threw ERR_HTTP_HEADERS_SENT from inside send's own callback
-      // where nothing catches it, and index.js answers uncaughtException with
-      // process.exit(1) — so one viewer scrubbing a video took the whole API
-      // down with it, on a feature whose stated premise is a flaky home
-      // connection. Once the response is committed the only honest move is to
-      // log it and drop the socket.
-      if (res.headersSent) {
-        console.error(`[${new Date().toISOString()}] GET /media/:id/${which} aborted mid-body`, err);
-        return res.destroy();
-      }
-      return fail(res, err, { context: `GET /media/:id/${which}` });
-    });
+    return await sendMediaBytes(res, row, which, `GET /media/:id/${which}`);
   } catch (err) {
     return fail(res, err, { context: `GET /media/:id/${which}` });
   }
+}
+
+/**
+ * Stream one row's bytes, once the caller has been authorized by whatever
+ * means its route uses. Shared by the owner-token routes above and the public
+ * share route below, so both get the same confinement, caching and
+ * mid-body-abort handling.
+ *
+ * Throws on an archive-escape refusal; the caller's catch logs it.
+ *
+ * `cacheControl` overrides the header below for a caller whose authorization
+ * can end before the bytes change — see the share route.
+ */
+async function sendMediaBytes(res, row, which, context, { cacheControl } = {}) {
+  // Resolved before the thumb/poster branch, and outside its try: an
+  // archive-escape refusal here is the single most important thing these
+  // routes can produce and must reach the outer catch and get logged, not
+  // be caught below and mistaken for "this video has no poster".
+  const archivePath = resolveArchivePath(row.rel_path);
+
+  let absPath;
+  // A rendition that appears later must not be masked by a year-old cached
+  // original, so `immutable` is only claimed once there is nothing left to
+  // supersede. See the Cache-Control below.
+  let servingOriginalForPlayback = false;
+  if (which === 'play') {
+    const chosen = await playableFor(archivePath, row.kind);
+    absPath = chosen.absPath;
+    servingOriginalForPlayback = !chosen.rendition && row.kind === 'VIDEO';
+  } else if (which === 'thumb') {
+    try {
+      absPath = await ensureThumb({
+        absPath: archivePath, kind: row.kind, sha256: row.sha256, relPath: row.rel_path,
+      });
+    } catch (err) {
+      if (err.code !== 'NO_POSTER' && err.code !== 'NO_SOURCE') throw err;
+      // A video whose poster extraction failed in the browser has none, and
+      // nothing here can decode one. NO_SOURCE is the same answer for a
+      // photo whose original is gone, which is what the file route already
+      // says about the same row. 404 so the grid draws its placeholder
+      // rather than retrying an image that is never coming.
+      return res.status(404).end();
+    }
+  } else {
+    absPath = archivePath;
+  }
+
+  // `send` defaults to dotfiles: 'ignore' and 404s a path with a dot segment
+  // regardless of permissions. A poster lives at <show>/.posters/<name>.webp,
+  // so without this every video thumb was a silent placeholder even with the
+  // poster sitting right there on disk. It applies to the file route too,
+  // and for a reason that has nothing to do with posters: with no `root`
+  // option set, send tests every segment of the ABSOLUTE path, so a single
+  // dot directory anywhere in MEDIA_ROOT turns every download in the archive
+  // into a 404. resolveArchivePath has already confined the path by this
+  // point, so send's dotfile heuristic guards nothing here and only breaks
+  // deploys whose mount happens to sit under a hidden directory.
+  const sendOpts = { dotfiles: 'allow' };
+
+  // Immutable: these paths are keyed by content that never changes in place.
+  // A replaced photo is a new row with a new id.
+  //
+  // Except one case. /play serves the original until the rendition service
+  // reaches that clip, and then serves the rendition from the same URL — so
+  // telling the browser to keep the original for a year would hide the
+  // rendition behind a cache entry nothing can invalidate. Five minutes keeps
+  // a scroll cheap and lets the better copy arrive.
+  res.set('Cache-Control', cacheControl ?? (servingOriginalForPlayback
+    ? 'private, max-age=300'
+    : 'private, max-age=31536000, immutable'));
+  return res.sendFile(absPath, sendOpts, (err) => {
+    if (!err) return;
+    // send's ENOENT carries a 404 status, and the global handler keeps an
+    // error's message for any status under 500 even in production — which
+    // would otherwise hand an absolute archive path on this container back
+    // to the browser. The caller is already authorized for this file, so this
+    // is closing a filesystem-layout leak, not a data leak.
+    if (err.code === 'ENOENT') {
+      // The immutable Cache-Control below is set before sendFile runs, so
+      // without this it is still on the response when this 404 goes out —
+      // and the browser is told to remember the miss for a year. The
+      // condition that produces it is usually transient (a share that
+      // dropped, or mounted late after a restart), so every tile looked at
+      // during the outage stayed broken long after it ended.
+      res.removeHeader('Cache-Control');
+      return res.status(404).end();
+    }
+    // Passing a callback here opts out of Express's own next(err) handling
+    // (see res.sendFile's source: "if (done) return done(err)"), so
+    // anything past ENOENT has to be logged and answered here, not thrown —
+    // this runs after the surrounding try/catch has already returned.
+    //
+    // Opting out also loses the res.headersSent guard that Express's default
+    // error handler applies, and that is the half that bites. Every error
+    // send reports mid-body arrives after the headers: the common one is a
+    // client that closed the tab or seeked in a video, which send reports as
+    // "Request aborted". Calling fail() there tried to write a second
+    // response, threw ERR_HTTP_HEADERS_SENT from inside send's own callback
+    // where nothing catches it, and index.js answers uncaughtException with
+    // process.exit(1) — so one viewer scrubbing a video took the whole API
+    // down with it, on a feature whose stated premise is a flaky home
+    // connection. Once the response is committed the only honest move is to
+    // log it and drop the socket.
+    if (res.headersSent) {
+      console.error(`[${new Date().toISOString()}] ${context} aborted mid-body`, err);
+      return res.destroy();
+    }
+    return fail(res, err, { context });
+  });
 }
 
 router.get('/media/:id/file', (req, res) => serveMedia(req, res, 'file'));
@@ -1215,5 +1305,45 @@ router.get('/media/:id/file', (req, res) => serveMedia(req, res, 'file'));
 // until then. Separate from /file so a download always gets the master.
 router.get('/media/:id/play', (req, res) => serveMedia(req, res, 'play'));
 router.get('/media/:id/thumb', (req, res) => serveMedia(req, res, 'thumb'));
+
+/**
+ * A share link, opened by someone with no account.
+ *
+ * Unknown, revoked and expired all answer 404, never 403 — the calendar feed's
+ * rule, for the same reason: a different answer would confirm the token
+ * exists.
+ *
+ * Always the /play copy, for either kind: for a photograph that is the
+ * original, and for a video it is the web rendition when there is one. The
+ * link has to just work when a browser is pointed straight at it, and a 4K
+ * HEVC master does not.
+ *
+ * no-store, not the byte routes' year-long immutable: the link is meant to
+ * stop working, and a cached copy would keep opening in the recipient's
+ * browser after it had been revoked.
+ */
+const shareLimiter = rateLimiter({
+  message: 'Too many requests for this link, please try again later.',
+  windowMs: 60 * 60 * 1000,
+  max: 300,
+});
+
+async function servePublicShare(req, res) {
+  try {
+    const link = await prisma.mediaShareLink.findUnique({ where: { token: req.params.token } });
+    if (!isActiveShareLink(link)) return res.status(404).end();
+
+    const row = await prisma.concertMedia.findUnique({ where: { id: link.media_id } });
+    if (!row) return res.status(404).end();
+
+    return await sendMediaBytes(res, row, 'play', 'GET /media/share/:token', {
+      cacheControl: 'private, no-store',
+    });
+  } catch (err) {
+    return fail(res, err, { context: 'GET /media/share/:token' });
+  }
+}
+
+router.get('/media/share/:token', shareLimiter, servePublicShare);
 
 module.exports = router;

@@ -260,10 +260,38 @@ model ConcertMedia {
 
   attendance_rel ConcertAttendance @relation("AttendanceMedia", fields: [attendance_id], references: [id], onDelete: Restrict)
   band_rel       Band?             @relation("BandMedia", fields: [band_id], references: [id], onDelete: SetNull)
+  share_links    MediaShareLink[]  @relation("MediaShareLinks")
 
   @@unique([attendance_id, filename])
   @@index([band_id])
   @@index([attendance_id])
+}
+
+/// A time-boxed public URL to one photo or video, for someone with no account.
+///
+/// Not folded into ConcertMedia as a nullable share-token column the way
+/// Wishlist.calendar_token is: a wishlist ever needs at most one token for its
+/// whole lifetime, but a media item can be shared, revoked and shared again
+/// repeatedly, and each minting deserves its own row rather than overwriting
+/// the last one's history. "One active link at a time" is therefore enforced
+/// by the route (look up the newest row that is neither revoked nor expired),
+/// not by a DB constraint on media_id.
+///
+/// onDelete: Cascade, unlike the Restrict on ConcertMedia.attendance_rel above
+/// — a share link is disposable metadata, not irreplaceable content, so
+/// deleting the media row should take its links with it.
+model MediaShareLink {
+  id         Int       @id @default(autoincrement())
+  media_id   Int
+  token      String    @unique
+  created_at DateTime  @default(now())
+  expires_at DateTime
+  revoked_at DateTime?
+
+  media_rel ConcertMedia @relation("MediaShareLinks", fields: [media_id], references: [id], onDelete: Cascade)
+
+  @@index([media_id])
+  @@index([expires_at])
 }
 
 // A user's watch for new concerts, in one of two shapes (the route keeps them apart):
