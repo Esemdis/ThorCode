@@ -5,15 +5,26 @@
 # decoder lives where the decoding happens instead of being paid for on every
 # deploy of everything else.
 #
-# jellyfin/ffmpeg would bring hardware encoders (QSV/VAAPI) already wired up; the
-# Debian package is the portable default and libx264 works everywhere. Swap the
-# base and set RENDITION_VCODEC if this box has a GPU to spend.
+# Debian's ffmpeg is built against the nv-codec headers and loads the driver's
+# libraries at runtime, so this same image does NVENC as well — given
+# `--gpus all` and the Unraid Nvidia driver plugin. It is worth confirming rather
+# than assuming, because a missing encoder shows up as every clip failing:
+#
+#   docker run --rm --gpus all thorcode-rendition \
+#     sh -c 'ffmpeg -hide_banner -encoders | grep nvenc && ffmpeg -hide_banner -hwaccels'
+#
+# If h264_nvenc or cuda is absent, base this on an image whose ffmpeg has them
+# (jellyfin/ffmpeg is the usual one) and keep the rest of this file as it is.
 FROM node:24-slim
 
+# ffprobe comes with it and is not optional: the service asks each clip what it
+# is before encoding, because colour decides the whole filter chain and the
+# sidecar does not record it.
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
-    && ffmpeg -version | head -1
+    && ffmpeg -version | head -1 \
+    && ffprobe -version | head -1
 
 WORKDIR /app
 

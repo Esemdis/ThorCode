@@ -278,7 +278,7 @@ PXL_20260624_200428424.mp4   1048 MB   193.2s   43.4 Mbit/s   hvc1
 28 videos  ·  9.26 GB for the gig
 ```
 
-Three separate problems in those numbers:
+Four separate problems in those numbers:
 
 - **HEVC** (`hvc1`). Firefox decodes none of it; Chrome only with hardware
   support. This is what the lightbox's "most likely HEVC" message is about.
@@ -286,6 +286,11 @@ Three separate problems in those numbers:
 - The phone writes the `moov` index at the **end** of the file, so a player has
   to range-request the tail of a gigabyte before it can start. That was most of
   what made playback feel slow to *begin*.
+- **HDR.** The `colr` box reports primaries 9, transfer 18 — HLG in BT.2020. A
+  plain re-encode to SDR H.264 without tone mapping comes out washed-out and
+  grey, which would look like a worse rendition for reasons nothing to do with
+  resolution. It is also what makes the GPU path work at all: `h264_nvenc`
+  refuses 10-bit input, and the tone-map chain is what ends in 8-bit.
 
 None of that is fixable in the API. `services/rendition/` is a separate
 container — ffmpeg plus a walker over the share — that writes
@@ -297,10 +302,19 @@ Doppler token, no network. It finds its work by reading the sidecars and records
 a finished rendition by the file existing, so it cannot corrupt the index and
 holds no secret to leak. Kill it mid-encode and the `.part` file goes with it.
 
-`services/rendition/README.md` has the settings and the `docker run`. The one
-worth knowing: `RENDITION_VCODEC=h264_nvenc` (or `_qsv`, `_vaapi`) turns hours
-of 4K into minutes if this box has a GPU to spend, and needs a base image with
-that encoder built in.
+`services/rendition/README.md` has the settings and the `docker run`. Measured
+on an RTX 3080 against a 4K60 HLG source:
+
+| Pipeline | Speed |
+|---|---|
+| `h264_nvenc`, scaling on the card then tone-mapping at 1080p | **0.872x** |
+| `libx264`, everything on the CPU | 0.225x |
+| `h264_nvenc`, but tone-mapping at 4K before scaling | 0.201x |
+
+So `RENDITION_VCODEC=h264_nvenc` plus `--gpus all` is worth about four times the
+throughput — that 30-minute night in roughly 34 minutes rather than a little over
+two hours. The third row is the warning: the tone map costs by the pixel, and
+doing it before the scale throws the GPU's advantage away entirely.
 
 Two routes serve a video, and the difference matters:
 
