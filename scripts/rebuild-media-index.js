@@ -32,7 +32,7 @@ async function main() {
     return;
   }
 
-  // wishlist_rel.user_id is what routes/data/media.js authorises byte access
+  // wishlist_rel.user_id is what routes/data/media/bytes.js authorises byte access
   // from, so the map used to place a restore's rows has to be built from the
   // same field — a map keyed on concert_id alone can only pick one of several
   // attendees at random.
