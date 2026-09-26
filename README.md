@@ -46,7 +46,14 @@ npm install
 cp .env_example .env
 # Fill in your tokens, API keys, database URL, etc.
 
-3. Start the server
+3. Create the database
+
+npx prisma migrate deploy
+# Builds an empty database from the migrations; on an existing one it applies
+# only what is new. `npm run test:integration` runs the Postgres-backed tests
+# when INTEGRATION_DATABASE_URL points at such a database.
+
+4. Start the server
 
 npm run dev
 

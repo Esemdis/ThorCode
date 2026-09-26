@@ -6,6 +6,7 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:integration": "vitest run test/integration",
     "postinstall": "prisma generate",
     "local": "doppler run -- npm start",
     "start": "nodemon index.js",
