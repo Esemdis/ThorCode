@@ -27,6 +27,10 @@ router.patch('/weather/bulk', auth, roleCheck(['SYSTEM']), async (req, res, next
     if (!Array.isArray(updates) || updates.length === 0) {
       return res.status(400).json({ error: 'Body must be a non-empty array' });
     }
+    // A string id reached Prisma and failed the request partway through.
+    if (!updates.every((item) => item && (item.id == null || Number.isInteger(item.id)))) {
+      return res.status(400).json({ error: 'Every entry needs an integer id' });
+    }
 
     let updated = 0;
     for (const item of updates) {

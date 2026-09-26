@@ -7,6 +7,9 @@ function rateLimiter({
   windowMs = 1 * 60 * 1000, // 1 minute
   max = 10,                 // requests per window, per IP
   keyGenerator,
+  // Count only requests that failed. For a login that is the whole point: the
+  // budget is for wrong guesses, and a household signing in is not guessing.
+  skipSuccessfulRequests = false,
 } = {}) {
   return rateLimit({
     windowMs,
@@ -16,6 +19,7 @@ function rateLimiter({
     // can back off deliberately instead of discovering the ceiling by hitting
     // it. Additive: the legacy X-RateLimit-* headers still go out too.
     standardHeaders: true,
+    skipSuccessfulRequests,
     ...(keyGenerator && { keyGenerator }),
   });
 }

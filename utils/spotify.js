@@ -169,13 +169,18 @@ async function getAppToken() {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * A GET that waits out a brief 429 rather than failing the whole playlist for
- * it, and gives up rather than sleeping through a long one.
+ * A request that waits out a brief 429 rather than failing the whole playlist
+ * for it, and gives up rather than sleeping through a long one.
+ *
+ * Writes go through it too. Adding a festival's worth of tracks is several
+ * POSTs in a row, and the searches before them have usually just spent the
+ * rate budget — a 429 on the second chunk used to fail the build and leave a
+ * half-filled playlist in the user's account.
  */
-async function getWithBackoff(url, config, attempts = 3) {
+async function requestWithBackoff(config, attempts = 3) {
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      return await axios.get(url, config);
+      return await axios.request(config);
     } catch (error) {
       const status = error.response?.status;
       if (status === 401) throw new SpotifyAuthError('Spotify rejected the token');
@@ -190,6 +195,23 @@ async function getWithBackoff(url, config, attempts = 3) {
     }
   }
   throw new Error('unreachable');
+}
+
+const getWithBackoff = (url, config, attempts) => requestWithBackoff({ ...config, method: 'get', url }, attempts);
+
+/**
+ * Run a read with the app token, fetching a fresh one once if Spotify refuses
+ * the memoised token. A token revoked or rotated before its stated expiry was
+ * otherwise reused until then, failing every artist lookup meanwhile.
+ */
+async function withAppToken(run) {
+  try {
+    return await run(await getAppToken());
+  } catch (error) {
+    if (!(error instanceof SpotifyAuthError) || !appToken) throw error;
+    appToken = null;
+    return run(await getAppToken());
+  }
 }
 
 /**
@@ -224,11 +246,10 @@ async function findTrack(accessToken, track) {
  *   them to use.
  */
 async function searchArtists(query) {
-  const token = await getAppToken();
-  const { data } = await getWithBackoff(`${API_URL}/search`, {
+  const { data } = await withAppToken((token) => getWithBackoff(`${API_URL}/search`, {
     headers: { Authorization: `Bearer ${token}` },
     params: { q: query, type: 'artist', limit: SEARCH_LIMIT },
-  });
+  }));
   return data?.artists?.items ?? [];
 }
 
@@ -248,12 +269,13 @@ async function searchArtists(query) {
  */
 async function getArtists(ids) {
   if (!ids?.length) return [];
-  const token = await getAppToken();
-  const headers = { Authorization: `Bearer ${token}` };
 
   const results = await Promise.all((ids).map(async (id) => {
     try {
-      const { data } = await getWithBackoff(`${API_URL}/artists/${id}`, { headers });
+      const { data } = await withAppToken((token) => getWithBackoff(
+        `${API_URL}/artists/${encodeURIComponent(id)}`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      ));
       return data;
     } catch (error) {
       console.error(`[spotify] Artist ${id} lookup failed:`, error.response?.status ?? error.message);
@@ -278,11 +300,12 @@ async function createPlaylist(accessToken, { name, description }) {
 async function addItems(accessToken, playlistId, uris) {
   const headers = { Authorization: `Bearer ${accessToken}` };
   for (let i = 0; i < uris.length; i += ADD_CHUNK) {
-    await axios.post(
-      `${API_URL}/playlists/${playlistId}/items`,
-      { uris: uris.slice(i, i + ADD_CHUNK) },
-      { headers },
-    );
+    await requestWithBackoff({
+      method: 'post',
+      url: `${API_URL}/playlists/${encodeURIComponent(playlistId)}/items`,
+      data: { uris: uris.slice(i, i + ADD_CHUNK) },
+      headers,
+    });
   }
 }
 

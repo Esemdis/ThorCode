@@ -43,7 +43,9 @@ async function main() {
     attendances.map((a) => [attendanceKey(a.wishlist_rel.user_id, a.concert_id), a.id]),
   );
 
-  const plan = planRebuild({ sidecars, filesOnDisk, attendanceIds });
+  const bandIds = new Set((await prisma.band.findMany({ select: { id: true } })).map((b) => b.id));
+
+  const plan = planRebuild({ sidecars, filesOnDisk, attendanceIds, bandIds });
 
   console.log(`${sidecars.length} shows, ${plan.upserts.length} files to index`);
   for (const dir of noSidecar) console.warn(`show with files but no sidecar: ${dir}`);
@@ -59,6 +61,7 @@ async function main() {
     ['sidecar whose concert has no attendance', plan.unknownConcerts],
     ['folder owner disagrees with its own sidecar', plan.mismatchedUsers],
     ['sidecar entry this build cannot read', plan.malformedEntries],
+    ['tagged with a band that no longer exists (indexed untagged)', plan.unknownBands],
   ]) {
     for (const item of list) console.warn(`${label}: ${JSON.stringify(item)}`);
   }
@@ -74,7 +77,7 @@ async function main() {
   const drift = noSidecar.length + unreadableSidecars.length
     + plan.missingFiles.length + plan.unlistedFiles.length
     + plan.unknownConcerts.length + plan.mismatchedUsers.length + plan.malformedEntries.length
-    + rejected.length;
+    + plan.unknownBands.length + rejected.length;
   process.exitCode = drift > 0 ? 1 : 0;
 }
 

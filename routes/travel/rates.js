@@ -47,18 +47,26 @@ router.get("/", async (req, res) => {
     return res.status(400).json({ error: "Expected from=XXX[,YYY] and to=XXX currency codes" });
   }
 
+  // Asking for the rate of a currency against itself is ordinary — a trip in
+  // SEK with a SEK expense — and it is 1. Sent upstream it came back missing,
+  // or failed the whole lookup when it was the only one asked for.
+  const foreign = symbols.filter((c) => c !== base);
+  const same = symbols.length !== foreign.length ? { [base]: 1 } : {};
+
   const today = new Date().toISOString().slice(0, 10);
   const date = req.query.date;
   const datePart = date && /^\d{4}-\d{2}-\d{2}$/.test(date) && date < today ? date : "latest";
 
-  const cacheKey = `travel:rates:${datePart}:${base}:${symbols.join(",")}`;
+  if (foreign.length === 0) return res.json({ data: { rates: same, date: datePart === "latest" ? today : datePart } });
+
+  const cacheKey = `travel:rates:${datePart}:${base}:${foreign.join(",")}`;
   const cached = await readCache(cacheKey);
-  if (cached) return res.json({ data: cached });
+  if (cached) return res.json({ data: { ...cached, rates: { ...cached.rates, ...same } } });
 
   try {
     // Ask for 1 <base> in each foreign currency, then invert to get foreign → base
     const r = await axios.get(`https://api.frankfurter.dev/v1/${datePart}`, {
-      params: { base, symbols: symbols.join(",") },
+      params: { base, symbols: foreign.join(",") },
       timeout: 10000,
     });
     const rates = {};
@@ -66,7 +74,7 @@ router.get("/", async (req, res) => {
       if (v > 0) rates[c] = Math.round((1 / v) * 10000) / 10000;
     }
     const payload = { rates, date: r.data?.date || null };
-    res.json({ data: payload });
+    res.json({ data: { ...payload, rates: { ...rates, ...same } } });
 
     // After responding — the client has what it needs, and a slow or missing
     // cache shouldn't be able to delay the answer. setCache swallows its own

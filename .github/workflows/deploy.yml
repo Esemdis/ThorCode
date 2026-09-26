@@ -31,8 +31,48 @@ jobs:
       - run: npm ci
       - run: npx vitest run
 
+  # The same code against a real Postgres, built from nothing by the
+  # migrations. Three things only this job can see:
+  #
+  # - The migrations build the database. They could not until the baseline:
+  #   `migrate deploy` on an empty database failed at the fourth.
+  # - What they build is exactly schema.prisma. A column added to the schema
+  #   without a migration is how the deployed image and the database drifted
+  #   apart before — see the Dockerfile — and it fails here instead of at boot.
+  # - The regressions a faked Prisma passes: selects that omit fields, a
+  #   transaction Postgres aborts, a filter that is silently not there.
+  database:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: thor
+          POSTGRES_PASSWORD: thor
+          POSTGRES_DB: thorcode
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U thor -d thorcode"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://thor:thor@localhost:5432/thorcode
+      INTEGRATION_DATABASE_URL: postgresql://thor:thor@localhost:5432/thorcode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx prisma migrate deploy
+      - run: npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code
+      - run: npx vitest run test/integration
+
   build:
-    needs: test
+    needs: [test, database]
     runs-on: ubuntu-latest
     permissions:
       contents: read

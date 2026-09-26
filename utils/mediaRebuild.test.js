@@ -13,6 +13,37 @@ const entry = (name, over = {}) => ({
   sha256: `h-${name}`, bytes: 10, width: 1, height: 1, duration_ms: null, taken_at: null, ...over,
 });
 
+describe('planRebuild with a band that no longer exists', () => {
+  it('indexes the file untagged and says so, rather than letting Postgres refuse the row', () => {
+    // Deleting a band SET NULLs its media rows but cannot reach the sidecars,
+    // so the next rebuild handed Postgres a band_id with nothing behind it and
+    // the foreign key refused every file tagged with it.
+    const plan = planRebuild({
+      sidecars: [sidecar('user-1/show', 8417, [
+        entry('a.mp4', { kind: 'VIDEO', song: 'Stranded' }),
+        entry('b.jpg', { band_id: 3, band_name: 'Alcest' }),
+      ])],
+      filesOnDisk: { 'user-1/show': ['a.mp4', 'b.jpg'] },
+      attendanceIds: new Map([[attendanceKey('user-1', 8417), 1]]),
+      bandIds: new Set([3]),
+    });
+
+    expect(plan.upserts.find((u) => u.filename === 'a.mp4')).toMatchObject({ band_id: null, song: null });
+    expect(plan.upserts.find((u) => u.filename === 'b.jpg')).toMatchObject({ band_id: 3 });
+    expect(plan.unknownBands).toEqual([{ relDir: 'user-1/show', name: 'a.mp4', band_id: 92, band_name: 'Gojira' }]);
+  });
+
+  it('trusts the tag when no band list is given, as before', () => {
+    const plan = planRebuild({
+      sidecars: [sidecar('user-1/show', 8417, [entry('a.jpg')])],
+      filesOnDisk: { 'user-1/show': ['a.jpg'] },
+      attendanceIds: new Map([[attendanceKey('user-1', 8417), 1]]),
+    });
+    expect(plan.upserts[0].band_id).toBe(92);
+    expect(plan.unknownBands).toEqual([]);
+  });
+});
+
 describe('planRebuild', () => {
   it('plans one upsert per sidecar entry that has a file behind it', () => {
     const plan = planRebuild({

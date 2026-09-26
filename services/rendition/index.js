@@ -222,7 +222,16 @@ async function encode(show, job) {
     return { ok: false, stale: true };
   }
 
-  await rename(part, target);
+  // Outside ffmpeg's try above on purpose — a failure here is not ffmpeg's
+  // verdict on the clip, so it must not leave a .failed marker. But it has to
+  // be caught: thrown, it ended the pass, and with it the whole service.
+  try {
+    await rename(part, target);
+  } catch (err) {
+    await unlink(part).catch(() => {});
+    warn(`${show.label}/${job.name}: could not move the finished rendition into place, will retry — ${err.message}`);
+    return { ok: false };
+  }
   const after = await stat(target).then((st) => st.size, () => null);
   const seconds = Math.round((Date.now() - started) / 1000);
   log(`${show.label}/${job.name}: ${mb(job.bytes)} → ${mb(after)} in ${seconds}s`);
@@ -291,7 +300,14 @@ async function cutClip(job) {
     return;
   }
 
-  await rename(files.part, files.output);
+  try {
+    await rename(files.part, files.output);
+  } catch (err) {
+    // Not ffmpeg's failure, so no marker: the next check cuts it again.
+    await unlink(files.part).catch(() => {});
+    warn(`clip ${job.id}: could not move the finished cut into place, will retry — ${err.message}`);
+    return;
+  }
   // Revoked mid-cut. The API deleted the request, and could not delete an
   // output that did not exist yet, so it falls to this side.
   if (!(await exists(files.request))) {
@@ -412,14 +428,25 @@ async function main() {
   // A loop rather than a cron entry: an encode runs for minutes and overlapping
   // runs would fight for the same CPU and the same .part path. Everything runs
   // on this one loop, so there is only ever one encode or cut at a time.
+  //
+  // A pass or a clip check that throws is logged and tried again, never let
+  // out. The share dropping mid-walk is an ordinary morning on this box, and
+  // one failure used to end the process — with nothing to restart it, every
+  // rendition stopped and every shared moment sat on "preparing" for good.
   while (!stopping) {
-    await pass();
+    try {
+      await pass();
+    } catch (err) {
+      if (!stopping) warn(`pass failed, trying again in ${INTERVAL}s — ${err.message}`);
+    }
     // Between archive walks only the clip queue is watched, and often: a clip
     // has someone waiting on it and a rendition does not.
     const due = Date.now() + INTERVAL * 1000;
     while (!stopping && Date.now() < due) {
       await sleep(Math.min(CLIP_POLL * 1000, due - Date.now()));
-      if (!stopping) await clips();
+      if (!stopping) {
+        await clips().catch((err) => warn(`clip check failed, trying again in ${CLIP_POLL}s — ${err.message}`));
+      }
     }
   }
   log('stopped');

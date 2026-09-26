@@ -51,6 +51,16 @@ async function backfillSourceUrls({ limit = 100, staleDays = STALE_DAYS_DEFAULT 
       // Not stamped: MusicBrainz being unreachable is not evidence the URLs
       // don't exist, so this band is picked up again on the next sweep.
       console.error(`[bandSourceUrlBackfill] Failed for "${band.name}":`, e.message);
+      // Except an answer that will not change by asking again tomorrow: a 404
+      // for an MBID MusicBrainz does not have, a 400 for one that is not an
+      // MBID at all. Unstamped, the band came back first in every sweep and
+      // failed the same way forever. Stamped, it is re-asked after staleDays
+      // like any other band with nothing found.
+      const status = e.response?.status;
+      if (status >= 400 && status < 500 && status !== 429) {
+        await prisma.band.update({ where: { id: band.id }, data: { source_urls_checked_at: new Date() } })
+          .catch((stampError) => console.error(`[bandSourceUrlBackfill] Could not stamp "${band.name}":`, stampError.message));
+      }
     }
     await sleep(SEARCH_SPACING_MS);
   }

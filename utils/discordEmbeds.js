@@ -33,6 +33,10 @@ function buildDiscordEmbeds({ title, concerts }) {
 
     let lineup = [];
     try { lineup = JSON.parse(concert.metadata || "[]"); } catch {}
+    // metadata is free-form text. Anything but a list of names threw on
+    // .join, outside the post's own try, and took the whole notify run down.
+    if (!Array.isArray(lineup)) lineup = [];
+    lineup = lineup.filter((n) => typeof n === "string");
     const fullLineup = lineup.length ? `\n${lineup.join(", ")}` : "";
     const maxLineup = FIELD_VALUE_LIMIT - venueStr.length - 1;
     const lineupStr = fullLineup.length > maxLineup ? fullLineup.slice(0, maxLineup) + "…" : fullLineup;

@@ -9,14 +9,19 @@
 const express = require("express");
 const router = express.Router();
 const { validationResult, param, body } = require("express-validator");
-const axios = require("axios");
 const { handleError } = require("../helpers");
+// Called through the module rather than destructured, so a test can stand in
+// for band creation (which reaches MusicBrainz) on the router's own copy.
+const bandCreate = require("../../../utils/bandCreate");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
 const { rateLimit } = require("./shared");
 
 const VALID_TIERS = ["LOVE", "LIKE", "FOLLOW"];
+
+const BULK_CHUNK = 25;
+const chunks = (list, size) => Array.from({ length: Math.ceil(list.length / size) }, (_, i) => list.slice(i * size, (i + 1) * size));
 
 // Discord's own webhook host+path shape — anything else lets a user aim the
 // server's outbound POST at an internal address (SSRF) via /wishlists/notify.
@@ -37,25 +42,29 @@ router.patch(
   "/weather/bulk",
   [auth, roleCheck(["SYSTEM"])],
   async (req, res) => {
+    const updates = req.body; // [{ id, weather }]
+    if (!Array.isArray(updates) || updates.length === 0) {
+      return res.status(400).json({ error: "Expected non-empty array of { id, weather }" });
+    }
+    if (!updates.every((u) => u && Number.isInteger(u.id))) {
+      return res.status(400).json({ error: "Every entry needs an integer id" });
+    }
+
+    // In chunks, each its own transaction — the shape trips' weather bulk
+    // already has. One unbounded Promise.all opened an update per concert at
+    // once against a pool of thirty, and a single missing id failed the
+    // request after an arbitrary subset had been written.
+    let updated = 0;
     try {
-      const updates = req.body; // [{ id, weather }]
-      if (!Array.isArray(updates) || updates.length === 0) {
-        return res.status(400).json({ error: "Expected non-empty array of { id, weather }" });
+      for (const chunk of chunks(updates, BULK_CHUNK)) {
+        await prisma.$transaction(chunk.map(({ id, weather }) =>
+          prisma.concert.updateMany({ where: { id }, data: { weather } })));
+        updated += chunk.length;
       }
-
-      await Promise.all(
-        updates.map(({ id, weather }) =>
-          prisma.concert.update({
-            where: { id },
-            data: { weather },
-          })
-        )
-      );
-
-      res.json({ ok: true, updated: updates.length });
+      res.json({ ok: true, updated });
     } catch (error) {
-      console.error("Error storing concert weather:", error);
-      return res.status(500).json({ error: "Internal server error" });
+      console.error(`Error storing concert weather after ${updated}/${updates.length}:`, error);
+      return res.status(500).json({ error: "Internal server error", updated });
     }
   }
 );
@@ -196,8 +205,8 @@ router.post(
     auth,
     roleCheck(["ADMIN", "USER"]),
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
-    body("name").optional().isString().notEmpty().withMessage("Band name must be a non-empty string"),
-    body("ticketmaster_id").optional().isString().notEmpty().withMessage("Ticketmaster ID must be a non-empty string"),
+    body("name").optional().isString().trim().notEmpty().withMessage("Band name must be a non-empty string"),
+    body("ticketmaster_id").optional().isString().trim().notEmpty().withMessage("Ticketmaster ID must be a non-empty string"),
     body("tier").optional().isIn(VALID_TIERS).withMessage("tier must be LOVE, LIKE, or FOLLOW"),
   ],
   rateLimit,
@@ -222,57 +231,30 @@ router.post(
       if (!existingWishlist) return res.status(404).json(handleError("wishlist", 404));
       if (existingWishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
 
+      // Created in-process. This used to be the API calling itself over HTTP
+      // at CALLBACK_URL with the caller's token, so a stale CALLBACK_URL broke
+      // adding bands outright, and every user's adds arrived from the server's
+      // own address and shared one rate-limit bucket on POST /bands.
       let band;
       let lookupWarning = null;
-      try {
-        const bandPayload = {};
-        if (ticketmasterId) bandPayload.ticketmaster_id = ticketmasterId;
-        if (bandName) bandPayload.name = bandName;
-        const createResponse = await axios.post(
-          `${process.env.CALLBACK_URL}/data/concerts/bands`,
-          bandPayload,
-          { headers: { Authorization: req.headers.authorization } },
-        );
-        band = createResponse.data.band;
-        // Carried through rather than dropped: the band-create route reports
-        // here when MusicBrainz could not be reached, and this endpoint is the
-        // one the app actually calls — swallowing it is what made "added, but
-        // with no links and so no concerts" look identical to a clean add.
-        lookupWarning = createResponse.data.warning ?? null;
-        if (!band) {
-          console.error("Band creation response missing band object:", createResponse.data);
-          return res.status(500).json({ error: "Band creation failed: no band returned" });
+      if (bandName) {
+        try {
+          const created = await bandCreate.createBand(bandName);
+          band = created.band;
+          // Carried through rather than dropped: MusicBrainz being unreachable
+          // is what made "added, but with no links and so no concerts" look
+          // identical to a clean add.
+          lookupWarning = created.warning;
+        } catch (error) {
+          if (!(error instanceof bandCreate.BandExistsError)) throw error;
+          band = error.band;
         }
-      } catch (error) {
-        if (error.response?.status === 409) {
-          band = ticketmasterId
-            ? await prisma.band.findUnique({ where: { ticketmaster_id: ticketmasterId } })
-            : await prisma.band.findUnique({ where: { name: bandName } });
-          if (!band) {
-            console.error("Band reported as existing but not found in DB");
-            return res.status(500).json({ error: "Band lookup failed after conflict" });
-          }
-        } else {
-          // Creating the band is this API calling itself over HTTP at
-          // CALLBACK_URL, so a stale value there answers with a stranger's 404
-          // — which was reported as "Band not found with that Ticketmaster ID"
-          // and sent people hunting for a band that was on Ticketmaster all
-          // along. Only a JSON { error } body is our own answer and safe to
-          // forward; anything else is the call itself failing, not a verdict on
-          // the band.
-          const upstreamMessage = error.response?.data?.error;
-          const status = error.response?.status;
-          console.error(
-            `Error creating band via ${process.env.CALLBACK_URL}/data/concerts/bands:`,
-            status ?? error.code ?? error.message,
-            upstreamMessage ?? "",
-          );
-          if (status && upstreamMessage) {
-            return res.status(status).json({ error: upstreamMessage });
-          }
-          return res.status(502).json({
-            error: "Could not reach the band service — check CALLBACK_URL.",
-          });
+      } else {
+        // A Ticketmaster id alone can only name a band that is already here:
+        // bands are created by name, from MusicBrainz, and that source is gone.
+        band = await prisma.band.findUnique({ where: { ticketmaster_id: ticketmasterId } });
+        if (!band) {
+          return res.status(404).json({ error: "No band with that Ticketmaster ID — add it by name instead" });
         }
       }
 
@@ -282,9 +264,16 @@ router.post(
 
       if (existingReference) return res.status(409).json(handleError("wishlist", 409));
 
-      await prisma.wishlistBandReference.create({
-        data: { wishlist_id: wishlistId, band_id: band.id, tier },
-      });
+      try {
+        await prisma.wishlistBandReference.create({
+          data: { wishlist_id: wishlistId, band_id: band.id, tier },
+        });
+      } catch (error) {
+        // The same add twice at once (a double tap) passes the check above
+        // together; the second one is this conflict, not a 500.
+        if (error.code === "P2002") return res.status(409).json(handleError("wishlist", 409));
+        throw error;
+      }
 
 
       res.status(201).json({
@@ -349,13 +338,34 @@ router.delete(
   rateLimit,
   async (req, res) => {
     try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ error: "Validation failed", details: errors.array() });
+      }
+
       const wishlistId = parseInt(req.params.id, 10);
       const existingWishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
       if (!existingWishlist) return res.status(404).json(handleError("wishlist", 404));
       if (existingWishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
 
-      await prisma.wishlistBandReference.deleteMany({ where: { wishlist_id: wishlistId } });
-      await prisma.wishlist.delete({ where: { id: wishlistId } });
+      // Shows attended hang off the wishlist, and photographs off them — the
+      // key restricts on purpose (see utils/mediaDetach.js). Refused in words
+      // rather than by the foreign key as a 500.
+      const attended = await prisma.concertAttendance.count({ where: { wishlist_id: wishlistId } });
+      if (attended > 0) {
+        return res.status(409).json({
+          error: `This wishlist has ${attended} attended show${attended === 1 ? "" : "s"}. Remove them first.`,
+        });
+      }
+
+      // The activity log restricts too, and nothing else ever deletes it, so
+      // any wishlist that had seen a new concert could not be deleted at all.
+      // One transaction, so a failure leaves the wishlist as it was.
+      await prisma.$transaction([
+        prisma.activityLog.deleteMany({ where: { wishlist_id: wishlistId } }),
+        prisma.wishlistBandReference.deleteMany({ where: { wishlist_id: wishlistId } }),
+        prisma.wishlist.delete({ where: { id: wishlistId } }),
+      ]);
 
       res.json({ message: "Wishlist deleted successfully." });
     } catch (error) {

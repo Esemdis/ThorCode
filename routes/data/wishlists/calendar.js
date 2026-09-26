@@ -18,6 +18,10 @@ const { generateCalendarToken, feedUrl, isPubliclyReachable } = require("../../.
 // Minted lazily rather than for every wishlist: most users never subscribe, and
 // a row full of unused credentials is a liability rather than a feature.
 const ownedWishlist = async (req, res) => {
+  if (!validationResult(req).isEmpty()) {
+    res.status(400).json({ error: "Wishlist ID must be an integer" });
+    return null;
+  }
   const wishlistId = parseInt(req.params.id, 10);
   const wishlist = await prisma.wishlist.findUnique({
     where: { id: wishlistId },
@@ -64,12 +68,21 @@ router.post(
       // Create-or-return, so the client never has to ask whether one exists
       // first. Rotating is an explicit DELETE then POST — issuing a new token
       // here would silently break every calendar already subscribed.
-      const token = wishlist.calendar_token ?? generateCalendarToken();
-      if (!wishlist.calendar_token) {
-        await prisma.wishlist.update({
-          where: { id: wishlist.id },
-          data: { calendar_token: token, calendar_token_at: new Date() },
+      //
+      // Written only where there is still no token, and read back after: two
+      // requests at once (two devices opening the dialog) each minted one and
+      // the second overwrote the first, so whoever subscribed with the first
+      // URL had a feed that never loaded.
+      let token = wishlist.calendar_token;
+      if (!token) {
+        await prisma.wishlist.updateMany({
+          where: { id: wishlist.id, calendar_token: null },
+          data: { calendar_token: generateCalendarToken(), calendar_token_at: new Date() },
         });
+        ({ calendar_token: token } = await prisma.wishlist.findUnique({
+          where: { id: wishlist.id },
+          select: { calendar_token: true },
+        }));
       }
       return res.json({
         token,

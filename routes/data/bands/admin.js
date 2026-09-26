@@ -171,23 +171,30 @@ router.get('/bands/setlist-pending', auth, roleCheck(['SYSTEM']), async (req, re
 
 // PATCH /bands/setlists/bulk — store fetched setlists for multiple bands (SYSTEM only)
 router.patch('/bands/setlists/bulk', auth, roleCheck(['SYSTEM']), async (req, res) => {
+  const updates = req.body; // [{ id, setlist }]
+  if (!Array.isArray(updates) || updates.length === 0) {
+    return res.status(400).json({ error: 'Expected non-empty array of { id, setlist }' });
+  }
+  if (!updates.every((u) => u && Number.isInteger(u.id))) {
+    return res.status(400).json({ error: 'Every entry needs an integer id' });
+  }
+
+  // Chunked transactions rather than one Promise.all over the whole payload,
+  // for the reasons PATCH /weather/bulk gives. updateMany, so a band deleted
+  // since the sync read it is skipped rather than failing everything after it.
+  const now = new Date();
+  let updated = 0;
   try {
-    const updates = req.body; // [{ id, setlist }]
-    if (!Array.isArray(updates) || updates.length === 0) {
-      return res.status(400).json({ error: 'Expected non-empty array of { id, setlist }' });
+    for (let i = 0; i < updates.length; i += 25) {
+      const chunk = updates.slice(i, i + 25);
+      await prisma.$transaction(chunk.map(({ id, setlist }) =>
+        prisma.band.updateMany({ where: { id }, data: { setlist, setlist_updated_at: now } })));
+      updated += chunk.length;
     }
-    await Promise.all(
-      updates.map(({ id, setlist }) =>
-        prisma.band.update({
-          where: { id },
-          data: { setlist, setlist_updated_at: new Date() },
-        })
-      )
-    );
-    res.json({ ok: true, updated: updates.length });
+    res.json({ ok: true, updated });
   } catch (error) {
-    console.error('[setlists/bulk] Error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error(`[setlists/bulk] Error after ${updated}/${updates.length}:`, error);
+    res.status(500).json({ error: 'Internal server error', updated });
   }
 });
 

@@ -53,7 +53,7 @@ function startCronJobs() {
   cron.schedule(NOTIFICATION_DIGEST_CRON, async () => {
     try {
       const result = await runNotificationDigest();
-      console.log(`[cron] Notification digest: sent to ${result.sent} user(s), ${result.concerts} new concert(s) scanned.`);
+      console.log(`[cron] Notification digest: sent to ${result.sent} user(s), ${result.failed ?? 0} failed, ${result.concerts} new concert(s) scanned.`);
     } catch (err) {
       console.error("[cron] Notification digest failed:", err);
     }

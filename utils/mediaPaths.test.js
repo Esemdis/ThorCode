@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   slugSegment, showFolderName, showFolderRelPath, uniqueFilename,
-  resolveArchivePath, thumbPath, archiveRoot, posterPath,
+  resolveArchivePath, thumbPath, archiveRoot, posterPath, safeExtension,
 } from './mediaPaths.js';
 
 beforeEach(() => { process.env.MEDIA_ROOT = '/media'; });
@@ -125,5 +125,27 @@ describe('posterPath', () => {
 
   it('refuses a poster path that climbs out of the archive', () => {
     expect(() => posterPath('../../etc/passwd')).toThrow(/outside the archive/i);
+  });
+});
+
+describe('safeExtension', () => {
+  it('keeps an ordinary extension as sent', () => {
+    expect(safeExtension('IMG_1.JPG')).toBe('.JPG');
+    expect(safeExtension('clip.mp4')).toBe('.mp4');
+  });
+
+  it('cleans what SMB would refuse or silently rename', () => {
+    // A ":" failed the write as a 500; a trailing space was dropped by SMB,
+    // leaving the file on disk under a name the index did not have.
+    expect(safeExtension('x.jp:g')).toBe('.jpg');
+    expect(safeExtension('photo.jpg ')).toBe('.jpg');
+    expect(safeExtension('a.b?c')).toBe('.bc');
+  });
+
+  it('gives no extension rather than a broken one', () => {
+    expect(safeExtension('noext')).toBe('');
+    expect(safeExtension('clip.mp4.')).toBe('');
+    expect(safeExtension('.jpg')).toBe('');
+    expect(safeExtension('a.:?')).toBe('');
   });
 });

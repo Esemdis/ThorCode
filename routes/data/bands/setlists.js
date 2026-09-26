@@ -9,16 +9,19 @@
 const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
-const axios = require('axios');
 const { cleanLineupNames, cleanLineupJson, canonicalBandName } = require('../../../utils/lineupNames');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
 const { setCache, getCache } = require('../../../utils/cache');
+// Called through the module rather than destructured, so a test can stand in
+// for setlist.fm on the router's own copy of it.
+const setlistFm = require('../../../utils/setlistFm');
 
 // POST /:concertId/enrich-lineup — match scraped artist names to known bands, link missing ones
 router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), async (req, res) => {
   const concertId = parseInt(req.params.concertId, 10);
+  if (Number.isNaN(concertId)) return res.status(400).json({ error: 'Invalid concert id' });
   const { band_names, event_name } = req.body;
 
   if ((!Array.isArray(band_names) || band_names.length === 0) && !event_name) {
@@ -101,7 +104,7 @@ router.get('/bands/:bandId/setlist-history', auth, async (req, res) => {
     const bandId = parseInt(req.params.bandId, 10);
     if (Number.isNaN(bandId)) return res.status(400).json({ error: 'Invalid band id' });
 
-    const page = parseInt(req.query.page, 10) || 1;
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
 
     const cacheKey = `sfm:setlists:${bandId}:p${page}`;
     const cached = await getCache(cacheKey);
@@ -113,45 +116,13 @@ router.get('/bands/:bandId/setlist-history', auth, async (req, res) => {
     });
 
     if (!band) return res.status(404).json({ error: 'Band not found' });
-    if (!band.MBID) return res.status(404).json({ error: 'Band has no MBID' });
+    // An MBID goes into setlist.fm's URL path, and one can arrive through
+    // quick-add from a client, so anything not shaped like one is treated as
+    // having none.
+    if (!setlistFm.isMbid(band.MBID)) return res.status(404).json({ error: 'Band has no MBID' });
 
-    const sfmRes = await axios.get(
-      `https://api.setlist.fm/rest/1.0/artist/${band.MBID}/setlists`,
-      {
-        headers: { 'x-api-key': process.env.SETLIST_API_KEY, Accept: 'application/json' },
-        params: { p: page },
-        timeout: 15000,
-      },
-    );
-
-    const raw = sfmRes.data;
-    const setlists = (raw.setlist || []).map((s) => {
-      const venue = s.venue || {};
-      const city = venue.city || {};
-      const sets = (s.sets?.set || []);
-      const songs = sets.flatMap((set) =>
-        (set.song || []).map((song) => ({
-          name: song.name || '',
-          cover: song.cover?.name ?? null,
-          tape: song.tape ?? false,
-        })),
-      );
-      return {
-        setlistfm_id: s.id,
-        date: s.eventDate,
-        venue: venue.name ?? null,
-        city: city.name ?? null,
-        country: city.country?.code ?? null,
-        // setlist.fm gives the venue's city coordinates and this used to drop
-        // them, so every show imported from history landed with no position and
-        // was filtered straight off the map.
-        latitude: city.coords?.lat ?? null,
-        longitude: city.coords?.long ?? null,
-        tour: s.tour?.name ?? null,
-        songs,
-        url: s.url ?? null,
-      };
-    });
+    const raw = await setlistFm.fetchArtistSetlists(band.MBID, page);
+    const setlists = (raw.setlist || []).map(setlistFm.setlistSummary);
 
     const payload = {
       setlists,
@@ -173,26 +144,12 @@ router.get('/setlist-lookup', auth, async (req, res) => {
   try {
     const { id } = req.query;
     if (!id) return res.status(400).json({ error: 'Missing id parameter' });
+    // Pasted straight into setlist.fm's URL path before, with the server's API
+    // key attached — so "../artist/…" or a "?" reached whichever endpoint the
+    // caller liked.
+    if (!setlistFm.isSetlistId(id)) return res.status(400).json({ error: 'That is not a setlist.fm id' });
 
-    const sfmRes = await axios.get(
-      `https://api.setlist.fm/rest/1.0/setlist/${id}`,
-      {
-        headers: { 'x-api-key': process.env.SETLIST_API_KEY, Accept: 'application/json' },
-        timeout: 15000,
-      },
-    );
-
-    const s = sfmRes.data;
-    const venue = s.venue || {};
-    const city = venue.city || {};
-    const sets = (s.sets?.set || []);
-    const songs = sets.flatMap((set) =>
-      (set.song || []).map((song) => ({
-        name: song.name || '',
-        cover: song.cover?.name ?? null,
-        tape: song.tape ?? false,
-      })),
-    );
+    const s = await setlistFm.fetchSetlistById(id);
 
     const artistMbid = s.artist?.mbid ?? null;
     const artistName = s.artist?.name ?? null;
@@ -207,16 +164,7 @@ router.get('/setlist-lookup', auth, async (req, res) => {
     }
 
     return res.json({
-      setlistfm_id: s.id,
-      date: s.eventDate,
-      venue: venue.name ?? null,
-      city: city.name ?? null,
-      country: city.country?.code ?? null,
-      latitude: city.coords?.lat ?? null,
-      longitude: city.coords?.long ?? null,
-      tour: s.tour?.name ?? null,
-      songs,
-      url: s.url ?? null,
+      ...setlistFm.setlistSummary(s),
       artist: { name: artistName, mbid: artistMbid },
       band: band ?? null,
     });

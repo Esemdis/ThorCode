@@ -846,8 +846,7 @@ describe('POST /attendances/:id/lineup', () => {
       create: vi.fn(async ({ data }) => ({ id: 501, ...data })),
     };
     prisma.concertBandReference = {
-      findUnique: vi.fn(async () => null),
-      create: vi.fn(async ({ data }) => ({ id: 900, ...data })),
+      createMany: vi.fn(async ({ data }) => ({ count: data.length })),
     };
     prisma.concertAttendance.findUnique = vi.fn(async () => withLineup(['Gojira', 'Svalbard']));
   });
@@ -862,9 +861,12 @@ describe('POST /attendances/:id/lineup', () => {
     expect(prisma.band.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ name: 'Svalbard' }),
     }));
-    expect(prisma.concertBandReference.create).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ concert: 8417, band: 501 }),
-    }));
+    // skipDuplicates: two presses of the same pill both found no link, and
+    // the second create failed on the unique key as a 500.
+    expect(prisma.concertBandReference.createMany).toHaveBeenCalledWith({
+      data: [{ concert: 8417, band: 501 }],
+      skipDuplicates: true,
+    });
     expect(res.body.data).toMatchObject({ band: { id: 501, name: 'Svalbard' }, created: true });
   });
 
@@ -907,7 +909,7 @@ describe('POST /attendances/:id/lineup', () => {
       .send({ name: 'Gojira' })
       .expect(201);
 
-    expect(prisma.concertBandReference.create).not.toHaveBeenCalled();
+    expect(prisma.concertBandReference.createMany).not.toHaveBeenCalled();
     expect(res.body.data).toMatchObject({ band: { id: 92 }, created: false });
   });
 

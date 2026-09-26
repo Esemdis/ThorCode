@@ -8,7 +8,9 @@
  */
 
 const prisma = require('../prisma/client');
-const { searchArtists, getArtists } = require('./spotify');
+// Through the module rather than destructured, so a test can stand in for
+// Spotify on this file's own copy of it.
+const spotify = require('./spotify');
 const { getCache, setCache } = require('./cache');
 const { exactArtistMatch, resolveArtistImages } = require('./bandImages');
 
@@ -35,7 +37,7 @@ async function matchBandToSpotify(band) {
 
   let match = null;
   try {
-    match = exactArtistMatch(await searchArtists(band.name), band.name);
+    match = exactArtistMatch(await spotify.searchArtists(band.name), band.name);
   } catch (error) {
     // Not stamped: Spotify being down is not evidence the band is unmatchable,
     // so the next run should try again.
@@ -51,8 +53,17 @@ async function matchBandToSpotify(band) {
   } catch (error) {
     // A unique index guards spotify_id, so two bands whose names both resolve
     // to one artist collide here. The row is worth keeping either way, so the
-    // clash costs the photo and nothing else.
+    // clash costs the photo and nothing else — but the search still happened,
+    // and has to be recorded as having happened. The update failing whole left
+    // spotify_checked_at empty, so the band was searched again on every visit
+    // to its page and by every nightly run, for good.
     console.error(`[spotify] Could not store artist id for "${band.name}":`, error.message);
+    if (error.code === 'P2002') {
+      await prisma.band.update({
+        where: { id: band.id },
+        data: { spotify_checked_at: new Date() },
+      }).catch((e) => console.error(`[spotify] Could not mark "${band.name}" as searched:`, e.message));
+    }
   }
 
   return match?.id ?? null;
@@ -107,7 +118,7 @@ async function warmBandImages() {
 
   const images = await resolveArtistImages(
     bands.map((b) => b.spotify_id),
-    { getCache, setCache, getArtists },
+    { getCache, setCache, getArtists: spotify.getArtists },
   );
 
   return { bands: bands.length, withPhoto: Object.keys(images).length };

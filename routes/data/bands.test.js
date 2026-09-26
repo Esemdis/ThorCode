@@ -3,20 +3,29 @@ import request from 'supertest';
 import { mkdtemp, mkdir, writeFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createRequire } from 'node:module';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 
 // Seeded before the router is imported — see installFakePrisma for why this
 // is a global rather than a vi.mock.
 const prisma = installFakePrisma({
   band: { findMany: vi.fn(), findUnique: vi.fn(), findFirst: vi.fn(), create: vi.fn(), update: vi.fn(), delete: vi.fn() },
-  concert: { findMany: vi.fn(), count: vi.fn(), findUnique: vi.fn(), delete: vi.fn(), deleteMany: vi.fn() },
+  concert: {
+    findMany: vi.fn(), count: vi.fn(), findUnique: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(),
+    create: vi.fn(), update: vi.fn(), updateMany: vi.fn(),
+  },
+  city: { upsert: vi.fn() },
   wishlist: { findUnique: vi.fn(), findFirst: vi.fn() },
   wishlistBandReference: { findMany: vi.fn(), create: vi.fn(), findUnique: vi.fn(), deleteMany: vi.fn() },
-  concertBandReference: { findMany: vi.fn(), deleteMany: vi.fn() },
+  concertBandReference: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn() },
   concertAttendance: { findMany: vi.fn(), deleteMany: vi.fn() },
   concertMedia: { findMany: vi.fn(), deleteMany: vi.fn() },
   // /bands answers with raw SQL rather than the query builder.
   $queryRaw: vi.fn(async () => []),
+  // /bulk's per-concert savepoints. Recorded as the statement text, so a test
+  // can read the order they ran in.
+  $executeRaw: vi.fn(async (strings) => { prisma.statements.push(strings.join('?')); return 0; }),
+  statements: [],
   // The array form ($transaction([...])) resolves an already-built list of
   // query promises; the interactive form ($transaction(async tx => ...)) runs
   // its callback against the fake client itself, same as the real client runs
@@ -72,12 +81,186 @@ describe('POST /bands', () => {
     expect(prisma.band.create).not.toHaveBeenCalled();
   });
 
+  it('names the band it is stored as when MusicBrainz says the two are one artist', async () => {
+    // The router's own copy of band creation: CommonJS, loaded through Node's
+    // require, which an ESM import does not share.
+    const bandCreate = createRequire(import.meta.url)('../../utils/bandCreate.js');
+    vi.spyOn(bandCreate, 'createBand').mockRejectedValue(new bandCreate.BandExistsError({ id: 4, name: 'Architects' }));
+
+    const res = await request(app).post('/bands').set(...authHeader()).send({ name: 'Architects (UK)' });
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'Band already exists as "Architects".', band: { id: 4, name: 'Architects' } });
+  });
+
   it('trims the name before deciding whether the band already exists', async () => {
     prisma.band.findUnique.mockResolvedValue({ id: 5, name: 'Architects' });
 
     await request(app).post('/bands').set(...authHeader()).send({ name: '  Architects  ' });
 
     expect(prisma.band.findUnique).toHaveBeenCalledWith({ where: { name: 'Architects' } });
+  });
+
+  it('refuses a name that is only whitespace', async () => {
+    // notEmpty() passed "   ", the handler trimmed it to "", and a band with
+    // no name went into the table every account reads.
+    const res = await request(app).post('/bands').set(...authHeader()).send({ name: '   ' });
+
+    expect(res.status).toBe(400);
+    expect(prisma.band.findUnique).not.toHaveBeenCalled();
+    expect(prisma.band.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /bands/quick-add', () => {
+  const MBID = '65f4f0c5-ef9e-490c-aee3-909e7ae6b2ab';
+
+  beforeEach(() => {
+    prisma.band.findFirst = vi.fn(async () => null);
+    prisma.band.create = vi.fn(async ({ data }) => ({ id: 50, name: data.name }));
+    prisma.concert.findMany.mockResolvedValue([]);
+  });
+
+  it('uses the band already stored under that name when its MBID is not on file', async () => {
+    // Looked up by MBID alone, this missed, and creating the band again hit
+    // the unique name as a 500.
+    prisma.band.findFirst = vi.fn(async ({ where }) => (where.name === 'Gojira' ? { id: 92, name: 'Gojira' } : null));
+
+    const res = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'Gojira', mbid: MBID });
+
+    expect(res.status).toBe(201);
+    expect(res.body.band).toEqual({ id: 92, name: 'Gojira' });
+    expect(prisma.band.create).not.toHaveBeenCalled();
+  });
+
+  it('takes the band someone else created a moment ago', async () => {
+    let created = false;
+    prisma.band.findFirst = vi.fn(async ({ where }) => (created && where.name === 'Gojira' ? { id: 93, name: 'Gojira' } : null));
+    prisma.band.create = vi.fn(async () => { created = true; throw Object.assign(new Error('unique'), { code: 'P2002' }); });
+
+    const res = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'Gojira' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.band.id).toBe(93);
+  });
+
+  it('refuses an MBID that is not one', async () => {
+    const res = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'Gojira', mbid: '../../x' });
+
+    expect(res.status).toBe(400);
+    expect(prisma.band.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /bands/search input', () => {
+  it('clamps a limit that is not a number instead of passing NaN to Prisma', async () => {
+    prisma.band.findMany.mockResolvedValue([]);
+
+    const res = await request(app).get('/bands/search').query({ q: 'gojira', limit: 'abc' });
+
+    expect(res.status).toBe(200);
+    expect(prisma.band.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 10 }));
+  });
+
+  it('caps a large limit', async () => {
+    prisma.band.findMany.mockResolvedValue([]);
+
+    await request(app).get('/bands/search').query({ q: 'gojira', limit: '100000' });
+
+    expect(prisma.band.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 50 }));
+  });
+
+  it('answers an empty list for a repeated q rather than throwing on it', async () => {
+    const res = await request(app).get('/bands/search?q=ab&q=cd');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+  });
+});
+
+describe('GET /setlist-lookup', () => {
+  it('refuses an id that would steer the request elsewhere on setlist.fm', async () => {
+    // The id went into the URL path unescaped, with the server's API key on
+    // the request.
+    for (const id of ['../artist/65f4f0c5-ef9e-490c-aee3-909e7ae6b2ab/setlists', '63de4613?p=2']) {
+      const res = await request(app).get('/setlist-lookup').query({ id }).set(...authHeader());
+      expect(res.status).toBe(400);
+    }
+  });
+});
+
+describe('POST /bulk', () => {
+  // Every concert runs inside one interactive transaction, and a failing
+  // statement in Postgres aborts the transaction rather than just itself. The
+  // loop caught each concert's error and carried on — so after one bad row
+  // every later statement was refused, the COMMIT silently became a ROLLBACK,
+  // and the response still said "inserted N". Reproduced against Postgres with
+  // one band listed twice on one concert: inserted 1 reported, 0 rows saved.
+  const system = { id: 'scraper', role: 'SYSTEM' };
+  const concert = (venue, bands = [{ band_id: 1 }]) => ({
+    country: 'SE', city: 'Stockholm', venue, concert_date: '2027-05-01T19:00:00Z', bands,
+  });
+
+  beforeEach(() => {
+    prisma.statements.length = 0;
+    prisma.band.findMany.mockResolvedValue([{ id: 1, name: 'Gojira' }]);
+    prisma.band.findUnique.mockImplementation(async ({ where }) => ({ id: where.id, name: `Band ${where.id}` }));
+    prisma.concert.findMany.mockResolvedValue([]);
+    prisma.city.upsert.mockResolvedValue({ id: 7 });
+    let nextId = 100;
+    prisma.concert.create.mockImplementation(async ({ data }) => ({ id: nextId++, ...data }));
+    prisma.concertBandReference.createMany.mockResolvedValue({ count: 1 });
+  });
+
+  it('gives each concert a savepoint, and rolls back only the one that failed', async () => {
+    prisma.concert.create
+      .mockImplementationOnce(async ({ data }) => ({ id: 100, ...data }))
+      .mockImplementationOnce(async () => { throw Object.assign(new Error('unique violation'), { code: 'P2002' }); })
+      .mockImplementationOnce(async ({ data }) => ({ id: 102, ...data }));
+
+    const res = await request(app)
+      .post('/bulk')
+      .set(...authHeader(system))
+      .send({ concerts: [concert('Fållan'), concert('Nalen'), concert('Kollektivet')] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.inserted).toBe(2);
+    expect(res.body.errors).toBe(1);
+    expect(res.body.details.errors).toEqual([{ index: 1, message: 'unique violation' }]);
+    expect(res.body.details.insertedConcerts.map((c) => c.venue)).toEqual(['Fållan', 'Kollektivet']);
+    expect(prisma.statements).toEqual([
+      'SAVEPOINT bulk_concert', 'RELEASE SAVEPOINT bulk_concert',
+      'SAVEPOINT bulk_concert', 'ROLLBACK TO SAVEPOINT bulk_concert', 'RELEASE SAVEPOINT bulk_concert',
+      'SAVEPOINT bulk_concert', 'RELEASE SAVEPOINT bulk_concert',
+    ]);
+  });
+
+  it('does not report a concert whose later statement failed', async () => {
+    // The concert row went in; linking its bands did not. Rolled back, so it
+    // must not be listed as inserted either.
+    prisma.concertBandReference.createMany.mockRejectedValueOnce(new Error('link failed'));
+
+    const res = await request(app)
+      .post('/bulk')
+      .set(...authHeader(system))
+      .send({ concerts: [concert('Fållan')] });
+
+    expect(res.body.inserted).toBe(0);
+    expect(res.body.details.insertedConcerts).toEqual([]);
+    expect(prisma.statements).toContain('ROLLBACK TO SAVEPOINT bulk_concert');
+  });
+
+  it('links a band listed twice once, rather than tripping the unique key', async () => {
+    const res = await request(app)
+      .post('/bulk')
+      .set(...authHeader(system))
+      .send({ concerts: [concert('Fållan', [{ band_id: 1 }, { band_id: 1 }])] });
+
+    expect(res.body.inserted).toBe(1);
+    expect(prisma.concertBandReference.createMany).toHaveBeenCalledWith({
+      data: [{ concert: 100, band: 1 }],
+      skipDuplicates: true,
+    });
   });
 });
 
@@ -399,10 +582,71 @@ describe('DELETE /bands/:bandId', () => {
     const res = await request(app).delete('/bands/9').set(...authHeader({ role: 'ADMIN' }));
 
     expect(res.status).toBe(200);
-    expect(prisma.concertMedia.findMany).not.toHaveBeenCalled();
+    // Nothing detached: media is only ever read by band here, never by the
+    // attendances a detach would move.
+    expect(prisma.concertMedia.findMany).not.toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ attendance_id: expect.anything() }),
+    }));
     expect(prisma.concertMedia.deleteMany).not.toHaveBeenCalled();
     expect(prisma.concertAttendance.deleteMany).not.toHaveBeenCalled();
     expect(prisma.concert.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('takes the band off its files, in the rows and in the sidecars', async () => {
+    // The key SET NULLs band_id on the rows but left the song, and could not
+    // reach the sidecars — so the next rebuild wrote the dead id back and had
+    // every such file refused by the foreign key.
+    const root = await mkdtemp(join(tmpdir(), 'band-untag-'));
+    process.env.MEDIA_ROOT = root;
+    const show = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    await mkdir(show, { recursive: true });
+    await writeFile(join(show, 'concert-media.json'), JSON.stringify({
+      version: 1, concert_id: 700, user_id: 'user-1', concert: {},
+      files: [
+        { name: 'a.mp4', kind: 'VIDEO', band_id: 9, band_name: 'Gojira', song: 'Stranded' },
+        { name: 'b.jpg', kind: 'PHOTO', band_id: 3, band_name: 'Alcest', song: null },
+      ],
+    }));
+
+    prisma.concert.findMany.mockResolvedValue([]);
+    prisma.concertMedia.findMany.mockResolvedValue([{ rel_path: 'user-1/2026-06-12 Oslo - Gojira/a.mp4' }]);
+    prisma.concertMedia.updateMany = vi.fn(async () => ({ count: 1 }));
+
+    const res = await request(app).delete('/bands/9').set(...authHeader({ role: 'ADMIN' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ untaggedFiles: 1, untagFailed: 0 });
+    expect(prisma.concertMedia.updateMany).toHaveBeenCalledWith({
+      where: { band_id: 9 },
+      data: { band_id: null, song: null },
+    });
+    const { readFile } = await import('node:fs/promises');
+    const sidecar = JSON.parse(await readFile(join(show, 'concert-media.json'), 'utf8'));
+    expect(sidecar.files).toEqual([
+      { name: 'a.mp4', kind: 'VIDEO', band_id: null, band_name: null, song: null },
+      { name: 'b.jpg', kind: 'PHOTO', band_id: 3, band_name: 'Alcest', song: null },
+    ]);
+  });
+});
+
+describe('band id validation on the sync routes', () => {
+  it('answers 400 for a band id that is not a number', async () => {
+    const res = await request(app).post('/bands/abc/sync-concerts').set(...authHeader({ role: 'ADMIN' }));
+
+    expect(res.status).toBe(400);
+    expect(prisma.band.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('skips a malformed entry in a reconcile rather than throwing on it', async () => {
+    prisma.concert.findMany.mockResolvedValueOnce([]);
+
+    const res = await request(app)
+      .post('/bands/5/reconcile')
+      .set(...authHeader({ role: 'SYSTEM' }))
+      .send({ upcoming: [null, 'x', { concert_date: '2030-01-01', venue: 'Debaser', city: 'Stockholm' }] });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ stale_removed: 0, resync_bands: [] });
   });
 });
 

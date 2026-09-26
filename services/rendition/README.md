@@ -65,7 +65,7 @@ frames are ever copied out of VRAM.
 To use the card:
 
 ```bash
-docker run -d --name Thorcode-Rendition --gpus all \
+docker run -d --name Thorcode-Rendition --gpus all --restart unless-stopped \
   -v /mnt/user/concert-media:/media \
   -e MEDIA_ROOT=/media \
   -e RENDITION_VCODEC=h264_nvenc \
@@ -104,7 +104,7 @@ As a container, from the repository root:
 
 ```bash
 docker build -f services/rendition/Dockerfile -t thorcode-rendition .
-docker run -d --name Thorcode-Rendition \
+docker run -d --name Thorcode-Rendition --restart unless-stopped \
   -v /mnt/user/concert-media:/media \
   -e MEDIA_ROOT=/media \
   --cpus 4 \
@@ -113,6 +113,11 @@ docker run -d --name Thorcode-Rendition \
 
 `--cpus` is worth setting. It shares the box with the API and the array, and an
 unbounded x264 run will take every core it can find.
+
+`--restart unless-stopped` is the other one. The loop survives a failed pass on
+its own, but the process still exits if the share is missing at start-up, and a
+stopped rendition service is silent: renditions stop appearing and shared
+moments wait on "preparing" with nothing in any log the app shows.
 
 ## Settings
 

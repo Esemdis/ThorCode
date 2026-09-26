@@ -1,4 +1,5 @@
 const { Resend } = require("resend");
+const { escapeHtml, safeHref } = require("./html");
 
 let resend;
 function getResend() {
@@ -16,29 +17,45 @@ function fmtDate(date) {
   });
 }
 
+// Every field here comes from a scraper — band names, venues, event links —
+// and went into the email as raw HTML: an event name with a tag in it was
+// markup in someone's inbox, and a link was whatever the page said it was.
 function buildDigestHtml(items) {
   const rows = items
     .map((c) => {
-      const title = c.bandNames.length ? c.bandNames.join(", ") : c.name || "Concert";
-      const link = c.url ? `<a href="${c.url}">${title}</a>` : title;
-      return `<li><strong>${link}</strong> — ${fmtDate(c.date)} @ ${c.venue}, ${c.city}, ${c.country}</li>`;
+      const title = escapeHtml(c.bandNames.length ? c.bandNames.join(", ") : c.name || "Concert");
+      const href = c.url ? safeHref(c.url) : null;
+      const link = href ? `<a href="${escapeHtml(href)}">${title}</a>` : title;
+      const where = [c.venue, c.city, c.country].filter(Boolean).map(escapeHtml).join(", ");
+      return `<li><strong>${link}</strong> — ${fmtDate(c.date)} @ ${where}</li>`;
     })
     .join("");
   return `<p>New concerts matching your subscriptions:</p><ul>${rows}</ul>`;
 }
 
+/**
+ * Send one user's digest. Throws when it was not sent.
+ *
+ * Resend does not throw on a failed send — it resolves `{ data: null, error }`
+ * for a bad key, an unverified sender, a rate limit or the network — and this
+ * never looked, so every failure was counted as a digest delivered.
+ */
 async function sendDigestEmail({ to, items }) {
   const subject =
     items.length === 1
       ? `New concert: ${items[0].bandNames[0] || items[0].name}`
       : `${items.length} new concerts matching your subscriptions`;
 
-  await getResend().emails.send({
+  const result = await getResend().emails.send({
     from: process.env.NOTIFICATIONS_FROM_EMAIL,
     to,
     subject,
     html: buildDigestHtml(items),
   });
+  if (result?.error) {
+    throw new Error(`Email service error: ${result.error.message ?? result.error.name ?? "unknown"}`);
+  }
+  return result;
 }
 
 /**
@@ -77,4 +94,4 @@ async function sendEmailVerificationCode({ to, code }) {
   }
 }
 
-module.exports = { sendDigestEmail, sendEmailVerificationCode };
+module.exports = { sendDigestEmail, sendEmailVerificationCode, buildDigestHtml };

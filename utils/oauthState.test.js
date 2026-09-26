@@ -28,6 +28,18 @@ describe('signOAuthState / verifyOAuthState', () => {
     expect(verifyOAuthState(session, 'spotify_oauth')).toBe(null);
   });
 
+  it('is not signed with the session secret, so it never verifies as a login', () => {
+    // It used to be, and a state handed in as a bearer token then passed
+    // verifyJWT with no id — which Prisma read as "every user's rows".
+    const state = signOAuthState({ user: 'user-1', purpose: 'spotify_oauth' });
+    expect(() => jwt.verify(state, process.env.JWT_SECRET)).toThrow();
+  });
+
+  it('rejects a state signed with the session secret itself', () => {
+    const legacy = jwt.sign({ user: 'user-1', purpose: 'spotify_oauth' }, process.env.JWT_SECRET);
+    expect(verifyOAuthState(legacy, 'spotify_oauth')).toBe(null);
+  });
+
   it('rejects a state signed with someone else\'s secret', () => {
     const forged = jwt.sign({ user: 'user-1', purpose: 'spotify_oauth' }, 'not-the-secret');
     expect(verifyOAuthState(forged, 'spotify_oauth')).toBe(null);

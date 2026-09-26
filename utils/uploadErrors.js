@@ -31,6 +31,15 @@ function uploadErrors(err, req, res, next) {
     case 'LIMIT_FILE_COUNT':
     case 'LIMIT_PART_COUNT':
       return error(res, 400, `Upload at most ${MAX_FILES_PER_REQUEST} files at once`);
+    case 'LIMIT_UNEXPECTED_FILE':
+      // What the upload route actually raises for one file too many: it caps
+      // each field with `maxCount`, and multer reports the extra file as
+      // unexpected rather than as a count. Handled only as LIMIT_FILE_COUNT,
+      // a 51st file came back as "Unexpected field".
+      if (err.field === 'files' || err.field === 'posters') {
+        return error(res, 400, `Upload at most ${MAX_FILES_PER_REQUEST} files at once`);
+      }
+      return error(res, 400, err.message);
     default:
       // multer's own wording for the rest. They describe a malformed request
       // rather than a policy, and are more use than anything paraphrased.

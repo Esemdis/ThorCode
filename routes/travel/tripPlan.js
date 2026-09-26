@@ -13,6 +13,22 @@ router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
 router.use(ownsTrip);
 
+// Every trip field buildPlanRequest reads, in one place for both solves. The
+// two routes each spelled out their own select, and both stopped at the
+// weather — so arrival and departure times, the terminals and the transfer
+// never reached the planner, and a trip landing at 14:00 was planned from
+// 09:00 on its first day.
+const PLAN_TRIP_SELECT = {
+  start_date: true,
+  end_date: true,
+  weather_data: true,
+  arrival_time: true,
+  departure_time: true,
+  arrival_place_id: true,
+  departure_place_id: true,
+  transfer_minutes: true,
+};
+
 /**
  * Whether the saved plan predates the last edit to the places it was built from.
  *
@@ -58,7 +74,7 @@ router.post("/", async (req, res) => {
     const [trip, places] = await Promise.all([
       prisma.trip.findUnique({
         where: { id: req.tripId },
-        select: { start_date: true, end_date: true, weather_data: true },
+        select: PLAN_TRIP_SELECT,
       }),
       prisma.tripPlace.findMany({
         where: { trip_id: req.tripId },
@@ -95,11 +111,12 @@ router.post("/explain/:placeId", async (req, res) => {
   // identity, so this conversion is the whole difference between an answer and
   // a confident "already in the plan" about a place that was left out.
   const placeId = Number(req.params.placeId);
+  if (!Number.isInteger(placeId)) return res.status(400).json({ error: "Invalid place id" });
   try {
     const [trip, places] = await Promise.all([
       prisma.trip.findUnique({
         where: { id: req.tripId },
-        select: { start_date: true, end_date: true, weather_data: true },
+        select: PLAN_TRIP_SELECT,
       }),
       prisma.tripPlace.findMany({
         where: { trip_id: req.tripId },
