@@ -2097,6 +2097,114 @@ describe('DELETE /media/:id', () => {
 
     expect(await readdir(join(dir, '.posters'))).not.toContain('VID_1.mp4.webp');
   });
+
+  // The two shows these tests move a file between, and the file as the index
+  // has it in either.
+  const gojira = 'user-1/2026-06-12 Oslo - Gojira';
+  const alcest = 'user-1/2026-06-13 Oslo - Alcest';
+  const photoIn = (attendanceId, folderRel) => ({
+    id: 1, attendance_id: attendanceId, filename: 'IMG_1.jpg', kind: 'PHOTO',
+    rel_path: `${folderRel}/IMG_1.jpg`,
+    attendance_rel: { wishlist_rel: { user_id: 'user-1' } },
+  });
+  const seedPhoto = async (folderRel) => {
+    const dir = join(root, 'archive', folderRel);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'IMG_1.jpg'), 'the photograph');
+    await writeFile(join(dir, 'concert-media.json'), JSON.stringify({
+      version: 1, concert_id: 1, user_id: 'user-1', concert: {}, files: [{ name: 'IMG_1.jpg', kind: 'PHOTO' }],
+    }));
+    return dir;
+  };
+  const del = () => request(app()).delete('/data/concerts/media/1').set(...authHeader({ id: 'user-1' }));
+
+  it('takes a video\'s web rendition and the rendition service\'s failure marker with it', async () => {
+    // Both live in the show folder, inside the archive that syncs offsite, and
+    // both used to stay there for good after their video was gone.
+    const dir = join(root, 'archive', gojira);
+    await mkdir(join(dir, '.web'), { recursive: true });
+    await writeFile(join(dir, 'VID_1.mp4'), 'clip');
+    await writeFile(join(dir, '.web', 'VID_1.mp4.mp4'), 'rendition');
+    await writeFile(join(dir, '.web', 'VID_1.mp4.mp4.failed'), 'an earlier attempt\n');
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      ...photoIn(1, gojira), filename: 'VID_1.mp4', kind: 'VIDEO', rel_path: `${gojira}/VID_1.mp4`,
+    }));
+    prisma.concertMedia.delete = vi.fn(async () => ({ id: 1 }));
+
+    await del().expect(200);
+
+    expect(await readdir(join(dir, '.web'))).toEqual([]);
+    expect(await readdir(dir)).not.toContain('VID_1.mp4');
+  });
+
+  it('keeps the row, and answers 500, when the file will not go', async () => {
+    // A non-empty directory where the photograph should be: unlink refuses it.
+    const dir = join(root, 'archive', gojira);
+    await mkdir(join(dir, 'IMG_1.jpg', 'inside'), { recursive: true });
+    prisma.concertMedia.findUnique = vi.fn(async () => photoIn(1, gojira));
+    prisma.concertMedia.delete = vi.fn(async () => ({ id: 1 }));
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      await del().expect(500);
+    } finally {
+      quiet.mockRestore();
+    }
+    expect(prisma.concertMedia.delete).not.toHaveBeenCalled();
+  });
+
+  it('waits on the lock of the show the file is in', async () => {
+    // The lock the upload route and PATCH take. Without it a delete could land
+    // in the middle of a tag moving this same file.
+    await seedPhoto(gojira);
+    prisma.concertMedia.findUnique = vi.fn(async () => photoIn(1, gojira));
+    prisma.concertMedia.delete = vi.fn(async () => ({ id: 1 }));
+
+    const release = await acquire('attendance:1');
+    let pending;
+    try {
+      pending = del().then((r) => r);
+      await vi.waitFor(() => expect(prisma.concertMedia.findUnique).toHaveBeenCalledTimes(1));
+      await sleep(30);
+      expect(prisma.concertMedia.findUnique).toHaveBeenCalledTimes(1);
+      expect(await readdir(join(root, 'archive', gojira))).toContain('IMG_1.jpg');
+    } finally {
+      release();
+    }
+
+    expect((await pending).status).toBe(200);
+    expect(prisma.concertMedia.delete).toHaveBeenCalled();
+  });
+
+  it('deletes the file from the show a tag moved it to while it waited', async () => {
+    // Read in one show, found under the lock to be in another. Working from
+    // the first read unlinked a path that was already empty, cleaned the old
+    // show's sidecar and deleted the row, leaving the photograph and its
+    // entry in the new show with nothing in the index pointing at either.
+    const dir = await seedPhoto(alcest);
+    const reads = [photoIn(1, gojira), photoIn(2, alcest)];
+    let n = 0;
+    prisma.concertMedia.findUnique = vi.fn(async () => reads[Math.min(n++, reads.length - 1)]);
+    prisma.concertMedia.delete = vi.fn(async () => ({ id: 1 }));
+
+    await del().expect(200);
+
+    expect(await readdir(dir)).not.toContain('IMG_1.jpg');
+    const sidecar = JSON.parse(await readFile(join(dir, 'concert-media.json'), 'utf8'));
+    expect(sidecar.files).toEqual([]);
+    expect(prisma.concertMedia.delete).toHaveBeenCalled();
+    expect(await isFree(1)).toBe(true);
+    expect(await isFree(2)).toBe(true);
+  });
+
+  it('answers 404 when the file has gone by the time the lock is held', async () => {
+    let n = 0;
+    prisma.concertMedia.findUnique = vi.fn(async () => (n++ === 0 ? photoIn(1, gojira) : null));
+    prisma.concertMedia.delete = vi.fn(async () => ({ id: 1 }));
+
+    await del().expect(404);
+    expect(prisma.concertMedia.delete).not.toHaveBeenCalled();
+  });
 });
 
 describe('GET /media/:id/file', () => {

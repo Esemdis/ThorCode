@@ -359,6 +359,12 @@ anything, `--dry-run`. A clip ffmpeg refuses gets a `.failed` file holding the
 error and is not retried until `--retry`, because otherwise every pass would
 spend itself on the same broken file and never reach the rest.
 
+Deleting a clip in the app deletes its `.web` copy and any `.failed` marker with
+it, and tagging a clip onto another stage of a festival day moves both along
+with the clip and its poster. Nothing else removes them: the service works from
+the sidecars, so it never learns that a clip is gone, and a rendition left
+behind would sit in the archive — and in Drive — with nothing pointing at it.
+
 ## Capture times, and the order a night is shown in
 
 The gallery shows a night in the order it happened, not the order it was

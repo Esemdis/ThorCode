@@ -23,7 +23,7 @@ const {
   fail, badRequest, notFound, forbidden, conflict, success,
 } = require('../../utils/apiResponse');
 const {
-  uniqueFilename, resolveArchivePath, slugSegment, posterPath,
+  uniqueFilename, resolveArchivePath, slugSegment,
 } = require('../../utils/mediaPaths');
 const { showDirForAttendance } = require('../../utils/mediaShowDir');
 const { capturedAtFor } = require('../../utils/mediaCapture');
@@ -42,6 +42,7 @@ const { billForConcert } = require('../../utils/concertBill');
 const { canonicalBandName } = require('../../utils/lineupNames');
 const { acquire } = require('../../utils/serialQueue');
 const { festivalSibling, moveFileBytes, undoRenames } = require('../../utils/mediaRehome');
+const { removeMediaFiles } = require('../../utils/mediaRemove');
 const { signMediaToken, verifyMediaToken, mediaUrls } = require('../../utils/mediaTokens');
 const {
   generateShareToken, shareExpiry, shareUrl, isActiveShareLink,
@@ -1152,47 +1153,46 @@ router.patch(
   },
 );
 
+// Who a media row belongs to, which is all the deletes need to know besides
+// the row itself.
+const withOwner = { attendance_rel: { include: { wishlist_rel: { select: { user_id: true } } } } };
+
 router.delete(
   '/media/:id',
   [auth, roleCheck(['ADMIN', 'USER']), param('id').isInt()],
   async (req, res) => {
+    let locked = null;
     try {
       const id = parseInt(req.params.id, 10);
-      const row = await prisma.concertMedia.findUnique({
-        where: { id },
-        include: { attendance_rel: { include: { wishlist_rel: { select: { user_id: true } } } } },
-      });
-      if (!row) return notFound(res, 'Media not found');
-      if (row.attendance_rel.wishlist_rel.user_id !== req.user.id) return forbidden(res, 'Forbidden');
+      const readRow = async () => {
+        const found = await prisma.concertMedia.findUnique({ where: { id }, include: withOwner });
+        return found ? [found] : [];
+      };
+      const firstRead = await readRow();
+      if (refuseRows(res, firstRead, [id], req.user.id, 'Media not found')) return undefined;
 
-      // File, then sidecar, then row. A failure partway leaves the index
-      // pointing at something that is gone, which the rebuild script reports
-      // and repairs. The reverse order leaves a file nothing knows about, which
-      // is invisible until someone happens to run a rebuild.
-      const absPath = resolveArchivePath(row.rel_path);
-      await unlink(absPath).catch((err) => {
-        // Already gone is the outcome we wanted. Anything else is not.
-        if (err.code !== 'ENOENT') throw err;
-      });
+      // The show's lock, the one the upload route and PATCH take, and the row
+      // read again under it. Without it a delete could land in the middle of a
+      // tag moving this same file: unlinking it where it had been while the
+      // move carried it, sidecar entry and all, into the next show — where it
+      // then outlived its row.
+      locked = await lockShows(firstRead, readRow, (rows) => rows.map((r) => r.attendance_id));
+      if (!locked) return conflict(res, 'That file changed while it was being deleted — try again');
+      if (refuseRows(res, locked.rows, [id], req.user.id, 'Media not found')) return undefined;
 
-      // A video's poster lives beside it in the archive rather than in the
-      // derived-thumbnail cache, because there is no ffmpeg here to make
-      // another one from the video. Left behind, it is a frame from a video
-      // that no longer exists, syncing to Drive forever with nothing to point
-      // it at.
-      if (row.kind === 'VIDEO') {
-        await unlink(posterPath(row.rel_path)).catch((err) => {
-          if (err.code !== 'ENOENT') throw err;
-        });
-      }
-
-      const absDir = path.dirname(absPath);
-      await updateSidecar(absDir, (sidecar) => (sidecar ? removeFile(sidecar, row.filename) : null));
+      // File, then sidecar, then row; see utils/mediaRemove.js for why, and
+      // for everything besides the original that a video leaves in the
+      // archive.
+      const { failed } = await removeMediaFiles(locked.rows);
+      // Logged in full already. The row stays, so a retry can finish the job.
+      if (failed.length) return fail(res, new Error(failed[0].error), { context: 'DELETE /media/:id' });
 
       await prisma.concertMedia.delete({ where: { id } });
       return success(res, 200, { deleted: true });
     } catch (err) {
       return fail(res, err, { context: 'DELETE /media/:id' });
+    } finally {
+      if (locked) locked.release();
     }
   },
 );
