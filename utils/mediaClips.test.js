@@ -3,7 +3,7 @@ import { mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  normaliseRange, isClip, parseClipRequest, planClips, prepareClip, removeClip, clipFiles,
+  normaliseRange, isClip, parseClipRequest, planClips, prepareClip, removeClip, retargetClipRequests, clipFiles,
 } from './mediaClips.js';
 
 describe('normaliseRange', () => {
@@ -197,5 +197,47 @@ describe('prepareClip and removeClip', () => {
     await writeFile(clipFiles(7, root).output, 'mp4');
     await removeClip(7, root);
     expect(await readdir(root)).toEqual([]);
+  });
+});
+
+describe('retargetClipRequests', () => {
+  let root;
+  const link = {
+    id: 7, start_ms: 2500, end_ms: 6000, expires_at: new Date('2026-09-27T00:00:00Z'),
+  };
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'clips-'));
+  });
+
+  it('points a waiting request at the file\'s new path', async () => {
+    await prepareClip(link, { rel_path: 'user-1/old-show/VID_1.mp4' }, root);
+
+    const moved = await retargetClipRequests('user-1/old-show/VID_1.mp4', 'user-1/new-show/VID_1.mp4', root);
+    expect(moved).toEqual([7]);
+
+    const written = await readFile(clipFiles(7, root).request, 'utf8');
+    expect(parseClipRequest('7.json', written).rel_path).toBe('user-1/new-show/VID_1.mp4');
+  });
+
+  it('leaves a request for a different file alone', async () => {
+    await prepareClip(link, { rel_path: 'user-1/old-show/VID_1.mp4' }, root);
+
+    const moved = await retargetClipRequests('user-1/old-show/VID_9.mp4', 'user-1/new-show/VID_9.mp4', root);
+    expect(moved).toEqual([]);
+
+    const written = await readFile(clipFiles(7, root).request, 'utf8');
+    expect(parseClipRequest('7.json', written).rel_path).toBe('user-1/old-show/VID_1.mp4');
+  });
+
+  it('does not touch a clip that is already cut or already failed', async () => {
+    await prepareClip(link, { rel_path: 'user-1/old-show/VID_1.mp4' }, root);
+    await writeFile(clipFiles(7, root).output, 'mp4');
+
+    expect(await retargetClipRequests('user-1/old-show/VID_1.mp4', 'user-1/new-show/VID_1.mp4', root)).toEqual([]);
+  });
+
+  it('is a no-op when nothing is waiting yet', async () => {
+    expect(await retargetClipRequests('user-1/old-show/VID_1.mp4', 'user-1/new-show/VID_1.mp4', root)).toEqual([]);
   });
 });

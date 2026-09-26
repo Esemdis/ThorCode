@@ -49,7 +49,7 @@ const {
 } = require('../../utils/mediaShareToken');
 const { rateLimiter } = require('../../utils/rateLimiter');
 const {
-  clipFiles, isClip, normaliseRange, prepareClip, removeClip,
+  clipFiles, isClip, normaliseRange, prepareClip, removeClip, retargetClipRequests,
 } = require('../../utils/mediaClips');
 
 const router = express.Router();
@@ -1119,6 +1119,14 @@ router.patch(
             for (const f of plan.files) {
               const renames = await moveFileBytes({ fromRelPath: f.r.rel_path, toRelPath: f.relPath, kind: f.r.kind });
               undo.push(() => undoRenames(renames));
+              // A video can carry a share link whose moment has not been cut
+              // yet — the request the rendition service is waiting on still
+              // names the folder this file just left. Left alone, the service
+              // finds nothing there and the link sits at "preparing" forever.
+              if (f.r.kind === 'VIDEO') {
+                await retargetClipRequests(f.r.rel_path, f.relPath);
+                undo.push(() => retargetClipRequests(f.relPath, f.r.rel_path));
+              }
               placed.set(f.r.id, { attendance_id: plan.homeId, rel_path: f.relPath, filename: f.filename });
             }
           }
@@ -1243,6 +1251,15 @@ router.delete(
       if (!locked) return conflict(res, 'That file changed while it was being deleted — try again');
       if (refuseRows(res, locked.rows, [id], req.user.id, 'Media not found')) return undefined;
 
+      // Read before the row goes: the cascade takes these rows with it, and a
+      // moment not yet cut would otherwise sit in cache/clips for the service
+      // to find, fail on a source that is gone, and only clear on its own
+      // expiry up to twelve hours later.
+      const clipLinks = (await prisma.mediaShareLink.findMany({
+        where: { media_id: id },
+        select: { id: true, start_ms: true, end_ms: true },
+      })).filter(isClip);
+
       // File, then sidecar, then row; see utils/mediaRemove.js for why, and
       // for everything besides the original that a video leaves in the
       // archive.
@@ -1251,6 +1268,7 @@ router.delete(
       if (failed.length) return fail(res, new Error(failed[0].error), { context: 'DELETE /media/:id' });
 
       await prisma.concertMedia.delete({ where: { id } });
+      for (const link of clipLinks) await removeClip(link.id);
       return success(res, 200, { deleted: true });
     } catch (err) {
       return fail(res, err, { context: 'DELETE /media/:id' });
@@ -1295,6 +1313,12 @@ router.delete(
       if (!locked) return conflict(res, 'Those files changed while they were being deleted — try again');
       if (refuseRows(res, locked.rows, ids, req.user.id)) return undefined;
 
+      // Read before the cascade removes these rows; see the single delete.
+      const clipLinks = await prisma.mediaShareLink.findMany({
+        where: { media_id: { in: ids } },
+        select: { id: true, media_id: true, start_ms: true, end_ms: true },
+      });
+
       // In the order they were asked for, so `deleted` and `failed` read back
       // in it too.
       const byId = new Map(locked.rows.map((r) => [r.id, r]));
@@ -1302,6 +1326,10 @@ router.delete(
       // Only the rows whose files and sidecar entries are gone. The others
       // keep describing files that are still there.
       if (removed.length) await prisma.concertMedia.deleteMany({ where: { id: { in: removed } } });
+      const removedSet = new Set(removed);
+      for (const link of clipLinks.filter((l) => removedSet.has(l.media_id) && isClip(l))) {
+        await removeClip(link.id);
+      }
       return success(res, 200, { deleted: removed, failed });
     } catch (err) {
       return fail(res, err, { context: 'DELETE /media' });
