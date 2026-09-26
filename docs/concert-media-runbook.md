@@ -121,23 +121,32 @@ rejects essentially every upload with a 413 the UI can only report as a failure.
 
 ```nginx
 location / {
-    client_max_body_size 2g;
+    client_max_body_size 2100m;
     proxy_request_buffering off;
     ...
 }
 ```
 
-Two things worth knowing about that number:
+Three things worth knowing about that number:
 
 - `client_max_body_size` applies to the **whole request**, not to each file.
-  The application caps a single file at 500 MB (`MAX_FILE_BYTES`) but puts no
-  cap on how many files one request may carry, and the whole design of the
-  tagging flow is "drop all thirty files from the gig at once". Thirty phone
-  photos is a couple of hundred megabytes; thirty clips is not. 2 GB leaves room
-  for a realistic batch without inviting an unbounded one.
+  The application caps a single file at one byte under 2 GiB (`MAX_FILE_BYTES`,
+  the most a Postgres `Int` holds) and a request at 50 files
+  (`MAX_FILES_PER_REQUEST`). The upload dialog splits a night into requests of
+  at most 50 files and 256 MB and sends anything bigger on its own, so the
+  largest request the proxy ever sees is one maximum-size clip plus its poster
+  and the multipart framing — which is why this is 2100m and not 2g: at exactly
+  2g, a clip within a few megabytes of the cap passes the dialog's own check and
+  is then refused here.
 - `proxy_request_buffering off` keeps nginx from spooling the entire batch to
   its own disk before ThorCode sees any of it. Without it a large upload is
   written twice and the client waits through both.
+- With buffering off the upload reaches Node at the phone's pace. Node ends a
+  request that has not finished arriving within five minutes by default, so
+  `index.js` raises `requestTimeout` to two hours — enough for a 2 GB clip down
+  to about 2.4 Mbit/s. nginx's `client_body_timeout` and `proxy_send_timeout`
+  run between reads rather than across the whole body, so a client that stalls,
+  rather than crawls, is still dropped after a minute.
 
 If uploads fail only for videos, or only for large batches, check this before
 anything else.

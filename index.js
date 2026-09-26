@@ -60,7 +60,7 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
-app.listen(port, async () => {
+const server = app.listen(port, async () => {
   console.log(`Example app listening on port ${port}`);
   startCronJobs();
   // Said once, at the only moment anyone is reading this log on purpose. Not
@@ -70,3 +70,13 @@ app.listen(port, async () => {
   const warning = archiveWarning(await archiveStatus());
   if (warning) console.warn(warning);
 });
+
+// Node ends any request that has not finished arriving within five minutes
+// (requestTimeout's default), and it counts a body that is still streaming in:
+// a live upload gets a 408 mid-file. The upload dialog sends a clip over 256 MB
+// on its own, and a 1 GB phone clip over a 20 Mbit/s uplink takes about seven
+// minutes, so the default refused exactly the files the archive exists for.
+// Two hours covers a 2 GB clip down to about 2.4 Mbit/s. A client that stalls
+// rather than crawls is still cut off by the reverse proxy, whose timeouts run
+// between reads (see the runbook's proxy section), not across the whole body.
+server.requestTimeout = 2 * 60 * 60 * 1000;
