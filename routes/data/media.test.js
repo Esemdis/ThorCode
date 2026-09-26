@@ -62,6 +62,7 @@ const prisma = installFakePrisma({
     findMany: vi.fn(async () => []),
     create: vi.fn(async ({ data }) => ({ id: 1, ...data })),
   },
+  mediaShareLink: { findMany: vi.fn(async () => []) },
 });
 const router = (await import('./media.js')).default ?? (await import('./media.js'));
 
@@ -81,6 +82,9 @@ beforeEach(async () => {
   prisma.concertAttendance.findMany = vi.fn(async () => []);
   prisma.concertMedia.findMany = vi.fn(async () => []);
   prisma.concertMedia.create = vi.fn(async ({ data }) => ({ id: 1, ...data }));
+  // Every listing asks which of its files are shared. None are unless a test
+  // says so; the sharing tests at the end replace the whole table.
+  prisma.mediaShareLink = { findMany: vi.fn(async () => []) };
 });
 
 const app = () => buildApp(router, '/data/concerts');
@@ -1216,6 +1220,29 @@ describe('GET /bands/:bandId/media', () => {
     expect(res.body.data).toMatchObject({ rail: [], files: [] });
     expect(res.body.data.stats.files).toBe(0);
   });
+
+  it('says until when each file is shared, from one query for the whole band', async () => {
+    const until = new Date(Date.now() + 5 * 3600e3);
+    prisma.concertAttendance.findMany = vi.fn(async () => [{ id: 1, concert_rel: {
+      id: 8417, concert_date: new Date('2026-06-12T19:00:00Z'), venue: 'Sentrum Scene', city: 'Oslo',
+      bands: [{ band_rel: { id: 92, name: 'Gojira' } }],
+    } }]);
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 5, attendance_id: 1, band_id: 92, filename: 'IMG_1.jpg', kind: 'PHOTO', sha256: 'h5' },
+      { id: 6, attendance_id: 1, band_id: 92, filename: 'IMG_2.jpg', kind: 'PHOTO', sha256: 'h6' },
+    ]);
+    prisma.mediaShareLink.findMany = vi.fn(async () => [{ media_id: 6, expires_at: until }]);
+
+    const res = await request(app())
+      .get('/data/concerts/bands/92/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    const byId = Object.fromEntries(res.body.data.files.map((f) => [f.id, f.shared_until]));
+    expect(byId).toEqual({ 5: null, 6: until.toISOString() });
+    expect(prisma.mediaShareLink.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.mediaShareLink.findMany.mock.calls[0][0].where.media_id).toEqual({ in: [5, 6] });
+  });
 });
 
 describe('GET /attendances/:id/media', () => {
@@ -1302,6 +1329,101 @@ describe('GET /attendances/:id/media', () => {
       .get('/data/concerts/attendances/1/media')
       .set(...authHeader({ id: 'someone-else' }))
       .expect(403);
+  });
+
+  it('names the show, so the upload dialog can say which stage a file goes to', async () => {
+    const res = await request(app())
+      .get('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(res.body.data.concert).toEqual({
+      id: 8417, date: '2026-06-12', venue: 'Sentrum Scene', city: 'Oslo',
+    });
+  });
+
+  it('gives a show with no confirmed date no date, rather than 1970', async () => {
+    prisma.concertAttendance.findUnique = vi.fn(async () => ({
+      ...attendanceRow,
+      concert_rel: { ...attendanceRow.concert_rel, concert_date: null },
+    }));
+
+    const res = await request(app())
+      .get('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(res.body.data.concert.date).toBeNull();
+  });
+
+  it('says until when each file is shared: its latest live link, or null', async () => {
+    // The route hands back one live link per file, but nothing in the table
+    // stops two, so the answer is the last of them to run out.
+    const soon = new Date(Date.now() + 3600e3);
+    const later = new Date(Date.now() + 11 * 3600e3);
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 1, attendance_id: 1, band_id: null, filename: 'a.jpg', kind: 'PHOTO', sha256: 'h1' },
+      { id: 2, attendance_id: 1, band_id: null, filename: 'b.jpg', kind: 'PHOTO', sha256: 'h2' },
+    ]);
+    prisma.mediaShareLink.findMany = vi.fn(async () => [
+      { media_id: 1, expires_at: soon },
+      { media_id: 1, expires_at: later },
+    ]);
+
+    const res = await request(app())
+      .get('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(res.body.data.files.map((f) => f.shared_until)).toEqual([later.toISOString(), null]);
+  });
+
+  it('asks about every file\'s links in one query, and only about live ones', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 1, attendance_id: 1, band_id: null, filename: 'a.jpg', kind: 'PHOTO', sha256: 'h1' },
+      { id: 2, attendance_id: 1, band_id: null, filename: 'b.jpg', kind: 'PHOTO', sha256: 'h2' },
+      { id: 3, attendance_id: 1, band_id: null, filename: 'c.jpg', kind: 'PHOTO', sha256: 'h3' },
+    ]);
+    const before = new Date();
+
+    await request(app())
+      .get('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(prisma.mediaShareLink.findMany).toHaveBeenCalledTimes(1);
+    const { where } = prisma.mediaShareLink.findMany.mock.calls[0][0];
+    expect(where).toMatchObject({ media_id: { in: [1, 2, 3] }, revoked_at: null });
+    expect(where.expires_at.gt.getTime()).toBeGreaterThanOrEqual(before.getTime());
+  });
+
+  it('counts only links to the whole file, not to a moment of a video', async () => {
+    // The lightbox answers shared_until by asking for the file's link again,
+    // with no range. A moment counted here would make that ask mint a
+    // whole-file link nobody meant to share.
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 1, attendance_id: 1, band_id: null, filename: 'VID_1.mp4', kind: 'VIDEO', sha256: 'h1' },
+    ]);
+
+    await request(app())
+      .get('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    const { where } = prisma.mediaShareLink.findMany.mock.calls[0][0];
+    // Exactly null, which is how normaliseRange stores the whole file; a
+    // missing key would match every link.
+    expect(where.start_ms).toBeNull();
+    expect(where.end_ms).toBeNull();
+  });
+
+  it('does not ask about links for a show with no files', async () => {
+    await request(app())
+      .get('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(prisma.mediaShareLink.findMany).not.toHaveBeenCalled();
   });
 });
 

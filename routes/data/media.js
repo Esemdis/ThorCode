@@ -240,6 +240,46 @@ async function lockShows(rows, read, showsFor) {
   return null;
 }
 
+/**
+ * When each of these files stops being shared: the latest expiry among its
+ * public links to the whole file that are neither revoked nor expired. A file
+ * with none is absent from the map.
+ *
+ * Links to a moment of a video are not counted. What the lightbox does with
+ * this is offer the file's link again, by asking POST /media/:id/share with no
+ * range — which hands back a live link to the whole file, and mints a new one
+ * when the only live links are to moments. Counted here, a video with one
+ * moment out would show as shared, and asking for "its" link would put a
+ * second, whole-file link out in the world.
+ *
+ * One query for the whole listing rather than one per file, since a festival's
+ * gallery is hundreds of tiles.
+ *
+ * @param {number[]} mediaIds
+ * @returns {Promise<Map<number, string>>} media id to an ISO timestamp
+ */
+async function sharedUntil(mediaIds) {
+  if (!mediaIds.length) return new Map();
+  const links = await prisma.mediaShareLink.findMany({
+    where: {
+      media_id: { in: mediaIds },
+      revoked_at: null,
+      expires_at: { gt: new Date() },
+      // The whole file, as normaliseRange stores it.
+      start_ms: null,
+      end_ms: null,
+    },
+    select: { media_id: true, expires_at: true },
+  });
+  const latest = new Map();
+  for (const link of links) {
+    const at = new Date(link.expires_at);
+    const known = latest.get(link.media_id);
+    if (!known || at > known) latest.set(link.media_id, at);
+  }
+  return new Map([...latest].map(([id, at]) => [id, at.toISOString()]));
+}
+
 // Admin-only. Everyone signed in can look at the archive; only an admin adds
 // to it. Enforced here and not merely by hiding the button, because the dialog
 // is a convenience and this is the lock.
@@ -662,10 +702,23 @@ router.get(
         metadata: row.concert_rel.metadata,
       });
 
+      // shared_until is when the file's public link stops working, or null
+      // when nothing of it is shared, so a tile can say so without asking.
+      const shared = await sharedUntil(rows.map((m) => m.id));
+
       return success(res, 200, {
-        files: rows.map((m) => ({ ...m, ...mint(m.id) })),
+        files: rows.map((m) => ({ ...m, ...mint(m.id), shared_until: shared.get(m.id) ?? null })),
         untagged,
         bands,
+        // Which show this is. A festival day is one show per stage, so this is
+        // what the upload dialog names the stage a file is going to by. No
+        // date rather than dateOnly's 1970 for a show that has none yet.
+        concert: {
+          id: row.concert_rel.id,
+          date: row.concert_rel.concert_date ? dateOnly(row.concert_rel.concert_date) : null,
+          venue: row.concert_rel.venue,
+          city: row.concert_rel.city,
+        },
       });
     } catch (err) {
       return fail(res, err, { context: 'GET /attendances/:attendanceId/media' });
@@ -723,6 +776,9 @@ router.get(
             where: { band_id: bandId, attendance_id: { in: attendances.map((a) => a.id) } },
           })
         : [];
+      // As on the gig view: when each file's public link stops working, if it
+      // has one. Carried on the row, which bandMediaOverview passes through.
+      const shared = await sharedUntil(media.map((m) => m.id));
 
       const payload = bandMediaOverview({
         attendances: attendances.map((a) => ({
@@ -746,7 +802,7 @@ router.get(
             })),
           },
         })),
-        media,
+        media: media.map((m) => ({ ...m, shared_until: shared.get(m.id) ?? null })),
         urlFor: urlMinter(req.user.id),
       });
 
