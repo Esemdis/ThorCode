@@ -743,7 +743,10 @@ describe('POST /wishlists/:id/bands', () => {
 
 describe('wishlist ids that are not numbers', () => {
   it('answer 400 rather than reaching Prisma as NaN', async () => {
-    for (const path of ['/wishlists/abc', '/wishlists/abc/new', '/wishlists/abc/activity', '/wishlists/abc/recent-concerts']) {
+    for (const path of [
+      '/wishlists/abc', '/wishlists/abc/new', '/wishlists/abc/activity', '/wishlists/abc/recent-concerts',
+      '/wishlists/abc/attendance', '/wishlists/abc/calendar-token',
+    ]) {
       const res = await request(app).get(path).set(...authHeader({ id: 'user-1' }));
       expect(res.status).toBe(400);
     }

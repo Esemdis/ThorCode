@@ -30,6 +30,9 @@ router.get(
   [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
   async (req, res) => {
     try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
+
       const wishlistId = parseInt(req.params.id, 10);
       const wishlist = await prisma.wishlist.findUnique({
         where: { id: wishlistId },

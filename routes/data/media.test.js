@@ -110,6 +110,25 @@ const baseJpeg = Buffer.from(
   'HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAA' +
   'AAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==', 'base64');
 
+describe('ids that are not numbers', () => {
+  // Each of these declared param(...).isInt() and never read the verdict, so
+  // "abc" reached Prisma as NaN and Postgres answered it as a 500. The fake
+  // here answers anything, which is why the assertion is that it was never
+  // asked rather than what it said.
+  it('answer 400 without reaching the database', async () => {
+    prisma.concertMedia.findUnique = vi.fn();
+    const user = authHeader({ id: 'user-1' });
+
+    await request(app()).get('/data/concerts/attendances/abc/media').set(...user).expect(400);
+    await request(app()).get('/data/concerts/bands/abc/media').set(...user).expect(400);
+    await request(app()).delete('/data/concerts/media/abc').set(...user).expect(400);
+
+    expect(prisma.concertAttendance.findUnique).not.toHaveBeenCalled();
+    expect(prisma.concertAttendance.findMany).not.toHaveBeenCalled();
+    expect(prisma.concertMedia.findUnique).not.toHaveBeenCalled();
+  });
+});
+
 describe('POST /attendances/:id/media', () => {
   it('exposes exactly the expected routes, with auth in front of every one of them', () => {
     // The handler count is part of this on purpose: dropping `auth` or

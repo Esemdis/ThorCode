@@ -657,6 +657,7 @@ router.get(
   [auth, roleCheck(['ADMIN', 'USER']), param('attendanceId').isInt()],
   async (req, res) => {
     try {
+      if (!validationResult(req).isEmpty()) return badRequest(res, 'Validation failed');
       const attendanceId = parseInt(req.params.attendanceId, 10);
       const { row, owned } = await ownAttendance(attendanceId, req.user.id);
       if (!row) return notFound(res, 'Attendance not found');
@@ -733,6 +734,7 @@ router.get(
   [auth, roleCheck(['ADMIN', 'USER']), param('bandId').isInt()],
   async (req, res) => {
     try {
+      if (!validationResult(req).isEmpty()) return badRequest(res, 'Validation failed');
       const bandId = parseInt(req.params.bandId, 10);
 
       // Scoped to the caller's own wishlist. Band rows are shared across every
@@ -1234,6 +1236,7 @@ router.delete(
   async (req, res) => {
     let locked = null;
     try {
+      if (!validationResult(req).isEmpty()) return badRequest(res, 'Validation failed');
       const id = parseInt(req.params.id, 10);
       const readRow = async () => {
         const found = await prisma.concertMedia.findUnique({ where: { id }, include: withOwner });
