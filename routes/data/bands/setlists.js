@@ -8,8 +8,8 @@
  */
 const express = require('express');
 const router = express.Router();
-const { validationResult, body } = require('express-validator');
-const { cleanLineupNames, cleanLineupJson, canonicalBandName } = require('../../../utils/lineupNames');
+const { body } = require('express-validator');
+const { cleanLineupNames, canonicalBandName } = require('../../../utils/lineupNames');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');

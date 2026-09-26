@@ -14,7 +14,7 @@
  */
 const express = require("express");
 const router = express.Router();
-const { validationResult, param, body } = require("express-validator");
+const { validationResult, body } = require("express-validator");
 const axios = require("axios");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");

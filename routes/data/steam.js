@@ -8,7 +8,7 @@ const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const STEAM_API_KEY = process.env.STEAM_API_KEY; // Set this in your .env
 const { rateLimiter } = require("../../utils/rateLimiter");
-// Defaults to 5 requests per 15 minutes per IP
+// 10 requests a minute per IP — rateLimiter's defaults.
 const rateLimit = rateLimiter({
   message: "Too many requests to the Steam data route, please try again later.",
 });

@@ -8,7 +8,7 @@
  */
 const express = require("express");
 const router = express.Router();
-const { validationResult, param, body } = require("express-validator");
+const { validationResult, param } = require("express-validator");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");

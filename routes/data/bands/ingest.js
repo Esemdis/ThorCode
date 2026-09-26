@@ -9,9 +9,8 @@
 const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
-const { checkDuplicateConcert } = require('../helpers');
-const { haversineKm, stringSimilarity, venueContains, deduplicateByCoords } = require('../../../utils/concertDedup');
-const { cleanLineupNames, cleanLineupJson, canonicalBandName } = require('../../../utils/lineupNames');
+const { checkDuplicateConcert, deduplicateByCoords } = require('../../../utils/concertDedup');
+const { cleanLineupJson, canonicalBandName } = require('../../../utils/lineupNames');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');

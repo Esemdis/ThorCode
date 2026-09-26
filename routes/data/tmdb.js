@@ -4,7 +4,7 @@ const prisma = require("../../prisma/client");
 const axios = require("axios");
 const auth = require("../../auth/verifyJWT");
 const { rateLimiter } = require("../../utils/rateLimiter");
-// Defaults to 5 requests per 15 minutes per IP
+// 10 requests a minute per IP — rateLimiter's defaults.
 const rateLimit = rateLimiter({
   message: "Too many requests to the TMDB data point, please try again later.",
 });
