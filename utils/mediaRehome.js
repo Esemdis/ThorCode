@@ -18,6 +18,7 @@
 const path = require('node:path');
 const { access, mkdir, rename } = require('node:fs/promises');
 const { resolveArchivePath, posterPath, webRenditionPath } = require('./mediaPaths');
+const { FAILED_SUFFIX } = require('./renditionPlan');
 
 const dateOnly = (d) => new Date(d).toISOString().slice(0, 10);
 const exists = (p) => access(p).then(() => true, () => false);
@@ -60,7 +61,10 @@ async function undoRenames(done) {
  * Rename one file into another show's folder, and a video's companions with
  * it. The poster matters most: nothing on this server can make another, so one
  * left behind is lost. The web rendition is only CPU to remake, but a 1 GB clip
- * is minutes of it, so it travels too. Photo thumbnails are keyed by checksum,
+ * is minutes of it, so it travels too. So does the marker the rendition
+ * service leaves beside a clip ffmpeg could not read: left behind, it marks
+ * nothing in the old show forever, and the clip in its new show is encoded,
+ * fails and is marked all over again. Photo thumbnails are keyed by checksum,
  * not path, and need nothing.
  *
  * All-or-nothing for the one file: a companion that fails to move takes the
@@ -87,6 +91,7 @@ async function moveFileBytes({ fromRelPath, toRelPath, kind }) {
       const companions = [
         [posterPath(fromRelPath), posterPath(toRelPath)],
         [webRenditionPath(from), webRenditionPath(to)],
+        [`${webRenditionPath(from)}${FAILED_SUFFIX}`, `${webRenditionPath(to)}${FAILED_SUFFIX}`],
       ];
       for (const [a, b] of companions) {
         // Checked first rather than caught, so a clip with no poster does not
