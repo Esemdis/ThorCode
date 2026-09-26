@@ -4,7 +4,7 @@ const prisma = require("../../prisma/client");
 const axios = require("axios");
 const auth = require("../../auth/verifyJWT");
 const { rateLimiter } = require("../../utils/rateLimiter");
-// Defaults to 5 requests per 15 minutes per IP
+// 10 requests a minute per IP — rateLimiter's defaults.
 const rateLimit = rateLimiter({
   message: "Too many requests to the TMDB data point, please try again later.",
 });
@@ -46,18 +46,20 @@ router.post("/me", auth, rateLimit, async (req, res) => {
         }
       );
 
+      // Checked before the map, not after it: an answer with no `results`
+      // threw inside the map and was reported as a 500.
+      if (!data.results || data.results.length === 0) {
+        return res.status(404).json({
+          error: "No rated movies found for this TMDb user.",
+        });
+      }
+
       movies = data.results.map((movie) => ({
         name: movie.original_title,
         // Use the TMDb movie ID as the unique identifier
         rating: movie.rating,
         id: movie.id,
       }));
-
-      if (!data.results || data.results.length === 0) {
-        return res.status(404).json({
-          error: "No rated movies found for this TMDb user.",
-        });
-      }
     } catch (error) {
       console.error("Error fetching users TMDB:", error);
       if (error.status === 429) {
@@ -69,10 +71,8 @@ router.post("/me", auth, rateLimit, async (req, res) => {
       return res.status(500).json({ error: "Internal server error" });
     }
 
-    const upsertedMovieIds = [];
     for (const movie of movies) {
       try {
-        console.log("Processing movie:", movie);
         // Upsert Movie
         const dbMovie = await prisma.movie.upsert({
           where: { tmdb_id: movie.id },
@@ -96,19 +96,21 @@ router.post("/me", auth, rateLimit, async (req, res) => {
             rating: movie.rating,
           },
         });
-
-        upsertedMovieIds.push(movie.id);
       } catch (error) {
         console.error("Error processing movie:", movie, error);
         continue; // Skip this movie if there's an error
       }
     }
 
-    // Optionally, remove reviews for movies not in the latest top list
+    // Reviews of movies TMDB no longer lists as rated. Matched on the movie's
+    // TMDB id: this compared TMDB ids against MovieReview.movie, which is our
+    // own Movie.id, so every sync deleted the reviews it had just written.
+    // Going by what TMDB listed, rather than by which upserts succeeded, also
+    // keeps a review whose refresh failed above.
     await prisma.movieReview.deleteMany({
       where: {
         user: userId,
-        movie: { notIn: upsertedMovieIds },
+        movie_rel: { tmdb_id: { notIn: movies.map((m) => m.id) } },
       },
     });
 

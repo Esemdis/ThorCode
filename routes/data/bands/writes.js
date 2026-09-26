@@ -11,7 +11,7 @@ const router = express.Router();
 const { validationResult, body } = require('express-validator');
 const { pythonServicePost, pythonServiceFailure } = require('../../../utils/pythonService');
 const { error: sendError } = require('../../../utils/apiResponse');
-const { haversineKm, stringSimilarity, venueContains, deduplicateByCoords } = require('../../../utils/concertDedup');
+const { haversineKm, stringSimilarity, venueContains } = require('../../../utils/concertDedup');
 const { backlinkBandToConcerts } = require('../../../utils/bandBacklink');
 // Called through the module rather than destructured, so a test can stand in
 // for band creation (which reaches MusicBrainz) on the router's own copy.
@@ -33,7 +33,7 @@ const rateLimit = rateLimiter({
 // .user_id is unique — one wishlist per account — and ids are sequential
 // autoincrement ints, so an unchecked id here let any signed-in caller count
 // up from 1 and plant a band on every account in the system. That is not only
-// an edit to someone else's list: utils/wishlists/notify.js fans a wishlist
+// an edit to someone else's list: routes/data/wishlists/notify.js fans a wishlist
 // band's new concerts out to that wishlist's Discord webhook, so the injected
 // band starts posting into a stranger's channel.
 //

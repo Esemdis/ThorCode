@@ -13,7 +13,7 @@ model User {
   password_hash              String?
   role                       Role                       @default(USER)
   created_at                 DateTime                   @default(now())
-  steam_id                   Int?                       @unique
+  steam_id                   BigInt?                    @unique
   settings                   Json?
   game_times                 GameTime[]                 @relation("UserGameTimes")
   movie_reviews              MovieReview[]              @relation("UserMovieReviews")
@@ -61,7 +61,7 @@ model MovieReview {
   id        Int    @id @default(autoincrement())
   user      String
   movie     Int
-  rating    Int
+  rating    Float
   movie_rel Movie  @relation("MovieMovieReviews", fields: [movie], references: [id])
   user_rel  User   @relation("UserMovieReviews", fields: [user], references: [id])
 

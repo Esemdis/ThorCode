@@ -6,6 +6,7 @@ const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
 const { fail } = require("../../utils/apiResponse");
+const { normaliseLoadoutInput } = require("../../utils/travel/loadoutInput");
 
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
@@ -40,19 +41,13 @@ router.get("/", async (req, res) => {
 });
 
 // POST /travel/loadouts
-router.post("/", body("name").notEmpty().trim(), async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+router.post("/", async (req, res) => {
+  const { data, error } = normaliseLoadoutInput(req.body);
+  if (error) return res.status(400).json({ error });
 
-  const { name, description, weight_budget } = req.body;
   try {
     const loadout = await prisma.loadout.create({
-      data: {
-        user_id: req.user.id,
-        name: name.trim(),
-        description: description?.trim() || null,
-        weight_budget: weight_budget != null ? parseInt(weight_budget, 10) : null,
-      },
+      data: { ...data, user_id: req.user.id },
       include: { entries: true },
     });
     res.status(201).json({ data: loadout });
@@ -66,11 +61,8 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-  const { name, description, weight_budget } = req.body;
-  const data = {};
-  if (name !== undefined) data.name = name.trim();
-  if (description !== undefined) data.description = description?.trim() || null;
-  if (weight_budget !== undefined) data.weight_budget = weight_budget != null ? parseInt(weight_budget, 10) : null;
+  const { data, error } = normaliseLoadoutInput(req.body, { partial: true });
+  if (error) return res.status(400).json({ error });
 
   try {
     const loadout = await prisma.loadout.update({

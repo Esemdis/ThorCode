@@ -10,13 +10,12 @@ const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
 const axios = require('axios');
-const { handleError, checkDuplicateConcert } = require('../helpers');
-const { cleanLineupNames, cleanLineupJson, canonicalBandName } = require('../../../utils/lineupNames');
+const { canonicalBandName } = require('../../../utils/lineupNames');
 const { searchArtists, getArtists } = require('../../../utils/spotify');
 const { getArtistInfo } = require('../../../utils/lastfm');
 const { relevantArtists } = require('../../../utils/artistSearch');
 const { resolveArtistImages } = require('../../../utils/bandImages');
-const { matchBandToSpotify, backfillSpotifyIds } = require('../../../utils/bandSpotifyMatch');
+const { matchBandToSpotify } = require('../../../utils/bandSpotifyMatch');
 const { findSourceUrls } = require('../../../utils/bandSourceUrls');
 const { detachAttendances, withDetach, sweepableConcertIds } = require('../../../utils/mediaDetach');
 const { untagBandInSidecars } = require('../../../utils/mediaUntag');
@@ -442,8 +441,9 @@ router.get('/bands/artist-search', auth, artistLookupRateLimit, async (req, res)
       artists = await searchArtists(searchTerm);
     } catch (error) {
       console.error('[spotify] Artist search failed:', error.response?.data ?? error.message);
-      const payload = handleError('wishlist', 502);
-      return res.status(502).json(payload);
+      // Said as what it is. This borrowed the wishlist's error table, which
+      // has no 502, so a Spotify outage read "An unknown error occurred."
+      return res.status(502).json({ error: 'Could not reach Spotify. Try again in a moment.' });
     }
 
     // Spotify's search recommends as much as it matches, so a query for
@@ -482,8 +482,7 @@ router.get('/bands/artist-search', auth, artistLookupRateLimit, async (req, res)
     res.json(withInfo);
   } catch (error) {
     console.error('Error in artist search:', error);
-    const payload = handleError('wishlist', 500);
-    return res.status(500).json(payload);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 

@@ -321,7 +321,7 @@ describe('adding a band to a wishlist that is not yours', () => {
   // wishlistId arrived in the request body and went straight into
   // wishlist_id. Wishlist.user_id is unique — one wishlist per account — and
   // ids are sequential autoincrement ints, so counting up from 1 planted a
-  // band on every account in the system. utils/wishlists/notify.js then fans
+  // band on every account in the system. routes/data/wishlists/notify.js then fans
   // that band's new concerts out to the victim's Discord webhook.
   beforeEach(() => {
     prisma.band.findFirst = vi.fn(async () => ({ id: 92, name: 'Gojira' }));

@@ -13,7 +13,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use("/users", require("./routes/users"));
 app.use("/data/steam", require("./routes/data/steam"));
-app.use("/data/concerts", require("./routes/data/ticketmaster"))
+app.use("/data/concerts", require("./routes/data/concerts"))
 app.use("/data/concerts", require("./routes/data/notifications"))
 app.use("/data/concerts", require("./routes/data/playlists"))
 app.use("/data/concerts", require("./routes/data/media"))

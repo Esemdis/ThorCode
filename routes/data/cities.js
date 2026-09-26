@@ -3,6 +3,7 @@ const router = express.Router();
 const prisma = require('../../prisma/client');
 const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
+const { RECORD_NOT_FOUND } = require('../../utils/apiResponse');
 
 // GET /data/cities — list all cities with concert count
 router.get('/', auth, async (req, res, next) => {
@@ -69,6 +70,9 @@ router.patch('/:id', auth, roleCheck(['ADMIN', 'SYSTEM']), async (req, res, next
 
     res.json(city);
   } catch (err) {
+    // No such city: the update's "record not found", which reached the
+    // global handler without a status and went out as a 500.
+    if (err.code === RECORD_NOT_FOUND) return res.status(404).json({ error: 'City not found' });
     next(err);
   }
 });

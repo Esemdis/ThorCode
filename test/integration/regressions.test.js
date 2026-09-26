@@ -46,6 +46,9 @@ describe.skipIf(!url)('against Postgres', () => {
 
   afterAll(async () => {
     await prisma.trip.deleteMany({ where: { user_id: { startsWith: RUN } } });
+    // Both restrict deleting their user, so they go first.
+    await prisma.gameTime.deleteMany({ where: { user: { startsWith: RUN } } });
+    await prisma.movieReview.deleteMany({ where: { user: { startsWith: RUN } } });
     await prisma.user.deleteMany({ where: { id: { startsWith: RUN } } });
     await prisma.$disconnect();
   });
@@ -138,6 +141,80 @@ describe.skipIf(!url)('against Postgres', () => {
     expect(days[0].start).toBe(14 * 60 + 45);
     expect(days[days.length - 1].end).toBe(11 * 60 - 45);
     solve.mockRestore();
+  });
+
+  it('links a real 17-digit Steam id, and to one account only', async () => {
+    // User.steam_id was an INTEGER and the route parseInt'ed the id into it.
+    // No SteamID64 fits in 32 bits, so the "already linked" lookup could never
+    // work, and nothing ever wrote the id for it to find in any case.
+    const steamId = `7656119${String(Date.now()).slice(-10)}`;
+    const appid = 900000000 + (Date.now() % 100000000);
+    const axios = require('axios');
+    const steam = vi.spyOn(axios, 'get').mockResolvedValue({
+      data: { response: { games: [{ appid, name: `${RUN} game`, playtime_forever: 600 }] } },
+    });
+    const first = await prisma.user.create({ data: { id: `${RUN}-steam-a`, email: `${RUN}-steam-a@example.test` } });
+    const second = await prisma.user.create({ data: { id: `${RUN}-steam-b`, email: `${RUN}-steam-b@example.test` } });
+
+    try {
+      const app = appWith([['/data/steam', require('../../routes/data/steam.js')]]);
+      const linked = await request(app).post(`/data/steam/${steamId}`).set('Authorization', token(first.id));
+      const taken = await request(app).post(`/data/steam/${steamId}`).set('Authorization', token(second.id));
+
+      expect(linked.status).toBe(200);
+      expect(taken.status).toBe(409);
+      const stored = (id) => prisma.user.findUnique({ where: { id }, select: { steam_id: true } });
+      expect((await stored(first.id)).steam_id).toBe(BigInt(steamId));
+      expect((await stored(second.id)).steam_id).toBeNull();
+      expect(await prisma.gameTime.count({ where: { user: second.id } })).toBe(0);
+    } finally {
+      steam.mockRestore();
+      await prisma.gameTime.deleteMany({ where: { user: { in: [first.id, second.id] } } });
+      await prisma.game.deleteMany({ where: { appid } });
+    }
+  });
+
+  it('keeps a half-star TMDB rating, and keeps it across a second sync', async () => {
+    // MovieReview.rating was an INTEGER and TMDB rates in half stars, so a 7.5
+    // failed its upsert and was skipped. The sync's delete then compared TMDB
+    // ids against our own movie ids and removed the rest.
+    const tmdbIds = [880000000 + (Date.now() % 10000000), 890000000 + (Date.now() % 10000000)];
+    const axios = require('axios');
+    const tmdb = vi.spyOn(axios, 'get').mockResolvedValue({
+      data: {
+        results: [
+          { id: tmdbIds[0], original_title: `${RUN} half`, rating: 7.5 },
+          { id: tmdbIds[1], original_title: `${RUN} whole`, rating: 9 },
+        ],
+      },
+    });
+    const viewer = await prisma.user.create({
+      data: {
+        id: `${RUN}-tmdb`, email: `${RUN}-tmdb@example.test`,
+        oauth: { create: { provider: 'tmdb', provider_user_id: '42', access_token: 'session' } },
+      },
+    });
+
+    try {
+      const app = appWith([['/data/tmdb', require('../../routes/data/tmdb.js')]]);
+      await request(app).post('/data/tmdb/me').set('Authorization', token(viewer.id)).expect(200);
+      await request(app).post('/data/tmdb/me').set('Authorization', token(viewer.id)).expect(200);
+
+      const reviews = await prisma.movieReview.findMany({
+        where: { user: viewer.id },
+        select: { rating: true, movie_rel: { select: { tmdb_id: true } } },
+        orderBy: { rating: 'asc' },
+      });
+      expect(reviews).toEqual([
+        { rating: 7.5, movie_rel: { tmdb_id: tmdbIds[0] } },
+        { rating: 9, movie_rel: { tmdb_id: tmdbIds[1] } },
+      ]);
+    } finally {
+      tmdb.mockRestore();
+      await prisma.movieReview.deleteMany({ where: { user: viewer.id } });
+      await prisma.oAuth.deleteMany({ where: { user: viewer.id } });
+      await prisma.movie.deleteMany({ where: { tmdb_id: { in: tmdbIds } } });
+    }
   });
 
   it('answers the admin user lookup', async () => {

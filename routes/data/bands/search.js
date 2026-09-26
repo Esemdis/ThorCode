@@ -9,7 +9,7 @@
 const express = require('express');
 const router = express.Router();
 const { shapeBandOverview } = require('../../../utils/bandOverview');
-const { searchArtists, getArtists } = require('../../../utils/spotify');
+const { getArtists } = require('../../../utils/spotify');
 const { resolveArtistImages } = require('../../../utils/bandImages');
 const prisma = require('../../../prisma/client');
 const { setCache, getCache } = require('../../../utils/cache');

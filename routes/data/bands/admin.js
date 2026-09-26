@@ -8,10 +8,10 @@
  */
 const express = require('express');
 const router = express.Router();
-const { validationResult, body } = require('express-validator');
+const { body } = require('express-validator');
 const { pythonServicePost, pythonServiceFailure } = require('../../../utils/pythonService');
 const { error: sendError } = require('../../../utils/apiResponse');
-const { matchBandToSpotify, backfillSpotifyIds, warmBandImages } = require('../../../utils/bandSpotifyMatch');
+const { backfillSpotifyIds, warmBandImages } = require('../../../utils/bandSpotifyMatch');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
