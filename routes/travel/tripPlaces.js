@@ -11,6 +11,7 @@ const { normalisePlaceInput } = require("../../utils/travel/placeInput");
 const { parseBulkPlaces, MAX_PLACES } = require("../../utils/travel/bulkPlaces");
 const { wikipediaLanguages } = require("../../utils/travel/language");
 const routePlanner = require("../../utils/travel/routePlanner");
+const { parseReorder } = require("../../utils/travel/reorder");
 
 // Mirrors the PlaceKind enum in schema.prisma. Prisma rejects an unknown value
 // anyway, but with a 500 rather than a sentence saying which values are allowed.
@@ -307,12 +308,12 @@ router.post("/bulk", async (req, res) => {
 // PATCH /travel/trips/:tripId/places/reorder — bulk sort_order update.
 // Declared before /:placeId so "reorder" isn't read as a place id.
 router.patch("/reorder", async (req, res) => {
-  const { places } = req.body;
-  if (!Array.isArray(places)) return res.status(400).json({ error: "places must be an array" });
+  const { entries, error } = parseReorder(req.body?.places, "places");
+  if (error) return res.status(400).json({ error });
 
   try {
     await prisma.$transaction(
-      places.map(({ id, sort_order }) =>
+      entries.map(({ id, sort_order }) =>
         prisma.tripPlace.updateMany({
           where: { id, trip_id: req.tripId },
           data: { sort_order },

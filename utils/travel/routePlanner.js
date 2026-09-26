@@ -140,7 +140,13 @@ async function describe(name, lat, lon, languages = ["en"]) {
  * later, which is the one method that always works.
  */
 async function geocode(query, near = null, context = null) {
-  assertConfigured();
+  // Not assertConfigured(): that throws, and a place is saved whether or not
+  // it could be located — an unconfigured planner used to turn every new place
+  // into a 500 instead of a place with no coordinates yet.
+  if (!baseUrl()) {
+    console.error(`[${new Date().toISOString()}] geocode "${query}" skipped: ROUTE_PLANNER_URL is not set`);
+    return null;
+  }
   try {
     const { data } = await axios.post(
       `${baseUrl()}/geocode`,

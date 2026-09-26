@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const { explain, RoutePlannerError } = require("./routePlanner");
+const { explain, geocode, RoutePlannerError } = require("./routePlanner");
 
 // Only the checks that happen before the network does. Everything else in this
 // module is an axios call, and a test that mocks axios to assert axios was
@@ -34,4 +34,19 @@ describe("guards that run before any request", () => {
       await expect(explain({}, id)).rejects.toMatchObject({ status: 400 });
     }
   );
+});
+
+describe("geocode without a planner configured", () => {
+  const saved = process.env.ROUTE_PLANNER_URL;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.ROUTE_PLANNER_URL;
+    else process.env.ROUTE_PLANNER_URL = saved;
+  });
+
+  // Saving a place never depended on the geocoder answering — except when it
+  // had no address at all, where it threw and every new place became a 500.
+  it("answers no coordinates rather than throwing", async () => {
+    delete process.env.ROUTE_PLANNER_URL;
+    await expect(geocode("Louvre")).resolves.toBe(null);
+  });
 });

@@ -268,7 +268,9 @@ function toPlace(row) {
 /**
  * Build the solve request.
  *
- * @param {object} trip   Trip row: start_date, end_date, weather_data
+ * @param {object} trip   Trip row: start_date, end_date, weather_data, and the
+ *                        arrival/departure fields (arrival_time, departure_time,
+ *                        arrival_place_id, departure_place_id, transfer_minutes)
  * @param {Array}  places TripPlace rows, hotels included
  * @param {object} options mode, max_per_day, time_limit_s, balance, transit,
  *                         day_start, day_end, meals

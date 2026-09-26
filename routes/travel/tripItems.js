@@ -7,12 +7,25 @@ const roleCheck = require("../../middlewares/roleCheck");
 const ownsTrip = require("../../middlewares/ownsTrip");
 const prisma = require("../../prisma/client");
 const { fail } = require("../../utils/apiResponse");
+const { parseReorder } = require("../../utils/travel/reorder");
 
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
 router.use(ownsTrip);
 
 const VALID_STATUSES = ["NEED_TO_BUY", "BOUGHT", "PACKED", "NOT_PACKED"];
+
+// A gear id or a sort position that is not a whole number reached Prisma as
+// NaN or a string and failed as a 500. Empty means "none" for the gear link.
+function numberProblem({ gear_item_id, sort_order }) {
+  if (gear_item_id != null && gear_item_id !== "" && !Number.isInteger(Number(gear_item_id))) {
+    return "gear_item_id must be a gear item id";
+  }
+  if (sort_order != null && !Number.isInteger(sort_order)) {
+    return "sort_order must be a whole number";
+  }
+  return null;
+}
 
 // GET /travel/trips/:tripId/items
 router.get("/", async (req, res) => {
@@ -37,6 +50,8 @@ router.post("/", body("name").notEmpty().trim(), async (req, res) => {
   if (status && !VALID_STATUSES.includes(status)) {
     return res.status(400).json({ error: "Invalid status" });
   }
+  const problem = numberProblem({ gear_item_id, sort_order });
+  if (problem) return res.status(400).json({ error: problem });
 
   try {
     // Linking to gear reads the gear row anyway — for its worn flag — so the
@@ -74,12 +89,12 @@ router.post("/", body("name").notEmpty().trim(), async (req, res) => {
 // PATCH /travel/trips/:tripId/items/reorder — bulk sort_order update.
 // Declared before /:itemId so "reorder" isn't read as an item id.
 router.patch("/reorder", async (req, res) => {
-  const { items } = req.body;
-  if (!Array.isArray(items)) return res.status(400).json({ error: "items must be an array" });
+  const { entries, error } = parseReorder(req.body?.items, "items");
+  if (error) return res.status(400).json({ error });
 
   try {
     await prisma.$transaction(
-      items.map(({ id, sort_order }) =>
+      entries.map(({ id, sort_order }) =>
         prisma.tripItem.updateMany({
           where: { id, trip_id: req.tripId },
           data: { sort_order },
@@ -101,6 +116,8 @@ router.patch("/:itemId", param("itemId").isInt(), async (req, res) => {
   if (status && !VALID_STATUSES.includes(status)) {
     return res.status(400).json({ error: "Invalid status" });
   }
+  const problem = numberProblem({ gear_item_id, sort_order });
+  if (problem) return res.status(400).json({ error: problem });
 
   const data = {};
   if (name !== undefined) data.name = name.trim();

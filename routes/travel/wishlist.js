@@ -80,40 +80,45 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const id = parseInt(req.params.id, 10);
   try {
     // Ticking "bought" moves the item into the gear closet, but only on the
-    // transition — so the previous value has to be read first. When `bought`
-    // isn't part of the update there is nothing to compare and the write scopes
-    // itself to the caller's rows instead.
-    let wasBought = null;
-    if (bought !== undefined) {
-      const existing = await prisma.travelWishlistItem.findFirst({
+    // transition. The transition is taken with a conditional write rather than
+    // read and then compared: two ticks in flight at once — a double tap, two
+    // devices — both read "not bought" and each added the item to the gear
+    // closet. The second conditional write waits on the first's row lock and
+    // then matches nothing. One transaction, so the item is never marked bought
+    // without its gear row, or the other way round.
+    const item = await prisma.$transaction(async (tx) => {
+      let becameBought = false;
+      if (bought !== undefined && Boolean(bought)) {
+        const { count } = await tx.travelWishlistItem.updateMany({
+          where: { id, user_id: req.user.id, bought: false },
+          data: { bought: true },
+        });
+        becameBought = count === 1;
+      }
+
+      const updated = await tx.travelWishlistItem.update({
         where: { id, user_id: req.user.id },
-        select: { bought: true },
+        data,
       });
-      if (!existing) return res.status(404).json({ error: "Item not found" });
-      wasBought = existing.bought;
-    }
 
-    const item = await prisma.travelWishlistItem.update({
-      where: { id, user_id: req.user.id },
-      data,
+      if (becameBought) {
+        await tx.gearItem.create({
+          data: {
+            user_id: req.user.id,
+            name: updated.name,
+            brand: updated.brand || null,
+            model: updated.model || null,
+            category: updated.category || null,
+            url: updated.url || null,
+            notes: updated.notes || null,
+            dimensions: updated.dimensions || null,
+            tags: updated.keywords || [],
+            worn: false,
+          },
+        });
+      }
+      return updated;
     });
-
-    if (Boolean(bought) && wasBought === false) {
-      await prisma.gearItem.create({
-        data: {
-          user_id: req.user.id,
-          name: item.name,
-          brand: item.brand || null,
-          model: item.model || null,
-          category: item.category || null,
-          url: item.url || null,
-          notes: item.notes || null,
-          dimensions: item.dimensions || null,
-          tags: item.keywords || [],
-          worn: false,
-        },
-      });
-    }
 
     res.json({ data: item });
   } catch (err) {

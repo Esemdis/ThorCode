@@ -171,7 +171,11 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   if (tags !== undefined) data.tags = Array.isArray(tags) ? tags.map((t) => t.trim()).filter(Boolean) : [];
   if (notes !== undefined) data.notes = notes?.trim() || null;
   if (url !== undefined) data.url = url?.trim() || null;
-  if (req.body.sort_order !== undefined) data.sort_order = parseInt(req.body.sort_order, 10);
+  if (req.body.sort_order !== undefined) {
+    const sortOrder = parseInt(req.body.sort_order, 10);
+    if (!Number.isInteger(sortOrder)) return res.status(400).json({ error: "sort_order must be a whole number" });
+    data.sort_order = sortOrder;
+  }
   if (worn !== undefined) data.worn = Boolean(worn);
   if (retail_price !== undefined) data.retail_price = retail_price != null && retail_price !== "" ? parseFloat(retail_price) : null;
   if (bought_for !== undefined) data.bought_for = bought_for != null && bought_for !== "" ? parseFloat(bought_for) : null;
@@ -190,6 +194,14 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
         data.replaced_by_id = null;
       } else {
         const replacedById = parseInt(replaced_by_id, 10);
+        if (!Number.isInteger(replacedById)) {
+          return res.status(400).json({ error: "replaced_by_id must reference your own gear item" });
+        }
+        // Replaced by itself is a loop every "what replaced this" walk follows
+        // forever.
+        if (replacedById === parseInt(req.params.id, 10)) {
+          return res.status(400).json({ error: "A gear item cannot replace itself" });
+        }
         // Must belong to the same user — otherwise this becomes a link an
         // attacker controls, and reads of their own gear leak the target's name/brand/model.
         const replacement = await prisma.gearItem.findFirst({

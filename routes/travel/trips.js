@@ -1,14 +1,14 @@
 const express = require("express");
 const router = express.Router();
-const { body, param, validationResult } = require("express-validator");
+const { param, validationResult } = require("express-validator");
 const { Prisma } = require("@prisma/client");
-const axios = require("axios");
 const { pythonServicePost, pythonServiceFailure } = require('../../utils/pythonService');
 
 const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
 const { fail, error: sendError, paginate, sendList } = require("../../utils/apiResponse");
+const { normaliseTripInput } = require("../../utils/travel/tripInput");
 
 router.use(auth);
 
@@ -139,31 +139,12 @@ router.get("/", async (req, res) => {
 });
 
 // POST /travel/trips — create trip
-router.post("/", body("name").notEmpty().trim(), async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+router.post("/", async (req, res) => {
+  const { data, error } = normaliseTripInput(req.body);
+  if (error) return res.status(400).json({ error });
 
-  const { name, destination, start_date, end_date, notes, weight_budget, money_budget, currency,
-          budget_flights, budget_hotel, budget_entertainment, budget_food, tags } = req.body;
   try {
-    const trip = await prisma.trip.create({
-      data: {
-        user_id: req.user.id,
-        name: name.trim(),
-        destination: destination?.trim() || null,
-        start_date: start_date ? new Date(start_date) : null,
-        end_date: end_date ? new Date(end_date) : null,
-        notes: notes?.trim() || null,
-        weight_budget: weight_budget != null ? parseInt(weight_budget, 10) : null,
-        money_budget: money_budget != null ? parseFloat(money_budget) : null,
-        currency: currency?.toUpperCase() || "SEK",
-        budget_flights: budget_flights != null ? parseFloat(budget_flights) : null,
-        budget_hotel: budget_hotel != null ? parseFloat(budget_hotel) : null,
-        budget_entertainment: budget_entertainment != null ? parseFloat(budget_entertainment) : null,
-        budget_food: budget_food != null ? parseFloat(budget_food) : null,
-        tags: Array.isArray(tags) ? tags.map((t) => t.trim()).filter(Boolean) : [],
-      },
-    });
+    const trip = await prisma.trip.create({ data: { ...data, user_id: req.user.id } });
     res.status(201).json({ data: trip });
   } catch (err) {
     fail(res, err, { context: "POST trip" });
@@ -204,64 +185,28 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-  const { name, destination, start_date, end_date, notes, weight_budget, money_budget, currency,
-          budget_flights, budget_hotel, budget_entertainment, budget_food, exchange_rates, tags,
-          arrival_time, departure_time, arrival_place_id, departure_place_id,
-          transfer_minutes } = req.body;
-  const data = {};
-
-  // Minutes since midnight, and a day is 1440 of them. Out of range means a
-  // client sent something other than minutes, which would silently produce an
-  // impossible day window rather than an error anybody could act on.
-  const minutes = (value) => {
-    if (value == null || value === "") return null;
-    const n = parseInt(value, 10);
-    return Number.isInteger(n) && n >= 0 && n < 1440 ? n : undefined;
-  };
-  for (const [field, value] of [["arrival_time", arrival_time], ["departure_time", departure_time]]) {
-    if (value === undefined) continue;
-    const parsed = minutes(value);
-    if (parsed === undefined) {
-      return res.status(400).json({ error: `${field} must be minutes since midnight, 0 to 1439` });
-    }
-    data[field] = parsed;
-  }
-  if (transfer_minutes !== undefined) {
-    const n = transfer_minutes == null || transfer_minutes === ""
-      ? null : parseInt(transfer_minutes, 10);
-    // A whole day of transfer is a typo, not a journey, and would eat the
-    // first and last day of the trip without saying why.
-    if (n !== null && (!Number.isInteger(n) || n < 0 || n > 720)) {
-      return res.status(400).json({ error: "transfer_minutes must be 0 to 720" });
-    }
-    data.transfer_minutes = n;
-  }
-  for (const [field, value] of [["arrival_place_id", arrival_place_id],
-                                ["departure_place_id", departure_place_id]]) {
-    if (value === undefined) continue;
-    data[field] = value == null || value === "" ? null : parseInt(value, 10);
-  }
-  if (tags !== undefined) data.tags = Array.isArray(tags) ? tags.map((t) => t.trim()).filter(Boolean) : [];
-  if (exchange_rates !== undefined) data.exchange_rates = exchange_rates ?? null;
-  if (name !== undefined) data.name = name.trim();
-  if (destination !== undefined) data.destination = destination?.trim() || null;
-  if (start_date !== undefined) data.start_date = start_date ? new Date(start_date) : null;
-  if (end_date !== undefined) data.end_date = end_date ? new Date(end_date) : null;
-  if (notes !== undefined) data.notes = notes?.trim() || null;
-  if (weight_budget !== undefined) data.weight_budget = weight_budget != null ? parseInt(weight_budget, 10) : null;
-  if (money_budget !== undefined) data.money_budget = money_budget != null ? parseFloat(money_budget) : null;
-  if (currency !== undefined) data.currency = currency.toUpperCase();
-  if (budget_flights !== undefined) data.budget_flights = budget_flights != null ? parseFloat(budget_flights) : null;
-  if (budget_hotel !== undefined) data.budget_hotel = budget_hotel != null ? parseFloat(budget_hotel) : null;
-  if (budget_entertainment !== undefined) data.budget_entertainment = budget_entertainment != null ? parseFloat(budget_entertainment) : null;
-  if (budget_food !== undefined) data.budget_food = budget_food != null ? parseFloat(budget_food) : null;
+  const { data, error } = normaliseTripInput(req.body, { partial: true, withPlaces: true });
+  if (error) return res.status(400).json({ error });
+  const tripId = parseInt(req.params.id, 10);
 
   try {
+    // A terminal has to be one of this trip's own places. The planner already
+    // ignores an id it cannot find on the trip, but storing another trip's
+    // place — someone else's, even — is a reference nothing should hold.
+    for (const field of ["arrival_place_id", "departure_place_id"]) {
+      if (data[field] == null) continue;
+      const place = await prisma.tripPlace.findFirst({
+        where: { id: data[field], trip_id: tripId, trip_rel: { user_id: req.user.id } },
+        select: { id: true },
+      });
+      if (!place) return res.status(400).json({ error: `${field} must be a place on this trip` });
+    }
+
     // user_id in the where does the authorising: a trip that isn't the caller's
     // simply doesn't match, and Prisma reports that the same way as a trip that
     // doesn't exist.
     const trip = await prisma.trip.update({
-      where: { id: parseInt(req.params.id, 10), user_id: req.user.id },
+      where: { id: tripId, user_id: req.user.id },
       data,
     });
     res.json({ data: trip });
@@ -298,35 +243,33 @@ router.post("/:id/duplicate", param("id").isInt(), async (req, res) => {
     });
     if (!source) return res.status(404).json({ error: "Trip not found" });
 
+    // One nested create, so a failure halfway cannot leave an empty "Copy of"
+    // behind — which is what a trip created first and filled in a second
+    // transaction did. The bag each item was packed in comes along too: it is
+    // the caller's own gear, the same as gear_item_id, and dropping it unpacked
+    // every bag in the copy.
     const newTrip = await prisma.trip.create({
       data: {
         user_id: req.user.id,
-        name: `Copy of ${source.name}`,
+        name: `Copy of ${source.name}`.slice(0, 200),
         destination: source.destination,
         notes: source.notes,
         tags: source.tags,
+        items: {
+          create: source.items.map((item) => ({
+            name: item.name,
+            category: item.category,
+            status: item.status,
+            note: item.note,
+            url: item.url,
+            sort_order: item.sort_order,
+            gear_item_id: item.gear_item_id,
+            bag_id: item.bag_id,
+            worn: item.worn,
+          })),
+        },
       },
     });
-
-    if (source.items.length > 0) {
-      await prisma.$transaction(
-        source.items.map((item) =>
-          prisma.tripItem.create({
-            data: {
-              trip_id: newTrip.id,
-              name: item.name,
-              category: item.category,
-              status: item.status,
-              note: item.note,
-              url: item.url,
-              sort_order: item.sort_order,
-              gear_item_id: item.gear_item_id,
-              worn: item.worn,
-            },
-          })
-        )
-      );
-    }
 
     res.status(201).json({ data: newTrip });
   } catch (err) {

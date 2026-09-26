@@ -79,3 +79,43 @@ describe('linking a trip item to a gear item that is not yours', () => {
     expect(prisma.gearItem.findFirst).not.toHaveBeenCalled();
   });
 });
+
+describe('PATCH /travel/trips/:tripId/items/reorder', () => {
+  it('answers a malformed entry with 400 rather than failing the transaction as a 500', async () => {
+    prisma.$transaction = vi.fn(async (ops) => Promise.all(ops));
+    prisma.tripItem.updateMany = vi.fn(async () => ({ count: 1 }));
+
+    const res = await request(app())
+      .patch('/travel/trips/1/items/reorder')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ items: [{ id: 1, sort_order: 0 }, { id: 'two', sort_order: 1 }] });
+
+    expect(res.status).toBe(400);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('reorders within this trip only', async () => {
+    prisma.$transaction = vi.fn(async (ops) => Promise.all(ops));
+    prisma.tripItem.updateMany = vi.fn(async () => ({ count: 1 }));
+
+    const res = await request(app())
+      .patch('/travel/trips/1/items/reorder')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ items: [{ id: '5', sort_order: 2 }] });
+
+    expect(res.status).toBe(200);
+    expect(prisma.tripItem.updateMany).toHaveBeenCalledWith({ where: { id: 5, trip_id: 1 }, data: { sort_order: 2 } });
+  });
+});
+
+describe('a gear id that is not a number', () => {
+  it('is a 400, not a Prisma error', async () => {
+    const res = await request(app())
+      .patch('/travel/trips/1/items/9')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ gear_item_id: 'abc' });
+
+    expect(res.status).toBe(400);
+    expect(prisma.gearItem.findFirst).not.toHaveBeenCalled();
+  });
+});
