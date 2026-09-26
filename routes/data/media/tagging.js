@@ -1,7 +1,9 @@
 /**
  * Tagging files: the band, the song and the caption, for a whole selection at
  * once — and moving a file to the stage its band played when its own show's
- * bill does not have them.
+ * bill does not have them. Also which files the year recap shows for a night,
+ * and the moment of a video it plays, which are tags of the same kind: typed
+ * by hand, kept in the sidecar, and lost in a rebuild if they are not.
  *
  * Split out of routes/data/media.js, which had grown to 1715 lines and
  * fourteen endpoints. media.js mounts this and its siblings in their
@@ -26,8 +28,9 @@ const {
 } = require('../../../utils/mediaSidecar');
 const { festivalSibling, moveFileBytes, undoRenames } = require('../../../utils/mediaRehome');
 const { retargetClipRequests } = require('../../../utils/mediaClips');
+const { recapMoment } = require('../../../utils/recapMoment');
 const {
-  dateOnly, headlinerOf, sidecarSeed, billCandidates, refuseRows, lockShows,
+  dateOnly, headlinerOf, INT32_MAX, sidecarSeed, billCandidates, refuseRows, lockShows,
 } = require('./shared');
 
 const router = express.Router();
@@ -41,6 +44,11 @@ router.patch(
     body('band_id').optional({ nullable: true }).isInt(),
     body('caption').optional({ nullable: true }).isString().isLength({ max: 500 }),
     body('song').optional({ nullable: true }).isString().isLength({ max: 200 }),
+    // A real boolean. isBoolean would pass "false", a string, which is truthy
+    // everywhere it is not parsed first.
+    body('picked').optional().custom((v) => typeof v === 'boolean'),
+    body('moment_start_ms').optional({ nullable: true }).isInt({ min: 0, max: INT32_MAX }).toInt(),
+    body('moment_end_ms').optional({ nullable: true }).isInt({ min: 1, max: INT32_MAX }).toInt(),
   ],
   async (req, res) => {
     // Declared out here so the finally below lets the shows go whichever way
@@ -54,6 +62,22 @@ router.patch(
       // for twice, not two files, and comparing against the raw array length
       // would read the repeat as a missing row and 404 a perfectly good id.
       const ids = [...new Set(req.body.ids.map((n) => parseInt(n, 10)))];
+
+      // Answered before anything is read, since none of it depends on a row.
+      // A moment is a stretch of one video: the same two timestamps mean
+      // nothing on the next clip along, so a selection is refused rather than
+      // given them all — though clearing is fine in bulk. And it comes as a
+      // pair: an end with no start is not a moment anybody marked.
+      const momentAsked = req.body.moment_start_ms !== undefined || req.body.moment_end_ms !== undefined;
+      const momentStart = req.body.moment_start_ms ?? null;
+      const momentEnd = req.body.moment_end_ms ?? null;
+      if (momentAsked && (momentStart == null) !== (momentEnd == null)) {
+        return badRequest(res, 'A moment needs both its start and its end');
+      }
+      if (momentStart != null && ids.length > 1) {
+        return badRequest(res, 'A moment is one video\'s — set it on one file at a time');
+      }
+
       const readRows = () => prisma.concertMedia.findMany({
         where: { id: { in: ids } },
         include: {
@@ -135,6 +159,24 @@ router.patch(
         }
       }
 
+      // Checked against the row read under the lock, for its kind and its
+      // length. One row, by the count check above.
+      let moment;
+      if (momentAsked) {
+        moment = { moment_start_ms: null, moment_end_ms: null };
+        if (momentStart != null) {
+          const [video] = rows;
+          if (video.kind !== 'VIDEO') return badRequest(res, 'Only a video has a moment to play');
+          const { range, error } = recapMoment(
+            { start_ms: momentStart, end_ms: momentEnd },
+            { durationMs: video.duration_ms },
+          );
+          if (error) return badRequest(res, error);
+          moment = { moment_start_ms: range.start_ms, moment_end_ms: range.end_ms };
+        }
+      }
+      const picked = req.body.picked;
+
       const patch = {
         ...(bandId !== undefined && { band_id: bandId }),
         ...(req.body.caption !== undefined && { caption: req.body.caption || null }),
@@ -143,6 +185,8 @@ router.patch(
         // the guard above refuses to create, so it must not be reachable from
         // the other direction either.
         ...(bandId === null && { song: null }),
+        ...(picked !== undefined && { picked }),
+        ...moment,
       };
       if (!Object.keys(patch).length) return badRequest(res, 'Nothing to change');
 
@@ -156,6 +200,8 @@ router.patch(
         band_id: r.band_id, band_name: billName(r.attendance_rel.concert_rel, r.band_id),
         caption: r.caption ?? '', song: r.song ?? null, sha256: r.sha256, bytes: r.bytes,
         width: r.width, height: r.height, duration_ms: r.duration_ms,
+        picked: r.picked ?? false,
+        moment_start_ms: r.moment_start_ms ?? null, moment_end_ms: r.moment_end_ms ?? null,
         taken_at: r.taken_at,
       };
       // The band's name comes from the bill of the show the file ends up in.
@@ -165,6 +211,8 @@ router.patch(
         ...(req.body.caption !== undefined && { caption: req.body.caption || '' }),
         ...(song !== undefined && { song }),
         ...(bandId === null && { song: null }),
+        ...(picked !== undefined && { picked }),
+        ...moment,
       });
 
       const moving = rows.filter((r) => homes.has(r.id));

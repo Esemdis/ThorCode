@@ -135,6 +135,32 @@ describe('planRebuild', () => {
     expect(plan.upserts[0].song).toBeNull();
   });
 
+  it('carries the recap\'s picks and a video\'s moment back out of the sidecar', () => {
+    // Picked by hand, one night at a time. A rebuild that dropped them would
+    // hand back a year of recaps chosen by the machine instead.
+    const plan = planRebuild({
+      sidecars: [sidecar('user-1/show', 8417, [
+        entry('a.jpg', { picked: true }),
+        entry('b.mp4', { kind: 'VIDEO', picked: true, moment_start_ms: 0, moment_end_ms: 9000 }),
+      ])],
+      filesOnDisk: { 'user-1/show': ['a.jpg', 'b.mp4'] },
+      attendanceIds: new Map([[attendanceKey('user-1', 8417), 1]]),
+    });
+    expect(plan.upserts[0]).toMatchObject({ picked: true, moment_start_ms: null, moment_end_ms: null });
+    // A moment from the first frame is a moment, not a missing one.
+    expect(plan.upserts[1]).toMatchObject({ picked: true, moment_start_ms: 0, moment_end_ms: 9000 });
+  });
+
+  it('reads a sidecar written before picks existed as nothing picked', () => {
+    const plan = planRebuild({
+      sidecars: [sidecar('user-1/show', 8417, [entry('a.mp4', { kind: 'VIDEO' })])],
+      filesOnDisk: { 'user-1/show': ['a.mp4'] },
+      attendanceIds: new Map([[attendanceKey('user-1', 8417), 1]]),
+    });
+    expect(plan.malformedEntries).toEqual([]);
+    expect(plan.upserts[0]).toMatchObject({ picked: false, moment_start_ms: null, moment_end_ms: null });
+  });
+
   it('attaches media to the attendance row belonging to the sidecar user, not just any row for that concert', () => {
     // Two people at the same gig have two attendance rows carrying the same
     // concert_id. Keyed on the concert alone, the second overwrote the first,
@@ -169,6 +195,9 @@ describe('planRebuild', () => {
     ['a dimension replaced with a word', { width: 'unknown' }],
     ['a checksum blanked out', { sha256: '' }],
     ['a name that is not there at all', { name: undefined }],
+    ['a pick in quotes', { picked: 'true' }],
+    ['a moment in quotes', { moment_start_ms: '83000', moment_end_ms: 95000 }],
+    ['half a moment', { moment_start_ms: 83000 }],
   ])('routes an entry with %s into malformedEntries rather than into an upsert', (_label, over) => {
     // The sidecar is a text file the spec invites a human to read and touch.
     // Passed through verbatim, one of these became an upsert Postgres refused,

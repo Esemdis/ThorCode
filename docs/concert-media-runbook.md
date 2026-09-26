@@ -34,7 +34,10 @@ demand from the originals, and `incoming/` holds bytes that are mid-flight.
 The thing to understand before touching any of this: **`concert-media.json` is
 the record of truth and Postgres is a disposable index of it.** Every sidecar
 names its concert, its owner, and for each file the band, the caption, the
-checksum and the dimensions. `scripts/rebuild-media-index.js` reconstructs the
+checksum and the dimensions — and, once you have chosen them, whether the file
+is one of the night's picks for the year recap and which moment of a video it
+plays (`picked`, `moment_start_ms`, `moment_end_ms`; absent means not picked
+and no moment). `scripts/rebuild-media-index.js` reconstructs the
 database from those files alone. That is what lets you treat the share as the
 thing being protected and the application as replaceable.
 
