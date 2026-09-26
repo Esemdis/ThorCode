@@ -13,9 +13,19 @@
 
 const crypto = require('node:crypto');
 
-// Six hours. Long enough that a browsing session never breaks mid-scroll, short
-// enough that a URL shared by accident stops working the same day.
+// Six hours at the least. Long enough that a browsing session never breaks
+// mid-scroll, short enough that a URL shared by accident stops working the same
+// day. The real lifetime runs up to an hour longer; see EXPIRY_STEP_SECONDS.
 const MEDIA_TOKEN_TTL_SECONDS = 6 * 60 * 60;
+
+// Every token minted within one clock hour carries the same expiry: the end of
+// that hour, plus the TTL. The expiry is part of the signed payload, so at
+// one-second resolution every listing minted a different URL for the same
+// file, and the byte routes' year-long `immutable` cache — keyed by URL — never
+// got a second hit: every refetch in the app downloaded every thumbnail and
+// clip again. Rounded up to the hour, a token is byte-identical all hour, and
+// still valid for at least the TTL however late in the hour it was minted.
+const EXPIRY_STEP_SECONDS = 60 * 60;
 
 const MEDIA_PATH = '/data/concerts/media';
 
@@ -36,8 +46,10 @@ const sign = (payload, secret) =>
 function signMediaToken({ mediaId, userId, secret, now = Math.floor(Date.now() / 1000) }) {
   if (typeof userId !== 'string') throw new Error('userId must be a string');
   const key = mediaSecret(secret);
+  const expires = (Math.floor(now / EXPIRY_STEP_SECONDS) + 1) * EXPIRY_STEP_SECONDS
+    + MEDIA_TOKEN_TTL_SECONDS;
   const payload = Buffer
-    .from(JSON.stringify({ m: mediaId, u: userId, e: now + MEDIA_TOKEN_TTL_SECONDS }))
+    .from(JSON.stringify({ m: mediaId, u: userId, e: expires }))
     .toString('base64url');
   return `${payload}.${sign(payload, key)}`;
 }

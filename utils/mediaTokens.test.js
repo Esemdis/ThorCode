@@ -35,18 +35,51 @@ describe('signMediaToken and verifyMediaToken', () => {
     expect(verifyMediaToken(token, { mediaId: 8 })).toEqual({ ok: false, reason: 'mismatch' });
   });
 
-  it('refuses a token after it expires', () => {
-    const now = 1_000_000;
-    const token = signMediaToken({ mediaId: 7, userId: 'user-1', now });
-    const later = now + MEDIA_TOKEN_TTL_SECONDS + 1;
+  // One hour on the clock, in seconds since the epoch: 997_200 is 277 × 3600,
+  // so every token minted in this hour expires at HOUR_END plus the TTL.
+  const HOUR_START = 997_200;
+  const HOUR_END = HOUR_START + 3600;
+
+  it('refuses a token once its hour and its TTL have both run out', () => {
+    const token = signMediaToken({ mediaId: 7, userId: 'user-1', now: HOUR_START + 1234 });
+    const later = HOUR_END + MEDIA_TOKEN_TTL_SECONDS;
     expect(verifyMediaToken(token, { mediaId: 7, now: later })).toEqual({ ok: false, reason: 'expired' });
   });
 
   it('still accepts a token one second before it expires', () => {
-    const now = 1_000_000;
-    const token = signMediaToken({ mediaId: 7, userId: 'user-1', now });
-    const later = now + MEDIA_TOKEN_TTL_SECONDS - 1;
+    const token = signMediaToken({ mediaId: 7, userId: 'user-1', now: HOUR_START + 1234 });
+    const later = HOUR_END + MEDIA_TOKEN_TTL_SECONDS - 1;
     expect(verifyMediaToken(token, { mediaId: 7, now: later }).ok).toBe(true);
+  });
+
+  it('mints the same token all hour, so the browser cache can hit', () => {
+    // The expiry is inside the signature. At one-second resolution every
+    // listing minted a different URL for the same file, and a year-long
+    // immutable cache keyed by URL was never hit a second time.
+    const first = signMediaToken({ mediaId: 7, userId: 'user-1', now: HOUR_START });
+    const last = signMediaToken({ mediaId: 7, userId: 'user-1', now: HOUR_END - 1 });
+    expect(last).toBe(first);
+  });
+
+  it('mints a different token once the hour turns', () => {
+    const before = signMediaToken({ mediaId: 7, userId: 'user-1', now: HOUR_END - 1 });
+    const after = signMediaToken({ mediaId: 7, userId: 'user-1', now: HOUR_END });
+    expect(after).not.toBe(before);
+  });
+
+  it('lasts the whole TTL even when minted in the last second of an hour', () => {
+    // Rounded up, never down: a URL minted at 13:59:59 must not stop working
+    // at 19:00, an hour short of what a browsing session was promised.
+    const now = HOUR_END - 1;
+    const token = signMediaToken({ mediaId: 7, userId: 'user-1', now });
+    expect(verifyMediaToken(token, { mediaId: 7, now: now + MEDIA_TOKEN_TTL_SECONDS }).ok).toBe(true);
+  });
+
+  it('never outlives the TTL by more than an hour', () => {
+    const now = HOUR_START;
+    const token = signMediaToken({ mediaId: 7, userId: 'user-1', now });
+    expect(verifyMediaToken(token, { mediaId: 7, now: now + MEDIA_TOKEN_TTL_SECONDS + 3600 }))
+      .toEqual({ ok: false, reason: 'expired' });
   });
 
   it('refuses a token whose payload was edited', () => {

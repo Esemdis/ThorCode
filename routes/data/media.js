@@ -1212,8 +1212,8 @@ async function serveMedia(req, res, which) {
     });
     if (!row) return res.status(404).end();
     // Ownership is re-checked against the database, not taken from the token.
-    // A token stays valid for six hours, and the file may have changed hands or
-    // been detached in that time.
+    // A token stays valid for six to seven hours, and the file may have
+    // changed hands or been detached in that time.
     if (row.attendance_rel.wishlist_rel.user_id !== verdict.userId) return res.status(403).end();
 
     return await sendMediaBytes(res, row, which, `GET /media/:id/${which}`);

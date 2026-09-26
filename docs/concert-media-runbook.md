@@ -347,6 +347,12 @@ and after the service reaches a clip, so telling the browser to keep the
 original for a year would hide the rendition behind a cache entry nothing can
 invalidate.
 
+Every one of these URLs is signed until the end of the current hour plus six
+hours, so a listing asked for twice within the hour hands out the same URLs and
+the browser cache answers the second time. A token minted at a second's
+resolution changed every URL on every listing, and `immutable` never got a
+second hit.
+
 To find out whether a clip has one: look for `.web/<name>.mp4` in its show
 folder. To force a re-encode: delete it. To see what is pending without writing
 anything, `--dry-run`. A clip ffmpeg refuses gets a `.failed` file holding the
