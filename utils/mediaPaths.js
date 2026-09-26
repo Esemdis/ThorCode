@@ -67,6 +67,24 @@ function slugSegment(text) {
   return cleaned === '' || /^\.+$/.test(cleaned) ? '-' : cleaned;
 }
 
+/**
+ * A filename's extension, made as safe as slugSegment makes the rest of it.
+ *
+ * The extension was kept exactly as the browser sent it, so a `:` or a `?` in
+ * it — illegal on the SMB share — failed the write as a 500, and a trailing
+ * dot or space, which SMB drops, left a file on disk under a different name
+ * from the one recorded. Anything that is not a plain `.ext` afterwards
+ * becomes no extension at all; the kind is decided by the MIME type, never by
+ * this.
+ */
+function safeExtension(filename) {
+  const ext = path.extname(String(filename ?? ''))
+    .replace(ILLEGAL, '')
+    .replace(/[\s\u0000-\u001f]+/g, '')
+    .replace(/[. ]+$/, '');
+  return /^\.[^.]+$/.test(ext) ? ext.slice(0, 16) : '';
+}
+
 function showFolderName({ date, city, headliner }) {
   const parts = [date, city, headliner].filter((p) => p != null && String(p).trim() !== '');
   const [d, ...rest] = parts;
@@ -152,7 +170,7 @@ function webRenditionPath(absOriginal) {
 
 module.exports = {
   ARCHIVE_DIR, CACHE_DIR, DETACHED_DIR, MAX_SEGMENT, POSTERS_DIR, WEB_DIR,
-  archiveRoot, thumbCacheRoot, clipCacheRoot, slugSegment, showFolderName,
+  archiveRoot, thumbCacheRoot, clipCacheRoot, slugSegment, safeExtension, showFolderName,
   showFolderRelPath, uniqueFilename, resolveArchivePath, thumbPath, posterPath,
   webRenditionPath,
 };

@@ -23,7 +23,7 @@ const {
   fail, badRequest, notFound, forbidden, conflict, success,
 } = require('../../utils/apiResponse');
 const {
-  uniqueFilename, resolveArchivePath, slugSegment,
+  uniqueFilename, resolveArchivePath, slugSegment, safeExtension,
 } = require('../../utils/mediaPaths');
 const { showDirForAttendance } = require('../../utils/mediaShowDir');
 const { capturedAtFor } = require('../../utils/mediaCapture');
@@ -64,7 +64,9 @@ const upload = multer({
       try { await mkdir(dir, { recursive: true }); cb(null, dir); }
       catch (err) { cb(err); }
     },
-    filename: (req, file, cb) => cb(null, `${crypto.randomUUID()}${path.extname(file.originalname)}`),
+    // The temp file sits on the same SMB share, so its extension gets the same
+    // cleaning as the stored one — raw, a `:` in it failed the upload.
+    filename: (req, file, cb) => cb(null, `${crypto.randomUUID()}${safeExtension(file.originalname)}`),
   }),
   limits: { fileSize: MAX_FILE_BYTES },
 });
@@ -108,12 +110,12 @@ const asInt = (v) => {
 // several characters ext4 would allow, which is why every other path segment
 // in this archive already goes through slugSegment. A browser-supplied
 // filename is exactly as untrusted as a venue name and gets the same
-// treatment before it becomes one. The extension is kept as-is and out of the
-// slug so MAX_SEGMENT truncating a long stem can never eat into it.
+// treatment before it becomes one. The extension is cleaned on its own and
+// kept out of the slug so MAX_SEGMENT truncating a long stem can never eat
+// into it.
 function slugFilename(originalName) {
-  const ext = path.extname(originalName);
-  const stem = originalName.slice(0, originalName.length - ext.length);
-  return `${slugSegment(stem)}${ext}`;
+  const stem = originalName.slice(0, originalName.length - path.extname(originalName).length);
+  return `${slugSegment(stem)}${safeExtension(originalName)}`;
 }
 
 /**
@@ -871,18 +873,23 @@ router.post(
         // entry.name, not req.body.name: the bill has already had the
         // scraper's "Counterparts266K Followers" cleaned off it, and this row
         // is permanent and shared.
-        band = await prisma.band.create({ data: { name: entry.name, created_at: new Date() } });
-        created = true;
+        try {
+          band = await prisma.band.create({ data: { name: entry.name, created_at: new Date() } });
+          created = true;
+        } catch (err) {
+          // Added by someone else since the read above. Theirs stands.
+          if (err.code !== 'P2002') throw err;
+          band = await prisma.band.findUnique({ where: { name: entry.name } });
+          if (!band) throw err;
+        }
       }
 
-      const link = await prisma.concertBandReference.findUnique({
-        where: { concert_band: { concert: row.concert_rel.id, band: band.id } },
+      // skipDuplicates rather than a read then a create: two presses of the
+      // same pill both read "no link" and the second create was a 500.
+      await prisma.concertBandReference.createMany({
+        data: [{ concert: row.concert_rel.id, band: band.id }],
+        skipDuplicates: true,
       });
-      if (!link) {
-        await prisma.concertBandReference.create({
-          data: { concert: row.concert_rel.id, band: band.id },
-        });
-      }
 
       return success(res, 201, { band: { id: band.id, name: band.name }, created });
     } catch (err) {
@@ -1389,13 +1396,20 @@ router.delete(
       const media = await ownedMediaForShare(req, res);
       if (!media) return undefined;
 
-      const live = await prisma.mediaShareLink.findMany({
-        where: { media_id: media.id, revoked_at: null },
-        select: { id: true, start_ms: true, end_ms: true },
-      });
-      await prisma.mediaShareLink.updateMany({
-        where: { media_id: media.id, revoked_at: null },
-        data: { revoked_at: new Date() },
+      // Under the same per-file queue as the share route's find-or-create.
+      // Outside it, a link minted between this read and the revoke below was
+      // revoked without its clip being swept, or — the other order — minted
+      // just after, leaving a live link out once the owner had stopped sharing.
+      const live = await serialise(`share:${media.id}`, async () => {
+        const links = await prisma.mediaShareLink.findMany({
+          where: { media_id: media.id, revoked_at: null },
+          select: { id: true, start_ms: true, end_ms: true },
+        });
+        await prisma.mediaShareLink.updateMany({
+          where: { media_id: media.id, revoked_at: null },
+          data: { revoked_at: new Date() },
+        });
+        return links;
       });
       // After the revoke, so a failure here leaves disk to the service's sweep
       // and never leaves a link working. A clip mid-cut is caught by the

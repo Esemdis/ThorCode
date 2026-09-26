@@ -124,13 +124,23 @@ function entryProblem(f) {
   return null;
 }
 
-function planRebuild({ sidecars, filesOnDisk, attendanceIds }) {
+/**
+ * @param {object} args
+ * @param {Set<number>} [args.bandIds] - every Band id that exists. When given,
+ *   a sidecar tag naming a band that is gone is indexed untagged and reported,
+ *   rather than handed to Postgres to refuse: a deleted band used to cost every
+ *   file tagged with it its place in the index on the next rebuild, since the
+ *   foreign key rejected the whole row. The sidecar keeps band_name, so the
+ *   tag can be put back by hand.
+ */
+function planRebuild({ sidecars, filesOnDisk, attendanceIds, bandIds = null }) {
   const upserts = [];
   const missingFiles = [];
   const unlistedFiles = [];
   const unknownConcerts = [];
   const mismatchedUsers = [];
   const malformedEntries = [];
+  const unknownBands = [];
 
   for (const { relDir, data } of sidecars) {
     // relDir is '<user_id>/<show folder>'. If the folder's owner and the
@@ -176,9 +186,13 @@ function planRebuild({ sidecars, filesOnDisk, attendanceIds }) {
         missingFiles.push(`${relDir}/${f.name}`);
         continue;
       }
+      const bandGone = f.band_id != null && bandIds !== null && !bandIds.has(f.band_id);
+      if (bandGone) {
+        unknownBands.push({ relDir, name: f.name, band_id: f.band_id, band_name: f.band_name ?? null });
+      }
       upserts.push({
         attendance_id: attendanceId,
-        band_id: f.band_id ?? null,
+        band_id: bandGone ? null : (f.band_id ?? null),
         rel_path: `${relDir}/${f.name}`,
         filename: f.name,
         kind: f.kind,
@@ -191,7 +205,8 @@ function planRebuild({ sidecars, filesOnDisk, attendanceIds }) {
         // `|| null` rather than `?? null`: every sidecar written before songs
         // existed has no key here at all, and an undefined reaching Prisma
         // means "leave it alone" on an update rather than "no song".
-        song: f.song || null,
+        // A song names nobody without its band, so it goes with it.
+        song: bandGone ? null : (f.song || null),
         taken_at: f.taken_at ? new Date(f.taken_at) : null,
       });
     }
@@ -207,7 +222,9 @@ function planRebuild({ sidecars, filesOnDisk, attendanceIds }) {
     }
   }
 
-  return { upserts, missingFiles, unlistedFiles, unknownConcerts, mismatchedUsers, malformedEntries };
+  return {
+    upserts, missingFiles, unlistedFiles, unknownConcerts, mismatchedUsers, malformedEntries, unknownBands,
+  };
 }
 
 /**

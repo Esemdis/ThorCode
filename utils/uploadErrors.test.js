@@ -85,6 +85,28 @@ describe('uploadErrors, wired the way the upload route wires it', () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
+  it('says how many files at once when one too many arrives', async () => {
+    // The route caps each field with maxCount. Multer reports the file past
+    // it as LIMIT_UNEXPECTED_FILE, not LIMIT_FILE_COUNT, so the message the
+    // unit test above pins was never what a real upload saw.
+    const express = (await import('express')).default;
+    const request = (await import('supertest')).default;
+
+    const upload = multer({ storage: multer.memoryStorage() });
+    const app = express();
+    app.post('/upload', upload.fields([{ name: 'files', maxCount: 2 }]), uploadErrors,
+      (req, res) => res.json({ reached: true }));
+
+    const res = await request(app)
+      .post('/upload')
+      .attach('files', Buffer.alloc(4), 'a.jpg')
+      .attach('files', Buffer.alloc(4), 'b.jpg')
+      .attach('files', Buffer.alloc(4), 'c.jpg')
+      .expect(400);
+
+    expect(res.body.error).toMatch(/at once/);
+  });
+
   it('still lets a file under the limit through to the handler', async () => {
     const express = (await import('express')).default;
     const request = (await import('supertest')).default;

@@ -19,6 +19,7 @@ const { resolveArtistImages } = require('../../../utils/bandImages');
 const { matchBandToSpotify, backfillSpotifyIds } = require('../../../utils/bandSpotifyMatch');
 const { findSourceUrls } = require('../../../utils/bandSourceUrls');
 const { detachAttendances, withDetach, sweepableConcertIds } = require('../../../utils/mediaDetach');
+const { untagBandInSidecars } = require('../../../utils/mediaUntag');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
@@ -341,6 +342,20 @@ router.delete(
           where: { band: bandId },
         });
 
+        // Photographs and clips tagged with the band. The key would SET NULL
+        // band_id on its own, but not the song: a song names nobody without
+        // its band, and the gallery would then show one with no artist.
+        const tagged = await tx.concertMedia.findMany({
+          where: { band_id: bandId },
+          select: { rel_path: true },
+        });
+        if (tagged.length) {
+          await tx.concertMedia.updateMany({
+            where: { band_id: bandId },
+            data: { band_id: null, song: null },
+          });
+        }
+
         // Delete the band itself
         await tx.band.delete({ where: { id: bandId } });
 
@@ -382,10 +397,16 @@ router.delete(
           removedWishlistReferences: wishlistRefsDeleted.count,
           removedConcertReferences: concertRefsDeleted.count,
           removedConcerts: orphanConcertIds,
+          untaggedFiles: tagged.map((m) => m.rel_path),
         };
       }, { timeout: 30000 });
 
-      res.json(result);
+      // The sidecars too, after the rows have committed. Best effort: a
+      // folder that cannot be written is logged, and a rebuild indexes its
+      // files untagged and names them.
+      const { untaggedFiles, ...response } = result;
+      const untagFailed = await untagBandInSidecars(untaggedFiles, bandId);
+      res.json({ ...response, untaggedFiles: untaggedFiles.length, untagFailed: untagFailed.length });
     } catch (error) {
       console.error('Error deleting band:', error);
       res.status(500).json({ error: 'Internal server error' });

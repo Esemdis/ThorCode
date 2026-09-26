@@ -569,10 +569,50 @@ describe('DELETE /bands/:bandId', () => {
     const res = await request(app).delete('/bands/9').set(...authHeader({ role: 'ADMIN' }));
 
     expect(res.status).toBe(200);
-    expect(prisma.concertMedia.findMany).not.toHaveBeenCalled();
+    // Nothing detached: media is only ever read by band here, never by the
+    // attendances a detach would move.
+    expect(prisma.concertMedia.findMany).not.toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ attendance_id: expect.anything() }),
+    }));
     expect(prisma.concertMedia.deleteMany).not.toHaveBeenCalled();
     expect(prisma.concertAttendance.deleteMany).not.toHaveBeenCalled();
     expect(prisma.concert.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('takes the band off its files, in the rows and in the sidecars', async () => {
+    // The key SET NULLs band_id on the rows but left the song, and could not
+    // reach the sidecars — so the next rebuild wrote the dead id back and had
+    // every such file refused by the foreign key.
+    const root = await mkdtemp(join(tmpdir(), 'band-untag-'));
+    process.env.MEDIA_ROOT = root;
+    const show = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    await mkdir(show, { recursive: true });
+    await writeFile(join(show, 'concert-media.json'), JSON.stringify({
+      version: 1, concert_id: 700, user_id: 'user-1', concert: {},
+      files: [
+        { name: 'a.mp4', kind: 'VIDEO', band_id: 9, band_name: 'Gojira', song: 'Stranded' },
+        { name: 'b.jpg', kind: 'PHOTO', band_id: 3, band_name: 'Alcest', song: null },
+      ],
+    }));
+
+    prisma.concert.findMany.mockResolvedValue([]);
+    prisma.concertMedia.findMany.mockResolvedValue([{ rel_path: 'user-1/2026-06-12 Oslo - Gojira/a.mp4' }]);
+    prisma.concertMedia.updateMany = vi.fn(async () => ({ count: 1 }));
+
+    const res = await request(app).delete('/bands/9').set(...authHeader({ role: 'ADMIN' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ untaggedFiles: 1, untagFailed: 0 });
+    expect(prisma.concertMedia.updateMany).toHaveBeenCalledWith({
+      where: { band_id: 9 },
+      data: { band_id: null, song: null },
+    });
+    const { readFile } = await import('node:fs/promises');
+    const sidecar = JSON.parse(await readFile(join(show, 'concert-media.json'), 'utf8'));
+    expect(sidecar.files).toEqual([
+      { name: 'a.mp4', kind: 'VIDEO', band_id: null, band_name: null, song: null },
+      { name: 'b.jpg', kind: 'PHOTO', band_id: 3, band_name: 'Alcest', song: null },
+    ]);
   });
 });
 
