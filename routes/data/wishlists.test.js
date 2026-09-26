@@ -709,3 +709,121 @@ describe('POST /wishlists/:id/bands', () => {
     expect(bandCreate.createBand).not.toHaveBeenCalled();
   });
 });
+
+describe('wishlist ids that are not numbers', () => {
+  it('answer 400 rather than reaching Prisma as NaN', async () => {
+    for (const path of ['/wishlists/abc', '/wishlists/abc/new', '/wishlists/abc/activity', '/wishlists/abc/recent-concerts']) {
+      const res = await request(app).get(path).set(...authHeader({ id: 'user-1' }));
+      expect(res.status).toBe(400);
+    }
+    expect(prisma.wishlist.findUnique).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /wishlists/:id with a date window', () => {
+  it('asks the database for the window rather than reading every concert ever', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [] });
+    prisma.band.findMany.mockResolvedValue([]);
+    prisma.concertAttendance.findMany.mockResolvedValue([]);
+
+    await request(app)
+      .get('/wishlists/7')
+      .query({ start_date: '2026-10-01', end_date: '2026-10-07', countries: 'SE,NO' })
+      .set(...authHeader({ id: 'user-1' }));
+
+    const { select } = prisma.band.findMany.mock.calls[0][0];
+    expect(select.concerts.where.concert_rel).toEqual({
+      concert_date: { gte: new Date('2026-10-01'), lte: expect.any(Date) },
+      country: { in: ['SE', 'NO'] },
+    });
+  });
+
+  it('asks for everything when no window is given', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [] });
+    prisma.band.findMany.mockResolvedValue([]);
+    prisma.concertAttendance.findMany.mockResolvedValue([]);
+
+    await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+
+    expect(prisma.band.findMany.mock.calls[0][0].select.concerts).not.toHaveProperty('where');
+  });
+});
+
+describe('GET /wishlists/:id/activity', () => {
+  it('survives one entry that is not JSON', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1' });
+    prisma.activityLog.findMany.mockResolvedValue([
+      { id: 1, type: 'NEW_CONCERTS', data: '{"total":2}' },
+      { id: 2, type: 'NEW_CONCERTS', data: 'not json' },
+    ]);
+
+    const res = await request(app).get('/wishlists/7/activity').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body.activity.map((a) => a.data)).toEqual([{ total: 2 }, null]);
+  });
+});
+
+describe('GET /wishlists/:id/new', () => {
+  it('moves the cursor only after everything it covers has been read', async () => {
+    // Written first, a failure below it moved the cursor past concerts nobody
+    // had been shown.
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', last_active_at: null, bands: [{ band_id: 1 }] });
+    prisma.concertBandReference.findMany.mockRejectedValue(new Error('connection lost'));
+
+    const res = await request(app).get('/wishlists/7/new').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(500);
+    expect(prisma.wishlist.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('DELETE /wishlists/:id', () => {
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1' });
+    prisma.activityLog.deleteMany.mockResolvedValue({ count: 3 });
+    prisma.wishlistBandReference.deleteMany.mockResolvedValue({ count: 2 });
+    prisma.wishlist.delete.mockResolvedValue({ id: 7 });
+  });
+
+  it('takes the activity log with it, in one transaction', async () => {
+    // ActivityLog restricts the delete, so any wishlist that had ever seen a
+    // new concert could not be deleted at all.
+    prisma.concertAttendance.count = vi.fn(async () => 0);
+
+    const res = await request(app).delete('/wishlists/7').set(...authHeader({ id: 'user-1', role: 'ADMIN' }));
+
+    expect(res.status).toBe(200);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.activityLog.deleteMany).toHaveBeenCalledWith({ where: { wishlist_id: 7 } });
+  });
+
+  it('refuses in words while shows attended still hang off it', async () => {
+    prisma.concertAttendance.count = vi.fn(async () => 2);
+
+    const res = await request(app).delete('/wishlists/7').set(...authHeader({ id: 'user-1', role: 'ADMIN' }));
+
+    expect(res.status).toBe(409);
+    expect(prisma.wishlist.delete).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /wishlists/:id/calendar-token', () => {
+  it('only writes a token where there is none, and answers with what is stored', async () => {
+    // Two requests at once each minted a token and the second overwrote the
+    // first, breaking whichever calendar had subscribed with it.
+    prisma.wishlist.findUnique
+      .mockResolvedValueOnce({ id: 7, user_id: 'user-1', calendar_token: null })
+      .mockResolvedValueOnce({ calendar_token: 'the-one-that-won' });
+    prisma.wishlist.updateMany.mockResolvedValue({ count: 0 });
+    process.env.CALLBACK_URL = 'https://api.example.test';
+
+    const res = await request(app).post('/wishlists/7/calendar-token').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(prisma.wishlist.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 7, calendar_token: null },
+    }));
+    expect(res.body.token).toBe('the-one-that-won');
+  });
+});

@@ -17,6 +17,14 @@ const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
 const { rateLimit } = require("./shared");
 
+// The id checks below are declared on each route but were never read, so
+// "/wishlists/abc/…" reached Prisma as NaN and came back a 500.
+function invalid(req, res) {
+  if (validationResult(req).isEmpty()) return false;
+  res.status(400).json({ error: "Wishlist ID must be an integer" });
+  return true;
+}
+
 // Deduplicates by date+venue+city (same logic as the Attended tab display),
 // preferring sfm_ records so a TM + sfm_ pair for the same show counts as 1.
 async function computeSeenCounts(wishlistId) {
@@ -194,6 +202,7 @@ router.get(
   [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
   async (req, res) => {
     try {
+      if (invalid(req, res)) return;
       const wishlistId = parseInt(req.params.id, 10);
 
       const wishlist = await prisma.wishlist.findUnique({
@@ -205,12 +214,11 @@ router.get(
       if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
 
       const sinceDate = wishlist.last_active_at ?? new Date(0);
-
-      // Update last_active_at before returning so any device hitting this endpoint moves the cursor
-      await prisma.wishlist.update({
-        where: { id: wishlistId },
-        data: { last_active_at: new Date() },
-      });
+      // Taken now, written last: the cursor moves to when this read began, and
+      // only once everything it covers has been read and logged. Written first,
+      // as it was, a failure anywhere below moved it past concerts nobody had
+      // been shown — gone from "new since your last visit" for good.
+      const visitedAt = new Date();
 
       const bandIds = wishlist.bands.map((b) => b.band_id);
 
@@ -297,6 +305,12 @@ router.get(
         (a, b) => new Date(a.concert_date || 0) - new Date(b.concert_date || 0),
       );
 
+      // Any device hitting this endpoint moves the cursor.
+      await prisma.wishlist.update({
+        where: { id: wishlistId },
+        data: { last_active_at: visitedAt },
+      });
+
       res.json({ concerts });
     } catch (error) {
       console.error("Error fetching new concerts:", error);
@@ -314,6 +328,7 @@ router.get(
   [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
   async (req, res) => {
     try {
+      if (invalid(req, res)) return;
       const wishlistId = parseInt(req.params.id, 10);
       const wishlist = await prisma.wishlist.findUnique({
         where: { id: wishlistId },
@@ -374,6 +389,7 @@ router.get(
   [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
   async (req, res) => {
     try {
+      if (invalid(req, res)) return;
       const wishlistId = parseInt(req.params.id, 10);
       const wishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
       if (!wishlist) return res.status(404).json({ error: "Not found" });
@@ -385,8 +401,11 @@ router.get(
         take: 15,
       });
 
+      // Parsed one entry at a time: `data` is a text column, and one entry
+      // that is not JSON used to take the whole feed down with it.
+      const parse = (text) => { try { return JSON.parse(text); } catch { return null; } };
       res.json({
-        activity: logs.map((log) => ({ ...log, data: JSON.parse(log.data) })),
+        activity: logs.map((log) => ({ ...log, data: parse(log.data) })),
       });
     } catch (error) {
       console.error("Error fetching activity log:", error);
@@ -401,8 +420,30 @@ router.get(
   [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
   async (req, res) => {
     try {
+      if (invalid(req, res)) return;
       const wishlistId = parseInt(req.params.id, 10);
       const { start_date, end_date, countries } = req.query;
+
+      // The date window and the countries go to the database. They used to be
+      // applied in JavaScript after every band's entire concert history had
+      // been read — weather, prices and city relations for every show ever —
+      // to hand back one week of it. A bound that does not parse is ignored,
+      // as it was, rather than refused.
+      const parsedDate = (value) => {
+        if (typeof value !== "string" || !value) return null;
+        const d = new Date(value);
+        return Number.isNaN(d.getTime()) ? null : d;
+      };
+      const startDate = parsedDate(start_date);
+      const endDate = parsedDate(end_date);
+      if (endDate) endDate.setHours(23, 59, 59, 999);
+      const countryList = typeof countries === "string" && countries
+        ? countries.split(",")
+        : null;
+      const concertFilter = {
+        ...(startDate && endDate && { concert_date: { gte: startDate, lte: endDate } }),
+        ...(countryList && { country: { in: countryList } }),
+      };
 
       const wishlist = await prisma.wishlist.findUnique({
         where: { id: wishlistId },
@@ -433,6 +474,7 @@ router.get(
           id: true,
           name: true,
           concerts: {
+            ...(Object.keys(concertFilter).length && { where: { concert_rel: concertFilter } }),
             include: {
               concert_rel: {
                 select: {
@@ -491,19 +533,6 @@ router.get(
         band.concerts.forEach((concertRef) => {
           const concert = concertRef.concert_rel;
           const eventId = concert.id;
-
-          if (start_date && end_date) {
-            const concertDate = new Date(concert.concert_date);
-            const startDate = new Date(start_date);
-            const endDate = new Date(end_date);
-            endDate.setHours(23, 59, 59, 999);
-            if (concertDate < startDate || concertDate > endDate) return;
-          }
-
-          if (countries) {
-            const countryList = countries.split(",");
-            if (!countryList.includes(concert.country)) return;
-          }
 
           if (!concertsMap.has(eventId)) {
             const wishlistBands = concert.bands

@@ -1,5 +1,7 @@
 const prisma = require("../prisma/client");
-const { sendDigestEmail } = require("./mail");
+// Through the module rather than destructured, so a test can stand in for
+// Resend on this file's own copy of it.
+const mail = require("./mail");
 // Shared with POST /wishlists/notify, which posts the same matches to Discord
 // the moment the scraper reports them. See notificationMatch.js for why the
 // rule cannot live in either caller.
@@ -56,6 +58,7 @@ async function runNotificationDigest() {
   const byUser = matchesByUser(concerts, subscriptions, followed);
 
   let sent = 0;
+  let attempted = 0;
   for (const [userId, { email, concerts: matched }] of byUser) {
     if (!email || matched.length === 0) continue;
     const items = matched.map((c) => ({
@@ -67,16 +70,27 @@ async function runNotificationDigest() {
       date: c.concert_date,
       url: c.url,
     }));
+    attempted++;
     try {
-      await sendDigestEmail({ to: email, items });
+      await mail.sendDigestEmail({ to: email, items });
       sent++;
     } catch (err) {
       console.error(`[notifyDigest] Failed to send digest to user ${userId}:`, err.message);
     }
   }
 
+  // When nothing went out at all — a bad key, an unverified sender, the
+  // email service down — the window stays where it was, so the next run sends
+  // these concerts instead of skipping past them. A partial failure still
+  // moves on: those that did send must not be sent again, and there is no
+  // record of who is owed what.
+  if (attempted > 0 && sent === 0) {
+    console.error(`[notifyDigest] No digest could be sent (${attempted} tried); keeping the window from ${since.toISOString()} for the next run.`);
+    return { sent, concerts: concerts.length, failed: attempted };
+  }
+
   await prisma.notificationDigestRun.update({ where: { id: run.id }, data: { last_run_at: now } });
-  return { sent, concerts: concerts.length };
+  return { sent, concerts: concerts.length, failed: attempted - sent };
 }
 
 module.exports = { runNotificationDigest };

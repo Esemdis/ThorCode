@@ -20,6 +20,9 @@ const { rateLimit } = require("./shared");
 
 const VALID_TIERS = ["LOVE", "LIKE", "FOLLOW"];
 
+const BULK_CHUNK = 25;
+const chunks = (list, size) => Array.from({ length: Math.ceil(list.length / size) }, (_, i) => list.slice(i * size, (i + 1) * size));
+
 // Discord's own webhook host+path shape — anything else lets a user aim the
 // server's outbound POST at an internal address (SSRF) via /wishlists/notify.
 const DISCORD_WEBHOOK_RE = /^https:\/\/(discord\.com|discordapp\.com)\/api\/webhooks\/\d+\/[\w-]+$/;
@@ -39,25 +42,29 @@ router.patch(
   "/weather/bulk",
   [auth, roleCheck(["SYSTEM"])],
   async (req, res) => {
+    const updates = req.body; // [{ id, weather }]
+    if (!Array.isArray(updates) || updates.length === 0) {
+      return res.status(400).json({ error: "Expected non-empty array of { id, weather }" });
+    }
+    if (!updates.every((u) => u && Number.isInteger(u.id))) {
+      return res.status(400).json({ error: "Every entry needs an integer id" });
+    }
+
+    // In chunks, each its own transaction — the shape trips' weather bulk
+    // already has. One unbounded Promise.all opened an update per concert at
+    // once against a pool of thirty, and a single missing id failed the
+    // request after an arbitrary subset had been written.
+    let updated = 0;
     try {
-      const updates = req.body; // [{ id, weather }]
-      if (!Array.isArray(updates) || updates.length === 0) {
-        return res.status(400).json({ error: "Expected non-empty array of { id, weather }" });
+      for (const chunk of chunks(updates, BULK_CHUNK)) {
+        await prisma.$transaction(chunk.map(({ id, weather }) =>
+          prisma.concert.updateMany({ where: { id }, data: { weather } })));
+        updated += chunk.length;
       }
-
-      await Promise.all(
-        updates.map(({ id, weather }) =>
-          prisma.concert.update({
-            where: { id },
-            data: { weather },
-          })
-        )
-      );
-
-      res.json({ ok: true, updated: updates.length });
+      res.json({ ok: true, updated });
     } catch (error) {
-      console.error("Error storing concert weather:", error);
-      return res.status(500).json({ error: "Internal server error" });
+      console.error(`Error storing concert weather after ${updated}/${updates.length}:`, error);
+      return res.status(500).json({ error: "Internal server error", updated });
     }
   }
 );
@@ -324,13 +331,34 @@ router.delete(
   rateLimit,
   async (req, res) => {
     try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ error: "Validation failed", details: errors.array() });
+      }
+
       const wishlistId = parseInt(req.params.id, 10);
       const existingWishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
       if (!existingWishlist) return res.status(404).json(handleError("wishlist", 404));
       if (existingWishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
 
-      await prisma.wishlistBandReference.deleteMany({ where: { wishlist_id: wishlistId } });
-      await prisma.wishlist.delete({ where: { id: wishlistId } });
+      // Shows attended hang off the wishlist, and photographs off them — the
+      // key restricts on purpose (see utils/mediaDetach.js). Refused in words
+      // rather than by the foreign key as a 500.
+      const attended = await prisma.concertAttendance.count({ where: { wishlist_id: wishlistId } });
+      if (attended > 0) {
+        return res.status(409).json({
+          error: `This wishlist has ${attended} attended show${attended === 1 ? "" : "s"}. Remove them first.`,
+        });
+      }
+
+      // The activity log restricts too, and nothing else ever deletes it, so
+      // any wishlist that had seen a new concert could not be deleted at all.
+      // One transaction, so a failure leaves the wishlist as it was.
+      await prisma.$transaction([
+        prisma.activityLog.deleteMany({ where: { wishlist_id: wishlistId } }),
+        prisma.wishlistBandReference.deleteMany({ where: { wishlist_id: wishlistId } }),
+        prisma.wishlist.delete({ where: { id: wishlistId } }),
+      ]);
 
       res.json({ message: "Wishlist deleted successfully." });
     } catch (error) {
