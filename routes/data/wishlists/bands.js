@@ -9,8 +9,10 @@
 const express = require("express");
 const router = express.Router();
 const { validationResult, param, body } = require("express-validator");
-const axios = require("axios");
 const { handleError } = require("../helpers");
+// Called through the module rather than destructured, so a test can stand in
+// for band creation (which reaches MusicBrainz) on the router's own copy.
+const bandCreate = require("../../../utils/bandCreate");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
@@ -196,8 +198,8 @@ router.post(
     auth,
     roleCheck(["ADMIN", "USER"]),
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
-    body("name").optional().isString().notEmpty().withMessage("Band name must be a non-empty string"),
-    body("ticketmaster_id").optional().isString().notEmpty().withMessage("Ticketmaster ID must be a non-empty string"),
+    body("name").optional().isString().trim().notEmpty().withMessage("Band name must be a non-empty string"),
+    body("ticketmaster_id").optional().isString().trim().notEmpty().withMessage("Ticketmaster ID must be a non-empty string"),
     body("tier").optional().isIn(VALID_TIERS).withMessage("tier must be LOVE, LIKE, or FOLLOW"),
   ],
   rateLimit,
@@ -222,57 +224,30 @@ router.post(
       if (!existingWishlist) return res.status(404).json(handleError("wishlist", 404));
       if (existingWishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
 
+      // Created in-process. This used to be the API calling itself over HTTP
+      // at CALLBACK_URL with the caller's token, so a stale CALLBACK_URL broke
+      // adding bands outright, and every user's adds arrived from the server's
+      // own address and shared one rate-limit bucket on POST /bands.
       let band;
       let lookupWarning = null;
-      try {
-        const bandPayload = {};
-        if (ticketmasterId) bandPayload.ticketmaster_id = ticketmasterId;
-        if (bandName) bandPayload.name = bandName;
-        const createResponse = await axios.post(
-          `${process.env.CALLBACK_URL}/data/concerts/bands`,
-          bandPayload,
-          { headers: { Authorization: req.headers.authorization } },
-        );
-        band = createResponse.data.band;
-        // Carried through rather than dropped: the band-create route reports
-        // here when MusicBrainz could not be reached, and this endpoint is the
-        // one the app actually calls — swallowing it is what made "added, but
-        // with no links and so no concerts" look identical to a clean add.
-        lookupWarning = createResponse.data.warning ?? null;
-        if (!band) {
-          console.error("Band creation response missing band object:", createResponse.data);
-          return res.status(500).json({ error: "Band creation failed: no band returned" });
+      if (bandName) {
+        try {
+          const created = await bandCreate.createBand(bandName);
+          band = created.band;
+          // Carried through rather than dropped: MusicBrainz being unreachable
+          // is what made "added, but with no links and so no concerts" look
+          // identical to a clean add.
+          lookupWarning = created.warning;
+        } catch (error) {
+          if (!(error instanceof bandCreate.BandExistsError)) throw error;
+          band = error.band;
         }
-      } catch (error) {
-        if (error.response?.status === 409) {
-          band = ticketmasterId
-            ? await prisma.band.findUnique({ where: { ticketmaster_id: ticketmasterId } })
-            : await prisma.band.findUnique({ where: { name: bandName } });
-          if (!band) {
-            console.error("Band reported as existing but not found in DB");
-            return res.status(500).json({ error: "Band lookup failed after conflict" });
-          }
-        } else {
-          // Creating the band is this API calling itself over HTTP at
-          // CALLBACK_URL, so a stale value there answers with a stranger's 404
-          // — which was reported as "Band not found with that Ticketmaster ID"
-          // and sent people hunting for a band that was on Ticketmaster all
-          // along. Only a JSON { error } body is our own answer and safe to
-          // forward; anything else is the call itself failing, not a verdict on
-          // the band.
-          const upstreamMessage = error.response?.data?.error;
-          const status = error.response?.status;
-          console.error(
-            `Error creating band via ${process.env.CALLBACK_URL}/data/concerts/bands:`,
-            status ?? error.code ?? error.message,
-            upstreamMessage ?? "",
-          );
-          if (status && upstreamMessage) {
-            return res.status(status).json({ error: upstreamMessage });
-          }
-          return res.status(502).json({
-            error: "Could not reach the band service — check CALLBACK_URL.",
-          });
+      } else {
+        // A Ticketmaster id alone can only name a band that is already here:
+        // bands are created by name, from MusicBrainz, and that source is gone.
+        band = await prisma.band.findUnique({ where: { ticketmaster_id: ticketmasterId } });
+        if (!band) {
+          return res.status(404).json({ error: "No band with that Ticketmaster ID — add it by name instead" });
         }
       }
 

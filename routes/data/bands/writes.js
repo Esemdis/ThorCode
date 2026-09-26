@@ -12,15 +12,18 @@ const { validationResult, body } = require('express-validator');
 const { pythonServicePost, pythonServiceFailure } = require('../../../utils/pythonService');
 const { error: sendError } = require('../../../utils/apiResponse');
 const { haversineKm, stringSimilarity, venueContains, deduplicateByCoords } = require('../../../utils/concertDedup');
-const { findSourceUrls } = require('../../../utils/bandSourceUrls');
 const { backlinkBandToConcerts } = require('../../../utils/bandBacklink');
+// Called through the module rather than destructured, so a test can stand in
+// for band creation (which reaches MusicBrainz) on the router's own copy.
+const bandCreate = require('../../../utils/bandCreate');
+const { isMbid } = require('../../../utils/setlistFm');
 const { detachAttendances, withDetach, sweepableConcertIds } = require('../../../utils/mediaDetach');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const { rateLimiter } = require('../../../utils/rateLimiter');
 const prisma = require('../../../prisma/client');
 
-// Defaults to 5 requests per 15 minutes per IP
+// 10 requests a minute per IP — rateLimiter's defaults.
 const rateLimit = rateLimiter({
   message:
     'Too many requests to the Ticketmaster data route, please try again later.',
@@ -59,11 +62,12 @@ router.post(
   auth,
   roleCheck(['ADMIN', 'SYSTEM']),
   async (req, res) => {
-    const { bandId } = req.params;
+    const bandId = parseInt(req.params.bandId, 10);
+    if (Number.isNaN(bandId)) return res.status(400).json({ error: 'Invalid band id' });
     try {
       // Fetch the band from the database
       const band = await prisma.band.findUnique({
-        where: { id: parseInt(bandId) },
+        where: { id: bandId },
         select: { id: true, name: true, songkick_url: true, bandsintown_url: true },
       });
 
@@ -116,8 +120,11 @@ router.post(
     const bandId = parseInt(req.params.bandId, 10);
     if (Number.isNaN(bandId)) return res.status(400).json({ error: 'Invalid band id' });
 
-    const { upcoming } = req.body;
-    if (!Array.isArray(upcoming)) return res.status(400).json({ error: 'upcoming must be an array' });
+    const { upcoming: raw } = req.body;
+    if (!Array.isArray(raw)) return res.status(400).json({ error: 'upcoming must be an array' });
+    // A null or a string among the concerts threw on the first property read,
+    // after nothing had been written — a 500 for one malformed entry.
+    const upcoming = raw.filter((c) => c && typeof c === 'object');
 
     // If scraper returned nothing, skip — likely a scrape failure, not a genuinely empty schedule
     if (upcoming.length === 0) {
@@ -250,9 +257,12 @@ router.post(
   rateLimit,
   auth,
   roleCheck(['ADMIN', 'USER']),
+  // Trimmed before it is checked: "   " passed notEmpty(), trimmed to "" in
+  // the handler and was created as a band with no name.
   body('name')
     .optional()
     .isString()
+    .trim()
     .notEmpty()
     .withMessage('Band name must be a non-empty string'),
   body('wishlistId')
@@ -280,56 +290,16 @@ router.post(
         return res.status(400).json({ error: "'name' must be provided" });
       }
 
-      const bandName = name.trim();
-
-      const existingBand = await prisma.band.findUnique({ where: { name: bandName } });
-      if (existingBand) {
-        return res.status(409).json({ error: 'Band already exists.' });
-      }
-
-      // No Ticketmaster lookup. It used to resolve the name here and 404 with
-      // "No band found." for anything its catalogue lacked, which is the only
-      // reason such a band could not be added — MusicBrainz and findSourceUrls
-      // both key off the name, and they are what produce concerts.
-      //
-      // This route used to run its own `artist:"name"` search and keep
-      // artists[0].id unconditionally. That was a second copy of the search in
-      // findSourceUrls with none of its protections: no isConfidentNameMatch,
-      // so MusicBrainz's closest guess for an unlisted band was stored as that
-      // band's identity; no retry, so the ~1-in-3 "server is currently busy"
-      // 503 simply lost the id; and no rate-limit spacing, so it fired a second
-      // request into a 1 req/sec API in the same instant. Worse, handing the
-      // unvetted id back in as `mbid` made findSourceUrls skip the very guard
-      // that would have caught it. One guarded lookup now does both jobs.
-      //
-      // Awaited rather than left in the background, for the same reason
-      // refresh-urls was changed: what this finds is the only thing that
-      // produces concerts, and a background failure could reach nobody. It
-      // costs one MusicBrainz call plus the mandatory 1.1s of spacing.
-      let songkickUrl = null;
-      let bandsintownUrl = null;
-      let mbid = null;
-      let lookupReachedMusicBrainz = true;
+      let created;
       try {
-        [songkickUrl, bandsintownUrl, mbid] = await findSourceUrls(bandName);
-      } catch (lookupError) {
-        lookupReachedMusicBrainz = false;
-        console.error(`[bands] MusicBrainz lookup failed for ${bandName}:`, lookupError.message);
+        created = await bandCreate.createBand(name);
+      } catch (error) {
+        if (error instanceof bandCreate.BandExistsError) {
+          return res.status(409).json({ error: 'Band already exists.' });
+        }
+        throw error;
       }
-
-      const newBand = await prisma.band.create({
-        data: {
-          name: bandName,
-          created_at: new Date(),
-          MBID: mbid,
-          ...(songkickUrl    && { songkick_url:    songkickUrl }),
-          ...(bandsintownUrl && { bandsintown_url: bandsintownUrl }),
-          // Stamped only when MusicBrainz actually answered. Unreachable is not
-          // evidence the urls do not exist, so the band stays queued for the
-          // next backfill sweep — same rule as refresh-urls and the backfill.
-          ...(lookupReachedMusicBrainz && { source_urls_checked_at: new Date() }),
-        },
-      });
+      const { band: newBand, songkickUrl, bandsintownUrl, warning } = created;
 
       // Add to wishlist if provided
       if (wid !== null) {
@@ -339,21 +309,6 @@ router.post(
             band_id: newBand.id,
           },
         });
-      }
-
-      // A band is usually added because it was seen on a bill already stored,
-      // where its name sits in metadata as a loose string: /bulk links lineup
-      // names against the bands existing at ingest time, and this band did not
-      // exist yet. Left unlinked it shows grey on that bill, and the next scrape
-      // of the band files its own copy of the gig — checkDuplicateConcert needs
-      // a shared band to recognise the two as one show.
-      //
-      // Never fails the request: the band is created either way, and a missing
-      // link is recoverable by hand.
-      try {
-        await backlinkBandToConcerts({ bandId: newBand.id, bandName, prisma });
-      } catch (backlinkError) {
-        console.error(`[bands] Back-linking existing concerts failed for ${bandName}:`, backlinkError.message);
       }
 
       // Says what was actually found. The old shape answered
@@ -373,20 +328,8 @@ router.post(
         songkick_url: songkickUrl ?? null,
         bandsintown_url: bandsintownUrl ?? null,
         sync: { status: 'queued' },
-        ...(!lookupReachedMusicBrainz && {
-          warning: 'Could not reach MusicBrainz, so no Songkick or Bandsintown links were found yet. The nightly backfill will retry this band.',
-        }),
+        ...(warning && { warning }),
       });
-
-      // The scrape itself stays in the background: it is long-running, and
-      // unlike the lookup above there is a retry path for it — the band now has
-      // its urls stored, so an admin re-sync or the cron picks it up.
-      pythonServicePost(`/sync/${newBand.id}`,
-        { songkick_url: songkickUrl || null, bandsintown_url: bandsintownUrl || null, band_name: newBand.name },
-      ).then(
-        () => console.log(`[bands] Sync queued for ${newBand.name}`),
-        (e) => console.error(`[bands] Background sync failed for ${newBand.name}:`, e.message),
-      );
     } catch (error) {
       console.error('Error creating band:', error);
       res.status(500).json({ error: 'Internal server error' });
@@ -399,9 +342,17 @@ router.post(
 // Does not do Ticketmaster lookup — adds straight to DB and optionally to a wishlist.
 router.post('/bands/quick-add', auth, async (req, res) => {
   try {
-    const { name, mbid, wishlistId, tier } = req.body;
-    if (!name || typeof name !== 'string' || !name.trim()) {
+    const { wishlistId, tier } = req.body;
+    const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
+    if (!name) {
       return res.status(400).json({ error: 'name is required' });
+    }
+    // The MBID arrives from the client and becomes the band's identity for
+    // every account — setlist.fm lookups go by it — so it has to at least be
+    // one. An absent one is fine.
+    const mbid = req.body.mbid == null || req.body.mbid === '' ? null : req.body.mbid;
+    if (mbid !== null && !isMbid(mbid)) {
+      return res.status(400).json({ error: 'mbid must be a MusicBrainz id' });
     }
 
     const validTiers = ['LOVE', 'LIKE', 'FOLLOW'];
@@ -413,18 +364,27 @@ router.post('/bands/quick-add', auth, async (req, res) => {
     if (invalid) return res.status(400).json({ error: 'wishlistId must be a positive integer' });
     if (!owned) return res.status(403).json({ error: 'That wishlist is not yours' });
 
-    // Check for existing band by MBID or name
-    const existing = await prisma.band.findFirst({
-      where: mbid ? { MBID: mbid } : { name: name.trim() },
-      select: { id: true, name: true },
-    });
+    // By MBID first, then by name. It used to be one or the other: with an
+    // MBID given, a band already stored under that name but without that MBID
+    // — which is most bands, whose MBID lookup found nothing or was never run —
+    // was not found, and creating it again hit the unique name as a 500.
+    const select = { id: true, name: true };
+    let band = (mbid && await prisma.band.findFirst({ where: { MBID: mbid }, select }))
+      || await prisma.band.findFirst({ where: { name }, select });
 
-    let band = existing;
     if (!band) {
-      band = await prisma.band.create({
-        data: { name: name.trim(), MBID: mbid ?? null, created_at: new Date() },
-        select: { id: true, name: true },
-      });
+      try {
+        band = await prisma.band.create({
+          data: { name, MBID: mbid, created_at: new Date() },
+          select,
+        });
+      } catch (error) {
+        // Added by someone else between the lookup and here. Use theirs.
+        if (error.code !== 'P2002') throw error;
+        band = (mbid && await prisma.band.findFirst({ where: { MBID: mbid }, select }))
+          || await prisma.band.findFirst({ where: { name }, select });
+        if (!band) throw error;
+      }
       // Same reason as the create route above. Only for a band that was just
       // created: one that already existed was linked as its bills were ingested.
       try {

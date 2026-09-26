@@ -22,6 +22,7 @@ const { signOAuthState, verifyOAuthState } = require('../../utils/oauthState');
 const {
   PROVIDER, authorizeUrl, exchangeCode, expiryFrom, me,
 } = require('../../utils/spotify');
+const { escapeHtml } = require('../../utils/html');
 
 const rateLimit = rateLimiter({
   message: 'Too many requests to the Spotify OAuth route, please try again later.',
@@ -66,16 +67,18 @@ router.get('/callback', rateLimit, async (req, res) => {
     if (!base) {
       // No frontend configured to return to: say so in the tab rather than
       // redirecting nowhere.
+      // `reason` can be Spotify's `?error=`, which is whatever the link says —
+      // written into this page unescaped, it ran as script on the API's origin.
       const ok = params.spotify === 'connected';
       return res
         .status(ok ? 200 : 400)
-        .send(`<p>${ok ? 'Spotify connected. You can close this tab.' : `Spotify connection failed: ${params.reason}`}</p>`);
+        .send(`<p>${ok ? 'Spotify connected. You can close this tab.' : `Spotify connection failed: ${escapeHtml(params.reason)}`}</p>`);
     }
     return res.redirect(`${base}/?${new URLSearchParams(params)}`);
   };
 
   try {
-    if (denied) return done({ spotify: 'failed', reason: String(denied) });
+    if (denied) return done({ spotify: 'failed', reason: String(denied).slice(0, 100) });
     if (!code || !state) return done({ spotify: 'failed', reason: 'missing_code' });
 
     const stored = verifyOAuthState(state, STATE_PURPOSE);

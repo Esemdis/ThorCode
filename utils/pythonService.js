@@ -7,33 +7,40 @@
 
 const axios = require('axios');
 
-// Errors that mean the request never reached a server. ECONNABORTED is axios's
-// own timeout, which belongs here for the same reason: nothing answered.
+// Errors that mean the request never reached a server: no name, no route, no
+// listener, no connection made.
 const UNREACHABLE = new Set([
   'ECONNREFUSED',
   'ENOTFOUND',
   'ETIMEDOUT',
-  'ECONNRESET',
-  'ECONNABORTED',
   'EAI_AGAIN',
   'EHOSTUNREACH',
   'ENETUNREACH',
 ]);
 
+// Errors after the request was sent, with no answer back. The worker may well
+// have it and be scraping: ECONNABORTED is axios's own timeout — five minutes
+// on the weather and setlist syncs, which is a job still running, not a host
+// that was never there — and ECONNRESET can drop a connection mid-response.
+// These used to count as unreachable, so a slow sync ran a second time on the
+// fallback host, which is the one thing the fallback promises never to do.
+const NO_ANSWER = new Set(['ECONNABORTED', 'ECONNRESET', 'EPIPE']);
+
 /**
  * Whether a failed call should be retried against the fallback host.
  *
- * True only when nothing answered. A 4xx or 5xx means the worker ran and
- * reported a result, so retrying elsewhere would run the same scrape twice
- * rather than fix anything — and an error that never became a request is a bug
- * on this side, which would simply reproduce on the other host.
+ * True only when the request provably never arrived. A 4xx or 5xx means the
+ * worker ran and reported a result, and a timeout or a reset may mean it is
+ * still running — either way retrying elsewhere would run the same scrape
+ * twice rather than fix anything. An error that never became a request is a
+ * bug on this side, which would simply reproduce on the other host.
  *
  * @param {Error} error
  * @returns {boolean}
  */
 function shouldFallBack(error) {
   if (!error || error.response) return false;
-  return UNREACHABLE.has(error.code) || Boolean(error.request);
+  return UNREACHABLE.has(error.code);
 }
 
 /**
@@ -110,10 +117,16 @@ function pythonServiceFailure(error) {
     return { status: 502, message: `The sync service answered ${upstream}.` };
   }
 
-  // Reuses the reachability rule rather than restating it, so "nothing
-  // answered" cannot come to mean two different things in one file.
+  // Reuses the reachability rule rather than restating it, so "never
+  // reached" cannot come to mean two different things in one file.
   if (shouldFallBack(error)) {
     return { status: 503, message: 'The sync service could not be reached.' };
+  }
+
+  // Sent, and no answer: not safe to call a failure, since the job may be
+  // running, and not a fault on this side either.
+  if (NO_ANSWER.has(error?.code) || error?.request) {
+    return { status: 504, message: 'The sync service did not answer in time. The job may still be running.' };
   }
 
   return { status: 500, message: 'The sync request could not be sent.' };

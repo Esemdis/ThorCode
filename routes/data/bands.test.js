@@ -87,6 +87,82 @@ describe('POST /bands', () => {
 
     expect(prisma.band.findUnique).toHaveBeenCalledWith({ where: { name: 'Architects' } });
   });
+
+  it('refuses a name that is only whitespace', async () => {
+    // notEmpty() passed "   ", the handler trimmed it to "", and a band with
+    // no name went into the table every account reads.
+    const res = await request(app).post('/bands').set(...authHeader()).send({ name: '   ' });
+
+    expect(res.status).toBe(400);
+    expect(prisma.band.findUnique).not.toHaveBeenCalled();
+    expect(prisma.band.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /bands/quick-add', () => {
+  const MBID = '65f4f0c5-ef9e-490c-aee3-909e7ae6b2ab';
+
+  beforeEach(() => {
+    prisma.band.findFirst = vi.fn(async () => null);
+    prisma.band.create = vi.fn(async ({ data }) => ({ id: 50, name: data.name }));
+    prisma.concert.findMany.mockResolvedValue([]);
+  });
+
+  it('uses the band already stored under that name when its MBID is not on file', async () => {
+    // Looked up by MBID alone, this missed, and creating the band again hit
+    // the unique name as a 500.
+    prisma.band.findFirst = vi.fn(async ({ where }) => (where.name === 'Gojira' ? { id: 92, name: 'Gojira' } : null));
+
+    const res = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'Gojira', mbid: MBID });
+
+    expect(res.status).toBe(201);
+    expect(res.body.band).toEqual({ id: 92, name: 'Gojira' });
+    expect(prisma.band.create).not.toHaveBeenCalled();
+  });
+
+  it('takes the band someone else created a moment ago', async () => {
+    let created = false;
+    prisma.band.findFirst = vi.fn(async ({ where }) => (created && where.name === 'Gojira' ? { id: 93, name: 'Gojira' } : null));
+    prisma.band.create = vi.fn(async () => { created = true; throw Object.assign(new Error('unique'), { code: 'P2002' }); });
+
+    const res = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'Gojira' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.band.id).toBe(93);
+  });
+
+  it('refuses an MBID that is not one', async () => {
+    const res = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'Gojira', mbid: '../../x' });
+
+    expect(res.status).toBe(400);
+    expect(prisma.band.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /bands/search input', () => {
+  it('clamps a limit that is not a number instead of passing NaN to Prisma', async () => {
+    prisma.band.findMany.mockResolvedValue([]);
+
+    const res = await request(app).get('/bands/search').query({ q: 'gojira', limit: 'abc' });
+
+    expect(res.status).toBe(200);
+    expect(prisma.band.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 10 }));
+  });
+
+  it('caps a large limit', async () => {
+    prisma.band.findMany.mockResolvedValue([]);
+
+    await request(app).get('/bands/search').query({ q: 'gojira', limit: '100000' });
+
+    expect(prisma.band.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 50 }));
+  });
+
+  it('answers an empty list for a repeated q rather than throwing on it', async () => {
+    const res = await request(app).get('/bands/search?q=ab&q=cd');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+  });
 });
 
 describe('GET /setlist-lookup', () => {
@@ -497,6 +573,27 @@ describe('DELETE /bands/:bandId', () => {
     expect(prisma.concertMedia.deleteMany).not.toHaveBeenCalled();
     expect(prisma.concertAttendance.deleteMany).not.toHaveBeenCalled();
     expect(prisma.concert.deleteMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('band id validation on the sync routes', () => {
+  it('answers 400 for a band id that is not a number', async () => {
+    const res = await request(app).post('/bands/abc/sync-concerts').set(...authHeader({ role: 'ADMIN' }));
+
+    expect(res.status).toBe(400);
+    expect(prisma.band.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('skips a malformed entry in a reconcile rather than throwing on it', async () => {
+    prisma.concert.findMany.mockResolvedValueOnce([]);
+
+    const res = await request(app)
+      .post('/bands/5/reconcile')
+      .set(...authHeader({ role: 'SYSTEM' }))
+      .send({ upcoming: [null, 'x', { concert_date: '2030-01-01', venue: 'Debaser', city: 'Stockholm' }] });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ stale_removed: 0, resync_bands: [] });
   });
 });
 

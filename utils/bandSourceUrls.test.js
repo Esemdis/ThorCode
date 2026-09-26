@@ -172,3 +172,13 @@ describe('findSourceUrls — MusicBrainz being busy', () => {
     expect(get).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('lucenePhrase', () => {
+  it('quotes a name so MusicBrainz searches for all of it', async () => {
+    const { lucenePhrase } = await import('./bandSourceUrls.js');
+    expect(lucenePhrase('Gojira')).toBe('"Gojira"');
+    // A quote ended the phrase early, and a backslash escaped what followed.
+    expect(lucenePhrase('The "Band"')).toBe('"The \\"Band\\""');
+    expect(lucenePhrase('A\\B')).toBe('"A\\\\B"');
+  });
+});

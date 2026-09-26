@@ -89,6 +89,21 @@ describe('canonicalBandName', () => {
     expect(sameBand('Caskets Open', 'Caskets')).toBe(false);
   });
 
+  it('keeps names that are not written in Latin letters', () => {
+    // Everything outside a-z used to be stripped, so these were all '' — no
+    // band written in Cyrillic or Japanese could be matched or put on a bill.
+    expect(canonicalBandName('Кино')).toBe('кино');
+    expect(sameBand('КИНО', 'Кино')).toBe(true);
+    expect(canonicalBandName('陰陽座')).toBe('陰陽座');
+    expect(sameBand('ガ', 'カ')).toBe(false);
+  });
+
+  it('keeps letters that have no accent to strip', () => {
+    expect(canonicalBandName('Møl')).toBe('møl');
+    expect(sameBand('Møl', 'Ml')).toBe(false);
+    expect(sameBand('Æther Realm', 'ÆTHER REALM')).toBe(true);
+  });
+
   it('is empty for names with nothing comparable left', () => {
     expect(canonicalBandName('')).toBe('');
     expect(canonicalBandName(null)).toBe('');

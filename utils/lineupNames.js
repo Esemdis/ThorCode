@@ -106,11 +106,19 @@ function canonicalBandName(name) {
   const cleaned = cleanLineupName(name);
   if (!cleaned) return '';
   const withoutSuffix = cleaned.replace(COUNTRY_SUFFIX, '').trim() || cleaned;
+  // Accents come off Latin letters (ö is o), and then any letter or digit in
+  // any script is kept. It used to keep a-z and 0-9 only, which erased every
+  // name not written in Latin — "Кино" and "陰陽座" were both '', so neither
+  // could be matched or put on a bill, and every such artist shared one
+  // Last.fm cache entry — and dropped letters like ø and æ that have no
+  // accent to strip, so "Møl" was "ml". Recomposed before filtering so marks
+  // that belong to a letter outside Latin (the dakuten in ガ) stay with it.
   return withoutSuffix
     .normalize('NFD')
-    .replace(/[̀-ͯ]/g, '')
+    .replace(/[\u0300-\u036f]/g, '')
+    .normalize('NFC')
     .toLowerCase()
-    .replace(/[^a-z0-9]/g, '');
+    .replace(/[^\p{L}\p{N}]/gu, '');
 }
 
 module.exports = { cleanLineupName, cleanLineupNames, cleanLineupJson, canonicalBandName };

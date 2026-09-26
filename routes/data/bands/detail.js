@@ -29,13 +29,22 @@ const { rateLimiter } = require('../../../utils/rateLimiter');
 // what fits on screen without scrolling the dropdown.
 const LASTFM_ROWS = 3;
 
-// Both endpoints below can trigger paid/limited third-party lookups. They are
-// normal signed-in UI operations, but must not be a public proxy to Spotify or
-// Last.fm.
+// Artist search spends a Spotify search and up to three Last.fm calls on every
+// query, so it is metered tightly: a signed-in convenience, not a public proxy.
 const artistLookupRateLimit = rateLimiter({
   windowMs: 15 * 60 * 1000,
   max: 30,
   message: 'Too many artist lookups. Please try again later.',
+});
+
+// Opening a band page is a database read, plus one Spotify search the first
+// time a band is ever opened. It used to share the limiter above — one
+// instance, one counter — so browsing thirty band pages in a quarter of an
+// hour locked out both the pages and the search.
+const bandPageRateLimit = rateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  message: 'Too many band pages at once. Please try again shortly.',
 });
 
 // Bound to the module's cache and Spotify client once, so no route has to
@@ -43,7 +52,7 @@ const artistLookupRateLimit = rateLimiter({
 const bandImageDeps = { getCache, setCache, getArtists };
 
 // Get all upcoming concerts for a specific band
-router.get('/bands/:bandId/upcoming', auth, artistLookupRateLimit, async (req, res) => {
+router.get('/bands/:bandId/upcoming', auth, bandPageRateLimit, async (req, res) => {
   try {
     const bandId = parseInt(req.params.bandId, 10);
     if (Number.isNaN(bandId)) {
@@ -107,10 +116,13 @@ router.get('/bands/:bandId/upcoming', auth, artistLookupRateLimit, async (req, r
       // Full lineup from metadata (JSON array of name strings)
       let metadataNames = [];
       try { metadataNames = JSON.parse(c.metadata || '[]'); } catch {}
+      // metadata is free-form text, and one non-array or non-string entry used
+      // to throw here and take the whole band page down with it.
+      if (!Array.isArray(metadataNames)) metadataNames = [];
 
       // Merge: tracked bands keep their id; metadata-only names get id: null
       const metadataOnly = metadataNames
-        .filter((n) => !trackedNames.has(n.toLowerCase()))
+        .filter((n) => typeof n === 'string' && !trackedNames.has(n.toLowerCase()))
         .map((n) => ({ id: null, name: n }));
 
       return {
@@ -397,7 +409,7 @@ router.delete(
 router.get('/bands/artist-search', auth, artistLookupRateLimit, async (req, res) => {
   try {
     const { q } = req.query;
-    if (!q || q.trim().length < 2) return res.json([]);
+    if (typeof q !== 'string' || q.trim().length < 2) return res.json([]);
 
     const searchTerm = q.trim();
     const cacheKey = `artist:search:${searchTerm.toLowerCase()}`;

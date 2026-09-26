@@ -112,12 +112,21 @@ function isConfidentNameMatch(bandName, candidateName) {
  * @returns {Promise<[string|null, string|null, string|null]>} songkick url,
  *   bandsintown url, and the MBID used — null when none could be trusted.
  */
+/**
+ * A name as a Lucene phrase. A double quote in it ended the phrase early and a
+ * backslash escaped whatever followed, so a band with either in its name was
+ * searched for as something else.
+ */
+function lucenePhrase(text) {
+  return `"${String(text).replace(/[\\"]/g, '\\$&')}"`;
+}
+
 async function findSourceUrls(bandName, mbid = null, client = axios) {
   let resolvedMbid = mbid;
 
   if (!resolvedMbid) {
     const searchRes = await getWithRetry(client, 'https://musicbrainz.org/ws/2/artist/', {
-      params: { query: `artist:"${bandName}"`, limit: 1, fmt: 'json' },
+      params: { query: `artist:${lucenePhrase(bandName)}`, limit: 1, fmt: 'json' },
       headers: MB_HEADERS,
       timeout: 10000,
     });
@@ -137,7 +146,7 @@ async function findSourceUrls(bandName, mbid = null, client = axios) {
     await sleep(SEARCH_SPACING_MS);
   }
 
-  const relRes = await getWithRetry(client, `https://musicbrainz.org/ws/2/artist/${resolvedMbid}`, {
+  const relRes = await getWithRetry(client, `https://musicbrainz.org/ws/2/artist/${encodeURIComponent(resolvedMbid)}`, {
     params: { inc: 'url-rels', fmt: 'json' },
     headers: MB_HEADERS,
     timeout: 10000,
@@ -157,6 +166,7 @@ async function findSourceUrls(bandName, mbid = null, client = axios) {
 
 module.exports = {
   findSourceUrls,
+  lucenePhrase,
   isConfidentNameMatch,
   NAME_MATCH_THRESHOLD,
   MB_RETRY_ATTEMPTS,

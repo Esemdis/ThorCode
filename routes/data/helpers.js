@@ -15,8 +15,12 @@ const errorMessages = {
     409: { error: 'Band already exists.' },
     500: { error: 'Internal server error' },
   },
+  // 403 and 409 are answered by several wishlist routes and were missing
+  // here, so a refusal came back as "An unknown error occurred."
   wishlist: {
+    403: { error: 'That wishlist is not yours.' },
     404: { error: 'Wishlist not found.' },
+    409: { error: 'That band is already on this wishlist.' },
     500: { error: 'Internal server error' },
   },
 };

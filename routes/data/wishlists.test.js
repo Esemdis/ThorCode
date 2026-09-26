@@ -653,3 +653,59 @@ describe('POST /wishlists/:id/attendance/from-setlist', () => {
     expect(setlistFm.fetchSetlistById).not.toHaveBeenCalled();
   });
 });
+
+describe('POST /wishlists/:id/bands', () => {
+  // The router's own copy of band creation — see the from-setlist tests.
+  const bandCreate = createRequire(import.meta.url)('../../utils/bandCreate.js');
+
+  beforeEach(() => {
+    delete process.env.CALLBACK_URL;
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1' });
+    prisma.wishlistBandReference.findFirst.mockResolvedValue(null);
+    prisma.wishlistBandReference.create.mockResolvedValue({});
+  });
+
+  const add = (body) => request(app).post('/wishlists/7/bands').set(...authHeader({ id: 'user-1' })).send(body);
+
+  it('creates the band in-process, with no CALLBACK_URL needed', async () => {
+    // This was the API calling itself over HTTP at CALLBACK_URL.
+    vi.spyOn(bandCreate, 'createBand').mockResolvedValue({ band: { id: 50, name: 'Gojira' }, warning: null });
+
+    const res = await add({ name: '  Gojira ', tier: 'LOVE' });
+
+    expect(res.status).toBe(201);
+    expect(bandCreate.createBand).toHaveBeenCalledWith('Gojira');
+    expect(prisma.wishlistBandReference.create).toHaveBeenCalledWith({
+      data: { wishlist_id: 7, band_id: 50, tier: 'LOVE' },
+    });
+  });
+
+  it('links the band that already exists', async () => {
+    vi.spyOn(bandCreate, 'createBand').mockRejectedValue(new bandCreate.BandExistsError({ id: 92, name: 'Gojira' }));
+
+    const res = await add({ name: 'Gojira' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.band.id).toBe(92);
+  });
+
+  it('says so when the band is already on the wishlist', async () => {
+    vi.spyOn(bandCreate, 'createBand').mockRejectedValue(new bandCreate.BandExistsError({ id: 92, name: 'Gojira' }));
+    prisma.wishlistBandReference.findFirst.mockResolvedValue({ id: 1 });
+
+    const res = await add({ name: 'Gojira' });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/already on this wishlist/);
+  });
+
+  it('answers 404 for a Ticketmaster id no band has', async () => {
+    vi.spyOn(bandCreate, 'createBand');
+    prisma.band.findUnique.mockResolvedValue(null);
+
+    const res = await add({ ticketmaster_id: 'K8vZ917G' });
+
+    expect(res.status).toBe(404);
+    expect(bandCreate.createBand).not.toHaveBeenCalled();
+  });
+});

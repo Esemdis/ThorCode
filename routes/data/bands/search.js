@@ -21,13 +21,17 @@ const bandImageDeps = { getCache, setCache, getArtists };
 // Search bands by name for autocomplete
 router.get('/bands/search', async (req, res) => {
   try {
-    const { q, limit = 10 } = req.query;
+    const { q } = req.query;
 
-    if (!q || q.trim().length < 2) {
+    // A repeated ?q= arrives as an array, and .trim() on it was a 500.
+    if (typeof q !== 'string' || q.trim().length < 2) {
       return res.json([]);
     }
 
     const searchTerm = q.trim();
+    // Clamped: "abc" became take: NaN (a 500) and a large number returned the
+    // whole table to an unauthenticated caller.
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 50);
 
     const bands = await prisma.band.findMany({
       where: {
@@ -45,7 +49,7 @@ router.get('/bands/search', async (req, res) => {
           name: 'asc',
         },
       ],
-      take: parseInt(limit, 10),
+      take: limit,
     });
 
     // Sort results to prioritize matches that start with the search term

@@ -15,8 +15,17 @@ const httpError = (status) => Object.assign(new Error(`Request failed with statu
 
 describe('shouldFallBack', () => {
   it('falls back when the service could not be reached at all', () => {
-    for (const code of ['ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT', 'ECONNRESET', 'ECONNABORTED']) {
+    for (const code of ['ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT', 'EAI_AGAIN', 'EHOSTUNREACH']) {
       expect(shouldFallBack(connectionError(code))).toBe(true);
+    }
+  });
+
+  it('does not fall back when the request may have arrived', () => {
+    // An axios timeout on a five-minute sync is a job still running, and a
+    // reset can land mid-response. Retrying either elsewhere ran the scrape
+    // twice — exactly what the fallback exists never to do.
+    for (const code of ['ECONNABORTED', 'ECONNRESET']) {
+      expect(shouldFallBack(connectionError(code))).toBe(false);
     }
   });
 
@@ -130,6 +139,12 @@ describe('pythonServiceFailure', () => {
     // Distinct from the above on purpose: nothing ran, so retrying is safe.
     // A 502 would say the scrape happened and went wrong.
     expect(pythonServiceFailure(connectionError('ECONNREFUSED')).status).toBe(503);
+  });
+
+  it('answers a gateway timeout when the request went out and nothing came back', () => {
+    const { status, message } = pythonServiceFailure(connectionError('ECONNABORTED'));
+    expect(status).toBe(504);
+    expect(message).toMatch(/may still be running/);
   });
 
   it('keeps a bug on our own side a plain server error', () => {
