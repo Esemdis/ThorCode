@@ -174,6 +174,49 @@ describe.skipIf(!url)('against Postgres', () => {
     }
   });
 
+  it('keeps a half-star TMDB rating, and keeps it across a second sync', async () => {
+    // MovieReview.rating was an INTEGER and TMDB rates in half stars, so a 7.5
+    // failed its upsert and was skipped. The sync's delete then compared TMDB
+    // ids against our own movie ids and removed the rest.
+    const tmdbIds = [880000000 + (Date.now() % 10000000), 890000000 + (Date.now() % 10000000)];
+    const axios = require('axios');
+    const tmdb = vi.spyOn(axios, 'get').mockResolvedValue({
+      data: {
+        results: [
+          { id: tmdbIds[0], original_title: `${RUN} half`, rating: 7.5 },
+          { id: tmdbIds[1], original_title: `${RUN} whole`, rating: 9 },
+        ],
+      },
+    });
+    const viewer = await prisma.user.create({
+      data: {
+        id: `${RUN}-tmdb`, email: `${RUN}-tmdb@example.test`,
+        oauth: { create: { provider: 'tmdb', provider_user_id: '42', access_token: 'session' } },
+      },
+    });
+
+    try {
+      const app = appWith([['/data/tmdb', require('../../routes/data/tmdb.js')]]);
+      await request(app).post('/data/tmdb/me').set('Authorization', token(viewer.id)).expect(200);
+      await request(app).post('/data/tmdb/me').set('Authorization', token(viewer.id)).expect(200);
+
+      const reviews = await prisma.movieReview.findMany({
+        where: { user: viewer.id },
+        select: { rating: true, movie_rel: { select: { tmdb_id: true } } },
+        orderBy: { rating: 'asc' },
+      });
+      expect(reviews).toEqual([
+        { rating: 7.5, movie_rel: { tmdb_id: tmdbIds[0] } },
+        { rating: 9, movie_rel: { tmdb_id: tmdbIds[1] } },
+      ]);
+    } finally {
+      tmdb.mockRestore();
+      await prisma.movieReview.deleteMany({ where: { user: viewer.id } });
+      await prisma.oAuth.deleteMany({ where: { user: viewer.id } });
+      await prisma.movie.deleteMany({ where: { tmdb_id: { in: tmdbIds } } });
+    }
+  });
+
   it('answers the admin user lookup', async () => {
     // It selected scalar columns with a nested select, which Postgres-backed
     // Prisma refuses outright: a 500 on every request.

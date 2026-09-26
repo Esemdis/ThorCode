@@ -61,7 +61,7 @@ model MovieReview {
   id        Int    @id @default(autoincrement())
   user      String
   movie     Int
-  rating    Int
+  rating    Float
   movie_rel Movie  @relation("MovieMovieReviews", fields: [movie], references: [id])
   user_rel  User   @relation("UserMovieReviews", fields: [user], references: [id])
 
