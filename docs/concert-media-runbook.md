@@ -21,8 +21,10 @@ $MEDIA_ROOT/
             concert-media.json      what the database is a copy of
             .posters/VID_0031.mp4.webp
             .web/VID_0031.mp4.mp4   1080p H.264 viewing copy. Delete at any time.
-    cache/            derived photo thumbnails, and shared moments cut from
-                      videos (cache/clips). Delete at any time.
+    cache/            derived copies. Delete at any time.
+        thumbs/<sha256>.webp        grid thumbnails of photos, 480px wide
+        display/<sha256>.webp       lightbox copies of photos, within 2048px
+        clips/<link id>.mp4         shared moments cut from videos
     incoming/         multer's scratch space during an upload.
 ```
 
@@ -346,6 +348,11 @@ The five minutes is not an oversight. `/play` answers from the same URL before
 and after the service reaches a clip, so telling the browser to keep the
 original for a year would hide the rendition behind a cache entry nothing can
 invalidate.
+
+Photos have a viewing copy too, made by the API itself rather than the service:
+`/media/:id/view` answers with a WebP that fits within 2048px, written to
+`cache/display/<sha256>.webp` the first time anyone opens the photo (for a
+video, `/view` is the same as `/play`).
 
 Every one of these URLs is signed until the end of the current hour plus six
 hours, so a listing asked for twice within the hour hands out the same URLs and

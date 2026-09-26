@@ -3,7 +3,9 @@ import { mkdtemp, writeFile, access, readdir, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import sharp from 'sharp';
-import { THUMB_WIDTH, ensureThumb, storePoster } from './mediaThumbs.js';
+import {
+  THUMB_WIDTH, DISPLAY_EDGE, ensureThumb, ensureDisplay, storePoster,
+} from './mediaThumbs.js';
 import { posterPath } from './mediaPaths.js';
 
 let root;
@@ -167,5 +169,69 @@ describe('ensureThumb for a photo whose original is gone', () => {
       absPath: join(root, 'not-there.jpg'), kind: 'PHOTO', sha256: 'gone1', relPath: 'u/s/x.jpg',
     }).catch((e) => e);
     expect(err.code).toBe('NO_SOURCE');
+  });
+});
+
+describe('ensureDisplay', () => {
+  // A photograph of a given shape, optionally with the EXIF orientation a phone
+  // writes when it stores a portrait shot as landscape pixels.
+  const photo = async (name, width, height, orientation) => {
+    const p = join(root, name);
+    let img = sharp({ create: { width, height, channels: 3, background: '#475569' } });
+    if (orientation) img = img.withMetadata({ orientation });
+    await img.jpeg().toFile(p);
+    return p;
+  };
+  const size = async (p) => {
+    const { width, height } = await sharp(p).metadata();
+    return [width, height];
+  };
+
+  it('writes a webp at the checksum-keyed path, beside the thumbnails', async () => {
+    const out = await ensureDisplay({ absPath: await aPhoto(), sha256: 'abc' });
+    expect(out).toBe(join(root, 'cache', 'display', 'abc.webp'));
+    expect((await sharp(out).metadata()).format).toBe('webp');
+  });
+
+  it('fits a phone-sized photograph inside the display edge, in proportion', async () => {
+    const out = await ensureDisplay({ absPath: await photo('big.jpg', 4000, 3000), sha256: 'big' });
+    expect(await size(out)).toEqual([DISPLAY_EDGE, 1536]);
+  });
+
+  it('bounds a portrait photograph by its height rather than its width', async () => {
+    // Capped on width alone, a 3000x4000 portrait would come out 2048 wide and
+    // 2731 tall — bigger than the screen it is meant for.
+    const out = await ensureDisplay({ absPath: await photo('tall.jpg', 3000, 4000), sha256: 'tall' });
+    expect(await size(out)).toEqual([1536, DISPLAY_EDGE]);
+  });
+
+  it('does not enlarge a photograph already smaller than a screen', async () => {
+    const out = await ensureDisplay({ absPath: await aPhoto(), sha256: 'small' });
+    expect(await size(out)).toEqual([1200, 900]);
+  });
+
+  it('stands a photograph up the way the camera was held', async () => {
+    // Orientation 6 is "rotate 90° clockwise to view". The copy carries no
+    // EXIF, so unless the rotation is applied to the pixels it is served lying
+    // on its side.
+    const sideways = await photo('sideways.jpg', 3000, 2000, 6);
+    const out = await ensureDisplay({ absPath: sideways, sha256: 'sideways' });
+    expect(await size(out)).toEqual([1365, DISPLAY_EDGE]);
+  });
+
+  it('reuses a copy it has already made', async () => {
+    const p = await aPhoto();
+    const first = await ensureDisplay({ absPath: p, sha256: 'again' });
+    const { stat } = await import('node:fs/promises');
+    const { mtimeMs } = await stat(first);
+    await ensureDisplay({ absPath: p, sha256: 'again' });
+    expect((await stat(first)).mtimeMs).toBe(mtimeMs);
+  });
+
+  it('reports an original that is gone in a form the route can tell apart', async () => {
+    const err = await ensureDisplay({ absPath: join(root, 'not-there.jpg'), sha256: 'gone' })
+      .catch((e) => e);
+    expect(err.code).toBe('NO_SOURCE');
+    await expect(access(join(root, 'cache', 'display', 'gone.webp'))).rejects.toThrow();
   });
 });

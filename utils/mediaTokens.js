@@ -146,6 +146,10 @@ function mediaUrls(baseUrl, mediaId, token) {
     // the download; `play` is the same bytes until a rendition exists, and the
     // viewing copy afterwards, without the client having to know which.
     play: `${base}${MEDIA_PATH}/${id}/play${q}`,
+    // What the lightbox shows. For a photograph, a copy sized for a screen
+    // rather than the phone's full-resolution original; for a video, exactly
+    // what `play` serves.
+    view: `${base}${MEDIA_PATH}/${id}/view${q}`,
   };
 }
 

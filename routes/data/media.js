@@ -35,7 +35,7 @@ const {
   kindForMime, posterProblem, MAX_FILE_BYTES, MAX_FILES_PER_REQUEST,
 } = require('../../utils/mediaTypes');
 const { uploadErrors } = require('../../utils/uploadErrors');
-const { storePoster, ensureThumb } = require('../../utils/mediaThumbs');
+const { storePoster, ensureThumb, ensureDisplay } = require('../../utils/mediaThumbs');
 const { playableFor } = require('../../utils/mediaRenditions');
 const { bandMediaOverview } = require('../../utils/mediaOverview');
 const { billForConcert } = require('../../utils/concertBill');
@@ -1409,7 +1409,7 @@ router.delete(
 );
 
 /**
- * The two routes that serve bytes.
+ * The routes that serve bytes.
  *
  * Deliberately no `auth` middleware. An <img src> and a <video src> issue their
  * own requests and cannot attach an Authorization header, so these authenticate
@@ -1472,7 +1472,10 @@ async function sendMediaBytes(res, row, which, context, { cacheControl } = {}) {
   // original, so `immutable` is only claimed once there is nothing left to
   // supersede. See the Cache-Control below.
   let servingOriginalForPlayback = false;
-  if (which === 'play') {
+  // /view is what the lightbox shows. A video's viewing copy is whatever /play
+  // chooses, so for a video /view is /play in every respect — the short cache
+  // while the original stands in for a rendition included.
+  if (which === 'play' || (which === 'view' && row.kind === 'VIDEO')) {
     const chosen = await playableFor(archivePath, row.kind);
     absPath = chosen.absPath;
     servingOriginalForPlayback = !chosen.rendition && row.kind === 'VIDEO';
@@ -1488,6 +1491,17 @@ async function sendMediaBytes(res, row, which, context, { cacheControl } = {}) {
       // photo whose original is gone, which is what the file route already
       // says about the same row. 404 so the grid draws its placeholder
       // rather than retrying an image that is never coming.
+      return res.status(404).end();
+    }
+  } else if (which === 'view') {
+    // A photograph's is a copy sized for a screen, made on first request and
+    // keyed by checksum like a thumbnail, which is why the immutable cache
+    // below suits it.
+    try {
+      absPath = await ensureDisplay({ absPath: archivePath, sha256: row.sha256 });
+    } catch (err) {
+      // An original that is gone, answered as the thumb route answers it.
+      if (err.code !== 'NO_SOURCE') throw err;
       return res.status(404).end();
     }
   } else {
@@ -1581,6 +1595,9 @@ router.get('/media/:id/file', (req, res) => serveMedia(req, res, 'file'));
 // until then. Separate from /file so a download always gets the master.
 router.get('/media/:id/play', (req, res) => serveMedia(req, res, 'play'));
 router.get('/media/:id/thumb', (req, res) => serveMedia(req, res, 'thumb'));
+// The lightbox's copy: a photograph at screen size rather than the phone's
+// full-resolution original, and for a video exactly what /play answers.
+router.get('/media/:id/view', (req, res) => serveMedia(req, res, 'view'));
 
 /**
  * A share link, opened by someone with no account.

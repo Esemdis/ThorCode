@@ -115,10 +115,10 @@ describe('POST /attendances/:id/media', () => {
     // otherwise. GET /media/:id/file and /thumb are the exception — they carry
     // their own auth via a signed URL token instead of this middleware, so
     // their count is 1: just the handler, no `auth` or `roleCheck` in front.
-    // /play is the same: it is what a <video> points at, and an element sends
-    // no Authorization header. GET /media/share/:token is public by design —
-    // the token in its path is the credential — so its 2 is the rate limiter
-    // and the handler.
+    // /play and /view are the same: they are what a <video> and the
+    // lightbox's <img> point at, and an element sends no Authorization
+    // header. GET /media/share/:token is public by design — the token in its
+    // path is the credential — so its 2 is the rate limiter and the handler.
     expect(routeManifest(router)).toEqual([
       'POST /attendances/:attendanceId/media [7]',
       'GET /attendances/:attendanceId/media [4]',
@@ -132,6 +132,7 @@ describe('POST /attendances/:id/media', () => {
       'GET /media/:id/file [1]',
       'GET /media/:id/play [1]',
       'GET /media/:id/thumb [1]',
+      'GET /media/:id/view [1]',
       'GET /media/share/:token [2]',
     ]);
   });
@@ -2750,6 +2751,86 @@ describe('GET /media/:id/thumb', () => {
     const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
     const res = await request(app()).get(`/data/concerts/media/1/thumb?t=${t}`);
     expect(res.status).not.toBe(404);
+  });
+});
+
+describe('GET /media/:id/view', () => {
+  // What the lightbox shows. A phone original is 12 to 50 megapixels and
+  // several megabytes: most of a second per photograph over a home uplink, for
+  // detail no screen shows at once.
+  const dir = () => join(root, 'archive', 'user-1', 'show');
+  const tok = () => signMediaToken({ mediaId: 1, userId: 'user-1' });
+  const point = (row) => {
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      id: 1, attendance_rel: { wishlist_rel: { user_id: 'user-1' } }, ...row,
+    }));
+  };
+  // The body as bytes whatever its type: a video is not text to superagent.
+  const bodyOf = (req) => req.buffer(true).parse((res, done) => {
+    const chunks = [];
+    res.on('data', (c) => chunks.push(c));
+    res.on('end', () => done(null, Buffer.concat(chunks)));
+  });
+
+  it('serves a photograph at screen size, as webp, cached like a thumbnail', async () => {
+    const sharp = (await import('sharp')).default;
+    await mkdir(dir(), { recursive: true });
+    await sharp({ create: { width: 4000, height: 3000, channels: 3, background: '#334155' } })
+      .jpeg().toFile(join(dir(), 'IMG_1.jpg'));
+    point({ kind: 'PHOTO', sha256: 'big1', filename: 'IMG_1.jpg', rel_path: 'user-1/show/IMG_1.jpg' });
+
+    const res = await bodyOf(request(app()).get(`/data/concerts/media/1/view?t=${tok()}`)).expect(200);
+
+    expect(res.headers['content-type']).toMatch(/image\/webp/);
+    const { width, height } = await sharp(res.body).metadata();
+    expect([width, height]).toEqual([2048, 1536]);
+    // Keyed by the photograph's checksum, so nothing can make it stale.
+    expect(res.headers['cache-control']).toMatch(/immutable/);
+  });
+
+  it('answers a video with exactly what /play answers', async () => {
+    await mkdir(join(dir(), '.web'), { recursive: true });
+    await writeFile(join(dir(), 'VID_1.mp4'), 'original bytes');
+    point({ kind: 'VIDEO', sha256: 'v1', filename: 'VID_1.mp4', rel_path: 'user-1/show/VID_1.mp4' });
+
+    const before = await bodyOf(request(app()).get(`/data/concerts/media/1/view?t=${tok()}`)).expect(200);
+    expect(before.body.toString()).toBe('original bytes');
+    // /play's short cache for an original, so the rendition can take over the
+    // URL when it arrives.
+    expect(before.headers['cache-control']).toBe('private, max-age=300');
+
+    await writeFile(join(dir(), '.web', 'VID_1.mp4.mp4'), 'rendition bytes');
+    const after = await bodyOf(request(app()).get(`/data/concerts/media/1/view?t=${tok()}`)).expect(200);
+    expect(after.body.toString()).toBe('rendition bytes');
+    expect(after.headers['cache-control']).toMatch(/immutable/);
+  });
+
+  it('answers 404 for a photograph whose original is gone, and does not cache the miss', async () => {
+    point({ kind: 'PHOTO', sha256: 'gone1', filename: 'gone.jpg', rel_path: 'user-1/show/gone.jpg' });
+
+    const res = await request(app()).get(`/data/concerts/media/1/view?t=${tok()}`).expect(404);
+
+    expect(res.headers['cache-control'] ?? '').not.toMatch(/immutable/);
+  });
+
+  it('carries its own auth and refuses a token for another file', async () => {
+    point({ kind: 'PHOTO', sha256: 'h1', filename: 'a.jpg', rel_path: 'user-1/show/a.jpg' });
+    const t = signMediaToken({ mediaId: 999, userId: 'user-1' });
+    await request(app()).get(`/data/concerts/media/1/view?t=${t}`).expect(401);
+  });
+
+  it('is handed out with every file in a listing', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 7, attendance_id: 1, band_id: null, filename: 'a.jpg', kind: 'PHOTO', sha256: 'h7' },
+    ]);
+
+    const res = await request(app())
+      .get('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(res.body.data.files[0].view)
+      .toMatch(/^https:\/\/api\.example\.com\/data\/concerts\/media\/7\/view\?t=/);
   });
 });
 
