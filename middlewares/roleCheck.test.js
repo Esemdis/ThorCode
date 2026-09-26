@@ -35,13 +35,14 @@ describe('roleCheck middleware', () => {
     expect(res.statusCode).toBe(403);
   });
 
-  it('treats a user with no role as USER', () => {
+  it('rejects a user with no role rather than assuming USER', () => {
+    // Defaulting to USER is what let an OAuth state — signed, but carrying no
+    // role and no id — through every USER route as though it were a login.
     const middleware = roleCheck(['USER']);
     const req = { user: {} };
     const res = mockRes();
-    let called = false;
-    middleware(req, res, () => { called = true; });
-    expect(called).toBe(true);
+    middleware(req, res, () => { throw new Error('next should not be called'); });
+    expect(res.statusCode).toBe(403);
   });
 
   it('rejects everyone when the allow-list is empty', () => {
