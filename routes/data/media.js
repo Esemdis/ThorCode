@@ -154,7 +154,8 @@ async function ownAttendance(attendanceId, userId) {
 /**
  * Every show of the caller's whose bill has this band: the candidates
  * festivalSibling chooses from when a file's own show does not have it. The
- * tag sweep moves a file into one of these.
+ * tag sweep moves a file into one of these, and the upload route files into
+ * one, by the same rule and from the same list.
  */
 function billCandidates(userId, bandId) {
   return prisma.concertAttendance.findMany({
@@ -273,10 +274,35 @@ router.post(
       const errors = validationResult(req);
       if (!errors.isEmpty()) { await cleanup(); return badRequest(res, 'Validation failed'); }
 
-      const attendanceId = parseInt(req.params.attendanceId, 10);
-      const { row, owned } = await ownAttendance(attendanceId, req.user.id);
-      if (!row) { await cleanup(); return notFound(res, 'Attendance not found'); }
-      if (!owned) { await cleanup(); return forbidden(res, 'Forbidden'); }
+      let attendanceId = parseInt(req.params.attendanceId, 10);
+      const posted = await ownAttendance(attendanceId, req.user.id);
+      if (!posted.row) { await cleanup(); return notFound(res, 'Attendance not found'); }
+      if (!posted.owned) { await cleanup(); return forbidden(res, 'Forbidden'); }
+
+      // Which show the files are of. The one posted to, unless the band sent
+      // with them is not on its bill: then the caller's show on the same day
+      // in the same city that has the band, which on a festival day is the
+      // stage the act played. That is the rule the tag sweep moves a file by
+      // (see utils/mediaRehome.js), so a band picked at upload and the same
+      // band picked afterwards file a photograph in the same place. Settled
+      // first, because everything below is about this show: its date, its
+      // folder, its sidecar, its lock.
+      //
+      // A band on none of that day's bills is still refused. Filed anywhere,
+      // it would put a photograph under a show the user never saw them at, and
+      // the band view would then assert it.
+      const bandId = req.body.band_id ? parseInt(req.body.band_id, 10) : null;
+      let { row } = posted;
+      if (bandId !== null && !row.concert_rel.bands.some((b) => b.band_rel.id === bandId)) {
+        const home = festivalSibling(row.concert_rel, await billCandidates(req.user.id, bandId));
+        const sibling = home ? await ownAttendance(home.id, req.user.id) : null;
+        if (!sibling?.row || !sibling.owned) {
+          await cleanup();
+          return badRequest(res, 'That band is not on the bill of any show you saw that day');
+        }
+        attendanceId = home.id;
+        row = sibling.row;
+      }
 
       // GET /bands/:bandId/media filters null-dated attendances out on purpose:
       // dateOnly(null) is the epoch, and a 1970 show wrecks first_year and the
@@ -312,14 +338,8 @@ router.post(
         return badRequest(res, 'meta is not valid JSON');
       }
 
-      const bandId = req.body.band_id ? parseInt(req.body.band_id, 10) : null;
+      // The bill of the show the files land in, which by now has the band.
       const onBill = new Map(row.concert_rel.bands.map((b) => [b.band_rel.id, b.band_rel.name]));
-      // A band that was not on the bill would file a photo under a show the
-      // user never saw them at, and the band view would then assert it.
-      if (bandId !== null && !onBill.has(bandId)) {
-        await cleanup();
-        return badRequest(res, 'That band is not on this bill');
-      }
 
       // Posters are named for the video they belong to, so a batch mixing
       // photos and video pairs them up without depending on array order.
@@ -558,7 +578,9 @@ router.post(
           .map((f) => unlink(f.path).catch(() => {})));
       }
 
-      success(res, 201, { created, duplicates });
+      // attendance_id says where the files landed, which is not the show in
+      // the URL when the band sent with them played another stage that day.
+      success(res, 201, { created, duplicates, attendance_id: attendanceId });
 
       // Photo thumbnails after the response, best effort. Twenty files should
       // not leave the browser waiting on image processing, and a missing photo

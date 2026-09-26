@@ -216,15 +216,30 @@ describe('POST /attendances/:id/media', () => {
     expect(sidecar.files[0]).toMatchObject({ band_id: null, band_name: null, song: null });
   });
 
-  it('refuses a band that is not on the bill', async () => {
+  it('refuses a band that is on no bill of any show the user saw that day', async () => {
     // Otherwise a typo files a Gojira photo under a band that was not there,
     // and the band view quietly shows a show the user never saw them at.
-    await request(app())
+    const res = await request(app())
       .post('/data/concerts/attendances/1/media')
       .set(...authHeader(admin))
       .field('band_id', '999')
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(400);
+
+    expect(res.body.error).toMatch(/not on the bill of any show you saw that day/);
+    expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+    expect(await readdir(join(root, 'incoming')).catch(() => [])).toEqual([]);
+  });
+
+  it('says which show the files landed in', async () => {
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', '92')
+      .attach('files', jpeg(), 'IMG_1.jpg')
+      .expect(201);
+
+    expect(res.body.data.attendance_id).toBe(1);
   });
 
   it('refuses a file type no browser renders', async () => {
@@ -708,6 +723,103 @@ describe('an upload carrying a band_id that is not a band id', () => {
       .set(...authHeader(admin))
       .attach('files', jpeg(), 'IMG_1.jpg')
       .expect(201);
+  });
+});
+
+describe('an upload tagged with an act from another stage that day', () => {
+  // A festival day is one concert row per act, and the dialog uploads to
+  // whichever row it was opened from. Tagging a file with an act from another
+  // stage moves it into that act's show, so an upload naming the same act
+  // files it there to begin with, by the same rule: the two paths must agree
+  // on where a photograph of a band lives.
+  const alcestShow = {
+    ...attendanceRow,
+    id: 2,
+    concert_id: 8418,
+    concert_rel: {
+      id: 8418, concert_date: new Date('2026-06-12T15:30:00Z'),
+      venue: 'Sentrum Scene', city: 'Oslo', country: 'NO', metadata: null,
+      bands: [{ band: 501, setlist: null, band_rel: { id: 501, name: 'Alcest', setlist: null } }],
+    },
+  };
+
+  beforeEach(() => {
+    prisma.concertAttendance.findUnique = vi.fn(async ({ where }) => (where.id === 2 ? alcestShow : attendanceRow));
+    prisma.concertAttendance.findMany = vi.fn(async () => [{ id: 2, concert_rel: alcestShow.concert_rel }]);
+  });
+
+  const upload = (bandId = '501') => request(app())
+    .post('/data/concerts/attendances/1/media')
+    .set(...authHeader(admin))
+    .field('band_id', bandId)
+    .attach('files', jpeg(), 'IMG_1.jpg');
+
+  it('files them in the show whose bill has the band, and says so', async () => {
+    const res = await upload().expect(201);
+
+    expect(res.body.data.attendance_id).toBe(2);
+    const { data } = prisma.concertMedia.create.mock.calls[0][0];
+    expect(data).toMatchObject({ attendance_id: 2, band_id: 501 });
+    expect(data.rel_path).toBe('user-1/2026-06-12 Oslo - Alcest/IMG_1.jpg');
+  });
+
+  it('writes that show\'s sidecar, with the band named from that show\'s bill', async () => {
+    await upload().expect(201);
+
+    const sidecar = JSON.parse(await readFile(
+      join(root, 'archive', 'user-1', '2026-06-12 Oslo - Alcest', 'concert-media.json'), 'utf8'));
+    expect(sidecar).toMatchObject({ concert_id: 8418, user_id: 'user-1' });
+    expect(sidecar.files[0]).toMatchObject({ name: 'IMG_1.jpg', band_id: 501, band_name: 'Alcest' });
+    // And nothing at all for the show it was posted to.
+    expect(await readdir(join(root, 'archive', 'user-1'))).toEqual(['2026-06-12 Oslo - Alcest']);
+  });
+
+  it('looks only among the caller\'s own shows with the band on the bill', async () => {
+    await upload().expect(201);
+
+    expect(prisma.concertAttendance.findMany.mock.calls[0][0].where).toEqual({
+      wishlist_rel: { user_id: 'user-1' },
+      concert_rel: { bands: { some: { band: 501 } } },
+    });
+  });
+
+  it('refuses an act whose show that day was in another city, and keeps no temp file', async () => {
+    prisma.concertAttendance.findMany = vi.fn(async () => [
+      { id: 2, concert_rel: { ...alcestShow.concert_rel, city: 'Bergen' } },
+    ]);
+
+    const res = await upload().expect(400);
+
+    expect(res.body.error).toMatch(/not on the bill of any show you saw that day/);
+    expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+    expect(await readdir(join(root, 'incoming')).catch(() => [])).toEqual([]);
+  });
+
+  it('looks no further for a band already on the bill of the show posted to', async () => {
+    const res = await upload('92').expect(201);
+
+    expect(prisma.concertAttendance.findMany).not.toHaveBeenCalled();
+    expect(res.body.data.attendance_id).toBe(1);
+  });
+
+  it('holds the lock of the show the files land in, not the one posted to', async () => {
+    // Filenames in a folder are chosen under that show's lock. Keyed by the
+    // show in the URL, a routed upload and one made straight to the act's own
+    // show could both pick IMG_1.jpg, and the second rename would overwrite
+    // the first.
+    const release = await acquire('attendance:2');
+    let pending;
+    try {
+      pending = upload().then((r) => r);
+      // Up to the lock: the show posted to and the one found are both read...
+      await vi.waitFor(() => expect(prisma.concertAttendance.findUnique).toHaveBeenCalledTimes(2));
+      await sleep(30);
+      // ...and the read that comes straight after taking it has not happened.
+      expect(prisma.concertMedia.findMany).not.toHaveBeenCalled();
+    } finally {
+      release();
+    }
+    expect((await pending).status).toBe(201);
   });
 });
 
