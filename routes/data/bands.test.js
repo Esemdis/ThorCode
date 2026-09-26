@@ -3,6 +3,7 @@ import request from 'supertest';
 import { mkdtemp, mkdir, writeFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createRequire } from 'node:module';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 
 // Seeded before the router is imported — see installFakePrisma for why this
@@ -78,6 +79,18 @@ describe('POST /bands', () => {
 
     expect(res.status).toBe(409);
     expect(prisma.band.create).not.toHaveBeenCalled();
+  });
+
+  it('names the band it is stored as when MusicBrainz says the two are one artist', async () => {
+    // The router's own copy of band creation: CommonJS, loaded through Node's
+    // require, which an ESM import does not share.
+    const bandCreate = createRequire(import.meta.url)('../../utils/bandCreate.js');
+    vi.spyOn(bandCreate, 'createBand').mockRejectedValue(new bandCreate.BandExistsError({ id: 4, name: 'Architects' }));
+
+    const res = await request(app).post('/bands').set(...authHeader()).send({ name: 'Architects (UK)' });
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'Band already exists as "Architects".', band: { id: 4, name: 'Architects' } });
   });
 
   it('trims the name before deciding whether the band already exists', async () => {
@@ -217,7 +230,7 @@ describe('POST /bulk', () => {
     expect(res.body.details.insertedConcerts.map((c) => c.venue)).toEqual(['Fållan', 'Kollektivet']);
     expect(prisma.statements).toEqual([
       'SAVEPOINT bulk_concert', 'RELEASE SAVEPOINT bulk_concert',
-      'SAVEPOINT bulk_concert', 'ROLLBACK TO SAVEPOINT bulk_concert',
+      'SAVEPOINT bulk_concert', 'ROLLBACK TO SAVEPOINT bulk_concert', 'RELEASE SAVEPOINT bulk_concert',
       'SAVEPOINT bulk_concert', 'RELEASE SAVEPOINT bulk_concert',
     ]);
   });

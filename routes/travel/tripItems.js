@@ -16,9 +16,16 @@ router.use(ownsTrip);
 const VALID_STATUSES = ["NEED_TO_BUY", "BOUGHT", "PACKED", "NOT_PACKED"];
 
 // A gear id or a sort position that is not a whole number reached Prisma as
-// NaN or a string and failed as a 500. Empty means "none" for the gear link.
+// NaN or a string and failed as a 500. Anything falsy means "none" for the
+// gear link, as the handlers read it. Digits only for an id, because parseInt
+// reads it afterwards: `true` and "1e3" are whole numbers to Number() and NaN
+// and 1 to parseInt.
+const INT32_MAX = 2147483647;
+const isId = (v) => (typeof v === "number" || (typeof v === "string" && /^\d+$/.test(v)))
+  && Number.isInteger(Number(v)) && Number(v) >= 1 && Number(v) <= INT32_MAX;
+
 function numberProblem({ gear_item_id, sort_order }) {
-  if (gear_item_id != null && gear_item_id !== "" && !Number.isInteger(Number(gear_item_id))) {
+  if (gear_item_id && !isId(gear_item_id)) {
     return "gear_item_id must be a gear item id";
   }
   if (sort_order != null && !Number.isInteger(sort_order)) {

@@ -297,7 +297,9 @@ router.post(
           // so one bad row does not cost the scraper the batch — used to answer
           // "inserted N" for a batch in which nothing at all was saved. Rolling
           // back to the savepoint discards just this concert's work and leaves
-          // the transaction usable for the rest.
+          // the transaction usable for the rest. It is released either way:
+          // ROLLBACK TO keeps the savepoint, and a batch with many bad rows
+          // would otherwise stack one open subtransaction per failure.
           await tx.$executeRaw`SAVEPOINT bulk_concert`;
           let outcome;
           try {
@@ -305,6 +307,7 @@ router.post(
             await tx.$executeRaw`RELEASE SAVEPOINT bulk_concert`;
           } catch (error) {
             await tx.$executeRaw`ROLLBACK TO SAVEPOINT bulk_concert`;
+            await tx.$executeRaw`RELEASE SAVEPOINT bulk_concert`;
             errors.push({ index: i, message: error.message });
             continue;
           }

@@ -12,9 +12,11 @@
  */
 
 const prisma = require('../prisma/client');
-const { findSourceUrls } = require('./bandSourceUrls');
-const { backlinkBandToConcerts } = require('./bandBacklink');
-const { pythonServicePost } = require('./pythonService');
+// Through the module objects, so a test can stand in for MusicBrainz, the
+// backlink and the Python service.
+const bandSourceUrls = require('./bandSourceUrls');
+const bandBacklink = require('./bandBacklink');
+const pythonService = require('./pythonService');
 
 class BandExistsError extends Error {
   constructor(band) {
@@ -56,7 +58,7 @@ async function createBand(name) {
   let mbid = null;
   let lookupReachedMusicBrainz = true;
   try {
-    [songkickUrl, bandsintownUrl, mbid] = await findSourceUrls(name);
+    [songkickUrl, bandsintownUrl, mbid] = await bandSourceUrls.findSourceUrls(name);
   } catch (lookupError) {
     lookupReachedMusicBrainz = false;
     console.error(`[bands] MusicBrainz lookup failed for ${name}:`, lookupError.message);
@@ -78,9 +80,13 @@ async function createBand(name) {
       },
     });
   } catch (error) {
-    // Someone added the same band during the lookup above. Theirs stands.
     if (error.code !== UNIQUE_VIOLATION) throw error;
-    const winner = await prisma.band.findUnique({ where: { name } });
+    // Either someone added the same band during the lookup above, or
+    // MusicBrainz matched this name to an artist already stored under another
+    // one ("Architects (UK)" for "Architects") — MBID is unique too, and that
+    // used to answer 500. Both are the band already existing; theirs stands.
+    const winner = await prisma.band.findUnique({ where: { name } })
+      || (mbid && await prisma.band.findUnique({ where: { MBID: mbid } }));
     if (winner) throw new BandExistsError(winner);
     throw error;
   }
@@ -95,7 +101,7 @@ async function createBand(name) {
   // Never fails the request: the band is created either way, and a missing
   // link is recoverable by hand.
   try {
-    await backlinkBandToConcerts({ bandId: band.id, bandName: name, prisma });
+    await bandBacklink.backlinkBandToConcerts({ bandId: band.id, bandName: name, prisma });
   } catch (backlinkError) {
     console.error(`[bands] Back-linking existing concerts failed for ${name}:`, backlinkError.message);
   }
@@ -103,7 +109,7 @@ async function createBand(name) {
   // The scrape itself stays in the background: it is long-running, and unlike
   // the lookup above there is a retry path for it — the band now has its urls
   // stored, so an admin re-sync or the cron picks it up.
-  pythonServicePost(`/sync/${band.id}`,
+  pythonService.pythonServicePost(`/sync/${band.id}`,
     { songkick_url: songkickUrl || null, bandsintown_url: bandsintownUrl || null, band_name: band.name },
   ).then(
     () => console.log(`[bands] Sync queued for ${band.name}`),

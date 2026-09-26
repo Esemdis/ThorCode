@@ -264,9 +264,16 @@ router.post(
 
       if (existingReference) return res.status(409).json(handleError("wishlist", 409));
 
-      await prisma.wishlistBandReference.create({
-        data: { wishlist_id: wishlistId, band_id: band.id, tier },
-      });
+      try {
+        await prisma.wishlistBandReference.create({
+          data: { wishlist_id: wishlistId, band_id: band.id, tier },
+        });
+      } catch (error) {
+        // The same add twice at once (a double tap) passes the check above
+        // together; the second one is this conflict, not a 500.
+        if (error.code === "P2002") return res.status(409).json(handleError("wishlist", 409));
+        throw error;
+      }
 
 
       res.status(201).json({

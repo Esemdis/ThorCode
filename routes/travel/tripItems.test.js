@@ -118,4 +118,14 @@ describe('a gear id that is not a number', () => {
     expect(res.status).toBe(400);
     expect(prisma.gearItem.findFirst).not.toHaveBeenCalled();
   });
+
+  it.each([true, '1e3', '5.5', -3])('is refused as %j, which parseInt would misread', async (value) => {
+    const res = await request(app())
+      .patch('/travel/trips/1/items/9')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ gear_item_id: value });
+
+    expect(res.status).toBe(400);
+    expect(prisma.gearItem.findFirst).not.toHaveBeenCalled();
+  });
 });

@@ -295,7 +295,13 @@ router.post(
         created = await bandCreate.createBand(name);
       } catch (error) {
         if (error instanceof bandCreate.BandExistsError) {
-          return res.status(409).json({ error: 'Band already exists.' });
+          // It can be there under another name, when MusicBrainz says the two
+          // are one artist; say which, or the 409 reads as wrong.
+          const stored = error.band;
+          return res.status(409).json({
+            error: stored.name === name ? 'Band already exists.' : `Band already exists as "${stored.name}".`,
+            band: { id: stored.id, name: stored.name },
+          });
         }
         throw error;
       }

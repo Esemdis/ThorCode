@@ -620,6 +620,26 @@ describe('POST /wishlists/:id/attendance/from-setlist', () => {
     expect(prisma.concert.upsert).not.toHaveBeenCalled();
   });
 
+  it('matches an MBID stored in capitals — quick-add accepts either case', async () => {
+    prisma.band.findUnique.mockResolvedValue({ id: 3, MBID: SETLIST.artist.mbid.toUpperCase() });
+
+    const res = await post({ setlistfm_id: '63de4613', band_id: 3 });
+
+    expect(res.status).toBe(200);
+  });
+
+  it('files the show under the id it asked for, even if the answer lacks one', async () => {
+    // "sfm_null" would have made every such show one concert.
+    setlistFm.fetchSetlistById.mockResolvedValue({ ...SETLIST, id: undefined });
+
+    const res = await post({ setlistfm_id: '63de4613', band_id: 3 });
+
+    expect(res.status).toBe(200);
+    expect(prisma.concert.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      where: { event_id: 'sfm_63de4613' },
+    }));
+  });
+
   it('refuses an id that could steer the request elsewhere on setlist.fm', async () => {
     const res = await post({ setlistfm_id: '../artist/x/setlists', band_id: 3 });
 
@@ -692,6 +712,17 @@ describe('POST /wishlists/:id/bands', () => {
   it('says so when the band is already on the wishlist', async () => {
     vi.spyOn(bandCreate, 'createBand').mockRejectedValue(new bandCreate.BandExistsError({ id: 92, name: 'Gojira' }));
     prisma.wishlistBandReference.findFirst.mockResolvedValue({ id: 1 });
+
+    const res = await add({ name: 'Gojira' });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/already on this wishlist/);
+  });
+
+  it('answers a double tap with the same conflict, not a 500', async () => {
+    // Both requests passed the "already on it?" read before either wrote.
+    vi.spyOn(bandCreate, 'createBand').mockRejectedValue(new bandCreate.BandExistsError({ id: 92, name: 'Gojira' }));
+    prisma.wishlistBandReference.create.mockRejectedValue(Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }));
 
     const res = await add({ name: 'Gojira' });
 

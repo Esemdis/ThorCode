@@ -286,7 +286,7 @@ router.post(
       // The setlist has to be this band's. Without an MBID on the band there is
       // nothing to compare, but the show itself is still setlist.fm's own.
       const artistMbid = setlist?.artist?.mbid ?? null;
-      if (band.MBID && artistMbid && band.MBID !== artistMbid) {
+      if (band.MBID && artistMbid && band.MBID.toLowerCase() !== String(artistMbid).toLowerCase()) {
         return res.status(400).json({ error: "That setlist is by a different artist" });
       }
 
@@ -306,7 +306,10 @@ router.post(
       const latitude = coord(show.latitude);
       const longitude = coord(show.longitude);
       const hasCoords = latitude != null && longitude != null;
-      const eventId = `sfm_${show.setlistfm_id}`;
+      // Keyed on the id that was asked for and fetched, as it always was, so a
+      // response that somehow lacked one cannot file every such show under
+      // "sfm_null".
+      const eventId = `sfm_${req.body.setlistfm_id}`;
 
       // Coordinates and a city link, both of which this route used to leave
       // empty: a concert without a position is dropped by the map's grouping and
