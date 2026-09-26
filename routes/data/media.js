@@ -151,6 +151,93 @@ async function ownAttendance(attendanceId, userId) {
   return { row, owned: row.wishlist_rel.user_id === userId };
 }
 
+/**
+ * Every show of the caller's whose bill has this band: the candidates
+ * festivalSibling chooses from when a file's own show does not have it. The
+ * tag sweep moves a file into one of these.
+ */
+function billCandidates(userId, bandId) {
+  return prisma.concertAttendance.findMany({
+    where: {
+      wishlist_rel: { user_id: userId },
+      concert_rel: { bands: { some: { band: bandId } } },
+    },
+    select: {
+      id: true,
+      concert_rel: {
+        select: {
+          id: true, concert_date: true, venue: true, city: true, country: true,
+          bands: { select: { band_rel: { select: { id: true, name: true } } } },
+        },
+      },
+    },
+  });
+}
+
+/**
+ * The refusals every write over a list of files shares, answered here.
+ * Returns the response it sent, or null when every id was found and every file
+ * is the caller's.
+ *
+ * Checked for every row before anything is written. A list containing one row
+ * belonging to someone else must change nothing at all, rather than updating
+ * the caller's rows and failing partway.
+ */
+function refuseRows(res, rows, ids, userId, missing = 'Some media not found') {
+  if (rows.length !== ids.length) return notFound(res, missing);
+  if (rows.some((r) => r.attendance_rel.wishlist_rel.user_id !== userId)) return forbidden(res, 'Forbidden');
+  return null;
+}
+
+// How many times a request takes its locks again when a file moves between the
+// read that chose them and the read made under them. Two requests racing
+// settle in one retry; missing three times running means the same files are
+// being changed as fast as they can be locked, which is better answered than
+// chased.
+const LOCK_ATTEMPTS = 3;
+
+/**
+ * Hold the upload route's lock on every show some work touches, and read the
+ * rows the work is about while holding them.
+ *
+ * Which shows to lock comes from where the rows are, and where the rows are is
+ * exactly what a concurrent tag changes. So they are read again once the locks
+ * are held, and that read is the one the work must use: a request that waited
+ * on another's locks and then went on with what it had read before waiting
+ * would undo the other's move, or write a sidecar in a folder a file had just
+ * left. If a row now lives in a show outside the set, every lock is let go and
+ * the set is chosen again from where the rows are now.
+ *
+ * Taken in ascending id order, so two requests over overlapping shows cannot
+ * each hold one and wait on the other.
+ *
+ * @param {object[]} rows - as first read, each with attendance_id
+ * @param {() => Promise<object[]>} read - reads the same rows afresh
+ * @param {(rows: object[]) => number[]} showsFor - every attendance to lock for these rows
+ * @returns {Promise<{rows: object[], release: () => void}|null>} null when the
+ *   rows would not hold still; otherwise the caller MUST release, in a finally
+ */
+async function lockShows(rows, read, showsFor) {
+  let seen = rows;
+  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
+    const ids = [...new Set(showsFor(seen))].sort((a, b) => a - b);
+    const releases = [];
+    const release = () => { for (const r of releases.splice(0)) r(); };
+    try {
+      for (const id of ids) releases.push(await acquire(`attendance:${id}`));
+      seen = await read();
+    } catch (err) {
+      release();
+      throw err;
+    }
+    // A row that has gone altogether did not move; the caller's own checks
+    // answer that one.
+    if (seen.every((r) => ids.includes(r.attendance_id))) return { rows: seen, release };
+    release();
+  }
+  return null;
+}
+
 // Admin-only. Everyone signed in can look at the archive; only an admin adds
 // to it. Enforced here and not merely by hiding the button, because the dialog
 // is a convenience and this is the lock.
@@ -736,6 +823,9 @@ router.patch(
     body('song').optional({ nullable: true }).isString().isLength({ max: 200 }),
   ],
   async (req, res) => {
+    // Declared out here so the finally below lets the shows go whichever way
+    // the handler leaves.
+    let locked = null;
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) return badRequest(res, 'Validation failed');
@@ -744,7 +834,7 @@ router.patch(
       // for twice, not two files, and comparing against the raw array length
       // would read the repeat as a missing row and 404 a perfectly good id.
       const ids = [...new Set(req.body.ids.map((n) => parseInt(n, 10)))];
-      const rows = await prisma.concertMedia.findMany({
+      const readRows = () => prisma.concertMedia.findMany({
         where: { id: { in: ids } },
         include: {
           attendance_rel: {
@@ -760,17 +850,32 @@ router.patch(
           },
         },
       });
-      if (rows.length !== ids.length) return notFound(res, 'Some media not found');
-
-      // Checked for every row before anything is written. A list containing one
-      // row belonging to someone else must change nothing at all, rather than
-      // updating the caller's rows and failing partway.
-      if (rows.some((r) => r.attendance_rel.wishlist_rel.user_id !== req.user.id)) {
-        return forbidden(res, 'Forbidden');
-      }
+      // Refused here before waiting on anyone's locks, and again below on the
+      // rows read under them, which a concurrent delete may have thinned out.
+      const firstRead = await readRows();
+      if (refuseRows(res, firstRead, ids, req.user.id)) return undefined;
 
       const bandId = req.body.band_id === undefined ? undefined
         : req.body.band_id === null ? null : parseInt(req.body.band_id, 10);
+
+      // Every show the file could be moved into, when a band is being set.
+      // Read before the locks because it decides which of them to take, and
+      // it does not depend on where the files are.
+      const candidates = bandId != null ? await billCandidates(req.user.id, bandId) : [];
+
+      // Every show this request can touch is locked before a row is trusted:
+      // the ones the files are in, and every one they could be moved into.
+      // Only the destinations used to be, and only for a move, so a
+      // double-press — or tagging A then B on a festival day — ran the second
+      // request against rows read before the first committed. That filed a
+      // file moved into A's show under B, where B's band page never looks, or
+      // put a file back into the sidecar of the show it had just left.
+      locked = await lockShows(firstRead, readRows, (current) => [
+        ...current.map((r) => r.attendance_id), ...candidates.map((a) => a.id),
+      ]);
+      if (!locked) return conflict(res, 'Those files changed while they were being tagged — try again');
+      const { rows } = locked;
+      if (refuseRows(res, rows, ids, req.user.id)) return undefined;
 
       // Where each file lives once this is done: its own show, unless the band
       // is not on that show's bill — then the caller's show on the same day in
@@ -780,28 +885,11 @@ router.patch(
       if (bandId != null) {
         const strays = rows.filter((r) =>
           !r.attendance_rel.concert_rel.bands.some((b) => b.band_rel.id === bandId));
-        if (strays.length) {
-          const candidates = await prisma.concertAttendance.findMany({
-            where: {
-              wishlist_rel: { user_id: req.user.id },
-              concert_rel: { bands: { some: { band: bandId } } },
-            },
-            select: {
-              id: true,
-              concert_rel: {
-                select: {
-                  id: true, concert_date: true, venue: true, city: true, country: true,
-                  bands: { select: { band_rel: { select: { id: true, name: true } } } },
-                },
-              },
-            },
-          });
-          for (const r of strays) {
-            const home = festivalSibling(r.attendance_rel.concert_rel, candidates);
-            // Every file answered before anything moves, like ownership above.
-            if (!home) return badRequest(res, 'That band is not on the bill of any show you saw that day');
-            homes.set(r.id, home);
-          }
+        for (const r of strays) {
+          const home = festivalSibling(r.attendance_rel.concert_rel, candidates);
+          // Every file answered before anything moves, like ownership above.
+          if (!home) return badRequest(res, 'That band is not on the bill of any show you saw that day');
+          homes.set(r.id, home);
         }
       }
 
@@ -875,15 +963,13 @@ router.patch(
       // back, and a failure anywhere up to the database write runs them newest
       // first, so the request stays all-or-nothing.
       const undo = [];
-      const releases = [];
       const placed = new Map();
       try {
         if (moving.length) {
+          // Every destination is a candidate, so its lock is already held —
+          // the upload route's, which matters because both choose free
+          // filenames in a show.
           const homeIds = [...new Set(moving.map((r) => homes.get(r.id).id))].sort((a, b) => a - b);
-          // The lock the upload route takes, since both choose free filenames
-          // in a show. Taken in id order, so two requests moving into the same
-          // two shows cannot each hold one and wait on the other.
-          for (const id of homeIds) releases.push(await acquire(`attendance:${id}`));
 
           // Planned in full before a single byte moves, so a refusal leaves the
           // archive exactly as it was.
@@ -999,8 +1085,6 @@ router.patch(
           await step().catch((e) => console.error('[media] could not undo part of a move', e));
         }
         throw err;
-      } finally {
-        for (const release of releases) release();
       }
 
       // The sidecar is the record of truth — Postgres is rebuilt from it, never
@@ -1010,6 +1094,11 @@ router.patch(
       // absent sidecar file, or a sidecar with no entry yet for this filename)
       // rather than skipped, because a skip here is exactly the kind of write
       // that looks like it worked and was never real.
+      //
+      // Still under the shows' locks, which are let go only in the finally
+      // below. Released before this, a second tag could commit a move of the
+      // same file in between, and this write would then list it again in the
+      // sidecar of the show it had just left.
       const byDir = new Map();
       for (const r of staying) byDir.set(path.posix.dirname(r.rel_path), []);
       for (const r of staying) byDir.get(path.posix.dirname(r.rel_path)).push(r);
@@ -1033,6 +1122,10 @@ router.patch(
       // as "Something went wrong": a rebuild is what repairs it.
       if (err.code === 'MISSING_SOURCE') return conflict(res, err.message);
       return fail(res, err, { context: 'PATCH /media' });
+    } finally {
+      // Every path out, refusals included. A show left locked wedges its
+      // uploads and tags for the life of the process.
+      if (locked) locked.release();
     }
   },
 );

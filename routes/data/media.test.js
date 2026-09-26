@@ -4,9 +4,23 @@ import { mkdtemp, mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 import { signMediaToken } from '../../utils/mediaTokens.js';
 import { buildExif, jpegWithExif } from '../../test/exifFixture.js';
+
+// The show locks, from the router's own copy of the queue. The router is
+// CommonJS and loads its dependencies through Node's require, so an `import`
+// here would get a second instance of the module with a lock table of its own,
+// and holding a lock in it would block nothing the router does.
+const { acquire } = createRequire(import.meta.url)('../../utils/serialQueue.js');
+const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
+// Whether nothing holds a show's lock right now: taken and handed straight
+// back if so, and a timeout rather than a hang if not.
+const isFree = (attendanceId) => Promise.race([
+  acquire(`attendance:${attendanceId}`).then((release) => { release(); return true; }),
+  sleep(100).then(() => false),
+]);
 
 let root;
 
@@ -1369,6 +1383,49 @@ describe('PATCH /media', () => {
     const sidecar = JSON.parse(await readFile(join(dir, 'concert-media.json'), 'utf8'));
     expect(sidecar.files[0]).toMatchObject({ name: 'IMG_1.jpg', band_id: 92, band_name: 'Gojira', sha256: 'h5' });
   });
+
+  it('waits on the show a file is in, even when the file is staying put', async () => {
+    // Only a show a file was moved INTO used to be locked, so a caption, or a
+    // band already on the bill, went through with no lock at all — against
+    // rows read while another tag of the same files was halfway done.
+    const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    await mkdir(dir, { recursive: true });
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      { id: 5, attendance_id: 1, rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_1.jpg', filename: 'IMG_1.jpg',
+        kind: 'PHOTO', sha256: 'h5', bytes: 1234, width: null, height: null, duration_ms: null,
+        caption: null, taken_at: null, band_id: null,
+        attendance_rel: {
+          wishlist_rel: { user_id: 'user-1' },
+          concert_rel: {
+            id: 8417, concert_date: new Date('2026-06-12T19:00:00Z'), venue: 'Sentrum Scene', city: 'Oslo', country: 'NO',
+            bands: [{ band_rel: { id: 92, name: 'Gojira' } }],
+          },
+        } },
+    ]);
+    prisma.concertMedia.update = vi.fn(async ({ data }) => ({ id: 5, ...data }));
+    prisma.$transaction = vi.fn(async (ops) => Promise.all(ops));
+
+    const release = await acquire('attendance:1');
+    let pending;
+    try {
+      pending = request(app())
+        .patch('/data/concerts/media')
+        .set(...authHeader({ id: 'user-1' }))
+        .send({ ids: [5], caption: 'held up' })
+        .then((r) => r);
+      await vi.waitFor(() => expect(prisma.concertMedia.findMany).toHaveBeenCalledTimes(1));
+      await sleep(30);
+      // Stopped at the lock: the read made under it has not happened, and
+      // nothing has been written.
+      expect(prisma.concertMedia.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.concertMedia.update).not.toHaveBeenCalled();
+    } finally {
+      release();
+    }
+
+    expect((await pending).status).toBe(200);
+    expect(prisma.concertMedia.findMany).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('PATCH /media — an act from another stage that day', () => {
@@ -1545,6 +1602,180 @@ describe('PATCH /media — an act from another stage that day', () => {
 
     const res = await tag({ ids: [5], band_id: 501 }).expect(409);
     expect(res.body.message ?? res.body.error).toMatch(/no longer in the archive/);
+    expect(prisma.concertMedia.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('PATCH /media — two requests over the same files', () => {
+  // The festival day again. The night's photograph was uploaded to WARGASM's
+  // row, attendance 40, and Dayseeker played the same day on another stage,
+  // attendance 41: tagging it Dayseeker moves it, tagging it WARGASM does not.
+  const day = new Date('2025-06-22T00:00:00Z');
+  const concerts = {
+    40: {
+      id: 900, concert_date: day, venue: 'Main Stage', city: 'Dessel', country: 'BE',
+      bands: [{ band_rel: { id: 125, name: 'WARGASM' } }],
+    },
+    41: {
+      id: 901, concert_date: day, venue: 'Jupiler Stage', city: 'Dessel', country: 'BE',
+      bands: [{ band_rel: { id: 501, name: 'Dayseeker' } }],
+    },
+  };
+  const folder = { 40: 'user-1/2025-06-22 Dessel - WARGASM', 41: 'user-1/2025-06-22 Dessel - Dayseeker' };
+  const abs = (rel) => join(root, 'archive', rel);
+  const exists = (p) => readFile(p).then(() => true, () => false);
+  const sidecarIn = async (attendanceId) => JSON.parse(await readFile(
+    join(abs(folder[attendanceId]), 'concert-media.json'), 'utf8',
+  ).catch(() => '{"files":[]}'));
+
+  // The photograph as the index has it, in whichever show it is in by then.
+  const photo = (attendanceId, over = {}) => ({
+    id: 5, attendance_id: attendanceId, rel_path: `${folder[attendanceId]}/IMG_1.jpg`, filename: 'IMG_1.jpg',
+    kind: 'PHOTO', sha256: 'h5', bytes: 14, width: null, height: null, duration_ms: null,
+    caption: null, song: null, taken_at: null, band_id: null, ...over,
+  });
+  const withShow = (r) => ({
+    ...r, attendance_rel: { wishlist_rel: { user_id: 'user-1' }, concert_rel: concerts[r.attendance_id] },
+  });
+
+  // The file in that show's folder, listed in its sidecar.
+  const seed = async (attendanceId) => {
+    const dir = abs(folder[attendanceId]);
+    const c = concerts[attendanceId];
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'IMG_1.jpg'), 'the photograph');
+    await writeFile(join(dir, 'concert-media.json'), JSON.stringify({
+      version: 1, concert_id: c.id, user_id: 'user-1',
+      concert: { date: '2025-06-22', venue: c.venue, city: c.city, country: c.country },
+      files: [{ name: 'IMG_1.jpg', kind: 'PHOTO', band_id: null, band_name: null, caption: '', song: null, sha256: 'h5' }],
+    }));
+  };
+
+  const tag = (body) => request(app())
+    .patch('/data/concerts/media')
+    .set(...authHeader({ id: 'user-1' }))
+    .send(body);
+
+  beforeEach(() => {
+    // The caller's shows with the band on the bill, as the real query finds them.
+    prisma.concertAttendance.findMany = vi.fn(async ({ where }) => Object.entries(concerts)
+      .filter(([, c]) => c.bands.some((b) => b.band_rel.id === where.concert_rel.bands.some.band))
+      .map(([id, c]) => ({ id: Number(id), concert_rel: c })));
+    prisma.concertMedia.update = vi.fn(async ({ where, data }) => ({ id: where.id, ...data }));
+    prisma.$transaction = vi.fn(async (ops) => Promise.all(ops));
+  });
+
+  it('ends with the index, the files and the sidecars agreeing when two tags race', async () => {
+    // A stand-in for the table that answers from what has been committed, so
+    // each request reads what the other has done, or has not done yet.
+    const table = new Map([[5, photo(40)]]);
+    prisma.concertMedia.findMany = vi.fn(async ({ where }) => (where.id
+      ? where.id.in.filter((id) => table.has(id)).map((id) => withShow({ ...table.get(id) }))
+      : [...table.values()].filter((r) => r.attendance_id === where.attendance_id)));
+    // Queued as Prisma's are, and committed only after a moment: long enough
+    // for the other request's reads to land first, which is the race.
+    prisma.concertMedia.update = vi.fn(({ where, data }) => ({ where, data }));
+    prisma.$transaction = vi.fn(async (ops) => {
+      await sleep(25);
+      return ops.map(({ where, data }) => Object.assign(table.get(where.id), data));
+    });
+    await seed(40);
+
+    // Dayseeker, and in the same breath WARGASM: a double-press in the sweep.
+    const [a, b] = await Promise.all([tag({ ids: [5], band_id: 501 }), tag({ ids: [5], band_id: 125 })]);
+    expect([a.status, b.status]).toEqual([200, 200]);
+
+    // Whichever landed last, the file is in the folder of the show the index
+    // says, that show's bill has the band it is tagged with, and that show's
+    // sidecar lists it under that band. The other show has neither the file
+    // nor an entry for it.
+    const row = table.get(5);
+    const other = row.attendance_id === 40 ? 41 : 40;
+    expect(dirname(row.rel_path)).toBe(folder[row.attendance_id]);
+    expect(await readFile(abs(row.rel_path), 'utf8')).toBe('the photograph');
+    expect(concerts[row.attendance_id].bands.map((x) => x.band_rel.id)).toContain(row.band_id);
+    expect((await sidecarIn(row.attendance_id)).files).toEqual([
+      expect.objectContaining({ name: row.filename, band_id: row.band_id }),
+    ]);
+    expect((await sidecarIn(other)).files).toEqual([]);
+    expect(await exists(abs(`${folder[other]}/IMG_1.jpg`))).toBe(false);
+  });
+
+  it('works from the files as they are once the locks are held, not as first read', async () => {
+    // First read in WARGASM's show; by the time the locks are held another
+    // tag has moved it into Dayseeker's. Worked from the first read, this
+    // "moved" it again out of a folder it had already left, and failed on a
+    // file that was not there.
+    await seed(41);
+    const reads = [photo(40), photo(41, { band_id: 501 })];
+    let n = 0;
+    prisma.concertMedia.findMany = vi.fn(async ({ where }) => (where.id
+      ? [withShow(reads[Math.min(n++, reads.length - 1)])]
+      : []));
+
+    const res = await tag({ ids: [5], band_id: 501, caption: 'second pass' }).expect(200);
+
+    expect(res.body.data).toMatchObject({ updated: 1, moved: 0 });
+    expect(prisma.concertMedia.update.mock.calls[0][0].data).toEqual({ band_id: 501, caption: 'second pass' });
+    expect((await sidecarIn(41)).files).toEqual([
+      expect.objectContaining({ name: 'IMG_1.jpg', band_id: 501, caption: 'second pass' }),
+    ]);
+    expect(await exists(join(abs(folder[40]), 'concert-media.json'))).toBe(false);
+  });
+
+  it('lets go and locks again when a file has moved to a show it had not locked', async () => {
+    // A caption only, so the one show locked is the one the file was first
+    // read in. Under that lock the file turns out to have moved on: the
+    // request has to let go, wait its turn at the show the file is in now,
+    // and write that show's sidecar, not the one the file left.
+    await seed(41);
+    const reads = [photo(40), photo(41)];
+    let n = 0;
+    prisma.concertMedia.findMany = vi.fn(async () => [withShow(reads[Math.min(n++, reads.length - 1)])]);
+
+    const release = await acquire('attendance:41');
+    let pending;
+    try {
+      pending = tag({ ids: [5], caption: 'found it' }).then((r) => r);
+      await vi.waitFor(() => expect(prisma.concertMedia.findMany).toHaveBeenCalledTimes(2));
+      await sleep(30);
+      // Saw the move under the first lock, and is now waiting on the file's
+      // new show without having written anything...
+      expect(prisma.concertMedia.findMany).toHaveBeenCalledTimes(2);
+      expect(prisma.concertMedia.update).not.toHaveBeenCalled();
+      // ...having let the first one go.
+      expect(await isFree(40)).toBe(true);
+    } finally {
+      release();
+    }
+
+    expect((await pending).status).toBe(200);
+    expect((await sidecarIn(41)).files).toEqual([expect.objectContaining({ name: 'IMG_1.jpg', caption: 'found it' })]);
+    expect(await exists(join(abs(folder[40]), 'concert-media.json'))).toBe(false);
+  });
+
+  it('gives up with a 409 when the files will not hold still, and holds nothing after', async () => {
+    // Every read under the locks finds the file somewhere the last attempt
+    // did not lock.
+    let n = 0;
+    prisma.concertMedia.findMany = vi.fn(async () => [withShow(photo(40 + (n++ % 2)))]);
+
+    const res = await tag({ ids: [5], caption: 'never lands' }).expect(409);
+
+    expect(res.body.error).toBe('Those files changed while they were being tagged — try again');
+    // One read to choose the locks, then one under each of three attempts.
+    expect(prisma.concertMedia.findMany).toHaveBeenCalledTimes(4);
+    expect(prisma.concertMedia.update).not.toHaveBeenCalled();
+    expect(await isFree(40)).toBe(true);
+    expect(await isFree(41)).toBe(true);
+  });
+
+  it('answers 404 when a file is deleted while the request waits for its locks', async () => {
+    // All or nothing, as when the id was missing from the start.
+    let n = 0;
+    prisma.concertMedia.findMany = vi.fn(async () => (n++ === 0 ? [withShow(photo(40))] : []));
+
+    await tag({ ids: [5], caption: 'too late' }).expect(404);
     expect(prisma.concertMedia.update).not.toHaveBeenCalled();
   });
 });
