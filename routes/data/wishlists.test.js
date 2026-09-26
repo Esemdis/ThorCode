@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
+import { createRequire } from 'node:module';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 
 const model = () => ({
@@ -58,7 +59,7 @@ const EXPECTED_ROUTES = [
   'GET /wishlists/:id/attendance [4]',
   'POST /wishlists/:id/attendance [5]',
   'DELETE /wishlists/:id/attendance/:concertId [5]',
-  'POST /wishlists/:id/attendance/from-setlist [12]',
+  'POST /wishlists/:id/attendance/from-setlist [6]',
 ];
 
 describe('the routing surface', () => {
@@ -543,5 +544,112 @@ describe('DELETE /wishlists/:id/attendance/:concertId', () => {
 
     expect(res.status).toBe(200);
     expect(prisma.concertAttendance.delete).toHaveBeenCalledWith({ where: { id: 42 } });
+  });
+});
+
+describe('POST /wishlists/:id/attendance/from-setlist', () => {
+  // The router's own copy of the setlist.fm client: it is CommonJS and loads
+  // its dependencies through Node's require, which an ESM import does not share.
+  const setlistFm = createRequire(import.meta.url)('../../utils/setlistFm.js');
+
+  const SETLIST = {
+    id: '63de4613',
+    eventDate: '24-06-2026',
+    url: 'https://www.setlist.fm/setlist/gojira/2026/falan-63de4613.html',
+    artist: { mbid: '65f4f0c5-ef9e-490c-aee3-909e7ae6b2ab', name: 'Gojira' },
+    venue: { name: 'Fållan', city: { name: 'Stockholm', country: { code: 'SE' }, coords: { lat: 59.3, long: 18.0 } } },
+    sets: { set: [{ song: [{ name: 'Stranded' }] }] },
+  };
+
+  beforeEach(() => {
+    process.env.SETLIST_API_KEY = 'test-key';
+    vi.spyOn(setlistFm, 'fetchSetlistById').mockResolvedValue(SETLIST);
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1' });
+    prisma.band.findUnique.mockResolvedValue({ id: 3, MBID: SETLIST.artist.mbid });
+    prisma.city.upsert.mockResolvedValue({ id: 12, latitude: 59.3 });
+    prisma.concert.upsert.mockResolvedValue({ id: 500 });
+    prisma.concert.updateMany.mockResolvedValue({ count: 0 });
+    prisma.concertBandReference.upsert.mockResolvedValue({});
+    prisma.concertAttendance.upsert.mockResolvedValue({ id: 900 });
+  });
+
+  const post = (body) => request(app)
+    .post('/wishlists/7/attendance/from-setlist')
+    .set(...authHeader({ id: 'user-1' }))
+    .send(body);
+
+  it('takes the show from setlist.fm and ignores what the client says about it', async () => {
+    // The body used to be the source for all of this, written into the table
+    // every account reads.
+    const res = await post({
+      setlistfm_id: '63de4613', band_id: 3,
+      date: '01-01-2030', venue: 'Somewhere else', city: 'Nowhere', country: 'XX',
+      url: 'https://evil.example/', songs: [{ name: 'Not played' }],
+    });
+
+    expect(res.status).toBe(200);
+    expect(setlistFm.fetchSetlistById).toHaveBeenCalledWith('63de4613');
+    expect(prisma.concert.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      where: { event_id: 'sfm_63de4613' },
+      create: expect.objectContaining({
+        venue: 'Fållan', city: 'Stockholm', country: 'SE',
+        concert_date: new Date('2026-06-24T12:00:00Z'),
+        url: SETLIST.url,
+      }),
+    }));
+    expect(prisma.concertBandReference.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      create: expect.objectContaining({ setlist: { songs: [{ name: 'Stranded', cover: null, tape: false }] } }),
+    }));
+  });
+
+  it('refuses a show that has not happened yet', async () => {
+    setlistFm.fetchSetlistById.mockResolvedValue({ ...SETLIST, eventDate: '01-01-2099' });
+
+    const res = await post({ setlistfm_id: '63de4613', band_id: 3 });
+
+    expect(res.status).toBe(400);
+    expect(prisma.concert.upsert).not.toHaveBeenCalled();
+  });
+
+  it('refuses a setlist by a different artist than the band named', async () => {
+    prisma.band.findUnique.mockResolvedValue({ id: 3, MBID: 'ca891d65-d9b0-4258-89f7-e6ba29d83767' });
+
+    const res = await post({ setlistfm_id: '63de4613', band_id: 3 });
+
+    expect(res.status).toBe(400);
+    expect(prisma.concert.upsert).not.toHaveBeenCalled();
+  });
+
+  it('refuses an id that could steer the request elsewhere on setlist.fm', async () => {
+    const res = await post({ setlistfm_id: '../artist/x/setlists', band_id: 3 });
+
+    expect(res.status).toBe(400);
+    expect(setlistFm.fetchSetlistById).not.toHaveBeenCalled();
+  });
+
+  it('answers 404 for a band that does not exist, before asking setlist.fm', async () => {
+    prisma.band.findUnique.mockResolvedValue(null);
+
+    const res = await post({ setlistfm_id: '63de4613', band_id: 3 });
+
+    expect(res.status).toBe(404);
+    expect(setlistFm.fetchSetlistById).not.toHaveBeenCalled();
+  });
+
+  it('passes setlist.fm\'s own 404 on', async () => {
+    setlistFm.fetchSetlistById.mockRejectedValue(Object.assign(new Error('nope'), { response: { status: 404 } }));
+
+    const res = await post({ setlistfm_id: '63de4613', band_id: 3 });
+
+    expect(res.status).toBe(404);
+  });
+
+  it('does nothing for someone else\'s wishlist', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-2' });
+
+    const res = await post({ setlistfm_id: '63de4613', band_id: 3 });
+
+    expect(res.status).toBe(403);
+    expect(setlistFm.fetchSetlistById).not.toHaveBeenCalled();
   });
 });

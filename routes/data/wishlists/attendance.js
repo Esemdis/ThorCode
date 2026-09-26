@@ -16,6 +16,13 @@ const { storesRealInstant } = require("../../../utils/ics");
 const { conflict } = require("../../../utils/apiResponse");
 const { countMediaForAttendances } = require("../../../utils/mediaDetach");
 const { enrichConcertBands } = require("../../../utils/setlistEnrich");
+// Called through the module rather than destructured, so a test can stand in
+// for setlist.fm on the router's own copy of it.
+const setlistFm = require("../../../utils/setlistFm");
+
+// A show logged "today" can be dated tomorrow in UTC, and setlist.fm takes the
+// venue's own date; a day of slack separates that from a show still to come.
+const FUTURE_SLACK_MS = 24 * 60 * 60 * 1000;
 
 // GET /wishlists/:id/attendance — all attended/going concerts for this wishlist
 router.get(
@@ -227,20 +234,23 @@ router.delete(
 );
 
 // POST /wishlists/:id/attendance/from-setlist — add a past concert from Setlist.fm history
+//
+// Everything about the show is read from setlist.fm by id, here. It used to be
+// taken from the request body — venue, date, coordinates, songs, link — and
+// written into Concert, the table every account reads. Any signed-in user could
+// invent a show for any band, date it next month with a link of their choosing,
+// and have it appear on that band's page for everyone and go out in other
+// people's digest emails and Discord posts; or overwrite the setlist on a real
+// one. The client now sends which setlist and which band, and nothing else it
+// says about the show is used.
 router.post(
   "/wishlists/:id/attendance/from-setlist",
   [
     auth,
     roleCheck(["ADMIN", "USER"]),
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
-    body("setlistfm_id").isString().notEmpty(),
-    body("date").isString().notEmpty(),
-    body("venue").isString().notEmpty(),
-    body("city").isString().notEmpty(),
-    body("country").isString().notEmpty(),
+    body("setlistfm_id").custom(setlistFm.isSetlistId).withMessage("setlistfm_id must be a setlist.fm id"),
     body("band_id").isInt().withMessage("band_id must be an integer"),
-    body("latitude").optional({ nullable: true }).isFloat().withMessage("latitude must be a number"),
-    body("longitude").optional({ nullable: true }).isFloat().withMessage("longitude must be a number"),
   ],
   async (req, res) => {
     try {
@@ -248,50 +258,76 @@ router.post(
       if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
 
       const wishlistId = parseInt(req.params.id, 10);
-      const { setlistfm_id, date, venue, city, country, band_id, url, songs, latitude, longitude } = req.body;
-      const bandId = parseInt(band_id, 10);
+      const bandId = parseInt(req.body.band_id, 10);
 
       const wishlist = await prisma.wishlist.findUnique({
         where: { id: wishlistId },
-        include: { bands: { select: { band_id: true } } },
+        select: { id: true, user_id: true },
       });
       if (!wishlist) return res.status(404).json({ error: "Not found" });
       if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
 
-      // Parse "DD-MM-YYYY" from Setlist.fm to ISO date
-      let concertDate = null;
-      try {
-        const [dd, mm, yyyy] = date.split("-");
-        concertDate = new Date(`${yyyy}-${mm}-${dd}T12:00:00Z`);
-      } catch {}
+      const band = await prisma.band.findUnique({ where: { id: bandId }, select: { id: true, MBID: true } });
+      if (!band) return res.status(404).json({ error: "Band not found" });
 
-      const eventId = `sfm_${setlistfm_id}`;
+      if (!process.env.SETLIST_API_KEY) {
+        return res.status(503).json({ error: "Setlist.fm is not configured on this server" });
+      }
+
+      let setlist;
+      try {
+        setlist = await setlistFm.fetchSetlistById(req.body.setlistfm_id);
+      } catch (error) {
+        if (error.response?.status === 404) return res.status(404).json({ error: "Setlist not found on setlist.fm" });
+        console.error("[from-setlist] setlist.fm lookup failed:", error.response?.status ?? error.message);
+        return res.status(502).json({ error: "Could not reach setlist.fm — try again shortly" });
+      }
+
+      // The setlist has to be this band's. Without an MBID on the band there is
+      // nothing to compare, but the show itself is still setlist.fm's own.
+      const artistMbid = setlist?.artist?.mbid ?? null;
+      if (band.MBID && artistMbid && band.MBID !== artistMbid) {
+        return res.status(400).json({ error: "That setlist is by a different artist" });
+      }
+
+      const show = setlistFm.setlistSummary(setlist);
+      const concertDate = setlistFm.setlistDate(show.date);
+      if (!concertDate) return res.status(422).json({ error: "setlist.fm has no usable date for that show" });
+      // Attended means it happened. setlist.fm does list shows ahead of time.
+      if (concertDate.getTime() > Date.now() + FUTURE_SLACK_MS) {
+        return res.status(400).json({ error: "That show has not happened yet" });
+      }
+      if (!show.venue || !show.city || !show.country) {
+        return res.status(422).json({ error: "setlist.fm has no venue for that show" });
+      }
+
+      const { venue, city, country, url } = show;
+      const coord = (v) => (v != null && Number.isFinite(Number(v)) ? Number(v) : null);
+      const latitude = coord(show.latitude);
+      const longitude = coord(show.longitude);
+      const hasCoords = latitude != null && longitude != null;
+      const eventId = `sfm_${show.setlistfm_id}`;
 
       // Coordinates and a city link, both of which this route used to leave
       // empty: a concert without a position is dropped by the map's grouping and
       // simply never appears, and the city link is what carries reachability.
-      // The client passes setlist.fm's own venue coordinates through.
-      const hasCoords = latitude != null && longitude != null;
-      let cityId = null;
-      if (city && country) {
-        const cityRecord = await prisma.city.upsert({
-          where: { name_country: { name: city, country } },
-          create: {
-            name: city,
-            country,
-            latitude: hasCoords ? parseFloat(latitude) : null,
-            longitude: hasCoords ? parseFloat(longitude) : null,
-          },
-          update: {},
-          select: { id: true, latitude: true },
+      const cityRecord = await prisma.city.upsert({
+        where: { name_country: { name: city, country } },
+        create: {
+          name: city,
+          country,
+          latitude: hasCoords ? latitude : null,
+          longitude: hasCoords ? longitude : null,
+        },
+        update: {},
+        select: { id: true, latitude: true },
+      });
+      const cityId = cityRecord.id;
+      if (hasCoords && cityRecord.latitude == null) {
+        await prisma.city.update({
+          where: { id: cityRecord.id },
+          data: { latitude, longitude },
         });
-        cityId = cityRecord.id;
-        if (hasCoords && cityRecord.latitude == null) {
-          await prisma.city.update({
-            where: { id: cityRecord.id },
-            data: { latitude: parseFloat(latitude), longitude: parseFloat(longitude) },
-          });
-        }
       }
 
       const concert = await prisma.concert.upsert({
@@ -323,15 +359,13 @@ router.post(
           data: { latitude: String(latitude), longitude: String(longitude) },
         });
       }
-      if (cityId) {
-        await prisma.concert.updateMany({
-          where: { id: concert.id, city_id: null },
-          data: { city_id: cityId },
-        });
-      }
+      await prisma.concert.updateMany({
+        where: { id: concert.id, city_id: null },
+        data: { city_id: cityId },
+      });
 
-      // Link band to concert, storing the specific setlist if provided
-      const setlistData = Array.isArray(songs) && songs.length > 0 ? { songs } : undefined;
+      // Link band to concert with the setlist setlist.fm has for it.
+      const setlistData = show.songs.length > 0 ? { songs: show.songs } : undefined;
       await prisma.concertBandReference.upsert({
         where: { concert_band: { concert: concert.id, band: bandId } },
         create: { concert: concert.id, band: bandId, setlist: setlistData },
@@ -347,7 +381,7 @@ router.post(
       res.json({ concert_id: concert.id, attendance_id: attendance.id });
 
       // Background: find other bands at the same show via Setlist.fm and link any that exist in the DB
-      enrichConcertBands(concert.id, date, venue, city).catch(() => {});
+      enrichConcertBands(concert.id, show.date, venue, city).catch(() => {});
     } catch (error) {
       console.error("Error adding from-setlist attendance:", error);
       return res.status(500).json({ error: "Internal server error" });

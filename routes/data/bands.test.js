@@ -89,6 +89,17 @@ describe('POST /bands', () => {
   });
 });
 
+describe('GET /setlist-lookup', () => {
+  it('refuses an id that would steer the request elsewhere on setlist.fm', async () => {
+    // The id went into the URL path unescaped, with the server's API key on
+    // the request.
+    for (const id of ['../artist/65f4f0c5-ef9e-490c-aee3-909e7ae6b2ab/setlists', '63de4613?p=2']) {
+      const res = await request(app).get('/setlist-lookup').query({ id }).set(...authHeader());
+      expect(res.status).toBe(400);
+    }
+  });
+});
+
 describe('POST /bulk', () => {
   // Every concert runs inside one interactive transaction, and a failing
   // statement in Postgres aborts the transaction rather than just itself. The
