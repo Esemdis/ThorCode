@@ -9,14 +9,14 @@
 const express = require("express");
 const router = express.Router();
 const { validationResult, param, body } = require("express-validator");
-const { handleError } = require("../helpers");
 // Called through the module rather than destructured, so a test can stand in
 // for band creation (which reaches MusicBrainz) on the router's own copy.
 const bandCreate = require("../../../utils/bandCreate");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
-const { rateLimit } = require("./shared");
+const { rateLimit, ownWishlist } = require("./shared");
+const { RECORD_NOT_FOUND } = require("../../../utils/apiResponse");
 
 const VALID_TIERS = ["LOVE", "LIKE", "FOLLOW"];
 
@@ -33,9 +33,9 @@ function validateDiscordWebhook(value) {
   return true;
 }
 
-// Helper: compute per-band seen counts from past attendance.
-// Deduplicates by date+venue+city (same logic as the Attended tab display),
-// preferring sfm_ records so a TM + sfm_ pair for the same show counts as 1.
+const NOT_ON_WISHLIST = { error: "That band is not on this wishlist." };
+const ALREADY_ON_WISHLIST = { error: "That band is already on this wishlist." };
+const SERVER_ERROR = { error: "Internal server error" };
 
 // PATCH /weather/bulk — store precomputed weather blobs from Python (SYSTEM only)
 router.patch(
@@ -94,22 +94,20 @@ router.patch(
         return res.status(400).json({ error: "Provide tier" });
       }
 
-      // Verify ownership
-      const wishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
-      if (!wishlist) return res.status(404).json(handleError("wishlist", 404));
-      if (wishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
+      if (!(await ownWishlist(req, res, { select: { id: true } }))) return;
 
       const updated = await prisma.wishlistBandReference.update({
         where: { band_wishlist: { band_id: bandId, wishlist_id: wishlistId } },
         data: { tier },
       });
 
-
       res.json(updated);
     } catch (error) {
+      // A band that is not on the list has no tier to change. The update
+      // reports that as "record not found", which was answered as a 500.
+      if (error.code === RECORD_NOT_FOUND) return res.status(404).json(NOT_ON_WISHLIST);
       console.error("Error updating band in wishlist:", error);
-      const payload = handleError("wishlist", 500);
-      return res.status(500).json(payload);
+      return res.status(500).json(SERVER_ERROR);
     }
   }
 );
@@ -149,8 +147,7 @@ router.post(
       res.status(201).json(newWishlist);
     } catch (error) {
       console.error("Error creating wishlist:", error);
-      const payload = handleError("wishlist", 500);
-      return res.status(500).json(payload);
+      return res.status(500).json(SERVER_ERROR);
     }
   }
 );
@@ -176,9 +173,7 @@ router.put(
       const wishlistId = parseInt(req.params.id, 10);
       const { name, discord_webhook } = req.body;
 
-      const existingWishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
-      if (!existingWishlist) return res.status(404).json(handleError("wishlist", 404));
-      if (existingWishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
+      if (!(await ownWishlist(req, res, { select: { id: true } }))) return;
 
       const updateData = { name: name.trim() };
       if (discord_webhook !== undefined) updateData.discord_webhook = discord_webhook || null;
@@ -192,8 +187,7 @@ router.put(
       res.json(updatedWishlist);
     } catch (error) {
       console.error("Error updating wishlist:", error);
-      const payload = handleError("wishlist", 500);
-      return res.status(500).json(payload);
+      return res.status(500).json(SERVER_ERROR);
     }
   }
 );
@@ -227,9 +221,7 @@ router.post(
       const bandName = name ? name.trim() : null;
       const ticketmasterId = ticketmaster_id ? ticketmaster_id.trim() : null;
 
-      const existingWishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
-      if (!existingWishlist) return res.status(404).json(handleError("wishlist", 404));
-      if (existingWishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
+      if (!(await ownWishlist(req, res, { select: { id: true } }))) return;
 
       // Created in-process. This used to be the API calling itself over HTTP
       // at CALLBACK_URL with the caller's token, so a stale CALLBACK_URL broke
@@ -262,7 +254,7 @@ router.post(
         where: { wishlist_id: wishlistId, band_id: band.id },
       });
 
-      if (existingReference) return res.status(409).json(handleError("wishlist", 409));
+      if (existingReference) return res.status(409).json(ALREADY_ON_WISHLIST);
 
       try {
         await prisma.wishlistBandReference.create({
@@ -271,10 +263,9 @@ router.post(
       } catch (error) {
         // The same add twice at once (a double tap) passes the check above
         // together; the second one is this conflict, not a 500.
-        if (error.code === "P2002") return res.status(409).json(handleError("wishlist", 409));
+        if (error.code === "P2002") return res.status(409).json(ALREADY_ON_WISHLIST);
         throw error;
       }
-
 
       res.status(201).json({
         message: "Band added to wishlist successfully",
@@ -283,8 +274,7 @@ router.post(
       });
     } catch (error) {
       console.error("Error adding band to wishlist:", error);
-      const payload = handleError("wishlist", 500);
-      return res.status(500).json(payload);
+      return res.status(500).json(SERVER_ERROR);
     }
   }
 );
@@ -309,24 +299,20 @@ router.delete(
       const wishlistId = parseInt(req.params.id, 10);
       const bandId = parseInt(req.params.bandId, 10);
 
-      const existingWishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
-      if (!existingWishlist) return res.status(404).json(handleError("wishlist", 404));
-      if (existingWishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
+      if (!(await ownWishlist(req, res, { select: { id: true } }))) return;
 
       const existingReference = await prisma.wishlistBandReference.findFirst({
         where: { wishlist_id: wishlistId, band_id: bandId },
       });
 
-      if (!existingReference) return res.status(404).json(handleError("wishlist", 404));
+      if (!existingReference) return res.status(404).json(NOT_ON_WISHLIST);
 
       await prisma.wishlistBandReference.delete({ where: { id: existingReference.id } });
-
 
       res.json({ message: "Band removed from wishlist successfully" });
     } catch (error) {
       console.error("Error removing band from wishlist:", error);
-      const payload = handleError("wishlist", 500);
-      return res.status(500).json(payload);
+      return res.status(500).json(SERVER_ERROR);
     }
   }
 );
@@ -344,9 +330,7 @@ router.delete(
       }
 
       const wishlistId = parseInt(req.params.id, 10);
-      const existingWishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
-      if (!existingWishlist) return res.status(404).json(handleError("wishlist", 404));
-      if (existingWishlist.user_id !== req.user.id) return res.status(403).json(handleError("wishlist", 403));
+      if (!(await ownWishlist(req, res, { select: { id: true } }))) return;
 
       // Shows attended hang off the wishlist, and photographs off them — the
       // key restricts on purpose (see utils/mediaDetach.js). Refused in words
@@ -370,8 +354,7 @@ router.delete(
       res.json({ message: "Wishlist deleted successfully." });
     } catch (error) {
       console.error("Error deleting wishlist:", error);
-      const payload = handleError("wishlist", 500);
-      return res.status(500).json(payload);
+      return res.status(500).json(SERVER_ERROR);
     }
   }
 );

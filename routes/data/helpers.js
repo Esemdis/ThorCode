@@ -4,41 +4,11 @@ const { checkDuplicateConcert, stringSimilarity } = require('../../utils/concert
 
 const ticketmasterURL = 'https://app.ticketmaster.com/discovery/v2/';
 
-const errorMessages = {
-  events: {
-    404: { error: 'No events found for this band.' },
-    429: { error: 'Too many requests, please try again later.' },
-    500: { error: 'Internal server error' },
-  },
-  band: {
-    404: { error: 'Band not found with that Ticketmaster ID' },
-    409: { error: 'Band already exists.' },
-    500: { error: 'Internal server error' },
-  },
-  // 403 and 409 are answered by several wishlist routes and were missing
-  // here, so a refusal came back as "An unknown error occurred."
-  wishlist: {
-    403: { error: 'That wishlist is not yours.' },
-    404: { error: 'Wishlist not found.' },
-    409: { error: 'That band is already on this wishlist.' },
-    500: { error: 'Internal server error' },
-  },
-};
-
 module.exports = {
-  handleError,
   checkDuplicateConcert,
   getTicketmasterId,
   stringSimilarity,
 };
-
-function handleError(module, status) {
-  const moduleErrors = errorMessages[module];
-  if (moduleErrors && moduleErrors[status]) {
-    return moduleErrors[status];
-  }
-  return { error: 'An unknown error occurred.' };
-}
 
 async function getTicketmasterId(bandIdentifier) {
   // If identifier looks like a Ticketmaster ID (numeric), check DB first

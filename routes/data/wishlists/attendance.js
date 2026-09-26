@@ -16,6 +16,7 @@ const { storesRealInstant } = require("../../../utils/ics");
 const { conflict } = require("../../../utils/apiResponse");
 const { countMediaForAttendances } = require("../../../utils/mediaDetach");
 const { enrichConcertBands } = require("../../../utils/setlistEnrich");
+const { ownWishlist } = require("./shared");
 // Called through the module rather than destructured, so a test can stand in
 // for setlist.fm on the router's own copy of it.
 const setlistFm = require("../../../utils/setlistFm");
@@ -33,13 +34,11 @@ router.get(
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
 
-      const wishlistId = parseInt(req.params.id, 10);
-      const wishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
+      const wishlist = await ownWishlist(req, res, {
         include: { bands: { select: { band_id: true, tier: true } } },
       });
-      if (!wishlist) return res.status(404).json({ error: "Not found" });
-      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+      if (!wishlist) return;
+      const wishlistId = wishlist.id;
 
       const bandTierMap = new Map(wishlist.bands.map((b) => [b.band_id, b.tier]));
       const bandIds = [...bandTierMap.keys()];
@@ -147,12 +146,7 @@ router.post(
       const wishlistId = parseInt(req.params.id, 10);
       const concertId = parseInt(req.body.concert_id, 10);
 
-      const wishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
-        include: { bands: { select: { band_id: true } } },
-      });
-      if (!wishlist) return res.status(404).json({ error: "Not found" });
-      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+      if (!(await ownWishlist(req, res, { select: { id: true } }))) return;
 
       const concert = await prisma.concert.findUnique({
         where: { id: concertId },
@@ -206,12 +200,7 @@ router.delete(
       const wishlistId = parseInt(req.params.id, 10);
       const concertId = parseInt(req.params.concertId, 10);
 
-      const wishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
-        include: { bands: { select: { band_id: true } } },
-      });
-      if (!wishlist) return res.status(404).json({ error: "Not found" });
-      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+      if (!(await ownWishlist(req, res, { select: { id: true } }))) return;
 
       const attendance = await prisma.concertAttendance.findUnique({
         where: { wishlist_id_concert_id: { wishlist_id: wishlistId, concert_id: concertId } },
@@ -263,12 +252,7 @@ router.post(
       const wishlistId = parseInt(req.params.id, 10);
       const bandId = parseInt(req.body.band_id, 10);
 
-      const wishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
-        select: { id: true, user_id: true },
-      });
-      if (!wishlist) return res.status(404).json({ error: "Not found" });
-      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+      if (!(await ownWishlist(req, res, { select: { id: true } }))) return;
 
       const band = await prisma.band.findUnique({ where: { id: bandId }, select: { id: true, MBID: true } });
       if (!band) return res.status(404).json({ error: "Band not found" });

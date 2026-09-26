@@ -13,23 +13,17 @@ const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
 const { generateCalendarToken, feedUrl, isPubliclyReachable } = require("../../../utils/calendarToken");
+const { ownWishlist } = require("./shared");
 
-//
-// Minted lazily rather than for every wishlist: most users never subscribe, and
-// a row full of unused credentials is a liability rather than a feature.
+// Tokens are minted lazily rather than for every wishlist: most users never
+// subscribe, and a row full of unused credentials is a liability rather than
+// a feature.
 const ownedWishlist = async (req, res) => {
   if (!validationResult(req).isEmpty()) {
     res.status(400).json({ error: "Wishlist ID must be an integer" });
     return null;
   }
-  const wishlistId = parseInt(req.params.id, 10);
-  const wishlist = await prisma.wishlist.findUnique({
-    where: { id: wishlistId },
-    select: { id: true, user_id: true, calendar_token: true, calendar_token_at: true },
-  });
-  if (!wishlist) { res.status(404).json({ error: "Not found" }); return null; }
-  if (wishlist.user_id !== req.user.id) { res.status(403).json({ error: "Forbidden" }); return null; }
-  return wishlist;
+  return ownWishlist(req, res, { select: { id: true, calendar_token: true, calendar_token_at: true } });
 };
 
 // GET /wishlists/:id/calendar-token — the current feed URL, if one exists

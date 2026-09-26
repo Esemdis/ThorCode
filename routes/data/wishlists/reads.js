@@ -9,13 +9,12 @@
 const express = require("express");
 const router = express.Router();
 const { validationResult, param, body } = require("express-validator");
-const { handleError } = require("../helpers");
 const { deduplicateConcerts } = require("../../../utils/concertDedup");
 const { groupConcertsByBand } = require("../../../utils/concertUpdateGroups");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
-const { rateLimit } = require("./shared");
+const { rateLimit, ownWishlist } = require("./shared");
 
 // The id checks below are declared on each route but were never read, so
 // "/wishlists/abc/…" reached Prisma as NaN and came back a 500.
@@ -85,8 +84,7 @@ router.get(
       res.json(wishlists);
     } catch (error) {
       console.error("Error fetching wishlists:", error);
-      const payload = handleError("wishlist", 500);
-      return res.status(500).json(payload);
+      return res.status(500).json({ error: "Internal server error" });
     }
   }
 );
@@ -203,15 +201,9 @@ router.get(
   async (req, res) => {
     try {
       if (invalid(req, res)) return;
-      const wishlistId = parseInt(req.params.id, 10);
-
-      const wishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
-        include: { bands: true },
-      });
-
-      if (!wishlist) return res.status(404).json({ error: "Not found" });
-      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+      const wishlist = await ownWishlist(req, res, { include: { bands: true } });
+      if (!wishlist) return;
+      const wishlistId = wishlist.id;
 
       const sinceDate = wishlist.last_active_at ?? new Date(0);
       // Taken now, written last: the cursor moves to when this read began, and
@@ -329,13 +321,10 @@ router.get(
   async (req, res) => {
     try {
       if (invalid(req, res)) return;
-      const wishlistId = parseInt(req.params.id, 10);
-      const wishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
+      const wishlist = await ownWishlist(req, res, {
         include: { bands: { select: { band_id: true, tier: true } } },
       });
-      if (!wishlist) return res.status(404).json({ error: "Not found" });
-      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+      if (!wishlist) return;
 
       const wishlistBandMap = new Map(wishlist.bands.map((b) => [b.band_id, b.tier]));
       const bandIds = [...wishlistBandMap.keys()];
@@ -390,13 +379,11 @@ router.get(
   async (req, res) => {
     try {
       if (invalid(req, res)) return;
-      const wishlistId = parseInt(req.params.id, 10);
-      const wishlist = await prisma.wishlist.findUnique({ where: { id: wishlistId } });
-      if (!wishlist) return res.status(404).json({ error: "Not found" });
-      if (wishlist.user_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+      const wishlist = await ownWishlist(req, res, { select: { id: true } });
+      if (!wishlist) return;
 
       const logs = await prisma.activityLog.findMany({
-        where: { wishlist_id: wishlistId },
+        where: { wishlist_id: wishlist.id },
         orderBy: { created_at: "desc" },
         take: 15,
       });
@@ -421,7 +408,6 @@ router.get(
   async (req, res) => {
     try {
       if (invalid(req, res)) return;
-      const wishlistId = parseInt(req.params.id, 10);
       const { start_date, end_date, countries } = req.query;
 
       // The date window and the countries go to the database. They used to be
@@ -436,7 +422,11 @@ router.get(
       };
       const startDate = parsedDate(start_date);
       const endDate = parsedDate(end_date);
-      if (endDate) endDate.setHours(23, 59, 59, 999);
+      // The last instant of that day in UTC, which is the day concert_date is
+      // filed under. setHours worked in the server's own zone: the same in a
+      // UTC container, but on a machine in CET it dropped the window's last
+      // two hours.
+      if (endDate) endDate.setUTCHours(23, 59, 59, 999);
       const countryList = typeof countries === "string" && countries
         ? countries.split(",")
         : null;
@@ -445,25 +435,12 @@ router.get(
         ...(countryList && { country: { in: countryList } }),
       };
 
-      const wishlist = await prisma.wishlist.findUnique({
-        where: { id: wishlistId },
-        include: {
-          bands: {
-            include: {
-              band_rel: true,
-            },
-          },
-        },
+      const wishlist = await ownWishlist(req, res, {
+        include: { bands: { include: { band_rel: true } } },
+        allowAdmin: true,
       });
-
-      if (!wishlist) {
-        const payload = handleError("wishlist", 404);
-        return res.status(404).json(payload);
-      }
-
-      if (wishlist.user_id !== req.user.id && req.user.role !== 'ADMIN') {
-        return res.status(403).json(handleError("wishlist", 403));
-      }
+      if (!wishlist) return;
+      const wishlistId = wishlist.id;
 
       const bandIds = wishlist.bands.map((ref) => ref.band_id);
       const bandTierMap = new Map(wishlist.bands.map((ref) => [ref.band_id, ref.tier]));
@@ -577,8 +554,6 @@ router.get(
 
       const seenCountMap = await computeSeenCounts(wishlistId);
 
-
-
       // Deduplicated concerts across all bands (by id first)
       const allConcerts = new Map();
       formattedBands.forEach((band) => {
@@ -624,8 +599,7 @@ router.get(
       });
     } catch (error) {
       console.error("Error fetching wishlist:", error);
-      const payload = handleError("wishlist", 500);
-      return res.status(500).json(payload);
+      return res.status(500).json({ error: "Internal server error" });
     }
   }
 );

@@ -103,6 +103,87 @@ describe('auth', () => {
   });
 });
 
+describe('a wishlist that is someone else\'s', () => {
+  // Every route that names a wishlist by id asks ownWishlist, and each one used
+  // to spell the check out for itself. This walks all of them, so a route that
+  // stops asking fails here rather than quietly serving a stranger's list.
+  const user = authHeader({ id: 'user-1', role: 'USER' });
+  const admin = authHeader({ id: 'user-1', role: 'ADMIN' });
+  const routes = [
+    ['get', '/wishlists/7', user],
+    ['get', '/wishlists/7/new', user],
+    ['get', '/wishlists/7/recent-concerts', user],
+    ['get', '/wishlists/7/activity', user],
+    ['get', '/wishlists/7/attendance', user],
+    ['post', '/wishlists/7/attendance', user, { concert_id: 1 }],
+    ['delete', '/wishlists/7/attendance/1', user],
+    ['post', '/wishlists/7/attendance/from-setlist', user, { setlistfm_id: '63de4613', band_id: 1 }],
+    ['patch', '/wishlists/7/bands/1', user, { tier: 'LOVE' }],
+    ['put', '/wishlists/7', admin, { name: 'Mine now' }],
+    ['post', '/wishlists/7/bands', user, { name: 'Gojira' }],
+    ['delete', '/wishlists/7/bands/1', user],
+    ['delete', '/wishlists/7', admin],
+    ['get', '/wishlists/7/calendar-token', user],
+    ['post', '/wishlists/7/calendar-token', user],
+    ['delete', '/wishlists/7/calendar-token', user],
+  ];
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-2', bands: [] });
+  });
+
+  // The writes share one limiter of ten a minute per IP (see ./shared.js), and
+  // this sweep spends it. Handed back so the tests after it are not refused
+  // for what these did.
+  afterAll(async () => {
+    const { rateLimit } = createRequire(import.meta.url)('./wishlists/shared.js');
+    for (const ip of ['::ffff:127.0.0.1', '127.0.0.1', '::1']) await rateLimit.resetKey(ip);
+  });
+
+  it.each(routes)('%s %s answers 403 and goes no further', async (method, path, auth, body) => {
+    const res = await request(app)[method](path).set(...auth).send(body ?? {});
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: 'That wishlist is not yours.' });
+    expect(prisma.wishlist.findUnique).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 7 } }));
+    for (const table of ['wishlistBandReference', 'concertAttendance', 'concert', 'band', 'activityLog']) {
+      for (const fn of ['findMany', 'findFirst', 'create', 'update', 'upsert', 'delete', 'deleteMany']) {
+        expect(prisma[table][fn]).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it('lets an admin read it whole, which is the one exception', async () => {
+    prisma.band.findMany.mockResolvedValue([]);
+    prisma.concertAttendance.findMany.mockResolvedValue([]);
+
+    const res = await request(app).get('/wishlists/7').set(...admin);
+
+    expect(res.status).toBe(200);
+  });
+
+  it('answers 404 in the same words everywhere when there is no such wishlist', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue(null);
+
+    for (const [method, path, auth, body] of routes) {
+      const res = await request(app)[method](path).set(...auth).send(body ?? {});
+      expect([path, res.status, res.body]).toEqual([path, 404, { error: 'Wishlist not found.' }]);
+    }
+  });
+});
+
+describe('PATCH /wishlists/:id/bands/:bandId', () => {
+  it('answers 404 for a band that is not on the list, rather than 500', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1' });
+    prisma.wishlistBandReference.update.mockRejectedValue(Object.assign(new Error('not found'), { code: 'P2025' }));
+
+    const res = await request(app).patch('/wishlists/7/bands/99').set(...authHeader({ id: 'user-1' })).send({ tier: 'LOVE' });
+
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: 'That band is not on this wishlist.' });
+  });
+});
+
 describe('GET /wishlists/bands', () => {
   const REFS = [
     { tier: 'LOVE', band_rel: { id: 1, name: 'Opeth' } },
@@ -767,9 +848,33 @@ describe('GET /wishlists/:id with a date window', () => {
 
     const { select } = prisma.band.findMany.mock.calls[0][0];
     expect(select.concerts.where.concert_rel).toEqual({
-      concert_date: { gte: new Date('2026-10-01'), lte: expect.any(Date) },
+      concert_date: { gte: new Date('2026-10-01'), lte: new Date('2026-10-07T23:59:59.999Z') },
       country: { in: ['SE', 'NO'] },
     });
+  });
+
+  it('ends the window at the end of the UTC day, whatever zone the server is in', async () => {
+    // concert_date files a show under its UTC day, so that is the day the
+    // window has to close on. Worked out in local time, a server in Stockholm
+    // closed it two hours early and lost the evening's shows.
+    const zone = process.env.TZ;
+    process.env.TZ = 'Europe/Stockholm';
+    try {
+      prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [] });
+      prisma.band.findMany.mockResolvedValue([]);
+      prisma.concertAttendance.findMany.mockResolvedValue([]);
+
+      await request(app)
+        .get('/wishlists/7')
+        .query({ start_date: '2026-10-01', end_date: '2026-10-07' })
+        .set(...authHeader({ id: 'user-1' }));
+
+      const { where } = prisma.band.findMany.mock.calls[0][0].select.concerts;
+      expect(where.concert_rel.concert_date.lte).toEqual(new Date('2026-10-07T23:59:59.999Z'));
+    } finally {
+      if (zone === undefined) delete process.env.TZ;
+      else process.env.TZ = zone;
+    }
   });
 
   it('asks for everything when no window is given', async () => {
