@@ -12,44 +12,16 @@
  * overwritten with them.
  */
 
-const INT32_MAX = 2147483647;
-// Decimal(10, 2): eight digits before the point.
-const DECIMAL_MAX = 99999999.99;
+const {
+  INT32_MAX, DECIMAL_MAX, blank, text, date, number, currency, textList,
+} = require('./fields');
+
 const MINUTES_IN_DAY = 1440;
 // A whole day of transfer is a typo, not a journey, and would eat the first
 // and last day of the trip without saying why.
 const MAX_TRANSFER_MIN = 720;
 
 const BUDGET_FIELDS = ['money_budget', 'budget_flights', 'budget_hotel', 'budget_entertainment', 'budget_food'];
-
-const blank = (v) => v === null || v === undefined || v === '';
-
-/** A string, trimmed, or null. Undefined means "not a string". */
-function text(value, max) {
-  if (blank(value)) return null;
-  if (typeof value !== 'string') return undefined;
-  const trimmed = value.trim();
-  if (max && trimmed.length > max) return undefined;
-  return trimmed || null;
-}
-
-/** A calendar date, or null. Undefined means "does not parse". */
-function date(value) {
-  if (blank(value)) return null;
-  if (typeof value !== 'string' && !(value instanceof Date)) return undefined;
-  const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? undefined : d;
-}
-
-/** A number from `min` to `max`, or null. Undefined means out of range or not a number. */
-function number(value, { min = 0, max, integer = false } = {}) {
-  if (blank(value)) return null;
-  if (typeof value !== 'number' && typeof value !== 'string') return undefined;
-  const n = Number(value);
-  if (!Number.isFinite(n) || n < min || (max != null && n > max)) return undefined;
-  if (integer && !Number.isInteger(n)) return undefined;
-  return n;
-}
 
 function normaliseTripInput(body = {}, { partial = false, withPlaces = false } = {}) {
   const data = {};
@@ -101,18 +73,16 @@ function normaliseTripInput(body = {}, { partial = false, withPlaces = false } =
       if (!partial) data.currency = 'SEK';
       else return { error: 'currency must be a three-letter code' };
     } else {
-      const code = typeof body.currency === 'string' ? body.currency.trim().toUpperCase() : '';
-      if (!/^[A-Z]{3}$/.test(code)) return { error: 'currency must be a three-letter code' };
+      const code = currency(body.currency);
+      if (!code) return { error: 'currency must be a three-letter code' };
       data.currency = code;
     }
   }
 
   if (given('tags') || !partial) {
-    const tags = body.tags ?? [];
-    if (!Array.isArray(tags) || tags.some((t) => typeof t !== 'string')) {
-      return { error: 'tags must be a list of text' };
-    }
-    data.tags = tags.map((t) => t.trim()).filter(Boolean);
+    const tags = textList(body.tags);
+    if (!tags) return { error: 'tags must be a list of text' };
+    data.tags = tags;
   }
 
   if (given('exchange_rates')) {
