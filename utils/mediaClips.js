@@ -20,7 +20,7 @@
 const path = require('node:path');
 const { randomBytes } = require('node:crypto');
 const {
-  access, mkdir, rename, unlink, writeFile,
+  access, mkdir, readdir, readFile, rename, unlink, writeFile,
 } = require('node:fs/promises');
 const { clipCacheRoot } = require('./mediaPaths');
 const { FAILED_SUFFIX, PART_SUFFIX } = require('./renditionPlan');
@@ -205,6 +205,53 @@ async function removeClip(id, root = clipCacheRoot()) {
   }
 }
 
+/**
+ * Point every waiting request at `fromRelPath` to `toRelPath` instead —
+ * called when tagging moves a video out from under a request nobody has
+ * cut yet. Without this the service goes on trying to read a path the file
+ * just left, and the moment sits at "preparing" forever.
+ *
+ * A request already cut, or already marked failed, names no path worth
+ * fixing — the service is done reading the source either way — so only a
+ * request still waiting is rewritten. Same temp-then-rename dance as
+ * `prepareClip`, for the same reason: the service lists this directory
+ * between cuts and must never see a half-written request.
+ *
+ * @returns {Promise<number[]>} ids rewritten, so a failed move elsewhere can
+ *   undo this by calling it again with the paths swapped
+ */
+async function retargetClipRequests(fromRelPath, toRelPath, root = clipCacheRoot()) {
+  const names = await readdir(root).catch((err) => {
+    if (err.code === 'ENOENT') return [];
+    throw err;
+  });
+  const moved = [];
+  for (const name of names) {
+    const match = REQUEST_NAME.exec(name);
+    if (!match) continue;
+    const id = Number(match[1]);
+    const text = await readFile(path.join(root, name), 'utf8').catch(() => null);
+    const request = text == null ? null : parseClipRequest(name, text);
+    if (!request || request.rel_path !== fromRelPath) continue;
+
+    const files = clipFiles(id, root);
+    // Already cut, or already given up on: nothing here still points at the
+    // source, so there is nothing to retarget.
+    if (await exists(files.output) || await exists(files.failed)) continue;
+
+    const temp = path.join(root, `.${id}.json.${randomBytes(6).toString('hex')}.tmp`);
+    await writeFile(temp, `${JSON.stringify({ ...request, id, rel_path: toRelPath })}\n`, 'utf8');
+    try {
+      await rename(temp, files.request);
+    } catch (err) {
+      await unlink(temp).catch(() => {});
+      throw err;
+    }
+    moved.push(id);
+  }
+  return moved;
+}
+
 module.exports = {
   MIN_CLIP_MS,
   clipFiles,
@@ -215,4 +262,5 @@ module.exports = {
   planClips,
   prepareClip,
   removeClip,
+  retargetClipRequests,
 };

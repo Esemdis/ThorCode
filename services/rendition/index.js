@@ -209,6 +209,19 @@ async function encode(show, job) {
     return { ok: false };
   }
 
+  // An encode is minutes long. If a tag moved the clip to another show's
+  // folder, or it was deleted outright, while this one ran, the render is
+  // still good — ffmpeg read it through the handle it opened — but nothing
+  // should be served from a folder the clip just left, or one still holding a
+  // rendition for a file that no longer exists at all. Not a failure: the
+  // next pass either finds the clip pending in its new home or finds nothing
+  // to do, so no marker is left behind for either case.
+  if (!(await exists(input))) {
+    await unlink(part).catch(() => {});
+    log(`${show.label}/${job.name}: source is gone, discarding the rendition`);
+    return { ok: false, stale: true };
+  }
+
   await rename(part, target);
   const after = await stat(target).then((st) => st.size, () => null);
   const seconds = Math.round((Date.now() - started) / 1000);
@@ -239,8 +252,11 @@ async function cutClip(job) {
   const files = clipFiles(job.id);
   const range = `${job.start_ms / 1000}s–${job.end_ms == null ? 'end' : `${job.end_ms / 1000}s`}`;
   const started = Date.now();
+  // Hoisted out of the try below so the exists() check after it can still
+  // name the file ffmpeg actually read.
+  let input;
   try {
-    const { absPath: input } = await playableFor(resolveArchivePath(job.rel_path), 'VIDEO');
+    ({ absPath: input } = await playableFor(resolveArchivePath(job.rel_path), 'VIDEO'));
     const source = await probe(input);
     if (!source) throw new Error('ffprobe found no usable video stream');
     await runFfmpeg(ffmpegArgs({
@@ -261,6 +277,17 @@ async function cutClip(job) {
     if (stopping) throw err;
     await writeFile(files.failed, `${err.message}\n`).catch(() => {});
     warn(`clip ${job.id} (${job.rel_path} ${range}): ${err.message}`);
+    return;
+  }
+
+  // Same race as a rendition's: the cut itself already succeeded off the
+  // handle ffmpeg opened, but if the source moved or was deleted while it
+  // ran, nothing should hand out a clip cut from a file that is no longer
+  // there. A moved source gets a fresh request at its new path (see
+  // utils/mediaRehome.js); a deleted one has no link left to ask for it.
+  if (!(await exists(input))) {
+    await unlink(files.part).catch(() => {});
+    log(`clip ${job.id}: source is gone, discarding the cut`);
     return;
   }
 
@@ -343,7 +370,7 @@ async function pass() {
       // slower than it was.
       const result = await encode(show, job);
       if (result.ok) { done += 1; before += result.before; after += result.after; }
-      else failed += 1;
+      else if (!result.stale) failed += 1;
     }
   }
 

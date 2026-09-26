@@ -8,6 +8,8 @@ import { createRequire } from 'node:module';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 import { signMediaToken } from '../../utils/mediaTokens.js';
 import { buildExif, jpegWithExif } from '../../test/exifFixture.js';
+import { clipCacheRoot } from '../../utils/mediaPaths.js';
+import { clipFiles, parseClipRequest } from '../../utils/mediaClips.js';
 
 // The show locks, from the router's own copy of the queue. The router is
 // CommonJS and loads its dependencies through Node's require, so an `import`
@@ -1782,6 +1784,44 @@ describe('PATCH /media — an act from another stage that day', () => {
     expect(await exists(join(srcDir(), '.web', 'VID_1.mp4.mp4'))).toBe(false);
   });
 
+  it('points a video\'s waiting clip request at where the tag just moved it', async () => {
+    // A share to a moment of this video was asked for, but the rendition
+    // service has not cut it yet — the request still names the show the file
+    // is about to leave. Left alone, the service would keep trying to read a
+    // path that no longer has anything in it.
+    const clip = row({ kind: 'VIDEO', rel_path: `${srcRel}/VID_1.mp4`, filename: 'VID_1.mp4' });
+    await seed([clip]);
+    mockDb({ rows: [clip] });
+    await mkdir(clipCacheRoot(), { recursive: true });
+    await writeFile(clipFiles(9).request, `${JSON.stringify({
+      id: 9, rel_path: clip.rel_path, start_ms: 1000, end_ms: 5000,
+      expires_at: new Date('2099-01-01T00:00:00Z').toISOString(),
+    })}\n`);
+
+    await tag({ ids: [5], band_id: 501 }).expect(200);
+
+    const destRelPath = prisma.concertMedia.update.mock.calls[0][0].data.rel_path;
+    const written = await readFile(clipFiles(9).request, 'utf8');
+    expect(parseClipRequest('9.json', written).rel_path).toBe(destRelPath);
+  });
+
+  it('puts a clip request back where it pointed when the database write fails', async () => {
+    const clip = row({ kind: 'VIDEO', rel_path: `${srcRel}/VID_1.mp4`, filename: 'VID_1.mp4' });
+    await seed([clip]);
+    mockDb({ rows: [clip] });
+    prisma.$transaction = vi.fn(async () => { throw new Error('connection reset'); });
+    await mkdir(clipCacheRoot(), { recursive: true });
+    await writeFile(clipFiles(9).request, `${JSON.stringify({
+      id: 9, rel_path: clip.rel_path, start_ms: 1000, end_ms: 5000,
+      expires_at: new Date('2099-01-01T00:00:00Z').toISOString(),
+    })}\n`);
+
+    await tag({ ids: [5], band_id: 501 }).expect(500);
+
+    const written = await readFile(clipFiles(9).request, 'utf8');
+    expect(parseClipRequest('9.json', written).rel_path).toBe(clip.rel_path);
+  });
+
   it('picks a free name when the act\'s show already has a file called that', async () => {
     const destRel = 'user-1/2025-06-22 Dessel - Dayseeker';
     await seed();
@@ -2261,6 +2301,44 @@ describe('DELETE /media/:id', () => {
     expect(await readdir(dir)).not.toContain('VID_1.mp4');
   });
 
+  it('clears a video\'s clip cache along with it, moment not yet cut and all', async () => {
+    // The cascade takes the MediaShareLink row on its own; nothing but this
+    // clears cache/clips. Left there, the rendition service finds the source
+    // gone, fails on it, and only sweeps the request on its own expiry.
+    const dir = join(root, 'archive', gojira);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'VID_1.mp4'), 'clip');
+    await mkdir(clipCacheRoot(), { recursive: true });
+    await writeFile(clipFiles(9).request, '{}');
+    await writeFile(clipFiles(10).output, 'mp4');
+    prisma.concertMedia.findUnique = vi.fn(async () => ({
+      ...photoIn(1, gojira), filename: 'VID_1.mp4', kind: 'VIDEO', rel_path: `${gojira}/VID_1.mp4`,
+    }));
+    prisma.concertMedia.delete = vi.fn(async () => ({ id: 1 }));
+    prisma.mediaShareLink.findMany = vi.fn(async () => [
+      { id: 9, start_ms: 1000, end_ms: null }, { id: 10, start_ms: null, end_ms: 5000 },
+    ]);
+
+    await del().expect(200);
+
+    expect(await readdir(clipCacheRoot())).toEqual([]);
+  });
+
+  it('leaves the clip cache alone for a share of the whole file', async () => {
+    // isClip is false for these — a share of the whole file has no cut of its
+    // own in cache/clips to remove, so its link id must not reach removeClip.
+    await seedPhoto(gojira);
+    await mkdir(clipCacheRoot(), { recursive: true });
+    await writeFile(clipFiles(11).output, 'unrelated, must survive');
+    prisma.concertMedia.findUnique = vi.fn(async () => photoIn(1, gojira));
+    prisma.concertMedia.delete = vi.fn(async () => ({ id: 1 }));
+    prisma.mediaShareLink.findMany = vi.fn(async () => [{ id: 11, start_ms: null, end_ms: null }]);
+
+    await del().expect(200);
+
+    expect(await readdir(clipCacheRoot())).toEqual(['11.mp4']);
+  });
+
   it('keeps the row, and answers 500, when the file will not go', async () => {
     // A non-empty directory where the photograph should be: unlink refuses it.
     const dir = join(root, 'archive', gojira);
@@ -2404,6 +2482,40 @@ describe('DELETE /media', () => {
     expect(prisma.concertMedia.deleteMany).not.toHaveBeenCalled();
     expect(await photosIn(gojira)).toEqual(['IMG_1.jpg', 'IMG_2.jpg']);
     expect(await photosIn(alcest)).toEqual(['IMG_3.jpg']);
+  });
+
+  it('clears the clip cache of every video actually removed, and none that were not', async () => {
+    // The DB cascades a MediaShareLink row with its ConcertMedia row on its
+    // own; nothing but this clears cache/clips. VID_4 goes; VID_5's file
+    // refuses to unlink, so its row — and its clip — must stay exactly as
+    // they were.
+    await writeFile(join(abs(gojira), 'VID_4.mp4'), 'clip');
+    await mkdir(join(abs(alcest), 'VID_5.mp4', 'inside'), { recursive: true });
+    const videos = [
+      mediaRow(4, 1, gojira, 'VID_4.mp4', { kind: 'VIDEO' }),
+      mediaRow(5, 2, alcest, 'VID_5.mp4', { kind: 'VIDEO' }),
+    ];
+    prisma.concertMedia.findMany = vi.fn(async ({ where }) => [...table(), ...videos]
+      .filter((r) => where.id.in.includes(r.id)));
+    await mkdir(clipCacheRoot(), { recursive: true });
+    await writeFile(clipFiles(20).output, 'mp4');
+    await writeFile(clipFiles(21).output, 'mp4');
+    prisma.mediaShareLink.findMany = vi.fn(async ({ where }) => [
+      { id: 20, media_id: 4, start_ms: 1000, end_ms: null },
+      { id: 21, media_id: 5, start_ms: 2000, end_ms: null },
+    ].filter((l) => where.media_id.in.includes(l.media_id)));
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    let res;
+    try {
+      res = await remove({ ids: [4, 5] }).expect(200);
+    } finally {
+      quiet.mockRestore();
+    }
+
+    expect(res.body.data.deleted).toEqual([4]);
+    expect(res.body.data.failed).toEqual([{ id: 5, error: expect.any(String) }]);
+    expect(await readdir(clipCacheRoot())).toEqual(['21.mp4']);
   });
 
   it('keeps the row of a file it could not remove, names it, and deletes the rest', async () => {
