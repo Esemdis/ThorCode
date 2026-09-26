@@ -2964,6 +2964,20 @@ describe('sharing one file by public link', () => {
 
       expect(tokenOf(second)).not.toBe(tokenOf(first));
     });
+
+    it('mints one link, not two, when two devices ask at the same moment', async () => {
+      // Found-or-created in two steps, so two requests that both looked
+      // before either had created each found nothing live and each minted a
+      // link. A lookup that takes a moment, as a real one does, was enough.
+      const find = prisma.mediaShareLink.findFirst;
+      prisma.mediaShareLink.findFirst = vi.fn(async (args) => { await sleep(10); return find(args); });
+
+      const [a, b] = await Promise.all([share(), share()]);
+
+      expect([a.status, b.status]).toEqual([200, 200]);
+      expect(prisma.mediaShareLink.create).toHaveBeenCalledTimes(1);
+      expect(b.body.data.url).toBe(a.body.data.url);
+    });
   });
 
   describe('DELETE /media/:id/share', () => {

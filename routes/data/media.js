@@ -40,7 +40,7 @@ const { playableFor } = require('../../utils/mediaRenditions');
 const { bandMediaOverview } = require('../../utils/mediaOverview');
 const { billForConcert } = require('../../utils/concertBill');
 const { canonicalBandName } = require('../../utils/lineupNames');
-const { acquire } = require('../../utils/serialQueue');
+const { acquire, serialise } = require('../../utils/serialQueue');
 const { festivalSibling, moveFileBytes, undoRenames } = require('../../utils/mediaRehome');
 const { removeMediaFiles } = require('../../utils/mediaRemove');
 const { signMediaToken, verifyMediaToken, mediaUrls } = require('../../utils/mediaTokens');
@@ -1347,18 +1347,23 @@ router.post(
       const { range, error } = normaliseRange(asked, { durationMs: media.duration_ms });
       if (error) return badRequest(res, error);
 
-      const now = new Date();
-      let link = await prisma.mediaShareLink.findFirst({
-        where: { media_id: media.id, revoked_at: null, expires_at: { gt: now }, ...range },
-        orderBy: { created_at: 'desc' },
-      });
-      if (!link) {
-        link = await prisma.mediaShareLink.create({
+      // One find-or-create at a time per file. Two devices asking at once for
+      // the same stretch each found nothing live and each minted a link,
+      // putting two URLs to it out in the world — the thing this route
+      // promises never happens.
+      const link = await serialise(`share:${media.id}`, async () => {
+        const now = new Date();
+        const live = await prisma.mediaShareLink.findFirst({
+          where: { media_id: media.id, revoked_at: null, expires_at: { gt: now }, ...range },
+          orderBy: { created_at: 'desc' },
+        });
+        if (live) return live;
+        return prisma.mediaShareLink.create({
           data: {
             media_id: media.id, token: generateShareToken(), expires_at: shareExpiry(now), ...range,
           },
         });
-      }
+      });
 
       return success(res, 200, {
         url: shareUrl(process.env.CALLBACK_URL, link.token),
