@@ -383,10 +383,14 @@ async function checkDuplicateConcert({ concert, bandIds, bandNames = [], tx }) {
       select: { band: true },
     });
     const linkedBandIds = new Set(existingRefs.map((r) => r.band));
-    const toLink = bandIds.filter((id) => !linkedBandIds.has(id));
+    const toLink = [...new Set(bandIds)].filter((id) => !linkedBandIds.has(id));
     if (toLink.length > 0) {
+      // skipDuplicates because this runs inside /bulk's transaction, where a
+      // unique violation is not one failed statement but an aborted
+      // transaction for everything after it.
       await tx.concertBandReference.createMany({
         data: toLink.map((band) => ({ concert: existingConcert.id, band })),
+        skipDuplicates: true,
       });
     }
   }

@@ -9,14 +9,22 @@ import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../te
 // is a global rather than a vi.mock.
 const prisma = installFakePrisma({
   band: { findMany: vi.fn(), findUnique: vi.fn(), findFirst: vi.fn(), create: vi.fn(), update: vi.fn(), delete: vi.fn() },
-  concert: { findMany: vi.fn(), count: vi.fn(), findUnique: vi.fn(), delete: vi.fn(), deleteMany: vi.fn() },
+  concert: {
+    findMany: vi.fn(), count: vi.fn(), findUnique: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(),
+    create: vi.fn(), update: vi.fn(), updateMany: vi.fn(),
+  },
+  city: { upsert: vi.fn() },
   wishlist: { findUnique: vi.fn(), findFirst: vi.fn() },
   wishlistBandReference: { findMany: vi.fn(), create: vi.fn(), findUnique: vi.fn(), deleteMany: vi.fn() },
-  concertBandReference: { findMany: vi.fn(), deleteMany: vi.fn() },
+  concertBandReference: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn() },
   concertAttendance: { findMany: vi.fn(), deleteMany: vi.fn() },
   concertMedia: { findMany: vi.fn(), deleteMany: vi.fn() },
   // /bands answers with raw SQL rather than the query builder.
   $queryRaw: vi.fn(async () => []),
+  // /bulk's per-concert savepoints. Recorded as the statement text, so a test
+  // can read the order they ran in.
+  $executeRaw: vi.fn(async (strings) => { prisma.statements.push(strings.join('?')); return 0; }),
+  statements: [],
   // The array form ($transaction([...])) resolves an already-built list of
   // query promises; the interactive form ($transaction(async tx => ...)) runs
   // its callback against the fake client itself, same as the real client runs
@@ -78,6 +86,81 @@ describe('POST /bands', () => {
     await request(app).post('/bands').set(...authHeader()).send({ name: '  Architects  ' });
 
     expect(prisma.band.findUnique).toHaveBeenCalledWith({ where: { name: 'Architects' } });
+  });
+});
+
+describe('POST /bulk', () => {
+  // Every concert runs inside one interactive transaction, and a failing
+  // statement in Postgres aborts the transaction rather than just itself. The
+  // loop caught each concert's error and carried on — so after one bad row
+  // every later statement was refused, the COMMIT silently became a ROLLBACK,
+  // and the response still said "inserted N". Reproduced against Postgres with
+  // one band listed twice on one concert: inserted 1 reported, 0 rows saved.
+  const system = { id: 'scraper', role: 'SYSTEM' };
+  const concert = (venue, bands = [{ band_id: 1 }]) => ({
+    country: 'SE', city: 'Stockholm', venue, concert_date: '2027-05-01T19:00:00Z', bands,
+  });
+
+  beforeEach(() => {
+    prisma.statements.length = 0;
+    prisma.band.findMany.mockResolvedValue([{ id: 1, name: 'Gojira' }]);
+    prisma.band.findUnique.mockImplementation(async ({ where }) => ({ id: where.id, name: `Band ${where.id}` }));
+    prisma.concert.findMany.mockResolvedValue([]);
+    prisma.city.upsert.mockResolvedValue({ id: 7 });
+    let nextId = 100;
+    prisma.concert.create.mockImplementation(async ({ data }) => ({ id: nextId++, ...data }));
+    prisma.concertBandReference.createMany.mockResolvedValue({ count: 1 });
+  });
+
+  it('gives each concert a savepoint, and rolls back only the one that failed', async () => {
+    prisma.concert.create
+      .mockImplementationOnce(async ({ data }) => ({ id: 100, ...data }))
+      .mockImplementationOnce(async () => { throw Object.assign(new Error('unique violation'), { code: 'P2002' }); })
+      .mockImplementationOnce(async ({ data }) => ({ id: 102, ...data }));
+
+    const res = await request(app)
+      .post('/bulk')
+      .set(...authHeader(system))
+      .send({ concerts: [concert('Fållan'), concert('Nalen'), concert('Kollektivet')] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.inserted).toBe(2);
+    expect(res.body.errors).toBe(1);
+    expect(res.body.details.errors).toEqual([{ index: 1, message: 'unique violation' }]);
+    expect(res.body.details.insertedConcerts.map((c) => c.venue)).toEqual(['Fållan', 'Kollektivet']);
+    expect(prisma.statements).toEqual([
+      'SAVEPOINT bulk_concert', 'RELEASE SAVEPOINT bulk_concert',
+      'SAVEPOINT bulk_concert', 'ROLLBACK TO SAVEPOINT bulk_concert',
+      'SAVEPOINT bulk_concert', 'RELEASE SAVEPOINT bulk_concert',
+    ]);
+  });
+
+  it('does not report a concert whose later statement failed', async () => {
+    // The concert row went in; linking its bands did not. Rolled back, so it
+    // must not be listed as inserted either.
+    prisma.concertBandReference.createMany.mockRejectedValueOnce(new Error('link failed'));
+
+    const res = await request(app)
+      .post('/bulk')
+      .set(...authHeader(system))
+      .send({ concerts: [concert('Fållan')] });
+
+    expect(res.body.inserted).toBe(0);
+    expect(res.body.details.insertedConcerts).toEqual([]);
+    expect(prisma.statements).toContain('ROLLBACK TO SAVEPOINT bulk_concert');
+  });
+
+  it('links a band listed twice once, rather than tripping the unique key', async () => {
+    const res = await request(app)
+      .post('/bulk')
+      .set(...authHeader(system))
+      .send({ concerts: [concert('Fållan', [{ band_id: 1 }, { band_id: 1 }])] });
+
+    expect(res.body.inserted).toBe(1);
+    expect(prisma.concertBandReference.createMany).toHaveBeenCalledWith({
+      data: [{ concert: 100, band: 1 }],
+      skipDuplicates: true,
+    });
   });
 });
 
