@@ -13,11 +13,18 @@ const rateLimit = rateLimiter({
   message: "Too many requests to the Steam data route, please try again later.",
 });
 
+// A SteamID64, the 17-digit id the Web API takes (76561197960265728 and up).
+// It does not fit a JavaScript number exactly, so it stays a string on the way
+// in and becomes a BigInt for the database — User.steam_id is a BIGINT.
+const STEAM_ID64 = /^\d{17}$/;
+
+const ALREADY_LINKED = { error: "That Steam account is already linked to another user." };
+
 router.post(
   "/:id",
   rateLimit,
   auth,
-  param("id").isInt().withMessage("Invalid Steam user ID format"),
+  param("id").matches(STEAM_ID64).withMessage("Invalid Steam user ID format"),
   async (req, res) => {
     try {
       const errors = validationResult(req);
@@ -29,20 +36,18 @@ router.post(
       const userId = req.user.id;
       const steamId = req.params.id;
 
-      // Check if Steam user already registered
+      // One account per Steam user. This used to parseInt a 17-digit id into
+      // a 32-bit column, which no real Steam id fits — and nothing ever wrote
+      // steam_id, so there was never anything here to find.
       const existingUser = await prisma.user.findFirst({
         where: {
-          steam_id: parseInt(steamId),
+          steam_id: BigInt(steamId),
           NOT: { id: userId },
         },
         select: { id: true },
       });
 
-      if (existingUser) {
-        return res
-          .status(400)
-          .json({ error: "Steam user already registered." });
-      }
+      if (existingUser) return res.status(409).json(ALREADY_LINKED);
 
       // Get last gameTime for user
       const lastGameTime = await prisma.gameTime.findFirst({
@@ -98,6 +103,16 @@ router.post(
         }
 
         return res.status(500).json({ error: "Internal server error" });
+      }
+
+      // Linked once Steam has answered for the id, and before anything is
+      // written from it: a caller who loses the race for this id below leaves
+      // no game times behind. The unique index is what settles that race.
+      try {
+        await prisma.user.update({ where: { id: userId }, data: { steam_id: BigInt(steamId) } });
+      } catch (error) {
+        if (error.code === "P2002") return res.status(409).json(ALREADY_LINKED);
+        throw error;
       }
 
       // Upsert Game and GameTime for each top game
