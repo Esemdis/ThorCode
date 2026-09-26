@@ -1,4 +1,3 @@
-const { v4: uuidv4 } = require("uuid");
 const { Redis } = require("ioredis");
 const { resolveRedisUrl } = require("./redisUrl");
 
@@ -8,10 +7,14 @@ const { resolveRedisUrl } = require("./redisUrl");
 const REDIS_URL = resolveRedisUrl();
 const useTls = /^rediss:\/\//i.test(REDIS_URL || "");
 
-// Said once, loudly, at boot. ioredis treats a missing url as localhost:6379 and
-// every cache miss thereafter looks ordinary, so an environment with no Redis
-// configured at all is otherwise indistinguishable from a cold one — it just
-// runs everything uncached and slow.
+// Said once, loudly, at boot. Caching is an optimisation everywhere it is used,
+// so an environment with no Redis runs, just uncached and slower — which is
+// otherwise indistinguishable from a cold cache.
+//
+// And no client at all in that case. `new Redis(null)` quietly means
+// localhost:6379, so the "disabled" cache used to dial a Redis that was never
+// there, retry it forever, log every attempt, and keep any script that loaded
+// this module from exiting.
 if (!REDIS_URL) {
   console.error(
     "[cache] No REDIS_URL, and no UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN to derive one from. " +
@@ -19,20 +22,18 @@ if (!REDIS_URL) {
   );
 }
 
-const client = new Redis(REDIS_URL, {
+const client = REDIS_URL ? new Redis(REDIS_URL, {
   ...(useTls ? { tls: {} } : {}),
-  retryDelayOnFailover: 300000, // 5 minutes
   maxRetriesPerRequest: 3,
   lazyConnect: true,
-  retryDelayOnClusterDown: 300000, // 5 minutes
   // Commands issued while the connection is down fail immediately instead of
   // queueing until it comes back. Without this a dead Redis does not disable the
   // cache, it just makes every cached route twelve seconds slower — measured
   // against a REDIS_URL whose host had stopped resolving.
   enableOfflineQueue: false,
   retryStrategy: (times) => {
-    // Exponential backoff with max delay of 5 minutes
-    const delay = Math.min(times * 2000, 300000); // Max 5 minutes
+    // Linear backoff, two seconds a step, capped at five minutes.
+    const delay = Math.min(times * 2000, 300000);
     console.log(`Redis retry attempt ${times}, waiting ${delay}ms`);
     return delay;
   },
@@ -41,76 +42,37 @@ const client = new Redis(REDIS_URL, {
     const targetError = "READONLY";
     return err.message.includes(targetError);
   }
-});
+}) : null;
 
-// lazyConnect means nothing dials Redis until the first command, and with the
-// offline queue off that first command would fail while the handshake is still
-// in flight. Kick it here so the connection is either up or known-down by the
-// time a request needs it.
-client.connect().catch(() => {});
+if (client) {
+  // lazyConnect means nothing dials Redis until the first command, and with the
+  // offline queue off that first command would fail while the handshake is still
+  // in flight. Kick it here so the connection is either up or known-down by the
+  // time a request needs it.
+  client.connect().catch(() => {});
 
-client.on("connect", () => console.log("Redis connected"));
-client.on("ready", () => console.log("Redis ready"));
-client.on("close", () => console.log("Redis connection closed"));
-client.on("reconnecting", () => console.log("Redis reconnecting..."));
-client.on("error", (err) => {
-  if (err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED') {
-    // Log once per unique hostname, not on every retry
-    if (!client._lastDnsError || client._lastDnsError !== err.hostname) {
-      client._lastDnsError = err.hostname;
-      console.warn(`Redis unavailable (${err.code}: ${err.hostname ?? err.address}). Cache disabled.`);
+  client.on("connect", () => console.log("Redis connected"));
+  client.on("ready", () => console.log("Redis ready"));
+  client.on("close", () => console.log("Redis connection closed"));
+  client.on("reconnecting", () => console.log("Redis reconnecting..."));
+  client.on("error", (err) => {
+    if (err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED') {
+      // Log once per unique hostname, not on every retry
+      if (!client._lastDnsError || client._lastDnsError !== err.hostname) {
+        client._lastDnsError = err.hostname;
+        console.warn(`Redis unavailable (${err.code}: ${err.hostname ?? err.address}). Cache disabled.`);
+      }
+    } else {
+      console.error('Redis connection error:', err);
     }
-  } else {
-    console.error('Redis connection error:', err);
-  }
-});
-
-function generateCacheKey(prefix) {
-  return `${prefix}:${uuidv4()}`;
-}
-async function cacheData({ prefix, data, ttl = 3600 }) {
-  try {
-    const key = generateCacheKey(prefix);
-    await client.set(key, JSON.stringify(data), "EX", ttl);
-    return key;
-  } catch (error) {
-    console.error("Error caching data:", error);
-    throw new Error("Failed to cache data");
-  }
-}
-// Reads and deletes answer "nothing there" when Redis is unreachable rather
-// than throwing. Only cacheData still throws: a caller storing something it
-// intends to read back — OAuth state, in tmdb.js — has to know it did not land,
-// whereas a miss is a cache behaving exactly as a cache may.
-async function getCachedData({ key }) {
-  try {
-    const data = await client.get(key);
-    return data ? JSON.parse(data) : null;
-  } catch (error) {
-    console.error("Error reading cached data:", error.message);
-    return null;
-  }
-}
-async function deleteCachedData({ key }) {
-  try {
-    await client.del(key);
-  } catch (error) {
-    console.error("Error deleting cached data:", error.message);
-  }
-}
-async function clearCache({ prefix }) {
-  try {
-    const keys = await client.keys(`${prefix}:*`);
-    if (keys.length > 0) {
-      await client.del(keys);
-    }
-  } catch (error) {
-    console.error("Error clearing cache:", error.message);
-  }
+  });
 }
 
-// Deterministic key helpers for API response caching
+// Deterministic key helpers for API response caching. Both answer as a cache
+// may when Redis is missing or down — a miss, a write that did not land —
+// rather than throwing: nothing here is a dependency.
 async function setCache(key, data, ttl = 3600) {
+  if (!client) return;
   try {
     await client.set(key, JSON.stringify(data), 'EX', ttl);
   } catch (err) {
@@ -118,6 +80,7 @@ async function setCache(key, data, ttl = 3600) {
   }
 }
 async function getCache(key) {
+  if (!client) return null;
   try {
     const data = await client.get(key);
     return data ? JSON.parse(data) : null;
@@ -126,21 +89,8 @@ async function getCache(key) {
     return null;
   }
 }
-async function invalidatePrefix(prefix) {
-  try {
-    const keys = await client.keys(`${prefix}:*`);
-    if (keys.length > 0) await client.del(keys);
-  } catch (err) {
-    console.error('Redis invalidatePrefix error:', err);
-  }
-}
 
 module.exports = {
-  cacheData,
-  getCachedData,
-  deleteCachedData,
-  clearCache,
   setCache,
   getCache,
-  invalidatePrefix,
 };

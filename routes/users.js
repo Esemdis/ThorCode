@@ -3,9 +3,9 @@ const router = express.Router();
 const { validationResult, param } = require('express-validator');
 const bcrypt = require('bcrypt');
 const multer = require('multer');
+const crypto = require('node:crypto');
 const { v4: uuidv4 } = require('uuid');
 const upload = multer();
-const jwt = require('jsonwebtoken');
 
 const userValidation = require('../utils/validation/user');
 const auth = require('../auth/verifyJWT');
@@ -22,14 +22,67 @@ const {
 } = require('../utils/emailRateLimiter');
 const response = require('../utils/apiResponse');
 
-// Defaults to 5 requests per 15 minutes per IP
-const rateLimit = rateLimiter({
-  message: 'Too many requests to the users route, please try again later.',
+// Wrong passwords, per IP: ten per quarter hour. Successful sign-ins do not
+// count. Login and register used to share one limiter at rateLimiter's default
+// of ten a minute — 14,400 guesses a day from one address — under a comment
+// promising five per fifteen minutes.
+const loginLimit = rateLimiter({
+  message: 'Too many failed sign-ins. Please wait a few minutes and try again.',
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  skipSuccessfulRequests: true,
 });
+
+// New accounts, per IP: a handful an hour is plenty for a household.
+const registerLimit = rateLimiter({
+  message: 'Too many accounts created from here. Please try again later.',
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+});
+
+// The profile both /me and the admin lookup return. The admin route spelled
+// its own, selecting `game` and `movie` — scalar id columns — with a nested
+// select, which Prisma refuses, so it answered 500 to every request it got.
+const PROFILE_SELECT = {
+  id: true,
+  email: true,
+  role: true,
+  created_at: true,
+  game_times: {
+    select: {
+      play_time: true,
+      updated_at: true,
+      game_rel: { select: { id: true, name: true, appid: true } },
+    },
+  },
+  movie_reviews: {
+    select: {
+      id: true,
+      rating: true,
+      movie_rel: { select: { id: true, name: true } },
+    },
+  },
+};
+
+// Top 3 game_times and movie_reviews, trimmed in JS.
+function trimProfile(user) {
+  user.game_times = (user.game_times || [])
+    .sort((a, b) => b.play_time - a.play_time)
+    .slice(0, 3);
+  user.movie_reviews = (user.movie_reviews || []).slice(0, 3);
+  return user;
+}
+
+const UNIQUE_VIOLATION = 'P2002';
+
+// Compared against when the email is unknown, so an unknown address costs the
+// same bcrypt round as a wrong password and the response time says nothing
+// about which it was.
+const DUMMY_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);
 
 router.post(
   '/register',
-  rateLimit,
+  registerLimit,
   upload.none(),
   userValidation,
   async (req, res) => {
@@ -52,18 +105,25 @@ router.post(
       // Hash the password
       const passwordHash = await bcrypt.hash(password, 10);
 
-      const user = await prisma.user.create({
-        data: {
-          id: uuidv4().replace(/-/g, ''),
-          email,
-          password_hash: passwordHash,
-        },
-        select: { id: true, email: true },
-      });
-
-      await prisma.wishlist.create({
-        data: { name: 'My Wishlist', user_id: user.id },
-      });
+      // The account and its wishlist in one write. Two writes left an account
+      // with no wishlist when the second failed — and every concert route
+      // assumes there is one.
+      let user;
+      try {
+        user = await prisma.user.create({
+          data: {
+            id: uuidv4().replace(/-/g, ''),
+            email,
+            password_hash: passwordHash,
+            wishlists: { create: { name: 'My Wishlist' } },
+          },
+          select: { id: true, email: true },
+        });
+      } catch (error) {
+        // Registered by a second request since the check above.
+        if (error.code === UNIQUE_VIOLATION) return res.status(409).json({ error: 'Email already in use' });
+        throw error;
+      }
 
       res.status(201).json({ message: 'User registered successfully', user });
     } catch (error) {
@@ -75,7 +135,7 @@ router.post(
 
 router.post(
   '/login',
-  rateLimit,
+  loginLimit,
   upload.none(),
   userValidation,
   async (req, res) => {
@@ -87,21 +147,20 @@ router.post(
       }
       const { email, password } = req.body;
 
-      // Check if user already exists
       const existingUser = await prisma.user.findUnique({
         where: { email },
       });
-      if (!existingUser) {
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
 
-      // Hash the password
+      // Always one bcrypt comparison, whether or not the account exists or has
+      // a password at all: an unknown email used to answer at once, which told
+      // anyone timing it which addresses have accounts, and a null hash threw
+      // inside bcrypt as a 500.
       const passwordCompare = await bcrypt.compare(
         password,
-        existingUser.password_hash,
+        existingUser?.password_hash || DUMMY_HASH,
       );
 
-      if (!passwordCompare) {
+      if (!existingUser?.password_hash || !passwordCompare) {
         return res.status(401).json({ error: 'Invalid credentials' });
       }
 
@@ -113,7 +172,7 @@ router.post(
 
       // If you want to be safer, you could insert the token into the DB
       // and check it on every request, but for simplicity, we will just sign it here and trust the expiry.
-      const token = await signJWT({ user });
+      const token = signJWT({ user });
 
       // Return the user and token
       res
@@ -155,52 +214,14 @@ router.get('/me', auth, async (req, res) => {
     const userId = req.user.id;
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-        created_at: true,
-        settings: true,
-        game_times: {
-          select: {
-            play_time: true,
-            updated_at: true,
-            game_rel: {
-              select: {
-                id: true,
-                name: true,
-                appid: true,
-              },
-            },
-          },
-        },
-        movie_reviews: {
-          select: {
-            id: true,
-            rating: true,
-            movie_rel: {
-              select: {
-                id: true,
-                name: true,
-              },
-            },
-          },
-        },
-      },
+      select: { ...PROFILE_SELECT, settings: true },
     });
 
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Limit to top 3 game_times and movie_reviews in JS
-    user.game_times = (user.game_times || [])
-      .sort((a, b) => b.play_time - a.play_time)
-      .slice(0, 3);
-
-    user.movie_reviews = (user.movie_reviews || []).slice(0, 3);
-
-    res.json({ user });
+    res.json({ user: trimProfile(user) });
   } catch (error) {
     console.error('Error fetching user:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -271,51 +292,14 @@ router.get(
       // Fetch user by ID
       const user = await prisma.user.findUnique({
         where: { id: req.params.id },
-        select: {
-          id: true,
-          email: true,
-          role: true,
-          created_at: true,
-          game_times: {
-            select: {
-              play_time: true,
-              updated_at: true,
-              game: {
-                select: {
-                  id: true,
-                  name: true,
-                  appid: true,
-                },
-              },
-            },
-          },
-          movie_reviews: {
-            select: {
-              id: true,
-              rating: true,
-              movie: {
-                select: {
-                  id: true,
-                  name: true,
-                },
-              },
-            },
-          },
-        },
+        select: PROFILE_SELECT,
       });
 
       if (!user) {
         return res.status(404).json({ error: 'User not found' });
       }
 
-      // Limit to top 3 game_times and movie_reviews in JS
-      user.game_times = (user.game_times || [])
-        .sort((a, b) => b.play_time - a.play_time)
-        .slice(0, 3);
-
-      user.movie_reviews = (user.movie_reviews || []).slice(0, 3);
-
-      res.json({ user });
+      res.json({ user: trimProfile(user) });
     } catch (error) {
       console.error('Error fetching user:', error);
       res.status(500).json({ error: 'Internal server error' });
@@ -363,8 +347,6 @@ router.post('/email/request-change', auth, emailRequestRateLimiter, upload.none(
       return response.conflict(res, 'Email is already pending verification');
     }
 
-    // Generate a 6-digit verification code
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
 
     // Delete any existing pending verification for this user
@@ -372,15 +354,26 @@ router.post('/email/request-change', auth, emailRequestRateLimiter, upload.none(
       where: { user_id: userId },
     });
 
-    // Create new verification record
-    const verification = await prisma.emailVerification.create({
-      data: {
-        user_id: userId,
-        new_email: newEmail,
-        code,
-        expires_at: expiresAt,
-      },
-    });
+    // A 6-digit code from a cryptographic source — Math.random is predictable
+    // from its own output. `code` is unique across every user's pending
+    // changes, so two accounts drawing the same six digits made the second
+    // request a 500; a collision now just draws again.
+    let verification;
+    for (let attempt = 0; !verification; attempt++) {
+      try {
+        verification = await prisma.emailVerification.create({
+          data: {
+            user_id: userId,
+            new_email: newEmail,
+            code: String(crypto.randomInt(100000, 1000000)),
+            expires_at: expiresAt,
+          },
+        });
+      } catch (error) {
+        if (error.code !== UNIQUE_VIOLATION || attempt >= 4) throw error;
+      }
+    }
+    const { code } = verification;
 
     // Send verification code to the new email
     try {
@@ -406,9 +399,10 @@ router.post('/email/request-change', auth, emailRequestRateLimiter, upload.none(
  * Verifies email change code and updates user email
  * @body {string} code - 6-digit verification code
  * @returns {object} { success: true, data: { user: { id, email } }, message: string }
- * @throws {400} Invalid or expired verification code
+ * @throws {400} Invalid or expired verification code — including one that is
+ *   someone else's, which is answered exactly like a wrong guess
  * @throws {401} Unauthorized
- * @throws {403} Code does not belong to user
+ * @throws {409} The new address was taken since the code was sent
  * @throws {500} Server error
  */
 router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.none(), async (req, res) => {
@@ -420,18 +414,15 @@ router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.non
       return response.badRequest(res, 'Verification code is required');
     }
 
-    // Find the verification record
-    const verification = await prisma.emailVerification.findUnique({
-      where: { code },
+    // Looked up within the caller's own pending change. Found globally and
+    // then compared, a guess that hit someone else's code answered "does not
+    // match your account" — telling the guesser that code was live.
+    const verification = await prisma.emailVerification.findFirst({
+      where: { code, user_id: userId },
     });
 
     if (!verification) {
       return response.badRequest(res, 'Invalid verification code');
-    }
-
-    // Check if it belongs to the current user
-    if (verification.user_id !== userId) {
-      return response.forbidden(res, 'Verification code does not match your account');
     }
 
     // Check if code has expired
@@ -442,17 +433,23 @@ router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.non
       return response.badRequest(res, 'Verification code has expired');
     }
 
-    // Update user email
-    const user = await prisma.user.update({
-      where: { id: userId },
-      data: { email: verification.new_email },
-      select: { id: true, email: true },
-    });
-
-    // Delete the verification record
-    await prisma.emailVerification.delete({
-      where: { id: verification.id },
-    });
+    // Update the email and spend the code together. The address was checked
+    // when the code was sent, fifteen minutes ago at most; someone may have
+    // registered with it since, and the unique key answering that was a 500.
+    let user;
+    try {
+      [user] = await prisma.$transaction([
+        prisma.user.update({
+          where: { id: userId },
+          data: { email: verification.new_email },
+          select: { id: true, email: true },
+        }),
+        prisma.emailVerification.delete({ where: { id: verification.id } }),
+      ]);
+    } catch (error) {
+      if (error.code === UNIQUE_VIOLATION) return response.conflict(res, 'Email already in use');
+      throw error;
+    }
 
     return response.success(res, 200, { user }, 'Email updated successfully');
   } catch (error) {

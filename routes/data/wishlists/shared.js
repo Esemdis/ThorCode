@@ -8,10 +8,9 @@
  */
 const { rateLimiter } = require("../../../utils/rateLimiter");
 
-// Defaults to 5 requests per 15 minutes per IP
+// 10 requests a minute per IP — rateLimiter's defaults.
 const rateLimit = rateLimiter({
-  message:
-    "Too many requests to the Ticketmaster data route, please try again later.",
+  message: "Too many wishlist changes at once, please try again shortly.",
 });
 
 module.exports = { rateLimit };

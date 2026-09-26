@@ -47,6 +47,15 @@ COPY . .
 
 RUN mkdir -p /doppler
 
+# Set here rather than left to Doppler, because it decides what a client is
+# told when something breaks: outside production, every 500 — from index.js's
+# handler and from apiResponse.fail — returns the raw error message, which for
+# a database error names tables, columns, constraints and sometimes the values
+# in them. Nothing in the repo set it, so whether the deployed API leaked those
+# depended on a config nobody could see from here. After `npm ci`, so the image
+# still installs exactly what the lock says.
+ENV NODE_ENV=production
+
 EXPOSE 4000
 
 # Apply any pending migrations, then start.

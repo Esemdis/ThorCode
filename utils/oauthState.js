@@ -3,9 +3,9 @@
 //
 // The obvious place to keep that is Redis, which is where this started. But
 // Redis is optional infrastructure here — utils/cache.js logs "Cache disabled"
-// and carries on when it cannot connect — and cacheData throws when it is down,
-// so connecting an account failed with a 500 on a server that was otherwise
-// completely healthy.
+// and carries on when it cannot connect — and storing a state there failed
+// whenever it was down, so connecting an account failed with a 500 on a server
+// that was otherwise completely healthy.
 //
 // So the state carries its own proof instead: a short-lived JWT. Nothing to
 // store and nothing to be down.
