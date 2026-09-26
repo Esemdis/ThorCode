@@ -352,7 +352,10 @@ invalidate.
 Photos have a viewing copy too, made by the API itself rather than the service:
 `/media/:id/view` answers with a WebP that fits within 2048px, written to
 `cache/display/<sha256>.webp` the first time anyone opens the photo (for a
-video, `/view` is the same as `/play`).
+video, `/view` is the same as `/play`). Adding `download=1` to a `/file` URL
+answers with `Content-Disposition: attachment` — the app runs on another origin
+than the API, and browsers ignore a link's `download` attribute across origins,
+so without it the "Download" link navigated the app away instead.
 
 Every one of these URLs is signed until the end of the current hour plus six
 hours, so a listing asked for twice within the hour hands out the same URLs and

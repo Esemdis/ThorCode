@@ -2548,6 +2548,30 @@ describe('GET /media/:id/file', () => {
       .expect(206);
     expect(res.headers['content-range']).toMatch(/^bytes 0-9\//);
   });
+
+  it('tells the browser to save the file, under its own name, when asked to download it', async () => {
+    // The app is on another origin, where <a download> is ignored, so a plain
+    // link to /file navigated the app away to the photograph.
+    await uploadOne();
+    const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
+    const res = await request(app()).get(`/data/concerts/media/1/file?t=${t}&download=1`).expect(200);
+    expect(res.headers['content-disposition']).toBe('attachment; filename="IMG_1.jpg"');
+    expect(res.headers['content-type']).toMatch(/image\/jpeg/);
+  });
+
+  it('serves the file inline otherwise', async () => {
+    await uploadOne();
+    const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
+    const res = await request(app()).get(`/data/concerts/media/1/file?t=${t}`).expect(200);
+    expect(res.headers['content-disposition']).toBeUndefined();
+  });
+
+  it('downloads only the master: the viewing copies ignore the flag', async () => {
+    await uploadOne();
+    const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
+    const res = await request(app()).get(`/data/concerts/media/1/play?t=${t}&download=1`).expect(200);
+    expect(res.headers['content-disposition']).toBeUndefined();
+  });
 });
 
 describe('a byte route answering 404', () => {

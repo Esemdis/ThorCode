@@ -1443,6 +1443,13 @@ async function serveMedia(req, res, which) {
     // changed hands or been detached in that time.
     if (row.attendance_rel.wishlist_rel.user_id !== verdict.userId) return res.status(403).end();
 
+    // A download, asked for as one. The app is served from another origin,
+    // where the browser ignores <a download>, so a link to /file navigated the
+    // app away to the photograph instead of saving it. Content-Disposition is
+    // the one way a cross-origin response can say "save this", and it carries
+    // the archive's name for the file rather than the id in the URL.
+    if (which === 'file' && req.query.download === '1') res.attachment(row.filename);
+
     return await sendMediaBytes(res, row, which, `GET /media/:id/${which}`);
   } catch (err) {
     return fail(res, err, { context: `GET /media/:id/${which}` });
