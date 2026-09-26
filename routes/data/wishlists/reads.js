@@ -14,7 +14,7 @@ const { groupConcertsByBand } = require("../../../utils/concertUpdateGroups");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
-const { rateLimit, ownWishlist } = require("./shared");
+const { rateLimit, ownWishlist, logActivity, ACTIVITY_KEPT } = require("./shared");
 
 // The id checks below are declared on each route but were never read, so
 // "/wishlists/abc/…" reached Prisma as NaN and came back a 500.
@@ -275,22 +275,7 @@ router.get(
           .map(([name, { ids, countries }]) => ({ name, count: ids.size, countries: [...countries] }))
           .sort((a, b) => b.count - a.count);
 
-        await prisma.activityLog.create({
-          data: {
-            wishlist_id: wishlistId,
-            type: "NEW_CONCERTS",
-            data: JSON.stringify({ total: concertMap.size, by_band: byBand }),
-          },
-        });
-        const old = await prisma.activityLog.findMany({
-          where: { wishlist_id: wishlistId },
-          orderBy: { created_at: "desc" },
-          skip: 15,
-          select: { id: true },
-        });
-        if (old.length > 0) {
-          await prisma.activityLog.deleteMany({ where: { id: { in: old.map((e) => e.id) } } });
-        }
+        await logActivity(wishlistId, "NEW_CONCERTS", { total: concertMap.size, by_band: byBand });
       }
 
       const concerts = Array.from(concertMap.values()).sort(
@@ -372,7 +357,7 @@ router.get(
   }
 );
 
-// GET /wishlists/:id/activity — last 15 activity log entries for this wishlist
+// GET /wishlists/:id/activity — the wishlist's activity feed, newest first
 router.get(
   "/wishlists/:id/activity",
   [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
@@ -385,7 +370,7 @@ router.get(
       const logs = await prisma.activityLog.findMany({
         where: { wishlist_id: wishlist.id },
         orderBy: { created_at: "desc" },
-        take: 15,
+        take: ACTIVITY_KEPT,
       });
 
       // Parsed one entry at a time: `data` is a text column, and one entry

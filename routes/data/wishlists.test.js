@@ -903,6 +903,34 @@ describe('GET /wishlists/:id/activity', () => {
   });
 });
 
+describe('logActivity', () => {
+  const { logActivity, ACTIVITY_KEPT } = createRequire(import.meta.url)('./wishlists/shared.js');
+
+  it('writes the entry as JSON and lets everything past the kept few fall off', async () => {
+    prisma.activityLog.create.mockResolvedValue({});
+    prisma.activityLog.findMany.mockResolvedValue([{ id: 3 }, { id: 1 }]);
+
+    await logActivity(7, 'BAND_ADDED', { band_name: 'Opeth' });
+
+    expect(prisma.activityLog.create).toHaveBeenCalledWith({
+      data: { wishlist_id: 7, type: 'BAND_ADDED', data: '{"band_name":"Opeth"}' },
+    });
+    expect(prisma.activityLog.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { wishlist_id: 7 }, skip: ACTIVITY_KEPT,
+    }));
+    expect(prisma.activityLog.deleteMany).toHaveBeenCalledWith({ where: { id: { in: [3, 1] } } });
+  });
+
+  it('deletes nothing while the feed is short', async () => {
+    prisma.activityLog.create.mockResolvedValue({});
+    prisma.activityLog.findMany.mockResolvedValue([]);
+
+    await logActivity(7, 'NEW_CONCERTS', { total: 1 });
+
+    expect(prisma.activityLog.deleteMany).not.toHaveBeenCalled();
+  });
+});
+
 describe('GET /wishlists/:id/new', () => {
   it('moves the cursor only after everything it covers has been read', async () => {
     // Written first, a failure below it moved the cursor past concerts nobody

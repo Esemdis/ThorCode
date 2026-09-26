@@ -21,6 +21,7 @@ const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
 const { matchesByUser, followedBandsByUser } = require("../../../utils/notificationMatch");
 const { buildDiscordEmbeds } = require("../../../utils/discordEmbeds");
+const { logActivity } = require("./shared");
 
 // The concert row the subscription pass matches against. Deliberately the same
 // selection runNotificationDigest makes, because the two share the matcher and
@@ -129,22 +130,9 @@ router.post(
         );
         for (const band of matchedBands) {
           const countries = [...new Set((band.concerts || []).map((c) => c.country).filter(Boolean))];
-          await prisma.activityLog.create({
-            data: {
-              wishlist_id: wishlist.id,
-              type: "BAND_ADDED",
-              data: JSON.stringify({ band_name: band.name, band_id: band.band_id, inserted: band.inserted, countries }),
-            },
+          await logActivity(wishlist.id, "BAND_ADDED", {
+            band_name: band.name, band_id: band.band_id, inserted: band.inserted, countries,
           });
-          const old = await prisma.activityLog.findMany({
-            where: { wishlist_id: wishlist.id },
-            orderBy: { created_at: "desc" },
-            skip: 15,
-            select: { id: true },
-          });
-          if (old.length > 0) {
-            await prisma.activityLog.deleteMany({ where: { id: { in: old.map((e) => e.id) } } });
-          }
         }
       }
 
