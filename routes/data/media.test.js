@@ -122,6 +122,7 @@ describe('POST /attendances/:id/media', () => {
       'POST /attendances/:attendanceId/lineup [5]',
       'PATCH /media [8]',
       'DELETE /media/:id [4]',
+      'DELETE /media [5]',
       'POST /media/:id/share [6]',
       'DELETE /media/:id/share [4]',
       'GET /media/:id/file [1]',
@@ -2204,6 +2205,173 @@ describe('DELETE /media/:id', () => {
 
     await del().expect(404);
     expect(prisma.concertMedia.delete).not.toHaveBeenCalled();
+  });
+});
+
+describe('DELETE /media', () => {
+  // Many files at once, for the grid's multi-select, across two shows so that
+  // a request spanning shows is the ordinary case rather than the edge.
+  const gojira = 'user-1/2026-06-12 Oslo - Gojira';
+  const alcest = 'user-1/2026-06-13 Oslo - Alcest';
+  const abs = (rel) => join(root, 'archive', rel);
+  const mediaRow = (id, attendanceId, folderRel, filename, over = {}) => ({
+    id, attendance_id: attendanceId, filename, kind: 'PHOTO', rel_path: `${folderRel}/${filename}`,
+    attendance_rel: { wishlist_rel: { user_id: 'user-1' } }, ...over,
+  });
+  const table = () => [
+    mediaRow(1, 1, gojira, 'IMG_1.jpg'),
+    mediaRow(2, 1, gojira, 'IMG_2.jpg'),
+    mediaRow(3, 2, alcest, 'IMG_3.jpg'),
+  ];
+  const seed = async (folderRel, names) => {
+    await mkdir(abs(folderRel), { recursive: true });
+    for (const name of names) await writeFile(join(abs(folderRel), name), name);
+    await writeFile(join(abs(folderRel), 'concert-media.json'), JSON.stringify({
+      version: 1, concert_id: 1, user_id: 'user-1', concert: {},
+      files: names.map((name) => ({ name, kind: 'PHOTO' })),
+    }));
+  };
+  const listed = async (folderRel) => JSON.parse(
+    await readFile(join(abs(folderRel), 'concert-media.json'), 'utf8'),
+  ).files.map((f) => f.name);
+  const photosIn = async (folderRel) => (await readdir(abs(folderRel))).filter((n) => n.endsWith('.jpg'));
+
+  beforeEach(async () => {
+    await seed(gojira, ['IMG_1.jpg', 'IMG_2.jpg']);
+    await seed(alcest, ['IMG_3.jpg']);
+    prisma.concertMedia.findMany = vi.fn(async ({ where }) => table().filter((r) => where.id.in.includes(r.id)));
+    prisma.concertMedia.deleteMany = vi.fn(async ({ where }) => ({ count: where.id.in.length }));
+  });
+
+  const remove = (body) => request(app())
+    .delete('/data/concerts/media')
+    .set(...authHeader({ id: 'user-1', role: 'USER' }))
+    .send(body);
+
+  it('removes every file asked for from the archive, the sidecars and the index', async () => {
+    const res = await remove({ ids: [1, 3] }).expect(200);
+
+    expect(res.body.data).toEqual({ deleted: [1, 3], failed: [] });
+    expect(prisma.concertMedia.deleteMany).toHaveBeenCalledWith({ where: { id: { in: [1, 3] } } });
+    expect(await photosIn(gojira)).toEqual(['IMG_2.jpg']);
+    expect(await photosIn(alcest)).toEqual([]);
+    expect(await listed(gojira)).toEqual(['IMG_2.jpg']);
+    expect(await listed(alcest)).toEqual([]);
+  });
+
+  it('refuses a caller who is not signed in', async () => {
+    await request(app()).delete('/data/concerts/media').send({ ids: [1] }).expect(401);
+  });
+
+  it('changes nothing when one of the ids does not exist', async () => {
+    await remove({ ids: [1, 99] }).expect(404);
+
+    expect(prisma.concertMedia.deleteMany).not.toHaveBeenCalled();
+    expect(await photosIn(gojira)).toEqual(['IMG_1.jpg', 'IMG_2.jpg']);
+  });
+
+  it('changes nothing when one of the files is someone else\'s', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      mediaRow(1, 1, gojira, 'IMG_1.jpg'),
+      mediaRow(3, 2, alcest, 'IMG_3.jpg', { attendance_rel: { wishlist_rel: { user_id: 'someone-else' } } }),
+    ]);
+
+    await remove({ ids: [1, 3] }).expect(403);
+
+    expect(prisma.concertMedia.deleteMany).not.toHaveBeenCalled();
+    expect(await photosIn(gojira)).toEqual(['IMG_1.jpg', 'IMG_2.jpg']);
+    expect(await photosIn(alcest)).toEqual(['IMG_3.jpg']);
+  });
+
+  it('keeps the row of a file it could not remove, names it, and deletes the rest', async () => {
+    // A non-empty directory where IMG_4.jpg should be: unlink refuses it.
+    await mkdir(join(abs(gojira), 'IMG_4.jpg', 'inside'), { recursive: true });
+    const stubborn = mediaRow(4, 1, gojira, 'IMG_4.jpg');
+    prisma.concertMedia.findMany = vi.fn(async ({ where }) => [...table(), stubborn]
+      .filter((r) => where.id.in.includes(r.id)));
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    let res;
+    try {
+      res = await remove({ ids: [4, 1] }).expect(200);
+    } finally {
+      quiet.mockRestore();
+    }
+
+    expect(res.body.data.deleted).toEqual([1]);
+    expect(res.body.data.failed).toEqual([{ id: 4, error: expect.stringMatching(/could not remove/i) }]);
+    expect(prisma.concertMedia.deleteMany).toHaveBeenCalledWith({ where: { id: { in: [1] } } });
+  });
+
+  it('deletes no row at all when no file could be removed', async () => {
+    await mkdir(join(abs(gojira), 'IMG_4.jpg', 'inside'), { recursive: true });
+    prisma.concertMedia.findMany = vi.fn(async () => [mediaRow(4, 1, gojira, 'IMG_4.jpg')]);
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    let res;
+    try {
+      res = await remove({ ids: [4] }).expect(200);
+    } finally {
+      quiet.mockRestore();
+    }
+
+    expect(res.body.data).toMatchObject({ deleted: [], failed: [{ id: 4 }] });
+    expect(prisma.concertMedia.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('treats a repeated id as one file, not a missing one', async () => {
+    const res = await remove({ ids: [1, 1] }).expect(200);
+    expect(res.body.data.deleted).toEqual([1]);
+  });
+
+  it('refuses anything but a list of one to two hundred ids', async () => {
+    await remove({}).expect(400);
+    await remove({ ids: [] }).expect(400);
+    await remove({ ids: ['one'] }).expect(400);
+    await remove({ ids: Array.from({ length: 201 }, (_, i) => i + 1) }).expect(400);
+    expect(prisma.concertMedia.findMany).not.toHaveBeenCalled();
+
+    // Two hundred is the chunk the client sends, and gets past validation to
+    // the lookup, which here finds most of them missing.
+    await remove({ ids: Array.from({ length: 200 }, (_, i) => i + 1) }).expect(404);
+  });
+
+  it('waits on every show it deletes from, taking them in ascending order', async () => {
+    const release = await acquire('attendance:2');
+    let pending;
+    try {
+      pending = remove({ ids: [3, 1] }).then((r) => r);
+      await vi.waitFor(() => expect(prisma.concertMedia.findMany).toHaveBeenCalledTimes(1));
+      await sleep(30);
+      // Holding show 1 and waiting on show 2, with nothing removed yet.
+      expect(prisma.concertMedia.findMany).toHaveBeenCalledTimes(1);
+      expect(await isFree(1)).toBe(false);
+      expect(await photosIn(gojira)).toEqual(['IMG_1.jpg', 'IMG_2.jpg']);
+    } finally {
+      release();
+    }
+
+    const res = await pending;
+    expect(res.status).toBe(200);
+    // In the order they were asked for.
+    expect(res.body.data.deleted).toEqual([3, 1]);
+    expect(await isFree(1)).toBe(true);
+    expect(await isFree(2)).toBe(true);
+  });
+
+  it('changes nothing when one of the files goes while it waits for the locks', async () => {
+    // IMG_3 is deleted by someone else between the first read and the one
+    // made under the locks.
+    let reads = 0;
+    prisma.concertMedia.findMany = vi.fn(async ({ where }) => {
+      reads += 1;
+      return table().filter((r) => where.id.in.includes(r.id) && (reads === 1 || r.id !== 3));
+    });
+
+    await remove({ ids: [1, 3] }).expect(404);
+
+    expect(prisma.concertMedia.deleteMany).not.toHaveBeenCalled();
+    expect(await photosIn(gojira)).toEqual(['IMG_1.jpg', 'IMG_2.jpg']);
   });
 });
 

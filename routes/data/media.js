@@ -1197,6 +1197,57 @@ router.delete(
   },
 );
 
+/**
+ * Delete many files at once, for the grid's multi-select. The client sends
+ * them in chunks of up to two hundred.
+ *
+ * Refused whole, as PATCH is, when any id is missing or any file is someone
+ * else's. Past that, each file is its own outcome: one that cannot be removed
+ * from the archive keeps its row and is named in `failed`, and the rest go.
+ * Undoing the whole batch over one stubborn file is not possible — a removed
+ * file cannot be put back — and a refusal after half of them had gone would
+ * leave the caller unable to tell which half.
+ */
+router.delete(
+  '/media',
+  [
+    auth, roleCheck(['ADMIN', 'USER']),
+    body('ids').isArray({ min: 1, max: 200 }),
+    body('ids.*').isInt(),
+  ],
+  async (req, res) => {
+    let locked = null;
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return badRequest(res, 'Validation failed');
+
+      // Deduped as PATCH dedupes: {ids:[5,5]} is one file asked for twice.
+      const ids = [...new Set(req.body.ids.map((n) => parseInt(n, 10)))];
+      const readRows = () => prisma.concertMedia.findMany({ where: { id: { in: ids } }, include: withOwner });
+      const firstRead = await readRows();
+      if (refuseRows(res, firstRead, ids, req.user.id)) return undefined;
+
+      // Every show the files are in, locked as the single delete locks one.
+      locked = await lockShows(firstRead, readRows, (rows) => rows.map((r) => r.attendance_id));
+      if (!locked) return conflict(res, 'Those files changed while they were being deleted — try again');
+      if (refuseRows(res, locked.rows, ids, req.user.id)) return undefined;
+
+      // In the order they were asked for, so `deleted` and `failed` read back
+      // in it too.
+      const byId = new Map(locked.rows.map((r) => [r.id, r]));
+      const { removed, failed } = await removeMediaFiles(ids.map((id) => byId.get(id)));
+      // Only the rows whose files and sidecar entries are gone. The others
+      // keep describing files that are still there.
+      if (removed.length) await prisma.concertMedia.deleteMany({ where: { id: { in: removed } } });
+      return success(res, 200, { deleted: removed, failed });
+    } catch (err) {
+      return fail(res, err, { context: 'DELETE /media' });
+    } finally {
+      if (locked) locked.release();
+    }
+  },
+);
+
 // Answers the response itself and returns null when the caller may not share
 // this file, so both share routes stop at the same place for the same reasons.
 async function ownedMediaForShare(req, res) {
