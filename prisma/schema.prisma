@@ -104,6 +104,7 @@ model Band {
   wishlists                  WishlistBandReference[]    @relation("BandWishlists")
   notification_subscriptions NotificationSubscription[] @relation("BandNotificationSubscriptions")
   media                      ConcertMedia[]             @relation("BandMedia")
+  missed_at                  AttendanceMissedBand[]     @relation("BandMissedAt")
 }
 
 model Concert {
@@ -213,16 +214,41 @@ model WishlistBandReference {
 }
 
 model ConcertAttendance {
-  id           Int            @id @default(autoincrement())
+  id           Int                    @id @default(autoincrement())
   wishlist_id  Int
   concert_id   Int
-  created_at   DateTime       @default(now())
-  wishlist_rel Wishlist       @relation("WishlistAttendance", fields: [wishlist_id], references: [id])
-  concert_rel  Concert        @relation("ConcertAttendances", fields: [concert_id], references: [id])
-  media        ConcertMedia[] @relation("AttendanceMedia")
+  created_at   DateTime               @default(now())
+  wishlist_rel Wishlist               @relation("WishlistAttendance", fields: [wishlist_id], references: [id])
+  concert_rel  Concert                @relation("ConcertAttendances", fields: [concert_id], references: [id])
+  media        ConcertMedia[]         @relation("AttendanceMedia")
+  missed_bands AttendanceMissedBand[] @relation("AttendanceMissedBands")
 
   @@unique([wishlist_id, concert_id])
   @@index([concert_id])
+}
+
+/// An act on the bill of a show you went to that you did not actually see —
+/// a festival clash, a set given up for food, a support act you arrived too
+/// late for.
+///
+/// Attending a show counts every act on its bill as seen, and on a festival
+/// that bill runs to dozens. This is the exception, one row per act and
+/// attendance, rather than a list of who was seen: the bill is shared by
+/// everyone who was there and keeps growing as enrichment links acts to it,
+/// and an act added later is one you saw unless you say otherwise.
+///
+/// Cascades both ways. It is a note about a sighting, not content, so it
+/// goes when the attendance or the band does — and a Restrict here would make
+/// the orphan sweeps that delete attendances in bulk fail over it.
+model AttendanceMissedBand {
+  attendance_id  Int
+  band_id        Int
+  created_at     DateTime          @default(now())
+  attendance_rel ConcertAttendance @relation("AttendanceMissedBands", fields: [attendance_id], references: [id], onDelete: Cascade)
+  band_rel       Band              @relation("BandMissedAt", fields: [band_id], references: [id], onDelete: Cascade)
+
+  @@id([attendance_id, band_id])
+  @@index([band_id])
 }
 
 /// Photos and video from a show you went to.

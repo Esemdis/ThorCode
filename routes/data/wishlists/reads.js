@@ -25,7 +25,13 @@ function invalid(req, res) {
 }
 
 // Deduplicates by date+venue+city (same logic as the Attended tab display),
-// preferring sfm_ records so a TM + sfm_ pair for the same show counts as 1.
+// so a TM + sfm_ pair for the same show counts as 1.
+//
+// Every record of a show adds its bill, not just the first: a festival day
+// scraped from Bandsintown is a row per act at one venue, and the first row
+// alone is one act of the day. An act marked missed on any record of a show is
+// not counted for it — the same night imported twice is one night, and a mark
+// made on either copy is about that night.
 async function computeSeenCounts(wishlistId) {
   const attendances = await prisma.concertAttendance.findMany({
     where: {
@@ -33,38 +39,37 @@ async function computeSeenCounts(wishlistId) {
       concert_rel: { concert_date: { lt: new Date() } },
     },
     select: {
-      concert_id: true,
       concert_rel: {
         select: {
-          event_id: true,
           concert_date: true,
           venue: true,
           city: true,
           bands: { select: { band: true } },
         },
       },
+      missed_bands: { select: { band_id: true } },
     },
   });
 
-  // Sort sfm_ first so they win deduplication
-  attendances.sort((a, b) => {
-    const aS = a.concert_rel.event_id?.startsWith('sfm_') ? 0 : 1;
-    const bS = b.concert_rel.event_id?.startsWith('sfm_') ? 0 : 1;
-    return aS - bS;
-  });
-
-  const deduped = new Map(); // "date|venue|city" -> attendance
+  const shows = new Map(); // "date|venue|city" -> { bands, missed }
   for (const a of attendances) {
     const c = a.concert_rel;
     const day = c.concert_date ? new Date(c.concert_date).toISOString().slice(0, 10) : 'unknown';
     const key = `${day}|${c.venue ?? ''}|${c.city ?? ''}`;
-    if (!deduped.has(key)) deduped.set(key, a);
+    let show = shows.get(key);
+    if (!show) {
+      show = { bands: new Set(), missed: new Set() };
+      shows.set(key, show);
+    }
+    for (const b of c.bands) show.bands.add(b.band);
+    for (const m of a.missed_bands) show.missed.add(m.band_id);
   }
 
   const seenCountMap = new Map();
-  for (const a of deduped.values()) {
-    for (const b of a.concert_rel.bands) {
-      seenCountMap.set(b.band, (seenCountMap.get(b.band) || 0) + 1);
+  for (const { bands, missed } of shows.values()) {
+    for (const band of bands) {
+      if (missed.has(band)) continue;
+      seenCountMap.set(band, (seenCountMap.get(band) || 0) + 1);
     }
   }
   return seenCountMap;

@@ -65,6 +65,7 @@ const prisma = installFakePrisma({
     create: vi.fn(async ({ data }) => ({ id: 1, ...data })),
   },
   mediaShareLink: { findMany: vi.fn(async () => []) },
+  attendanceMissedBand: { findMany: vi.fn(async () => []) },
 });
 const router = (await import('./media.js')).default ?? (await import('./media.js'));
 
@@ -87,6 +88,8 @@ beforeEach(async () => {
   // Every listing asks which of its files are shared. None are unless a test
   // says so; the sharing tests at the end replace the whole table.
   prisma.mediaShareLink = { findMany: vi.fn(async () => []) };
+  // Every act on the bill was seen unless a test says otherwise.
+  prisma.attendanceMissedBand = { findMany: vi.fn(async () => []) };
 });
 
 const app = () => buildApp(router, '/data/concerts');
@@ -1323,7 +1326,21 @@ describe('GET /attendances/:id/media', () => {
       // `linked` is how the client tells an act it can tag straight away from
       // one that needs a Band row created first.
       linked: true,
+      missed: false,
     }]);
+  });
+
+  it('says which acts on the bill you did not see, so the rail can show it', async () => {
+    prisma.attendanceMissedBand.findMany = vi.fn(async () => [{ band_id: 92 }]);
+    const res = await request(app())
+      .get('/data/concerts/attendances/1/media')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(prisma.attendanceMissedBand.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { attendance_id: 1 },
+    }));
+    expect(res.body.data.bands[0]).toMatchObject({ id: 92, missed: true });
   });
 
   it('sends the support acts too, so the bill is the whole bill', async () => {

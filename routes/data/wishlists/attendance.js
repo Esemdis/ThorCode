@@ -48,10 +48,18 @@ router.get(
       const records = await prisma.concertAttendance.findMany({
         where: {
           wishlist_id: wishlistId,
-          ...(filterBandId ? { concert_rel: { bands: { some: { band: filterBandId } } } } : {}),
+          ...(filterBandId
+            ? {
+                concert_rel: { bands: { some: { band: filterBandId } } },
+                // A band's own list of shows you saw them at. Being at a
+                // festival they played is not that, when you missed their set.
+                missed_bands: { none: { band_id: filterBandId } },
+              }
+            : {}),
         },
         orderBy: { concert_rel: { concert_date: "desc" } },
         include: {
+          missed_bands: { select: { band_id: true } },
           concert_rel: {
             select: {
               id: true,
@@ -100,26 +108,32 @@ router.get(
         : [];
       const attendanceIdsWithPhotos = new Set(mediaCounts.map((m) => m.attendance_id));
 
-      const result = records.map((r) => ({
-        attendance_id: r.id,
-        created_at: r.created_at,
-        has_photos: attendanceIdsWithPhotos.has(r.id),
-        concert: {
-          ...r.concert_rel,
-          source: undefined,
-          // concert_date does not mean the same thing for every row: some
-          // sources store a true UTC instant, others the venue's wall clock
-          // wearing a Z. The client cannot render a time correctly without
-          // knowing which, and deriving it here keeps that rule in one place.
-          time_is_instant: storesRealInstant(r.concert_rel.source),
-          participating_bands: r.concert_rel.bands.map((b) => ({
-            id: b.band_rel.id,
-            name: b.band_rel.name,
-            tier: bandTierMap.get(b.band_rel.id) ?? null,
-            setlist: b.setlist ?? null,
-          })),
-        },
-      }));
+      const result = records.map((r) => {
+        const missed = new Set(r.missed_bands.map((m) => m.band_id));
+        return {
+          attendance_id: r.id,
+          created_at: r.created_at,
+          has_photos: attendanceIdsWithPhotos.has(r.id),
+          concert: {
+            ...r.concert_rel,
+            source: undefined,
+            // concert_date does not mean the same thing for every row: some
+            // sources store a true UTC instant, others the venue's wall clock
+            // wearing a Z. The client cannot render a time correctly without
+            // knowing which, and deriving it here keeps that rule in one place.
+            time_is_instant: storesRealInstant(r.concert_rel.source),
+            participating_bands: r.concert_rel.bands.map((b) => ({
+              id: b.band_rel.id,
+              name: b.band_rel.name,
+              tier: bandTierMap.get(b.band_rel.id) ?? null,
+              setlist: b.setlist ?? null,
+              // On the bill and still listed, but not seen: every count of
+              // who you have seen leaves it out.
+              missed: missed.has(b.band_rel.id),
+            })),
+          },
+        };
+      });
 
       res.json({ attendance: result });
     } catch (error) {
@@ -220,6 +234,80 @@ router.delete(
       res.json({ deleted: true });
     } catch (error) {
       console.error("Error removing attendance:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// PUT /wishlists/:id/attendance/missed — say you did or did not see one act
+// of a night you went to
+//
+// Takes the night's attendances rather than one: a festival day is a record
+// per stage or per act, and the client holds the day as one night. The mark
+// lands on each of them whose bill has the act, so whichever record a count
+// or a band's page reads the night from, it says the same thing.
+router.put(
+  "/wishlists/:id/attendance/missed",
+  [
+    auth,
+    roleCheck(["ADMIN", "USER"]),
+    param("id").isInt().withMessage("Wishlist ID must be an integer"),
+    body("attendance_ids").isArray({ min: 1, max: 200 }).withMessage("attendance_ids must be a list of 1 to 200 ids"),
+    body("attendance_ids.*").isInt().withMessage("attendance_ids must be integers"),
+    body("band_id").isInt().withMessage("band_id must be an integer"),
+    body("missed").isBoolean({ strict: true }).withMessage("missed must be true or false"),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
+
+      const wishlistId = parseInt(req.params.id, 10);
+      const bandId = parseInt(req.body.band_id, 10);
+      const attendanceIds = [...new Set(req.body.attendance_ids.map((id) => parseInt(id, 10)))];
+      // A JSON true or false, nothing else: the validator is strict.
+      const missed = req.body.missed === true;
+
+      if (!(await ownWishlist(req, res, { select: { id: true } }))) return;
+
+      const rows = await prisma.concertAttendance.findMany({
+        where: { id: { in: attendanceIds }, wishlist_id: wishlistId },
+        select: {
+          id: true,
+          concert_rel: { select: { bands: { where: { band: bandId }, select: { band: true } } } },
+        },
+      });
+      // One answer for "not yours" and "not there", as ownWishlist gives for
+      // the wishlist itself — and nothing written for any of them.
+      if (rows.length !== attendanceIds.length) {
+        return res.status(404).json({ error: "Attendance record not found" });
+      }
+
+      if (!missed) {
+        // Wherever it is, including a show whose bill has since lost the act:
+        // the question was whether you saw them, and the answer is yes.
+        await prisma.attendanceMissedBand.deleteMany({
+          where: { attendance_id: { in: attendanceIds }, band_id: bandId },
+        });
+        return res.json({ band_id: bandId, missed: false, attendance_ids: attendanceIds });
+      }
+
+      // Only an act on the bill can be one you missed. The bill is a
+      // ConcertBandReference; an act that is a name in the scraped lineup has
+      // no row to hang this on, and counts for nothing anyway.
+      const onBill = rows.filter((r) => r.concert_rel.bands.length > 0).map((r) => r.id);
+      if (!onBill.length) {
+        return res.status(400).json({ error: "That band is not on the bill of this night" });
+      }
+
+      await prisma.attendanceMissedBand.createMany({
+        data: onBill.map((attendanceId) => ({ attendance_id: attendanceId, band_id: bandId })),
+        skipDuplicates: true,
+      });
+
+      res.json({ band_id: bandId, missed: true, attendance_ids: onBill });
+    } catch (error) {
+      console.error("Error marking a band missed:", error);
       return res.status(500).json({ error: "Internal server error" });
     }
   }

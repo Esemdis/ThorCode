@@ -114,12 +114,20 @@ router.get(
       // Spelled out field by field rather than spread from band_rel, which
       // carries a `setlist` of its own: a spread would silently put the band's
       // most recent setlist in the field meaning "what they played that night".
+      //
+      // And whether you saw each of them. The night's rail is where an act you
+      // did not catch is marked, so it has to know which ones already are.
+      const missed = new Set((await prisma.attendanceMissedBand.findMany({
+        where: { attendance_id: attendanceId },
+        select: { band_id: true },
+      })).map((m) => m.band_id));
       const bands = billForConcert({
         bands: row.concert_rel.bands.map((b) => ({
           id: b.band_rel.id,
           name: b.band_rel.name,
           setlist: b.setlist ?? null,
           recent_setlist: b.band_rel.setlist ?? null,
+          missed: missed.has(b.band_rel.id),
         })),
         metadata: row.concert_rel.metadata,
       });

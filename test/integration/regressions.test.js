@@ -230,4 +230,79 @@ describe.skipIf(!url)('against Postgres', () => {
     expect(res.body.user.id).toBe(id);
     await prisma.user.delete({ where: { id } });
   });
+
+  it('keeps a missed act out of what was seen, and never stands in the way of a delete', async () => {
+    // A fake client cannot say whether the foreign keys cascade. Were either
+    // one Restrict, un-attending a show or deleting a band would start failing
+    // for anyone who had ever marked an act missed.
+    const user = await prisma.user.create({ data: { id: `${RUN}-missed`, email: `${RUN}-missed@example.test` } });
+    const wishlist = await prisma.wishlist.create({ data: { name: 'Mine', user_id: user.id } });
+    const seenBand = await prisma.band.create({ data: { name: `${RUN} seen` } });
+    const missedBand = await prisma.band.create({ data: { name: `${RUN} missed` } });
+    const concert = await prisma.concert.create({
+      data: {
+        country: 'BE', city: `${RUN} city`, venue: 'Festivalpark', created_at: new Date(),
+        on_sale: false, concert_date: new Date('2025-06-21T12:00:00Z'), festival: true,
+      },
+    });
+    await prisma.concertBandReference.createMany({
+      data: [{ concert: concert.id, band: seenBand.id }, { concert: concert.id, band: missedBand.id }],
+    });
+    await prisma.wishlistBandReference.createMany({
+      data: [{ wishlist_id: wishlist.id, band_id: seenBand.id }, { wishlist_id: wishlist.id, band_id: missedBand.id }],
+    });
+    const attendance = await prisma.concertAttendance.create({
+      data: { wishlist_id: wishlist.id, concert_id: concert.id },
+    });
+
+    const app = appWith([['/data/concerts', require('../../routes/data/wishlists.js')]]);
+    const auth = token(user.id);
+    const mark = (bandId, missed) => request(app)
+      .put(`/data/concerts/wishlists/${wishlist.id}/attendance/missed`)
+      .set('Authorization', auth)
+      .send({ attendance_ids: [attendance.id], band_id: bandId, missed });
+
+    try {
+      expect((await mark(missedBand.id, true)).status).toBe(200);
+      // Twice is the same as once.
+      expect((await mark(missedBand.id, true)).status).toBe(200);
+
+      const all = await request(app)
+        .get(`/data/concerts/wishlists/${wishlist.id}/attendance`)
+        .set('Authorization', auth);
+      const bill = all.body.attendance[0].concert.participating_bands;
+      expect(Object.fromEntries(bill.map((b) => [b.id, b.missed])))
+        .toEqual({ [seenBand.id]: false, [missedBand.id]: true });
+
+      const theirs = await request(app)
+        .get(`/data/concerts/wishlists/${wishlist.id}/attendance?band_id=${missedBand.id}`)
+        .set('Authorization', auth);
+      expect(theirs.body.attendance).toEqual([]);
+
+      const list = await request(app).get(`/data/concerts/wishlists/${wishlist.id}`).set('Authorization', auth);
+      expect(Object.fromEntries(list.body.bands.map((b) => [b.id, b.times_seen])))
+        .toEqual({ [seenBand.id]: 1, [missedBand.id]: 0 });
+
+      // Both cascades: the band first, then the attendance with a mark still on it.
+      expect((await mark(seenBand.id, true)).status).toBe(200);
+      await prisma.wishlistBandReference.deleteMany({ where: { band_id: missedBand.id } });
+      await prisma.concertBandReference.deleteMany({ where: { band: missedBand.id } });
+      await prisma.band.delete({ where: { id: missedBand.id } });
+      const gone = await request(app)
+        .delete(`/data/concerts/wishlists/${wishlist.id}/attendance/${concert.id}`)
+        .set('Authorization', auth);
+
+      expect(gone.status).toBe(200);
+      expect(await prisma.attendanceMissedBand.count({ where: { attendance_id: attendance.id } })).toBe(0);
+    } finally {
+      await prisma.attendanceMissedBand.deleteMany({ where: { attendance_id: attendance.id } });
+      await prisma.concertAttendance.deleteMany({ where: { id: attendance.id } });
+      await prisma.wishlistBandReference.deleteMany({ where: { wishlist_id: wishlist.id } });
+      await prisma.concertBandReference.deleteMany({ where: { concert: concert.id } });
+      await prisma.concert.delete({ where: { id: concert.id } });
+      await prisma.city.deleteMany({ where: { name: `${RUN} city` } });
+      await prisma.band.deleteMany({ where: { id: { in: [seenBand.id, missedBand.id] } } });
+      await prisma.wishlist.delete({ where: { id: wishlist.id } });
+    }
+  });
 });

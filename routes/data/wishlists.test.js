@@ -19,6 +19,7 @@ const prisma = installFakePrisma({
   concertBandReference: model(),
   concertAttendance: model(),
   concertMedia: model(),
+  attendanceMissedBand: model(),
   activityLog: model(),
   city: model(),
   notificationSubscription: model(),
@@ -59,6 +60,7 @@ const EXPECTED_ROUTES = [
   'GET /wishlists/:id/attendance [4]',
   'POST /wishlists/:id/attendance [5]',
   'DELETE /wishlists/:id/attendance/:concertId [5]',
+  'PUT /wishlists/:id/attendance/missed [8]',
   'POST /wishlists/:id/attendance/from-setlist [6]',
 ];
 
@@ -117,6 +119,7 @@ describe('a wishlist that is someone else\'s', () => {
     ['get', '/wishlists/7/attendance', user],
     ['post', '/wishlists/7/attendance', user, { concert_id: 1 }],
     ['delete', '/wishlists/7/attendance/1', user],
+    ['put', '/wishlists/7/attendance/missed', user, { attendance_ids: [1], band_id: 1, missed: true }],
     ['post', '/wishlists/7/attendance/from-setlist', user, { setlistfm_id: '63de4613', band_id: 1 }],
     ['patch', '/wishlists/7/bands/1', user, { tier: 'LOVE' }],
     ['put', '/wishlists/7', admin, { name: 'Mine now' }],
@@ -530,6 +533,7 @@ describe('GET /wishlists/:id/attendance', () => {
   const attendanceRow = (id) => ({
     id,
     created_at: new Date('2026-01-01'),
+    missed_bands: [],
     concert_rel: {
       id: id * 10, event_id: `e${id}`, name: null, venue: 'Vega', city: 'Copenhagen',
       country: 'DK', concert_date: new Date('2026-01-01'), url: null, festival: false,
@@ -565,6 +569,163 @@ describe('GET /wishlists/:id/attendance', () => {
     expect(res.status).toBe(200);
     expect(res.body.attendance).toEqual([]);
     expect(prisma.concertMedia.groupBy).not.toHaveBeenCalled();
+  });
+
+  it('marks an act you missed on the bill, and leaves the rest of it seen', async () => {
+    const band = (id, name) => ({ setlist: null, band_rel: { id, name } });
+    prisma.concertAttendance.findMany.mockResolvedValue([{
+      ...attendanceRow(1),
+      missed_bands: [{ band_id: 2 }],
+      concert_rel: { ...attendanceRow(1).concert_rel, bands: [band(1, 'Gojira'), band(2, 'Mastodon')] },
+    }]);
+    prisma.concertMedia.groupBy.mockResolvedValue([]);
+
+    const res = await request(app).get('/wishlists/7/attendance').set(...authHeader({ id: 'user-1' }));
+
+    const bands = res.body.attendance[0].concert.participating_bands;
+    expect(bands.find((b) => b.id === 1).missed).toBe(false);
+    expect(bands.find((b) => b.id === 2).missed).toBe(true);
+  });
+
+  it("leaves a show you missed a band at out of that band's own list", async () => {
+    prisma.concertAttendance.findMany.mockResolvedValue([]);
+
+    await request(app).get('/wishlists/7/attendance?band_id=5').set(...authHeader({ id: 'user-1' }));
+
+    expect(prisma.concertAttendance.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        concert_rel: { bands: { some: { band: 5 } } },
+        missed_bands: { none: { band_id: 5 } },
+      }),
+    }));
+  });
+});
+
+describe('PUT /wishlists/:id/attendance/missed', () => {
+  const WISHLIST = { id: 7, user_id: 'user-1' };
+  const put = (body) => request(app)
+    .put('/wishlists/7/attendance/missed')
+    .set(...authHeader({ id: 'user-1' }))
+    .send(body);
+  // An attendance as the route reads it: just whether its bill has the band.
+  const row = (id, onBill) => ({ id, concert_rel: { bands: onBill ? [{ band: 3 }] : [] } });
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue(WISHLIST);
+  });
+
+  it("marks the act missed on each of the night's shows whose bill has it, and no other", async () => {
+    // A festival day: the act played one stage's show of the two.
+    prisma.concertAttendance.findMany.mockResolvedValue([row(11, true), row(12, false)]);
+
+    const res = await put({ attendance_ids: [11, 12], band_id: 3, missed: true });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ band_id: 3, missed: true, attendance_ids: [11] });
+    expect(prisma.concertAttendance.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: { in: [11, 12] }, wishlist_id: 7 },
+    }));
+    expect(prisma.attendanceMissedBand.createMany).toHaveBeenCalledWith({
+      data: [{ attendance_id: 11, band_id: 3 }],
+      skipDuplicates: true,
+    });
+  });
+
+  it('takes the mark off every show it was asked about', async () => {
+    prisma.concertAttendance.findMany.mockResolvedValue([row(11, true), row(12, false)]);
+
+    const res = await put({ attendance_ids: [11, 12], band_id: 3, missed: false });
+
+    expect(res.status).toBe(200);
+    expect(prisma.attendanceMissedBand.deleteMany).toHaveBeenCalledWith({
+      where: { attendance_id: { in: [11, 12] }, band_id: 3 },
+    });
+    expect(prisma.attendanceMissedBand.createMany).not.toHaveBeenCalled();
+  });
+
+  it('refuses an act that is not on the bill of any of them', async () => {
+    prisma.concertAttendance.findMany.mockResolvedValue([row(11, false)]);
+
+    const res = await put({ attendance_ids: [11], band_id: 3, missed: true });
+
+    expect(res.status).toBe(400);
+    expect(prisma.attendanceMissedBand.createMany).not.toHaveBeenCalled();
+  });
+
+  it("writes nothing when one of the shows is not on this wishlist", async () => {
+    // Asked for two, found one: the other is someone else's, or gone.
+    prisma.concertAttendance.findMany.mockResolvedValue([row(11, true)]);
+
+    const res = await put({ attendance_ids: [11, 99], band_id: 3, missed: true });
+
+    expect(res.status).toBe(404);
+    expect(prisma.attendanceMissedBand.createMany).not.toHaveBeenCalled();
+    expect(prisma.attendanceMissedBand.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['no shows', { attendance_ids: [], band_id: 3, missed: true }],
+    ['a show that is not an id', { attendance_ids: ['x'], band_id: 3, missed: true }],
+    ['no band', { attendance_ids: [11], missed: true }],
+    ['a yes or no that is neither', { attendance_ids: [11], band_id: 3, missed: 'maybe' }],
+    ['no yes or no at all', { attendance_ids: [11], band_id: 3 }],
+  ])('turns away %s', async (_label, body) => {
+    const res = await put(body);
+
+    expect(res.status).toBe(400);
+    expect(prisma.concertAttendance.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /wishlists/:id times_seen', () => {
+  const band = (id, name) => ({
+    id, name, setlist: null, MBID: null, songkick_url: null, bandsintown_url: null,
+  });
+  // A seen-count row as computeSeenCounts reads it.
+  const seen = (date, bands, missed = []) => ({
+    concert_rel: {
+      concert_date: new Date(date), venue: 'Festivalpark Stenehei', city: 'Dessel',
+      bands: bands.map((id) => ({ band: id })),
+    },
+    missed_bands: missed.map((id) => ({ band_id: id })),
+  });
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue({
+      id: 7, user_id: 'user-1', name: 'My Wishlist',
+      bands: [
+        { band_id: 1, tier: 'LOVE', band_rel: band(1, 'Gojira') },
+        { band_id: 2, tier: 'LIKE', band_rel: band(2, 'Mastodon') },
+      ],
+    });
+    prisma.band.findMany.mockResolvedValue([]);
+  });
+
+  const timesSeen = async () => {
+    const res = await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+    expect(res.status).toBe(200);
+    return Object.fromEntries(res.body.bands.map((b) => [b.name, b.times_seen]));
+  };
+
+  it("counts every act of a festival day, not just the first record's", async () => {
+    // Bandsintown's shape: one record per act, all at the same grounds.
+    prisma.concertAttendance.findMany.mockResolvedValue([
+      seen('2025-06-21', [1]),
+      seen('2025-06-21', [2]),
+    ]);
+
+    expect(await timesSeen()).toEqual({ Gojira: 1, Mastodon: 1 });
+  });
+
+  it('leaves out an act you missed, whichever copy of the night says so', async () => {
+    prisma.concertAttendance.findMany.mockResolvedValue([
+      seen('2025-06-21', [1, 2]),
+      // The next day, imported twice: once with the mark, once without.
+      seen('2025-06-22', [1, 2], [2]),
+      seen('2025-06-22', [2]),
+    ]);
+
+    expect(await timesSeen()).toEqual({ Gojira: 2, Mastodon: 1 });
   });
 });
 
