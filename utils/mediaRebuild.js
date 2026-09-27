@@ -107,8 +107,8 @@ async function collectArchive(rootAbs) {
  * in walk order unindexed, under a stack trace.
  *
  * The columns are checked against the schema, not against taste: `kind` is a
- * non-null enum, `bytes` and `sha256` are non-null, and width/height/duration
- * are nullable integers.
+ * non-null enum, `bytes` and `sha256` are non-null, width/height/duration and
+ * the two ends of a moment are nullable integers, and `picked` is a boolean.
  */
 const numberOrAbsent = (v) => v === undefined || v === null
   || (typeof v === 'number' && Number.isFinite(v));
@@ -118,8 +118,16 @@ function entryProblem(f) {
   if (f.kind !== 'PHOTO' && f.kind !== 'VIDEO') return `kind is ${JSON.stringify(f.kind)}, not PHOTO or VIDEO`;
   if (typeof f.bytes !== 'number' || !Number.isFinite(f.bytes)) return 'bytes is not a finite number';
   if (typeof f.sha256 !== 'string' || f.sha256 === '') return 'sha256 is not a non-empty string';
-  for (const key of ['width', 'height', 'duration_ms']) {
+  for (const key of ['width', 'height', 'duration_ms', 'moment_start_ms', 'moment_end_ms']) {
     if (!numberOrAbsent(f[key])) return `${key} is neither a finite number nor null`;
+  }
+  // "true" in quotes is the likely hand edit, and read as a string it would
+  // either be refused by Postgres or, coerced, pick a file nobody picked.
+  if (f.picked != null && typeof f.picked !== 'boolean') return 'picked is neither true nor false';
+  // Half a moment is not a shorter one. The API only ever writes the pair, so
+  // one without the other is an edit to look at, not a stretch to guess.
+  if ((f.moment_start_ms == null) !== (f.moment_end_ms == null)) {
+    return 'moment_start_ms and moment_end_ms are not both set or both empty';
   }
   return null;
 }
@@ -207,6 +215,12 @@ function planRebuild({ sidecars, filesOnDisk, attendanceIds, bandIds = null }) {
         // means "leave it alone" on an update rather than "no song".
         // A song names nobody without its band, so it goes with it.
         song: bandGone ? null : (f.song || null),
+        // The recap's picks. Absent from every sidecar written before they
+        // existed, which is the same as not picked; and `?? null` rather than
+        // `|| null` for the moment, since a moment can start at 0.
+        picked: f.picked === true,
+        moment_start_ms: f.moment_start_ms ?? null,
+        moment_end_ms: f.moment_end_ms ?? null,
         taken_at: f.taken_at ? new Date(f.taken_at) : null,
       });
     }

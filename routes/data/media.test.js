@@ -145,7 +145,7 @@ describe('POST /attendances/:id/media', () => {
       'GET /attendances/:attendanceId/media [4]',
       'GET /bands/:bandId/media [4]',
       'POST /attendances/:attendanceId/lineup [5]',
-      'PATCH /media [8]',
+      'PATCH /media [11]',
       'DELETE /media/:id [4]',
       'DELETE /media [5]',
       'POST /media/:id/share [6]',
@@ -2217,6 +2217,206 @@ describe('PATCH /media — the song a video is of', () => {
     );
     const sidecar = JSON.parse(await readFile(join(dirFor(), 'concert-media.json'), 'utf8'));
     expect(sidecar.files[0]).toMatchObject({ name: 'VID_1.mp4', song: null });
+  });
+});
+
+describe('PATCH /media — the recap\'s picks, and the moment of a video it plays', () => {
+  // Picks are typed by hand like a caption, so they follow a caption's rule:
+  // Postgres and the sidecar both, or a rebuild quietly unpicks the year.
+  const dirFor = () => join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+
+  const row = (over = {}) => ({
+    id: 5,
+    attendance_id: 1,
+    rel_path: 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4',
+    filename: 'VID_1.mp4',
+    kind: 'VIDEO',
+    sha256: 'h5',
+    bytes: 99999,
+    width: 1920,
+    height: 1080,
+    duration_ms: 214000,
+    caption: null,
+    taken_at: null,
+    band_id: 92,
+    song: null,
+    picked: false,
+    moment_start_ms: null,
+    moment_end_ms: null,
+    attendance_rel: {
+      wishlist_rel: { user_id: 'user-1' },
+      concert_rel: {
+        id: 8417,
+        concert_date: new Date('2026-06-12T19:00:00Z'),
+        venue: 'Sentrum Scene',
+        city: 'Oslo',
+        country: 'NO',
+        bands: [{ band_rel: { id: 92, name: 'Gojira' } }],
+      },
+    },
+    ...over,
+  });
+  const photo = (over = {}) => row({
+    kind: 'PHOTO', filename: 'IMG_1.jpg', rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_1.jpg', duration_ms: null, ...over,
+  });
+  const readSidecarFile = async () => JSON.parse(await readFile(join(dirFor(), 'concert-media.json'), 'utf8'));
+  const patch = (body) => request(app())
+    .patch('/data/concerts/media')
+    .set(...authHeader({ id: 'user-1' }))
+    .send(body);
+
+  beforeEach(async () => {
+    await mkdir(dirFor(), { recursive: true });
+    prisma.concertMedia.update = vi.fn(async ({ data }) => ({ id: 5, ...data }));
+    prisma.$transaction = vi.fn(async (fns) => Promise.all(fns.map((f) => (typeof f === 'function' ? f() : f))));
+  });
+
+  it('picks a file in Postgres and in the sidecar', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [photo()]);
+
+    await patch({ ids: [5], picked: true }).expect(200);
+
+    expect(prisma.concertMedia.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ picked: true }) }),
+    );
+    expect((await readSidecarFile()).files[0]).toMatchObject({ name: 'IMG_1.jpg', picked: true });
+  });
+
+  it('unpicks one the same way', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [photo({ picked: true })]);
+
+    await patch({ ids: [5], picked: false }).expect(200);
+
+    expect(prisma.concertMedia.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ picked: false }) }),
+    );
+    expect((await readSidecarFile()).files[0]).toMatchObject({ picked: false });
+  });
+
+  it('picks a selection at once', async () => {
+    // Three tiles ticked in the grid and starred together is the quick way
+    // through a night, and nothing about a pick is particular to one file.
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      photo(),
+      photo({ id: 6, filename: 'IMG_2.jpg', rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_2.jpg' }),
+    ]);
+
+    await patch({ ids: [5, 6], picked: true }).expect(200);
+
+    expect(prisma.concertMedia.update).toHaveBeenCalledTimes(2);
+    const { files } = await readSidecarFile();
+    expect(files.map((f) => [f.name, f.picked])).toEqual([['IMG_1.jpg', true], ['IMG_2.jpg', true]]);
+  });
+
+  it('refuses a pick sent as a string', async () => {
+    // "false" is truthy. Taken as it came, it would pick the file it was
+    // sent to unpick.
+    prisma.concertMedia.findMany = vi.fn(async () => [photo()]);
+
+    await patch({ ids: [5], picked: 'false' }).expect(400);
+
+    expect(prisma.concertMedia.update).not.toHaveBeenCalled();
+  });
+
+  it('writes a video\'s moment to Postgres and to the sidecar', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [row()]);
+
+    await patch({ ids: [5], moment_start_ms: 83000, moment_end_ms: 95000 }).expect(200);
+
+    expect(prisma.concertMedia.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ moment_start_ms: 83000, moment_end_ms: 95000 }),
+    }));
+    expect((await readSidecarFile()).files[0]).toMatchObject({ moment_start_ms: 83000, moment_end_ms: 95000 });
+  });
+
+  it('ends a moment asked to run past the video on its last frame', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [row()]);
+
+    await patch({ ids: [5], moment_start_ms: 204000, moment_end_ms: 214040 }).expect(200);
+
+    expect(prisma.concertMedia.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ moment_start_ms: 204000, moment_end_ms: 214000 }),
+    }));
+  });
+
+  it('clears a moment with two nulls, in both places', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [row({ moment_start_ms: 83000, moment_end_ms: 95000 })]);
+
+    await patch({ ids: [5], moment_start_ms: null, moment_end_ms: null }).expect(200);
+
+    expect(prisma.concertMedia.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ moment_start_ms: null, moment_end_ms: null }),
+    }));
+    expect((await readSidecarFile()).files[0]).toMatchObject({ moment_start_ms: null, moment_end_ms: null });
+  });
+
+  it('keeps the moment a video already has when it is only unpicked', async () => {
+    // The two are apart on purpose: finding the moment was the work, and
+    // unpicking a clip for a week should not throw it away.
+    await writeFile(join(dirFor(), 'concert-media.json'), JSON.stringify({
+      version: 1, concert_id: 8417, user_id: 'user-1',
+      concert: { date: '2026-06-12', venue: 'Sentrum Scene', city: 'Oslo', country: 'NO' },
+      files: [{
+        name: 'VID_1.mp4', kind: 'VIDEO', band_id: 92, band_name: 'Gojira', caption: '', song: null,
+        sha256: 'h5', bytes: 99999, width: 1920, height: 1080, duration_ms: 214000, taken_at: null,
+        picked: true, moment_start_ms: 83000, moment_end_ms: 95000,
+      }],
+    }));
+    prisma.concertMedia.findMany = vi.fn(async () => [row({ picked: true, moment_start_ms: 83000, moment_end_ms: 95000 })]);
+
+    await patch({ ids: [5], picked: false }).expect(200);
+
+    const { data } = prisma.concertMedia.update.mock.calls[0][0];
+    expect(data).not.toHaveProperty('moment_start_ms');
+    expect((await readSidecarFile()).files[0]).toMatchObject({ picked: false, moment_start_ms: 83000, moment_end_ms: 95000 });
+  });
+
+  it('carries a pick and a moment from the row into a sidecar that never recorded the file', async () => {
+    // The entry is built from the row when the sidecar has none, and a
+    // caption edit on such a file must not come out of it unpicked.
+    prisma.concertMedia.findMany = vi.fn(async () => [row({ picked: true, moment_start_ms: 83000, moment_end_ms: 95000 })]);
+
+    await patch({ ids: [5], caption: 'the breakdown' }).expect(200);
+
+    expect((await readSidecarFile()).files[0]).toMatchObject({
+      caption: 'the breakdown', picked: true, moment_start_ms: 83000, moment_end_ms: 95000,
+    });
+  });
+
+  it('refuses a moment on a photograph', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [photo()]);
+
+    const res = await patch({ ids: [5], moment_start_ms: 0, moment_end_ms: 5000 }).expect(400);
+
+    expect(res.body.error).toMatch(/video/i);
+    expect(prisma.concertMedia.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses one moment for several videos, before reading any of them', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [row(), row({ id: 6, filename: 'VID_2.mp4' })]);
+
+    const res = await patch({ ids: [5, 6], moment_start_ms: 0, moment_end_ms: 5000 }).expect(400);
+
+    expect(res.body.error).toMatch(/one file at a time/);
+    expect(prisma.concertMedia.findMany).not.toHaveBeenCalled();
+  });
+
+  it('refuses half a moment', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [row()]);
+
+    const res = await patch({ ids: [5], moment_start_ms: 83000 }).expect(400);
+
+    expect(res.body.error).toMatch(/both/);
+    expect(prisma.concertMedia.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses a moment longer than a slide should run', async () => {
+    prisma.concertMedia.findMany = vi.fn(async () => [row()]);
+
+    const res = await patch({ ids: [5], moment_start_ms: 0, moment_end_ms: 45000 }).expect(400);
+
+    expect(res.body.error).toMatch(/at most/);
+    expect(prisma.concertMedia.update).not.toHaveBeenCalled();
   });
 });
 

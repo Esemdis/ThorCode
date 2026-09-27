@@ -255,6 +255,32 @@ model ConcertMedia {
   /// a VIDEO, and only alongside a band_id — a song title with no artist
   /// names nobody on a festival bill.
   song          String?
+  /// One of the files that stand for the night in the year recap.
+  ///
+  /// The recap shows three a night, and the lightbox offers no fourth, but
+  /// nothing here counts them. A night is every show you saw that day in one
+  /// city — six stage records on a festival day — and that grouping is made
+  /// on the client, from the attended list, not from anything this table
+  /// can see. The recap reads the first three in the order of the night, so
+  /// a fourth, which moving a file to another stage can produce, costs
+  /// nothing but the file that sorts last.
+  ///
+  /// A night with fewer than three picked is topped up by the recap's own
+  /// choice. That is what keeps an unpicked year from being an empty one.
+  picked        Boolean   @default(false)
+  /// The stretch of a video the recap plays, in milliseconds into the clip.
+  ///
+  /// Not a MediaShareLink, though those carry a range too: a link lasts
+  /// twelve hours and its clip is a cut in the cache, where this is a
+  /// property of the file that has to survive a rebuild from the sidecars.
+  /// Nor is it ever cut into a file — the recap seeks the viewing copy to it,
+  /// which the byte routes' Range support already allows.
+  ///
+  /// Both or neither, only on a VIDEO, and set one file at a time. Held
+  /// apart from `picked` on purpose: unpicking a video and picking it again
+  /// should not lose the moment someone took the trouble to find.
+  moment_start_ms Int?
+  moment_end_ms   Int?
   taken_at      DateTime?
   created_at    DateTime  @default(now())
 
