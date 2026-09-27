@@ -12,7 +12,7 @@
 // Shorter than this is a double-press on the marker, not a moment.
 const MIN_MOMENT_MS = 1000;
 // Long enough for a chorus, short enough that a slide still feels like one.
-const MAX_MOMENT_MS = 30000;
+const MAX_MOMENT_MS = 25000;
 
 /**
  * @param {{start_ms: number, end_ms: number}} asked - both ends, in ms.

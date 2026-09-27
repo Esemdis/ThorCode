@@ -38,6 +38,8 @@ describe('recapMoment', () => {
   });
 
   it('refuses a moment longer than a slide should run', () => {
+    expect(recapMoment({ start_ms: 0, end_ms: 25_000 })).toEqual({ range: { start_ms: 0, end_ms: 25_000 } });
+    expect(recapMoment({ start_ms: 0, end_ms: 27_000 })).toEqual({ error: 'A moment can be at most 25 seconds long' });
     expect(recapMoment({ start_ms: 0, end_ms: MAX_MOMENT_MS })).toEqual({ range: { start_ms: 0, end_ms: MAX_MOMENT_MS } });
     expect(recapMoment({ start_ms: 0, end_ms: MAX_MOMENT_MS + 1 })).toEqual({ error: expect.stringMatching(/at most/) });
   });
