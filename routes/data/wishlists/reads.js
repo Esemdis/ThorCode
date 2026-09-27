@@ -24,14 +24,20 @@ function invalid(req, res) {
   return true;
 }
 
-// Deduplicates by date+venue+city (same logic as the Attended tab display),
-// so a TM + sfm_ pair for the same show counts as 1.
+// Counts each band once per night, a night being a day in one city (the same
+// as concert-map's bandsSeenByNight), so a TM + sfm_ pair for the same show
+// counts as 1.
 //
-// Every record of a show adds its bill, not just the first: a festival day
-// scraped from Bandsintown is a row per act at one venue, and the first row
-// alone is one act of the day. An act marked missed on any record of a show is
-// not counted for it — the same night imported twice is one night, and a mark
-// made on either copy is about that night.
+// Not per day at one venue: Bandsintown files a festival's acts under the
+// grounds and under each stage, so an act listed under two of those names was
+// counted twice for one day. A band does not play two venues in one city on
+// one day.
+//
+// Every record of a night adds its bill, not just the first: a festival day
+// scraped from Bandsintown is a row per act, and the first row alone is one
+// act of the day. An act marked missed on any record of a night is not counted
+// for it — the same night imported twice is one night, and a mark made on
+// either copy is about that night.
 async function computeSeenCounts(wishlistId) {
   const attendances = await prisma.concertAttendance.findMany({
     where: {
@@ -42,7 +48,6 @@ async function computeSeenCounts(wishlistId) {
       concert_rel: {
         select: {
           concert_date: true,
-          venue: true,
           city: true,
           bands: { select: { band: true } },
         },
@@ -51,22 +56,22 @@ async function computeSeenCounts(wishlistId) {
     },
   });
 
-  const shows = new Map(); // "date|venue|city" -> { bands, missed }
+  const nights = new Map(); // "date|city" -> { bands, missed }
   for (const a of attendances) {
     const c = a.concert_rel;
     const day = c.concert_date ? new Date(c.concert_date).toISOString().slice(0, 10) : 'unknown';
-    const key = `${day}|${c.venue ?? ''}|${c.city ?? ''}`;
-    let show = shows.get(key);
-    if (!show) {
-      show = { bands: new Set(), missed: new Set() };
-      shows.set(key, show);
+    const key = `${day}|${c.city ?? ''}`;
+    let night = nights.get(key);
+    if (!night) {
+      night = { bands: new Set(), missed: new Set() };
+      nights.set(key, night);
     }
-    for (const b of c.bands) show.bands.add(b.band);
-    for (const m of a.missed_bands) show.missed.add(m.band_id);
+    for (const b of c.bands) night.bands.add(b.band);
+    for (const m of a.missed_bands) night.missed.add(m.band_id);
   }
 
   const seenCountMap = new Map();
-  for (const { bands, missed } of shows.values()) {
+  for (const { bands, missed } of nights.values()) {
     for (const band of bands) {
       if (missed.has(band)) continue;
       seenCountMap.set(band, (seenCountMap.get(band) || 0) + 1);

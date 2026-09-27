@@ -682,9 +682,9 @@ describe('GET /wishlists/:id times_seen', () => {
     id, name, setlist: null, MBID: null, songkick_url: null, bandsintown_url: null,
   });
   // A seen-count row as computeSeenCounts reads it.
-  const seen = (date, bands, missed = []) => ({
+  const seen = (date, bands, missed = [], venue = 'Festivalpark Stenehei') => ({
     concert_rel: {
-      concert_date: new Date(date), venue: 'Festivalpark Stenehei', city: 'Dessel',
+      concert_date: new Date(date), venue, city: 'Dessel',
       bands: bands.map((id) => ({ band: id })),
     },
     missed_bands: missed.map((id) => ({ band_id: id })),
@@ -726,6 +726,25 @@ describe('GET /wishlists/:id times_seen', () => {
     ]);
 
     expect(await timesSeen()).toEqual({ Gojira: 2, Mastodon: 1 });
+  });
+
+  it('counts an act listed under two stages of one day once', async () => {
+    // Bandsintown files the day's acts under the grounds and under each stage.
+    prisma.concertAttendance.findMany.mockResolvedValue([
+      seen('2025-06-21', [1]),
+      seen('2025-06-21', [1, 2], [], 'South Stage'),
+    ]);
+
+    expect(await timesSeen()).toEqual({ Gojira: 1, Mastodon: 1 });
+  });
+
+  it('takes a missed mark under one stage name for the whole day', async () => {
+    prisma.concertAttendance.findMany.mockResolvedValue([
+      seen('2025-06-21', [1], [1]),
+      seen('2025-06-21', [1, 2], [], 'South Stage'),
+    ]);
+
+    expect(await timesSeen()).toEqual({ Gojira: 0, Mastodon: 1 });
   });
 });
 
