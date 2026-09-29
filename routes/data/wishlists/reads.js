@@ -340,6 +340,7 @@ router.get(
           concert_date: true,
           url: true,
           festival: true,
+          sold_out: true,
           created_at: true,
           latitude: true,
           longitude: true,

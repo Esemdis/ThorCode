@@ -1125,6 +1125,26 @@ describe('GET /wishlists/:id/new', () => {
   });
 });
 
+describe('GET /wishlists/:id/recent-concerts', () => {
+  it('says which shows have sold out', async () => {
+    // The Updates panel marks them on the row. It is the only news a show
+    // carries after it was announced, now that the panel has no activity log.
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [{ band_id: 1, tier: 1 }] });
+    prisma.concert.findMany.mockResolvedValue([{
+      id: 10, name: null, city: 'Oslo', country: 'NO', venue: 'Spektrum',
+      concert_date: new Date('2027-03-12'), url: null, festival: false, sold_out: true,
+      created_at: new Date('2026-09-01'), latitude: null, longitude: null,
+      bands: [{ band_rel: { id: 1, name: 'Ghost' } }],
+    }]);
+
+    const res = await request(app).get('/wishlists/7/recent-concerts').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(prisma.concert.findMany.mock.calls[0][0].select.sold_out).toBe(true);
+    expect(res.body.groups[0].concerts[0].sold_out).toBe(true);
+  });
+});
+
 describe('DELETE /wishlists/:id', () => {
   beforeEach(() => {
     prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1' });
