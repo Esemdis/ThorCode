@@ -13,7 +13,9 @@ const {
   buildPlaylistTracks, concertPerformers, unresolvedBillNames,
   playlistName, playlistDescription, coverCredits,
 } = require('../../utils/setlistPlaylist');
-const { fetchSetlistsForNames } = require('../../utils/externalSetlists');
+// Through the module rather than destructured, so a test can stand in for
+// setlist.fm on the router's own copy of it.
+const externalSetlists = require('../../utils/externalSetlists');
 const {
   SpotifyAuthError, getValidToken, findTrack, createPlaylist, addItems,
 } = require('../../utils/spotify');
@@ -83,9 +85,14 @@ router.post('/:concertId/playlist', auth, rateLimit, async (req, res) => {
     });
     if (!concert) return res.status(404).json({ error: 'Concert not found' });
 
+    // Before anything is fetched: with no Spotify to put the playlist in, the
+    // setlist.fm searches below — one per act, on the key every user shares —
+    // were spent for nothing.
+    const token = await getValidToken(req.user.id);
+
     // A concert is the whole bill, not just the acts you follow. The names of
     // the rest are in metadata; their songs have to be fetched.
-    const external = await fetchSetlistsForNames(unresolvedBillNames(concert));
+    const external = await externalSetlists.fetchSetlistsForNames(unresolvedBillNames(concert));
     const performers = concertPerformers(concert, external);
 
     const tracks = buildPlaylistTracks(performers);
@@ -95,7 +102,6 @@ router.post('/:concertId/playlist', auth, rateLimit, async (req, res) => {
       });
     }
 
-    const token = await getValidToken(req.user.id);
     const { uris, missed } = await resolveTracks(token, tracks);
 
     if (uris.length === 0) {
