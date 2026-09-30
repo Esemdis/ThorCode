@@ -14,7 +14,7 @@ const { groupConcertsByBand } = require("../../../utils/concertUpdateGroups");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
-const { rateLimit, ownWishlist, logActivity, ACTIVITY_KEPT } = require("./shared");
+const { ownWishlist, logActivity, ACTIVITY_KEPT } = require("./shared");
 
 // The id checks below are declared on each route but were never read, so
 // "/wishlists/abc/…" reached Prisma as NaN and came back a 500.
@@ -81,10 +81,14 @@ async function computeSeenCounts(wishlistId) {
 }
 
 // GET /wishlists — list the user's single wishlist
+//
+// Not behind the wishlist limiter. That is a budget for adding and removing
+// bands, ten a minute per address, and this is the read the app makes on
+// every load: sharing it, a few bands added and a reload or two came back 429,
+// and the app sat empty with no wishlist to show.
 router.get(
   "/wishlists",
   [auth, roleCheck(["ADMIN", "USER"])],
-  rateLimit,
   async (req, res) => {
     try {
       const wishlists = await prisma.wishlist.findMany({

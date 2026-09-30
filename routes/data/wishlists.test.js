@@ -39,7 +39,9 @@ beforeEach(() => { vi.clearAllMocks(); });
  * change rather than a leap. See that file for the reasoning on the counts.
  */
 const EXPECTED_ROUTES = [
-  'GET /wishlists [4]',
+  // No limiter: it shared the 10-a-minute budget for adding and removing
+  // bands, and the app reads it on every load.
+  'GET /wishlists [3]',
   'GET /wishlists/raw [3]',
   'GET /wishlists/bands [3]',
   'GET /wishlists/:id/new [4]',
@@ -185,6 +187,21 @@ describe('PATCH /wishlists/:id/bands/:bandId', () => {
 
     expect(res.status).toBe(404);
     expect(res.body).toEqual({ error: 'That band is not on this wishlist.' });
+  });
+});
+
+describe('GET /wishlists', () => {
+  it('is not counted against adding and removing bands', async () => {
+    // It shared their 10-a-minute limiter. The app reads it on every load, so
+    // a few bands added and a reload or two came back 429, and the app sat
+    // empty with no wishlist to show.
+    prisma.wishlist.findMany.mockResolvedValue([{ id: 7, user_id: 'user-1', bands: [] }]);
+
+    for (let i = 0; i < 12; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      const res = await request(app).get('/wishlists').set(...authHeader({ id: 'user-1' }));
+      expect(res.status).toBe(200);
+    }
   });
 });
 
