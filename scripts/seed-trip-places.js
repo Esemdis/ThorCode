@@ -15,12 +15,14 @@ require("dotenv").config();
 
 const jwt = require("jsonwebtoken");
 const prisma = require("../prisma/client");
+const { normaliseEmail } = require("../utils/validation/email");
 const { PLACES, START, END } = require("./fixtures/paris-places");
 
 const TRIP_NAME = "Paris (route planner demo)";
 
 async function main() {
-  const email = process.argv[2];
+  // Stored lowercased; see utils/validation/email.js.
+  const email = process.argv[2] && normaliseEmail(process.argv[2]);
   if (!email) {
     console.error("Usage: doppler run -- node scripts/seed-trip-places.js <email> [--replace]");
     process.exit(1);

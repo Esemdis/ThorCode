@@ -1,7 +1,10 @@
 const { body } = require("express-validator");
+const { normaliseEmail } = require("./email");
 
 const userValidation = [
-  body("email").isEmail().withMessage("Valid email required"),
+  // Normalised before it is checked, so every route below reads the address
+  // as it is stored. See normaliseEmail.
+  body("email").customSanitizer(normaliseEmail).isEmail().withMessage("Valid email required"),
   body("password")
     .isLength({ min: 8, max: 100 })
     .withMessage(

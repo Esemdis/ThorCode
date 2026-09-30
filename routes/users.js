@@ -15,7 +15,7 @@ const { rateLimiter } = require('../utils/rateLimiter');
 const prisma = require('../prisma/client');
 const signJWT = require('../auth/signJWT');
 const { sendEmailVerificationCode } = require('../utils/mail');
-const { validateEmail } = require('../utils/validation/email');
+const { validateEmail, normaliseEmail } = require('../utils/validation/email');
 const {
   emailRequestRateLimiter,
   emailVerificationRateLimiter,
@@ -75,6 +75,23 @@ function trimProfile(user) {
 
 const UNIQUE_VIOLATION = 'P2002';
 
+// Any account whose address differs from this one only by case. Addresses are
+// stored lowercased now, but the migration that folded the old ones left alone
+// any two accounts that differ only by case, rather than fail on the unique key.
+const sameAddress = (email) => ({ email: { equals: email, mode: 'insensitive' } });
+
+/**
+ * The account an address signs in to, however it was capitalised. An exact
+ * match wins; otherwise one account differing only by case, and never a guess
+ * between two.
+ *
+ * @param {string} email - already normalised
+ */
+async function findUserByEmail(email) {
+  const candidates = await prisma.user.findMany({ where: sameAddress(email), take: 2 });
+  return candidates.find((u) => u.email === email) ?? (candidates.length === 1 ? candidates[0] : null);
+}
+
 // Compared against when the email is unknown, so an unknown address costs the
 // same bcrypt round as a wrong password and the response time says nothing
 // about which it was.
@@ -94,9 +111,10 @@ router.post(
       }
       const { email, password } = req.body;
 
-      // Check if user already exists
-      const existingUser = await prisma.user.findUnique({
-        where: { email },
+      // Already registered, in any case. `email` arrives normalised.
+      const existingUser = await prisma.user.findFirst({
+        where: sameAddress(email),
+        select: { id: true },
       });
       if (existingUser) {
         return res.status(409).json({ error: 'Email already in use' });
@@ -147,9 +165,7 @@ router.post(
       }
       const { email, password } = req.body;
 
-      const existingUser = await prisma.user.findUnique({
-        where: { email },
-      });
+      const existingUser = await findUserByEmail(email);
 
       // Always one bcrypt comparison, whether or not the account exists or has
       // a password at all: an unknown email used to answer at once, which told
@@ -320,20 +336,21 @@ router.get(
 router.post('/email/request-change', auth, emailRequestRateLimiter, upload.none(), async (req, res) => {
   try {
     const userId = req.user.id;
-    const { newEmail } = req.body;
-
     // Validate email input
-    if (!newEmail || typeof newEmail !== 'string') {
+    if (!req.body.newEmail || typeof req.body.newEmail !== 'string') {
       return response.badRequest(res, 'New email is required');
     }
+    // Stored and compared as sign-in compares it. See normaliseEmail.
+    const newEmail = normaliseEmail(req.body.newEmail);
 
     if (!validateEmail(newEmail)) {
       return response.badRequest(res, 'Invalid email format');
     }
 
-    // Check if email is already in use by another user
-    const existingUser = await prisma.user.findUnique({
-      where: { email: newEmail },
+    // Check if email is already in use by another user, in any case
+    const existingUser = await prisma.user.findFirst({
+      where: sameAddress(newEmail),
+      select: { id: true },
     });
     if (existingUser) {
       return response.conflict(res, 'Email already in use');

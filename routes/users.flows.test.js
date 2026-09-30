@@ -4,7 +4,7 @@ import bcrypt from 'bcrypt';
 import { buildApp, authHeader, installFakePrisma } from '../test/routeApp.js';
 
 const prisma = installFakePrisma({
-  user: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
+  user: { findUnique: vi.fn(), findFirst: vi.fn(), findMany: vi.fn(), create: vi.fn(), update: vi.fn() },
   emailVerification: { findFirst: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(), create: vi.fn() },
   $transaction: vi.fn(async (ops) => Promise.all(ops)),
 });
@@ -36,7 +36,7 @@ describe('POST /users/login', () => {
   const body = { email: 'someone@example.test', password: 'Password1' };
 
   it('answers an unknown email the same way as a wrong password, after the same work', async () => {
-    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.findMany.mockResolvedValue([]);
     const compare = vi.spyOn(bcrypt, 'compare');
 
     const res = await request(app).post('/users/login').send(body);
@@ -48,7 +48,7 @@ describe('POST /users/login', () => {
   });
 
   it('refuses an account with no password instead of throwing inside bcrypt', async () => {
-    prisma.user.findUnique.mockResolvedValue({ id: 'u1', email: body.email, role: 'USER', password_hash: null });
+    prisma.user.findMany.mockResolvedValue([{ id: 'u1', email: body.email, role: 'USER', password_hash: null }]);
 
     const res = await request(app).post('/users/login').send(body);
 
@@ -56,14 +56,43 @@ describe('POST /users/login', () => {
   });
 
   it('signs a token for the right password', async () => {
-    prisma.user.findUnique.mockResolvedValue({
+    prisma.user.findMany.mockResolvedValue([{
       id: 'u1', email: body.email, role: 'USER', password_hash: await bcrypt.hash(body.password, 4),
-    });
+    }]);
 
     const res = await request(app).post('/users/login').send(body);
 
     expect(res.status).toBe(200);
     expect(res.body.token).toEqual(expect.any(String));
+  });
+
+  it('finds the account however the address is capitalised or padded', async () => {
+    // A phone keyboard capitalises the first letter. The address was compared
+    // exactly, so "Someone@…" could not sign in to the account "someone@…".
+    prisma.user.findMany.mockResolvedValue([{
+      id: 'u1', email: body.email, role: 'USER', password_hash: await bcrypt.hash(body.password, 4),
+    }]);
+
+    const res = await request(app).post('/users/login').send({ ...body, email: ' Someone@Example.TEST ' });
+
+    expect(res.status).toBe(200);
+    expect(prisma.user.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { email: { equals: 'someone@example.test', mode: 'insensitive' } },
+    }));
+  });
+
+  it('takes the exact address when two old accounts differ only by case', async () => {
+    // The migration that lowercased stored addresses leaves such a pair alone
+    // rather than failing on the unique key. Either one is only a guess.
+    const hash = await bcrypt.hash(body.password, 4);
+    prisma.user.findMany.mockResolvedValue([
+      { id: 'mixed', email: 'Someone@example.test', role: 'USER', password_hash: hash },
+      { id: 'lower', email: 'someone@example.test', role: 'USER', password_hash: hash },
+    ]);
+
+    const res = await request(app).post('/users/login').send(body);
+
+    expect(res.body.user.id).toBe('lower');
   });
 });
 
@@ -71,7 +100,7 @@ describe('POST /users/register', () => {
   const body = { email: 'new@example.test', password: 'Password1' };
 
   it('creates the account and its wishlist in one write', async () => {
-    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.findFirst.mockResolvedValue(null);
     prisma.user.create.mockResolvedValue({ id: 'u2', email: body.email });
 
     const res = await request(app).post('/users/register').send(body);
@@ -83,18 +112,35 @@ describe('POST /users/register', () => {
   });
 
   it('answers 409 when a second request registered the address first', async () => {
-    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.findFirst.mockResolvedValue(null);
     prisma.user.create.mockRejectedValue(Object.assign(new Error('unique'), { code: 'P2002' }));
 
     const res = await request(app).post('/users/register').send(body);
 
     expect(res.status).toBe(409);
   });
+
+  it('stores the address lowercased, and refuses one that differs only by case', async () => {
+    prisma.user.findFirst.mockResolvedValueOnce(null);
+    prisma.user.create.mockResolvedValue({ id: 'u2', email: body.email });
+
+    await request(app).post('/users/register').send({ ...body, email: ' New@Example.TEST' });
+
+    expect(prisma.user.create.mock.calls[0][0].data.email).toBe('new@example.test');
+
+    prisma.user.findFirst.mockResolvedValueOnce({ id: 'u2', email: 'new@example.test' });
+    const res = await request(app).post('/users/register').send({ ...body, email: 'NEW@example.test' });
+
+    expect(res.status).toBe(409);
+    expect(prisma.user.findFirst).toHaveBeenLastCalledWith(expect.objectContaining({
+      where: { email: { equals: 'new@example.test', mode: 'insensitive' } },
+    }));
+  });
 });
 
 describe('the email change codes', () => {
   it('draws again when six digits collide with another account\'s pending code', async () => {
-    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.findFirst.mockResolvedValue(null);
     prisma.emailVerification.findFirst.mockResolvedValue(null);
     prisma.emailVerification.create
       .mockRejectedValueOnce(Object.assign(new Error('unique'), { code: 'P2002' }))
@@ -115,17 +161,20 @@ describe('the email change codes', () => {
     // The pending check found the caller's own request and refused it, so
     // "Back" and asking again for the same address was a 409 — and so was
     // every address anyone had asked for and abandoned, until the hourly sweep.
-    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.findFirst.mockResolvedValue(null);
     prisma.emailVerification.findFirst.mockResolvedValue(null);
     prisma.emailVerification.create.mockImplementation(async ({ data }) => ({ id: 1, ...data }));
 
     await request(app)
       .post('/users/email/request-change')
       .set(...authHeader({ id: 'user-1' }))
-      .send({ newEmail: 'new@example.test' });
+      .send({ newEmail: ' New@Example.test' });
 
+    // Stored as it will be compared: lowercased.
+    expect(prisma.emailVerification.create.mock.calls[0][0].data.new_email).toBe('new@example.test');
     const { where } = prisma.emailVerification.findFirst.mock.calls[0][0];
     expect(where.user_id).toEqual({ not: 'user-1' });
+    expect(where.new_email).toBe('new@example.test');
     expect(where.expires_at.gt).toBeInstanceOf(Date);
     expect(Math.abs(where.expires_at.gt - Date.now())).toBeLessThan(5_000);
   });
