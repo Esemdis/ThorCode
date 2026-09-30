@@ -250,6 +250,73 @@ describe('POST /bulk', () => {
     expect(prisma.statements).toContain('ROLLBACK TO SAVEPOINT bulk_concert');
   });
 
+  describe('a show it already has, by event id', () => {
+    // A postponed or moved show keeps its event id, and kept its old date and
+    // venue here: only prices, sale state and sold-out were ever updated, and
+    // reconcile matches it by event id and looks no further.
+    const stored = (over = {}) => ({
+      id: 55, event_id: 'bit_1', name: 'Gojira', venue: 'Annexet', city: 'Stockholm', country: 'SE',
+      concert_date: new Date('2030-05-01T19:00:00Z'), latitude: '59.2936', longitude: '18.0836',
+      sold_out: false, _count: { bands: 1 }, ...over,
+    });
+    const again = (over = {}) => ({ ...concert('Annexet'), event_id: 'bit_1', ...over });
+    const ingest = async (incoming) => request(app).post('/bulk').set(...authHeader(system)).send({ concerts: [incoming] });
+    const written = () => prisma.concert.update.mock.calls.map(([{ data }]) => data);
+
+    beforeEach(() => {
+      prisma.concertBandReference.findMany.mockResolvedValue([{ band: 1 }]);
+      prisma.concert.update.mockResolvedValue({});
+    });
+
+    it('moves a show still to come to its new date', async () => {
+      prisma.concert.findUnique.mockResolvedValue(stored());
+
+      const res = await ingest(again({ concert_date: '2030-09-12T19:00:00Z' }));
+
+      expect(res.body.updated).toBe(1);
+      expect(written()[0].concert_date).toEqual(new Date('2030-09-12T19:00:00Z'));
+    });
+
+    it('takes a start time for the same day, and keeps one it has over a bare date', async () => {
+      prisma.concert.findUnique.mockResolvedValue(stored({ concert_date: new Date('2030-05-01T00:00:00Z') }));
+      await ingest(again({ concert_date: '2030-05-01T19:30:00Z' }));
+      expect(written()[0].concert_date).toEqual(new Date('2030-05-01T19:30:00Z'));
+
+      prisma.concert.update.mockClear();
+      prisma.concert.findUnique.mockResolvedValue(stored());
+      await ingest(again({ concert_date: '2030-05-01T00:00:00Z' }));
+      expect(written().every((data) => !('concert_date' in data))).toBe(true);
+    });
+
+    it('never moves a night already been to, nor a show into the past', async () => {
+      prisma.concert.findUnique.mockResolvedValue(stored({ concert_date: new Date('2020-05-01T19:00:00Z') }));
+      await ingest(again({ concert_date: '2030-09-12T19:00:00Z', venue: 'Avicii Arena', latitude: '59.2936', longitude: '18.0836' }));
+      expect(written().every((data) => !('concert_date' in data) && !('venue' in data))).toBe(true);
+
+      prisma.concert.findUnique.mockResolvedValue(stored());
+      await ingest(again({ concert_date: '2021-09-12T19:00:00Z' }));
+      expect(written().every((data) => !('concert_date' in data))).toBe(true);
+    });
+
+    it('moves a show to a new venue across town, with its position', async () => {
+      prisma.concert.findUnique.mockResolvedValue(stored());
+
+      await ingest(again({ venue: 'Cirkus', latitude: '59.3247', longitude: '18.0991' }));
+
+      expect(written()[0]).toMatchObject({ venue: 'Cirkus', latitude: '59.3247', longitude: '18.0991' });
+    });
+
+    it('keeps its venue for another name at the same place, or one with no position', async () => {
+      // Bandsintown files a festival's acts under the grounds and under each
+      // stage. The same spot under another name is not a move.
+      prisma.concert.findUnique.mockResolvedValue(stored());
+      await ingest(again({ venue: 'Annexet Main Stage', latitude: '59.2937', longitude: '18.0837' }));
+      await ingest(again({ venue: 'Somewhere Else' }));
+
+      expect(written().every((data) => !('venue' in data))).toBe(true);
+    });
+  });
+
   it('links a band listed twice once, rather than tripping the unique key', async () => {
     const res = await request(app)
       .post('/bulk')

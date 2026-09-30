@@ -9,11 +9,59 @@
 const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
-const { checkDuplicateConcert, deduplicateByCoords } = require('../../../utils/concertDedup');
+const { checkDuplicateConcert, deduplicateByCoords, haversineKm } = require('../../../utils/concertDedup');
 const { cleanLineupJson, canonicalBandName } = require('../../../utils/lineupNames');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Two positions further apart than this are two places, not one venue under
+// two names. Bandsintown files a festival's acts under the grounds and under
+// each stage, all at one spot.
+const VENUE_MOVE_KM = 1;
+
+/**
+ * What changed about a show the scrapers already sent, when it has moved.
+ *
+ * A postponed or moved show keeps its event id, and used to keep its old date
+ * and venue here for good: only prices, sale state and sold-out were updated,
+ * and reconcile matches it by event id and looks no further.
+ *
+ * Only a show still to come moves, and only to a date still to come: a night
+ * already been to has photographs filed under its date and venue. A time
+ * of day is taken for the same date, but a bare date never replaces one. A
+ * venue changes only with a position more than VENUE_MOVE_KM from the stored
+ * one, so a stage name at the same grounds is not a move, and a new name with
+ * no position cannot be told from one.
+ *
+ * @returns {object} fields for concert.update, empty when nothing moved
+ */
+function movedFields(existing, incoming, now = new Date()) {
+  const moved = {};
+  const was = existing.concert_date ? new Date(existing.concert_date) : null;
+  if (!was || was <= now) return moved;
+
+  const next = incoming.concert_date ? new Date(incoming.concert_date) : null;
+  if (next && !Number.isNaN(next.getTime())) {
+    const day = (d) => Math.floor(d.getTime() / DAY_MS);
+    const untimed = (d) => d.getTime() % DAY_MS === 0;
+    const startOfToday = day(now) * DAY_MS;
+    if (next.getTime() >= startOfToday
+      && (day(next) !== day(was) || (untimed(was) && !untimed(next)))) {
+      moved.concert_date = next;
+    }
+  }
+
+  const venue = typeof incoming.venue === 'string' ? incoming.venue.trim() : '';
+  const [lat, lng] = [parseFloat(incoming.latitude), parseFloat(incoming.longitude)];
+  const [oldLat, oldLng] = [parseFloat(existing.latitude), parseFloat(existing.longitude)];
+  if (venue && venue !== existing.venue && Number.isFinite(lat) && Number.isFinite(lng)
+    && (!Number.isFinite(oldLat) || !Number.isFinite(oldLng) || haversineKm(oldLat, oldLng, lat, lng) > VENUE_MOVE_KM)) {
+    Object.assign(moved, { venue, latitude: String(incoming.latitude), longitude: String(incoming.longitude) });
+  }
+  return moved;
+}
 
 // Bulk insert concerts with deduplication
 router.post(
@@ -124,6 +172,8 @@ router.post(
               if (concert.price_max != null) concertFieldUpdate.price_max = concert.price_max;
               if (concert.price_currency != null) concertFieldUpdate.price_currency = concert.price_currency;
               if (concert.sold_out !== undefined) concertFieldUpdate.sold_out = concert.sold_out ?? false;
+              const moved = movedFields(existingByEventId, concert);
+              Object.assign(concertFieldUpdate, moved);
 
               const becameSoldOut = concert.sold_out === true && !existingByEventId.sold_out;
 
@@ -146,6 +196,7 @@ router.post(
                     bandsAdded: toLink.length,
                     name: betterName || existingByEventId.name,
                     bandCount: existingByEventId._count.bands + toLink.length,
+                    ...(Object.keys(moved).length && { moved: Object.keys(moved) }),
                   },
                   soldOut: becameSoldOut ? {
                     concertId: existingByEventId.id,
