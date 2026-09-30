@@ -53,6 +53,20 @@ describe('runNotificationDigest', () => {
     expect(result).toMatchObject({ sent: 1, failed: 1 });
     expect(prisma.notificationDigestRun.update).toHaveBeenCalledTimes(1);
   });
+
+  it('mails only shows still to come, not a past one imported today', async () => {
+    // A show added from setlist.fm history is created today with a date years
+    // back. Read by created_at alone, it went out as a new concert.
+    vi.spyOn(mail, 'sendDigestEmail').mockResolvedValue({ data: { id: 'a' } });
+
+    await runNotificationDigest();
+
+    const { where } = prisma.concert.findMany.mock.calls[0][0];
+    const from = where.OR.find((clause) => clause.concert_date?.gte).concert_date.gte;
+    expect(from.toISOString()).toBe(`${new Date().toISOString().slice(0, 10)}T00:00:00.000Z`);
+    // "Date TBA" is how the email already prints one without a date.
+    expect(where.OR).toContainEqual({ concert_date: null });
+  });
 });
 
 describe('buildDigestHtml', () => {

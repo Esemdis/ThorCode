@@ -1123,6 +1123,22 @@ describe('GET /wishlists/:id/new', () => {
     expect(res.status).toBe(500);
     expect(prisma.wishlist.update).not.toHaveBeenCalled();
   });
+
+  it('asks only for shows still to come, or not yet dated', async () => {
+    // A show imported from setlist.fm history is a row created today with a
+    // date years back. Filtered on created_at alone, it came back as news.
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', last_active_at: null, bands: [{ band_id: 1 }] });
+    prisma.concertBandReference.findMany.mockResolvedValue([]);
+    prisma.wishlist.update.mockResolvedValue({});
+
+    const res = await request(app).get('/wishlists/7/new').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    const { concert_rel: filter } = prisma.concertBandReference.findMany.mock.calls[0][0].where;
+    const from = filter.OR.find((clause) => clause.concert_date?.gte).concert_date.gte;
+    expect(from.toISOString()).toBe(`${new Date().toISOString().slice(0, 10)}T00:00:00.000Z`);
+    expect(filter.OR).toContainEqual({ concert_date: null });
+  });
 });
 
 describe('GET /wishlists/:id/recent-concerts', () => {

@@ -224,10 +224,20 @@ router.get(
 
       const bandIds = wishlist.bands.map((b) => b.band_id);
 
+      // Still to come, compared by calendar day as the calendar feed does, or
+      // not dated yet. created_at alone is not "announced": a show imported
+      // from setlist.fm history is a row created today with a date years back,
+      // and it came back here as news to everyone following the band.
+      const startOfToday = new Date();
+      startOfToday.setUTCHours(0, 0, 0, 0);
+
       const refs = await prisma.concertBandReference.findMany({
         where: {
           band: { in: bandIds },
-          concert_rel: { created_at: { gt: sinceDate } },
+          concert_rel: {
+            created_at: { gt: sinceDate },
+            OR: [{ concert_date: null }, { concert_date: { gte: startOfToday } }],
+          },
         },
         include: {
           band_rel: { select: { name: true } },

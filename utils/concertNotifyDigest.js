@@ -16,8 +16,19 @@ async function runNotificationDigest() {
   if (!run) run = await prisma.notificationDigestRun.create({ data: { last_run_at: new Date(0) } });
   const since = run.last_run_at;
 
+  // Created in the window is not the same as announced in it: a show imported
+  // from setlist.fm history is created today with a date years back, and it
+  // went out as a new concert. Still to come by calendar day, or not dated yet
+  // — the email prints that one as "Date TBA".
+  const startOfToday = new Date(now);
+  startOfToday.setUTCHours(0, 0, 0, 0);
+
   const concerts = await prisma.concert.findMany({
-    where: { created_at: { gt: since, lte: now }, city_id: { not: null } },
+    where: {
+      created_at: { gt: since, lte: now },
+      city_id: { not: null },
+      OR: [{ concert_date: null }, { concert_date: { gte: startOfToday } }],
+    },
     select: {
       id: true,
       name: true,
