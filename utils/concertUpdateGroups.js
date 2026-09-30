@@ -6,15 +6,22 @@
  * news vanished. Collapsing each band's concerts into one group keeps a tour to
  * a single entry, so the panel stays a list of *bands with news* rather than a
  * list of dates.
+ *
+ * A group is keyed by the whole set of wishlist bands on a bill, not by one
+ * band. A festival with three of yours on it used to become three groups, each
+ * repeating the same show; now it is one group headed by all three. A
+ * co-headline tour stacks the same way, and a band's own shows stay under it
+ * alone.
  */
 
 const DEFAULT_MAX_GROUPS = 30;
 const DEFAULT_MAX_CONCERTS_PER_GROUP = 50;
 
 /**
- * Collapse concerts into one group per wishlist band.
+ * Collapse concerts into one group per set of wishlist bands on the bill.
  *
- * @param {Array} concerts concerts carrying `participating_bands`, newest-inserted first
+ * @param {Array} concerts concerts carrying `participating_bands` (only the
+ *   wishlist's own), newest-inserted first
  * @param {{maxGroups?: number, maxConcertsPerGroup?: number}} [options]
  * @returns {Array} groups, most recently announced first
  */
@@ -24,23 +31,21 @@ function groupConcertsByBand(concerts, options = {}) {
     maxConcertsPerGroup = DEFAULT_MAX_CONCERTS_PER_GROUP,
   } = options;
 
-  const byBand = new Map();
+  const byBill = new Map();
 
   for (const concert of concerts ?? []) {
-    // A concert with several wishlist bands on it — a festival, usually — is
-    // added to each of their groups. It is real news for every one of them, and
-    // choosing a single owner would drop it from the others' updates entirely.
-    for (const band of concert.participating_bands ?? []) {
-      let group = byBand.get(band.id);
-      if (!group) {
-        group = { band, concerts: [] };
-        byBand.set(band.id, group);
-      }
-      group.concerts.push(concert);
+    const bands = [...new Map((concert.participating_bands ?? []).map((b) => [b.id, b])).values()];
+    if (bands.length === 0) continue;
+    const key = billKey(bands);
+    let group = byBill.get(key);
+    if (!group) {
+      group = { key, bands, concerts: [] };
+      byBill.set(key, group);
     }
+    group.concerts.push(concert);
   }
 
-  return [...byBand.values()]
+  return [...byBill.values()]
     // Order by the newest announcement, never by group size: a band with one
     // brand-new show should outrank a tour that was inserted last week.
     .map((group) => summarize(group, maxConcertsPerGroup))
@@ -54,7 +59,11 @@ function summarize(group, maxConcertsPerGroup) {
   );
 
   return {
-    band: group.band,
+    key: group.key,
+    bands: group.bands,
+    // The first of them alone, for a client that predates `bands`: it heads
+    // the row with this one and still shows the rest as pills on the show.
+    band: group.bands[0],
     // The true total, even when the list below is capped, so the row can say
     // "24 shows" while sending far fewer.
     count: byDate.length,
@@ -67,6 +76,12 @@ function summarize(group, maxConcertsPerGroup) {
     ),
     concerts: byDate.slice(0, maxConcertsPerGroup),
   };
+}
+
+// The same bands in any order are the same bill. Ids are compared as strings
+// because they have arrived as both.
+function billKey(bands) {
+  return bands.map((b) => String(b.id)).sort().join('+');
 }
 
 // Most-visited country first, so a tour reads as "SE · NO · DK" with its centre

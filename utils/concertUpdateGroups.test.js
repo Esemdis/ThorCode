@@ -86,17 +86,56 @@ describe('groupConcertsByBand', () => {
     expect(groupConcertsByBand(rows)[0].band.name).toBe('Opeth');
   });
 
-  it('lists a shared festival under every wishlist band playing it', () => {
+  it('stacks a festival with several wishlist bands into one group headed by all of them', () => {
+    // It used to be one group per band, the same show repeated under each —
+    // ten of yours on a bill was ten rows saying the same thing.
     const ghost = band(1, 'Ghost');
     const opeth = band(2, 'Opeth');
-    const rows = [concert(10, '2026-01-03', '2026-06-18', [ghost, opeth], { festival: true })];
+    const alcest = band(3, 'Alcest');
+    const rows = [concert(10, '2026-01-03', '2026-06-18', [ghost, opeth, alcest], { festival: true })];
 
     const groups = groupConcertsByBand(rows);
 
-    // Duplicating the festival is deliberate: it is genuinely news for both bands,
-    // and picking one owner would silently drop it from the other's updates.
-    expect(groups).toHaveLength(2);
-    expect(groups.every((g) => g.count === 1)).toBe(true);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].bands).toEqual([ghost, opeth, alcest]);
+    expect(groups[0].count).toBe(1);
+  });
+
+  it("keeps a band's own shows apart from the festival it shares with others", () => {
+    const ghost = band(1, 'Ghost');
+    const opeth = band(2, 'Opeth');
+    const rows = [
+      concert(10, '2026-01-03', '2026-03-12', [ghost]),
+      concert(11, '2026-01-03', '2026-03-14', [ghost]),
+      concert(12, '2026-01-03', '2026-06-18', [ghost, opeth], { festival: true }),
+    ];
+
+    const groups = groupConcertsByBand(rows);
+
+    expect(groups.map((g) => g.bands.map((b) => b.name))).toEqual([['Ghost'], ['Ghost', 'Opeth']]);
+    expect(groups.map((g) => g.count)).toEqual([2, 1]);
+  });
+
+  it('stacks a co-headline tour into one group whatever order each date lists the bands in', () => {
+    const ghost = band(1, 'Ghost');
+    const opeth = band(2, 'Opeth');
+    const rows = [
+      concert(10, '2026-01-03', '2026-03-12', [ghost, opeth]),
+      concert(11, '2026-01-03', '2026-03-14', [opeth, ghost]),
+    ];
+
+    const groups = groupConcertsByBand(rows);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0].count).toBe(2);
+  });
+
+  it('still names one band for a client that only reads `band`', () => {
+    const ghost = band(1, 'Ghost');
+    const opeth = band(2, 'Opeth');
+    const [group] = groupConcertsByBand([concert(10, '2026-01-03', '2026-06-18', [ghost, opeth])]);
+
+    expect(group.band).toEqual(ghost);
   });
 
   it('keeps each group internally sorted by concert date', () => {
@@ -116,8 +155,8 @@ describe('groupConcertsByBand', () => {
 
     const [group] = groupConcertsByBand(rows);
 
-    // The group already names its band; the rest of the lineup still matters for
-    // festivals, so it is kept — only the redundant grouping key would be noise.
+    // Left whole even though the group's header names these bands: a client
+    // that reads only `band` shows the rest of the lineup from here.
     expect(group.concerts[0].participating_bands).toEqual([ghost, opeth]);
   });
 
