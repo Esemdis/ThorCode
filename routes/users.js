@@ -339,9 +339,12 @@ router.post('/email/request-change', auth, emailRequestRateLimiter, upload.none(
       return response.conflict(res, 'Email already in use');
     }
 
-    // Check if email is already pending verification by any user
+    // Pending for someone else, and not yet expired. The caller's own request
+    // is replaced below, which is how asking again for the same address works;
+    // counted here, it refused exactly that. An expired one is nobody's claim
+    // any more, though the hourly sweep may not have removed it yet.
     const existingPending = await prisma.emailVerification.findFirst({
-      where: { new_email: newEmail },
+      where: { new_email: newEmail, user_id: { not: userId }, expires_at: { gt: new Date() } },
     });
     if (existingPending) {
       return response.conflict(res, 'Email is already pending verification');

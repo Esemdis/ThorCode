@@ -111,6 +111,25 @@ describe('the email change codes', () => {
     for (const code of codes) expect(code).toMatch(/^\d{6}$/);
   });
 
+  it('lets you ask again for the address you asked for, and ignores expired asks', async () => {
+    // The pending check found the caller's own request and refused it, so
+    // "Back" and asking again for the same address was a 409 — and so was
+    // every address anyone had asked for and abandoned, until the hourly sweep.
+    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.emailVerification.findFirst.mockResolvedValue(null);
+    prisma.emailVerification.create.mockImplementation(async ({ data }) => ({ id: 1, ...data }));
+
+    await request(app)
+      .post('/users/email/request-change')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ newEmail: 'new@example.test' });
+
+    const { where } = prisma.emailVerification.findFirst.mock.calls[0][0];
+    expect(where.user_id).toEqual({ not: 'user-1' });
+    expect(where.expires_at.gt).toBeInstanceOf(Date);
+    expect(Math.abs(where.expires_at.gt - Date.now())).toBeLessThan(5_000);
+  });
+
   it('looks a code up within the caller\'s own pending change only', async () => {
     prisma.emailVerification.findFirst.mockResolvedValue(null);
 
