@@ -17,6 +17,7 @@ const { setCache, getCache } = require('../../../utils/cache');
 // Called through the module rather than destructured, so a test can stand in
 // for setlist.fm on the router's own copy of it.
 const setlistFm = require('../../../utils/setlistFm');
+const { setlistFmLimit } = require('../../../utils/setlistFmLimit');
 
 // POST /:concertId/enrich-lineup — match scraped artist names to known bands, link missing ones
 router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), async (req, res) => {
@@ -99,7 +100,7 @@ router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), a
   }
 });
 
-router.get('/bands/:bandId/setlist-history', auth, async (req, res) => {
+router.get('/bands/:bandId/setlist-history', auth, setlistFmLimit, async (req, res) => {
   try {
     const bandId = parseInt(req.params.bandId, 10);
     if (Number.isNaN(bandId)) return res.status(400).json({ error: 'Invalid band id' });
@@ -140,7 +141,7 @@ router.get('/bands/:bandId/setlist-history', auth, async (req, res) => {
 
 // GET /data/concerts/setlist-lookup?id=:setlistfm_id
 // Fetch a specific setlist by Setlist.fm ID and return preview data + DB band match
-router.get('/setlist-lookup', auth, async (req, res) => {
+router.get('/setlist-lookup', auth, setlistFmLimit, async (req, res) => {
   try {
     const { id } = req.query;
     if (!id) return res.status(400).json({ error: 'Missing id parameter' });

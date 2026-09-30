@@ -61,7 +61,8 @@ const EXPECTED_ROUTES = [
   'POST /wishlists/:id/attendance [5]',
   'DELETE /wishlists/:id/attendance/:concertId [5]',
   'PUT /wishlists/:id/attendance/missed [8]',
-  'POST /wishlists/:id/attendance/from-setlist [6]',
+  // One more than it was: the setlist.fm budget it shares with the band routes.
+  'POST /wishlists/:id/attendance/from-setlist [7]',
 ];
 
 describe('the routing surface', () => {

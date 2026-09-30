@@ -20,6 +20,7 @@ const { ownWishlist } = require("./shared");
 // Called through the module rather than destructured, so a test can stand in
 // for setlist.fm on the router's own copy of it.
 const setlistFm = require("../../../utils/setlistFm");
+const { setlistFmLimit } = require("../../../utils/setlistFmLimit");
 
 // A show logged "today" can be dated tomorrow in UTC, and setlist.fm takes the
 // venue's own date; a day of slack separates that from a show still to come.
@@ -328,6 +329,9 @@ router.post(
   [
     auth,
     roleCheck(["ADMIN", "USER"]),
+    // It reads the show from setlist.fm, then searches it for the rest of the
+    // bill: the same shared key as the band routes, so the same budget.
+    setlistFmLimit,
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
     body("setlistfm_id").custom(setlistFm.isSetlistId).withMessage("setlistfm_id must be a setlist.fm id"),
     body("band_id").isInt().withMessage("band_id must be an integer"),

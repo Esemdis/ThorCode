@@ -374,9 +374,31 @@ const EXPECTED_ROUTES = [
   'PATCH /bands/setlists/bulk [3]',
   'DELETE /concerts/:concertId [3]',
   'POST /:concertId/enrich-lineup [3]',
-  'GET /bands/:bandId/setlist-history [2]',
-  'GET /setlist-lookup [2]',
+  // auth + setlistFmLimit + handler: both spend the server's setlist.fm key.
+  'GET /bands/:bandId/setlist-history [3]',
+  'GET /setlist-lookup [3]',
 ];
+
+describe('the setlist.fm routes', () => {
+  // They spend the server's own setlist.fm key, which every account shares
+  // and which setlist.fm caps per day. With no limit, one account — or one
+  // runaway loop — could spend it for everyone.
+  it('stop one account at its budget without stopping anyone else', async () => {
+    const require = createRequire(import.meta.url);
+    const setlistFm = require('../../utils/setlistFm.js');
+    vi.spyOn(setlistFm, 'fetchSetlistById').mockResolvedValue({ id: '63de4613', artist: {} });
+    prisma.band.findFirst.mockResolvedValue(null);
+    const lookup = (user) => request(app).get('/setlist-lookup').query({ id: '63de4613' }).set(...authHeader({ id: user }));
+
+    for (let i = 0; i < 100; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      expect((await lookup('greedy')).status).toBe(200);
+    }
+
+    expect((await lookup('greedy')).status).toBe(429);
+    expect((await lookup('someone-else')).status).toBe(200);
+  });
+});
 
 describe('the routing surface', () => {
   it('registers exactly the routes it did before, in the same order', () => {
