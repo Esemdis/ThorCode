@@ -20,6 +20,7 @@ const prisma = installFakePrisma({
   concertBandReference: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn() },
   concertAttendance: { findMany: vi.fn(), deleteMany: vi.fn() },
   concertMedia: { findMany: vi.fn(), deleteMany: vi.fn() },
+  activityLog: { create: vi.fn(async () => ({})), findMany: vi.fn(async () => []), deleteMany: vi.fn() },
   // /bands answers with raw SQL rather than the query builder.
   $queryRaw: vi.fn(async () => []),
   // /bulk's per-concert savepoints. Recorded as the statement text, so a test
@@ -304,6 +305,26 @@ describe('POST /bulk', () => {
       await ingest(again({ venue: 'Cirkus', latitude: '59.3247', longitude: '18.0991' }));
 
       expect(written()[0]).toMatchObject({ venue: 'Cirkus', latitude: '59.3247', longitude: '18.0991' });
+    });
+
+    it('keeps a wishlist\'s feed to its fifteen entries when a show sells out', async () => {
+      // Sold-out entries were written straight to the table, past logActivity,
+      // so they were the one kind that never let the oldest fall off the end.
+      prisma.concert.findUnique.mockResolvedValue(stored());
+      prisma.concertBandReference.findMany
+        .mockResolvedValueOnce([{ band: 1 }])
+        .mockResolvedValueOnce([{ band_rel: { name: 'Gojira', wishlists: [{ wishlist_id: 7 }] } }]);
+      prisma.activityLog.findMany.mockResolvedValue([{ id: 1 }]);
+
+      await ingest(again({ sold_out: true }));
+
+      expect(prisma.activityLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ wishlist_id: 7, type: 'SOLD_OUT' }),
+      });
+      expect(prisma.activityLog.findMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: { wishlist_id: 7 }, skip: 15,
+      }));
+      expect(prisma.activityLog.deleteMany).toHaveBeenCalledWith({ where: { id: { in: [1] } } });
     });
 
     it('keeps its venue for another name at the same place, or one with no position', async () => {

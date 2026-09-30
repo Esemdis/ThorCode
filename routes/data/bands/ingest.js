@@ -14,6 +14,7 @@ const { cleanLineupJson, canonicalBandName } = require('../../../utils/lineupNam
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
+const { logActivity } = require('../../../utils/activityLog');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Two positions further apart than this are two places, not one venue under
@@ -407,19 +408,15 @@ router.post(
               }
             }
 
+            // Through logActivity, so each feed keeps to its length like
+            // every other entry does.
             await Promise.all([...wishlistMap.entries()].map(([wishlistId, bandNames]) =>
-              prisma.activityLog.create({
-                data: {
-                  wishlist_id: wishlistId,
-                  type: 'SOLD_OUT',
-                  data: JSON.stringify({
-                    concert_name: soldOut.name,
-                    city: soldOut.city,
-                    country: soldOut.country,
-                    concert_date: soldOut.concert_date,
-                    band_names: [...bandNames],
-                  }),
-                },
+              logActivity(wishlistId, 'SOLD_OUT', {
+                concert_name: soldOut.name,
+                city: soldOut.city,
+                country: soldOut.country,
+                concert_date: soldOut.concert_date,
+                band_names: [...bandNames],
               })
             ));
           } catch (e) {
