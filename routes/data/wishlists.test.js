@@ -189,8 +189,8 @@ describe('PATCH /wishlists/:id/bands/:bandId', () => {
 
 describe('GET /wishlists/bands', () => {
   const REFS = [
-    { tier: 'LOVE', band_rel: { id: 1, name: 'Opeth' } },
-    { tier: 'FOLLOW', band_rel: { id: 2, name: 'Tool' } },
+    { tier: 'LOVE', band_rel: { id: 1, name: 'Opeth', MBID: 'c14b4180-dc87-481e-b17a-64e4150f90f6' } },
+    { tier: 'FOLLOW', band_rel: { id: 2, name: 'Tool', MBID: null } },
   ];
 
   it('turns away an unauthenticated caller', async () => {
@@ -198,15 +198,17 @@ describe('GET /wishlists/bands', () => {
     expect(res.status).toBe(401);
   });
 
-  it('answers with the caller’s own bands, flattened to id, name and tier', async () => {
+  it('answers with the caller’s own bands, flattened to id, name, tier and MBID', async () => {
+    // The MBID is for the band page's Similar tab, which tells an artist you
+    // follow by it. Without it here, that page loaded the whole wishlist.
     prisma.wishlistBandReference.findMany.mockResolvedValue(REFS);
 
     const res = await request(app).get('/wishlists/bands').set(...authHeader({ id: 'user-1' }));
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual([
-      { id: 1, name: 'Opeth', tier: 'LOVE' },
-      { id: 2, name: 'Tool', tier: 'FOLLOW' },
+      { id: 1, name: 'Opeth', tier: 'LOVE', mbid: 'c14b4180-dc87-481e-b17a-64e4150f90f6' },
+      { id: 2, name: 'Tool', tier: 'FOLLOW', mbid: null },
     ]);
   });
 

@@ -175,7 +175,7 @@ router.get(
   }
 );
 
-// GET /wishlists/bands — just the caller's own bands: id, name, tier.
+// GET /wishlists/bands — just the caller's own bands: id, name, tier, MBID.
 //
 // Must stay ahead of GET /wishlists/:id, which validates its id as an integer
 // and would answer 400 for every call to this. /wishlists/raw above sits here
@@ -193,10 +193,14 @@ router.get(
     try {
       const refs = await prisma.wishlistBandReference.findMany({
         where: { wishlist_rel: { user_id: req.user.id } },
-        select: { tier: true, band_rel: { select: { id: true, name: true } } },
+        select: { tier: true, band_rel: { select: { id: true, name: true, MBID: true } } },
         orderBy: { band_rel: { name: "asc" } },
       });
-      res.json(refs.map((ref) => ({ id: ref.band_rel.id, name: ref.band_rel.name, tier: ref.tier })));
+      // The MBID is how the band page's Similar tab knows an artist you follow
+      // when Last.fm spells the name differently.
+      res.json(refs.map((ref) => ({
+        id: ref.band_rel.id, name: ref.band_rel.name, tier: ref.tier, mbid: ref.band_rel.MBID ?? null,
+      })));
     } catch (error) {
       console.error("Error fetching wishlist bands:", error);
       return res.status(500).json({ error: "Internal server error" });
