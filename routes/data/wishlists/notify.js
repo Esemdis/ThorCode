@@ -123,6 +123,20 @@ router.post(
 
       const subscriptionNotified = await notifySubscribers(bands, allWishlists, reportedByWishlist);
 
+      // Delivered, so no longer owed. Cleared before the activity logs below:
+      // a failure there must not leave the shows flagged, or the next sync
+      // would post them to Discord a second time. Discord refusing a single
+      // webhook is logged above and not retried, same as before the flag.
+      const deliveredIds = [...new Set(
+        bands.flatMap((b) => b.concerts ?? []).map((c) => c.concert_id).filter((id) => Number.isInteger(id)),
+      )];
+      if (deliveredIds.length > 0) {
+        await prisma.concert.updateMany({
+          where: { id: { in: deliveredIds }, notify_pending: true },
+          data: { notify_pending: false },
+        });
+      }
+
       // Activity logs — all wishlists that have the band, only when concerts were inserted
       for (const wishlist of allWishlists) {
         const matchedBands = bands.filter(

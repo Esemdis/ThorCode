@@ -80,6 +80,10 @@ router.post(
       }
       
       const { concerts } = req.body;
+      // Only the scheduled sync announces what it inserts. A manual full sync
+      // or a single band's sync stays quiet, and must not leave its shows
+      // flagged for the next scheduled one to announce instead.
+      const notify = req.body.notify === true;
 
       const deduplicatedConcerts = deduplicateByCoords(concerts);
 
@@ -198,6 +202,8 @@ router.post(
                     name: betterName || existingByEventId.name,
                     bandCount: existingByEventId._count.bands + toLink.length,
                     ...(Object.keys(moved).length && { moved: Object.keys(moved) }),
+                    // Still owed its notification: the scraper sends it again.
+                    ...(existingByEventId.notify_pending && { notifyPending: true }),
                   },
                   soldOut: becameSoldOut ? {
                     concertId: existingByEventId.id,
@@ -216,6 +222,7 @@ router.post(
                   event_id: concert.event_id,
                   name: existingByEventId.name,
                   bandCount: existingByEventId._count.bands,
+                  ...(existingByEventId.notify_pending && { notifyPending: true }),
                 },
               };
             }
@@ -248,6 +255,7 @@ router.post(
                 event_id: existingConcert.event_id || '',
                 name: existingConcert.name,
                 bandCount: existingConcert.bands.length,
+                ...(existingConcert.notify_pending && { notifyPending: true }),
               },
             };
           }
@@ -295,6 +303,7 @@ router.post(
               price_currency: concert.price_currency ?? null,
               sold_out: concert.sold_out ?? false,
               reachable: concert.reachable ?? null,
+              notify_pending: notify,
               city_id: cityId,
               created_at: new Date(),
             },

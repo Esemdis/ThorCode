@@ -534,6 +534,29 @@ describe('POST /wishlists/notify subscription delivery', () => {
     expect(mine[0].body.content).toBe('<@4242>');
   });
 
+  it('clears the flag on the shows it posted, so the next sync does not send them again', async () => {
+    await post(payload(9, 'Someone Elses Band'));
+
+    expect(prisma.concert.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: [100] }, notify_pending: true },
+      data: { notify_pending: false },
+    });
+  });
+
+  it('clears it before the activity feed, so a failure there cannot post twice', async () => {
+    // The 500 below leaves the scraper to try again next sync. With the flag
+    // still set, that try would post the same show to Discord a second time.
+    prisma.activityLog.create.mockRejectedValue(new Error('connection reset'));
+
+    const res = await post(payload(9, 'Someone Elses Band'));
+
+    expect(res.status).toBe(500);
+    expect(received.filter((r) => r.path === '/theirs')).toHaveLength(1);
+    expect(prisma.concert.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: { notify_pending: false },
+    }));
+  });
+
   it('skips the concert read entirely when no concert ids came through', async () => {
     // Older scraper builds post without them. The wishlist digest still has to
     // work, and matching subscriptions is impossible without a resolved city.

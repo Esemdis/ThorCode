@@ -327,6 +327,21 @@ describe('POST /bulk', () => {
       expect(prisma.activityLog.deleteMany).toHaveBeenCalledWith({ where: { id: { in: [1] } } });
     });
 
+    it('hands back a show still owed its notification, so the scraper can send it again', async () => {
+      // The scraper used to announce only what it had just inserted, so a
+      // notification that failed to go out was never tried again.
+      const sameNight = { concert_date: '2030-05-01T19:00:00Z' };
+      prisma.concert.findUnique.mockResolvedValue(stored({ notify_pending: true }));
+      const unchanged = await ingest(again(sameNight));
+      const repriced = await ingest(again({ ...sameNight, price_min: 450 }));
+      prisma.concert.findUnique.mockResolvedValue(stored());
+      const settled = await ingest(again(sameNight));
+
+      expect(unchanged.body.details.duplicateConcerts[0].notifyPending).toBe(true);
+      expect(repriced.body.details.updatedConcerts[0].notifyPending).toBe(true);
+      expect(settled.body.details.duplicateConcerts[0]).not.toHaveProperty('notifyPending');
+    });
+
     it('keeps its venue for another name at the same place, or one with no position', async () => {
       // Bandsintown files a festival's acts under the grounds and under each
       // stage. The same spot under another name is not a move.
@@ -336,6 +351,16 @@ describe('POST /bulk', () => {
 
       expect(written().every((data) => !('venue' in data))).toBe(true);
     });
+  });
+
+  it('flags what it inserts as owed a notification only when the sync will send one', async () => {
+    // A manual sync or a single band's stays quiet. Flagged anyway, its shows
+    // would be announced by the next scheduled sync instead.
+    await request(app).post('/bulk').set(...authHeader(system)).send({ concerts: [concert('Fållan')], notify: true });
+    await request(app).post('/bulk').set(...authHeader(system)).send({ concerts: [concert('Nalen')] });
+    await request(app).post('/bulk').set(...authHeader(system)).send({ concerts: [concert('Kollektivet')], notify: 'yes' });
+
+    expect(prisma.concert.create.mock.calls.map(([{ data }]) => data.notify_pending)).toEqual([true, false, false]);
   });
 
   it('links a band listed twice once, rather than tripping the unique key', async () => {

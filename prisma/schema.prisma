@@ -131,6 +131,11 @@ model Concert {
   sold_out          Boolean?               @default(false)
   reachable         String?
   setlist_checked_at DateTime?
+  // Set when a scheduled sync inserts the show, cleared once /wishlists/notify
+  // has posted it. A delivery that failed leaves it set, and the next sync's
+  // /bulk hands the show back to be sent again — the scraper only ever
+  // announced what it had just inserted, so a failed one was never retried.
+  notify_pending    Boolean                @default(false)
   city_id           Int?
   city_rel          City?                  @relation(fields: [city_id], references: [id])
   bands             ConcertBandReference[] @relation("ConcertBands")
