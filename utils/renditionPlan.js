@@ -19,8 +19,6 @@
  * filterChain.
  */
 
-const path = require('node:path');
-
 // A marker rather than a retry. A clip ffmpeg cannot read will not become
 // readable on the next pass, and a service that retried it every interval would
 // spend every interval failing on the same file and never reach the rest.
@@ -284,8 +282,6 @@ const isAbandonedPart = (name) => name.endsWith(PART_SUFFIX);
 
 const partNameFor = (output) => `${output}${PART_SUFFIX}`;
 
-const showDirOf = (relPath) => path.posix.dirname(relPath);
-
 module.exports = {
   FAILED_SUFFIX,
   PART_SUFFIX,
@@ -299,5 +295,4 @@ module.exports = {
   pendingInShow,
   isAbandonedPart,
   partNameFor,
-  showDirOf,
 };

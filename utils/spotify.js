@@ -309,15 +309,6 @@ async function addItems(accessToken, playlistId, uris) {
   }
 }
 
-/** Whether this user has connected Spotify. */
-async function isConnected(userId) {
-  const row = await prisma.oAuth.findUnique({
-    where: { user_provider: { user: userId, provider: PROVIDER } },
-    select: { id: true },
-  });
-  return !!row;
-}
-
 module.exports = {
   PROVIDER,
   SCOPES,
@@ -333,5 +324,4 @@ module.exports = {
   findTrack,
   createPlaylist,
   addItems,
-  isConnected,
 };
