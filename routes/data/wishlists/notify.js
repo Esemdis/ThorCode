@@ -39,13 +39,84 @@ const CONCERT_SELECT = {
   bands: { select: { band_rel: { select: { id: true, name: true } } } },
 };
 
-async function postEmbeds(webhook, embeds, content) {
+/**
+ * Post concerts to a webhook and say which of them arrived.
+ *
+ * buildDiscordEmbeds makes one field per concert, in order, so each embed
+ * covers the next fields.length of them. A busy batch is several posts, and
+ * when a later one fails the shows in the earlier ones have still arrived:
+ * marking the whole batch failed would send those again on the retry.
+ *
+ * @returns {Promise<{ delivered: object[], undelivered: object[], error: Error|null }>}
+ */
+async function postConcerts(webhook, { title, concerts, content }) {
+  const embeds = buildDiscordEmbeds({ title, concerts });
+  let sent = 0;
   for (const [i, embed] of embeds.entries()) {
     // The mention rides the first message only — one buzz per batch, not one
     // per embed, and a busy night can be several embeds.
     const payload = content && i === 0 ? { content, embeds: [embed] } : { embeds: [embed] };
-    await axios.post(webhook, payload, { timeout: 10000 });
+    try {
+      await axios.post(webhook, payload, { timeout: 10000 });
+    } catch (error) {
+      return { delivered: concerts.slice(0, sent), undelivered: concerts.slice(sent), error };
+    }
+    sent += embed.fields.length;
   }
+  return { delivered: concerts, undelivered: [], error: null };
+}
+
+// Discord turning a post down for good: a deleted webhook (404), a revoked
+// one (401, 403), a payload it will never take (400). Retried, those fail the
+// same way every sync until the show has passed. A timeout, a rate limit, a
+// 5xx or no answer at all is worth another go.
+function failedForGood(error) {
+  const status = error.response?.status;
+  return Number.isInteger(status) && status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
+const concertIdsOf = (concerts) => concerts.map((c) => c.concert_id ?? c.id).filter((id) => Number.isInteger(id));
+
+/**
+ * Who has had which show, and which shows are still owed to someone.
+ *
+ * A show stays pending while any recipient's post of it failed in a way worth
+ * retrying, and the retry goes only where there is no delivery on record.
+ * Scraper builds older than concert_id send shows this cannot track, which
+ * are posted as before and never held.
+ */
+async function deliveryLedger(concertIds) {
+  const rows = concertIds.length
+    ? await prisma.concertDelivery.findMany({
+        where: { concert_id: { in: concertIds } },
+        select: { concert_id: true, wishlist_id: true },
+      })
+    : [];
+  const had = new Set(rows.map((r) => `${r.concert_id}:${r.wishlist_id}`));
+  const held = new Set();
+
+  return {
+    held,
+    /** The concerts this wishlist has not had yet. */
+    unsent: (wishlistId, concerts) => concerts.filter((c) => {
+      const id = c.concert_id ?? c.id;
+      return !Number.isInteger(id) || !had.has(`${id}:${wishlistId}`);
+    }),
+    /** Posts them, records what arrived, and holds what failed for a retry. */
+    async send(wishlistId, webhook, post) {
+      const { delivered, undelivered, error } = await postConcerts(webhook, post);
+      const arrived = concertIdsOf(delivered);
+      if (arrived.length) {
+        await prisma.concertDelivery.createMany({
+          data: arrived.map((id) => ({ concert_id: id, wishlist_id: wishlistId })),
+          skipDuplicates: true,
+        });
+        for (const id of arrived) had.add(`${id}:${wishlistId}`);
+      }
+      if (error && !failedForGood(error)) for (const id of concertIdsOf(undelivered)) held.add(id);
+      return error;
+    },
+  };
 }
 
 // Discord reads <@id> in `content` as a ping. Anything else there would be
@@ -66,6 +137,8 @@ router.post(
       if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
 
       const { bands } = req.body;
+      const requestIds = [...new Set(concertIdsOf(bands.flatMap((b) => b.concerts ?? [])))];
+      const ledger = await deliveryLedger(requestIds);
 
       // All wishlists — needed for activity logs regardless of webhook
       const allWishlists = await prisma.wishlist.findMany({
@@ -108,46 +181,64 @@ router.post(
             for (const concert of band.concerts ?? []) {
               if (Number.isInteger(concert.concert_id)) reported.add(concert.concert_id);
             }
-            const embeds = buildDiscordEmbeds({
-              title: `New concerts: ${band.name}`,
-              concerts: band.concerts ?? [],
+            // A retried show goes only to the wishlists that did not get it.
+            const concerts = ledger.unsent(wishlist.id, band.concerts ?? []);
+            if (concerts.length === 0) continue;
+            const e = await ledger.send(wishlist.id, wishlist.discord_webhook, {
+              title: `New concerts: ${band.name}`, concerts,
             });
-            try {
-              await postEmbeds(wishlist.discord_webhook, embeds);
-            } catch (e) {
+            if (e) {
               console.error(`[Discord] Failed to notify wishlist ${wishlist.id} for band "${band.name}":`, e.response?.status ?? e.message);
             }
           }
         }),
       );
 
-      const subscriptionNotified = await notifySubscribers(bands, allWishlists, reportedByWishlist);
+      const subscriptionNotified = await notifySubscribers(bands, allWishlists, reportedByWishlist, ledger);
 
-      // Delivered, so no longer owed. Cleared before the activity logs below:
-      // a failure there must not leave the shows flagged, or the next sync
-      // would post them to Discord a second time. Discord refusing a single
-      // webhook is logged above and not retried, same as before the flag.
-      const deliveredIds = [...new Set(
-        bands.flatMap((b) => b.concerts ?? []).map((c) => c.concert_id).filter((id) => Number.isInteger(id)),
-      )];
-      if (deliveredIds.length > 0) {
-        await prisma.concert.updateMany({
-          where: { id: { in: deliveredIds }, notify_pending: true },
-          data: { notify_pending: false },
-        });
-      }
-
-      // Activity logs — all wishlists that have the band, only when concerts were inserted
+      // Activity logs — all wishlists that have the band, only when concerts
+      // were inserted. A show whose post failed somewhere comes back on the
+      // next sync, and the feeds already have it: only the shows they have
+      // not been told about are logged.
+      const announced = new Set(requestIds.length
+        ? (await prisma.concert.findMany({
+            where: { id: { in: requestIds }, announced_at: { not: null } },
+            select: { id: true, announced_at: true },
+          })).filter((c) => c.announced_at != null).map((c) => c.id)
+        : []);
       for (const wishlist of allWishlists) {
         const matchedBands = bands.filter(
           (b) => b.inserted > 0 && wishlist.bands.some((ref) => ref.band_rel.id === b.band_id),
         );
         for (const band of matchedBands) {
-          const countries = [...new Set((band.concerts || []).map((c) => c.country).filter(Boolean))];
+          const all = band.concerts || [];
+          const fresh = all.filter((c) => !announced.has(c.concert_id));
+          if (fresh.length === 0) continue;
+          const countries = [...new Set(fresh.map((c) => c.country).filter(Boolean))];
           await logActivity(wishlist.id, "BAND_ADDED", {
-            band_name: band.name, band_id: band.band_id, inserted: band.inserted, countries,
+            band_name: band.name, band_id: band.band_id,
+            inserted: fresh.length === all.length ? band.inserted : fresh.length, countries,
           });
         }
+      }
+      const unannounced = requestIds.filter((id) => !announced.has(id));
+      if (unannounced.length > 0) {
+        await prisma.concert.updateMany({
+          where: { id: { in: unannounced }, announced_at: null },
+          data: { announced_at: new Date() },
+        });
+      }
+
+      // No longer owed to anyone, except where a post failed in a way worth
+      // another go: those stay pending, and the next sync's /bulk hands them
+      // back. Last, so a failure anywhere above leaves them pending too — the
+      // deliveries on record keep the retry from posting anything twice.
+      const settled = requestIds.filter((id) => !ledger.held.has(id));
+      if (settled.length > 0) {
+        await prisma.concert.updateMany({
+          where: { id: { in: settled }, notify_pending: true },
+          data: { notify_pending: false },
+        });
       }
 
       res.json({ notified: notifications.length, subscription_notified: subscriptionNotified });
@@ -168,7 +259,7 @@ router.post(
  *
  * @returns {Promise<number>} how many users were posted to
  */
-async function notifySubscribers(bands, allWishlists, reportedByWishlist) {
+async function notifySubscribers(bands, allWishlists, reportedByWishlist, ledger) {
   const concertIds = [
     ...new Set(
       bands
@@ -209,15 +300,16 @@ async function notifySubscribers(bands, allWishlists, reportedByWishlist) {
       if (!wishlist) return;
 
       const already = reportedByWishlist.get(wishlist.id) ?? new Set();
-      const fresh = matched.filter((c) => !already.has(c.id));
+      const fresh = ledger.unsent(wishlist.id, matched.filter((c) => !already.has(c.id)));
       if (fresh.length === 0) return;
 
-      const embeds = buildDiscordEmbeds({ title: "New concerts you're watching", concerts: fresh });
-      try {
-        await postEmbeds(wishlist.discord_webhook, embeds, mentionFor(settingsByUser.get(userId)));
-        notified++;
-      } catch (e) {
+      const e = await ledger.send(wishlist.id, wishlist.discord_webhook, {
+        title: "New concerts you're watching", concerts: fresh, content: mentionFor(settingsByUser.get(userId)),
+      });
+      if (e) {
         console.error(`[Discord] Failed to notify subscriber ${userId}:`, e.response?.status ?? e.message);
+      } else {
+        notified++;
       }
     }),
   );

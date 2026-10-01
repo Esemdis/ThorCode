@@ -136,10 +136,16 @@ model Concert {
   // /bulk hands the show back to be sent again — the scraper only ever
   // announced what it had just inserted, so a failed one was never retried.
   notify_pending    Boolean                @default(false)
+  // When the activity feeds were told about the show. A post that failed keeps
+  // notify_pending set and is sent again, and the feeds must not get a second
+  // BAND_ADDED entry for it each time. Null on rows from before it existed,
+  // which nothing announces again.
+  announced_at      DateTime?
   city_id           Int?
   city_rel          City?                  @relation(fields: [city_id], references: [id])
   bands             ConcertBandReference[] @relation("ConcertBands")
   attendances       ConcertAttendance[]    @relation("ConcertAttendances")
+  deliveries        ConcertDelivery[]      @relation("ConcertDeliveries")
 
   @@index([city_id])
   @@index([concert_date, latitude, longitude])
@@ -193,6 +199,21 @@ model Wishlist {
   bands              WishlistBandReference[] @relation("WishlistBands")
   activity_logs      ActivityLog[]           @relation("WishlistActivityLogs")
   attendance         ConcertAttendance[]     @relation("WishlistAttendance")
+  deliveries         ConcertDelivery[]       @relation("WishlistDeliveries")
+}
+
+// One new show's announcement having reached one wishlist's Discord webhook.
+// A retried announcement goes only where there is no row, so the recipients
+// whose post went through are not sent it twice.
+model ConcertDelivery {
+  concert_id   Int
+  wishlist_id  Int
+  delivered_at DateTime @default(now())
+  concert_rel  Concert  @relation("ConcertDeliveries", fields: [concert_id], references: [id], onDelete: Cascade)
+  wishlist_rel Wishlist @relation("WishlistDeliveries", fields: [wishlist_id], references: [id], onDelete: Cascade)
+
+  @@id([concert_id, wishlist_id])
+  @@index([wishlist_id])
 }
 
 model ActivityLog {

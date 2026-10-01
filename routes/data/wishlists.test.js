@@ -23,6 +23,7 @@ const prisma = installFakePrisma({
   activityLog: model(),
   city: model(),
   notificationSubscription: model(),
+  concertDelivery: model(),
   $transaction: vi.fn(async (arg) => (typeof arg === 'function' ? arg(prisma) : Promise.all(arg))),
 });
 
@@ -410,6 +411,9 @@ describe('POST /wishlists/notify subscription delivery', () => {
   // route requires axios through CommonJS, so vi.mock cannot reach it.
   let server;
   let received;
+  // What each webhook answers, by path and how many posts it has had: 204
+  // unless a test says otherwise.
+  let answer;
   const hook = (path) => `http://127.0.0.1:${server.address().port}${path}`;
 
   beforeAll(async () => {
@@ -419,7 +423,8 @@ describe('POST /wishlists/notify subscription delivery', () => {
       req.on('data', (chunk) => { body += chunk; });
       req.on('end', () => {
         received.push({ path: req.url, body: JSON.parse(body || '{}') });
-        res.writeHead(204);
+        const nth = received.filter((r) => r.path === req.url).length;
+        res.writeHead(answer(req.url, nth));
         res.end();
       });
     });
@@ -462,6 +467,9 @@ describe('POST /wishlists/notify subscription delivery', () => {
 
   beforeEach(() => {
     received = [];
+    answer = () => 204;
+    prisma.concertDelivery.findMany.mockResolvedValue([]);
+    prisma.concertDelivery.createMany.mockResolvedValue({ count: 0 });
     prisma.wishlist.findMany.mockResolvedValue([MINE(), THEIRS()]);
     prisma.concert.findMany.mockResolvedValue([CONCERT]);
     prisma.notificationSubscription.findMany.mockResolvedValue([]);
@@ -543,18 +551,106 @@ describe('POST /wishlists/notify subscription delivery', () => {
     });
   });
 
-  it('clears it before the activity feed, so a failure there cannot post twice', async () => {
-    // The 500 below leaves the scraper to try again next sync. With the flag
-    // still set, that try would post the same show to Discord a second time.
+  it('records each post that went through, before the activity feed can fail', async () => {
+    // The 500 below leaves the show pending for the next sync, and what was
+    // already posted is on record, so that try does not post it again.
     prisma.activityLog.create.mockRejectedValue(new Error('connection reset'));
 
     const res = await post(payload(9, 'Someone Elses Band'));
 
     expect(res.status).toBe(500);
     expect(received.filter((r) => r.path === '/theirs')).toHaveLength(1);
-    expect(prisma.concert.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+    expect(prisma.concertDelivery.createMany).toHaveBeenCalledWith({
+      data: [{ concert_id: 100, wishlist_id: 8 }], skipDuplicates: true,
+    });
+    expect(prisma.concert.updateMany).not.toHaveBeenCalledWith(expect.objectContaining({
       data: { notify_pending: false },
     }));
+  });
+
+  describe('when a post fails', () => {
+    // Both wishlists follow band 9 here, so one show has two recipients.
+    const BOTH = () => [
+      { ...MINE(), bands: [{ band_rel: { id: 9, name: 'Someone Elses Band', ticketmaster_id: null } }] },
+      THEIRS(),
+    ];
+    const cleared = () => prisma.concert.updateMany.mock.calls
+      .filter(([arg]) => arg.data.notify_pending === false)
+      .flatMap(([arg]) => arg.where.id.in);
+
+    beforeEach(() => {
+      prisma.wishlist.findMany.mockResolvedValue(BOTH());
+    });
+
+    it('keeps the show pending, and records who did get it', async () => {
+      // The flag was cleared for every show in the request, so the recipient
+      // whose post failed was never sent it again.
+      answer = (path) => (path === '/mine' ? 503 : 204);
+
+      const res = await post(payload(9, 'Someone Elses Band'));
+
+      expect(res.status).toBe(200);
+      expect(cleared()).not.toContain(100);
+      expect(prisma.concertDelivery.createMany).toHaveBeenCalledWith({
+        data: [{ concert_id: 100, wishlist_id: 8 }], skipDuplicates: true,
+      });
+    });
+
+    it('sends the retry only to the recipient that did not get it', async () => {
+      prisma.concertDelivery.findMany.mockResolvedValue([{ concert_id: 100, wishlist_id: 8 }]);
+
+      await post(payload(9, 'Someone Elses Band'));
+
+      expect(received.filter((r) => r.path === '/theirs')).toHaveLength(0);
+      expect(received.filter((r) => r.path === '/mine')).toHaveLength(1);
+      expect(cleared()).toContain(100);
+    });
+
+    it('lets the show go when Discord refuses a webhook for good', async () => {
+      // A deleted webhook answers 404 to every retry until the show is past.
+      answer = (path) => (path === '/mine' ? 404 : 204);
+
+      await post(payload(9, 'Someone Elses Band'));
+
+      expect(cleared()).toContain(100);
+    });
+
+    it('holds only the shows a split post did not get to', async () => {
+      // Twenty-five fields fill an embed, so twenty-six shows are two posts.
+      // The first went through; only the show in the second is owed.
+      answer = (path, nth) => (path === '/theirs' && nth === 2 ? 503 : 204);
+      prisma.wishlist.findMany.mockResolvedValue([THEIRS()]);
+      const body = payload(9, 'Someone Elses Band');
+      body.bands[0].concerts = Array.from({ length: 26 }, (_, i) => ({
+        ...body.bands[0].concerts[0], concert_id: 200 + i,
+      }));
+
+      await post(body);
+
+      const recorded = prisma.concertDelivery.createMany.mock.calls.flatMap(([arg]) => arg.data);
+      expect(recorded.map((d) => d.concert_id)).toEqual(Array.from({ length: 25 }, (_, i) => 200 + i));
+      expect(cleared()).toHaveLength(25);
+      expect(cleared()).not.toContain(225);
+    });
+
+    it('adds no second activity entry for a show the feeds were already told about', async () => {
+      prisma.concert.findMany.mockResolvedValue([{ ...CONCERT, announced_at: new Date('2026-10-01') }]);
+      prisma.concertDelivery.findMany.mockResolvedValue([{ concert_id: 100, wishlist_id: 8 }]);
+
+      await post(payload(9, 'Someone Elses Band'));
+
+      expect(prisma.activityLog.create).not.toHaveBeenCalled();
+    });
+
+    it('marks the shows announced once the feeds have them', async () => {
+      await post(payload(9, 'Someone Elses Band'));
+
+      expect(prisma.activityLog.create).toHaveBeenCalled();
+      expect(prisma.concert.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: [100] }, announced_at: null },
+        data: { announced_at: expect.any(Date) },
+      });
+    });
   });
 
   it('skips the concert read entirely when no concert ids came through', async () => {
