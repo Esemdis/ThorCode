@@ -146,6 +146,38 @@ function unresolvedBillNames(concert) {
   });
 }
 
+/**
+ * One night out of the several concert rows it can be stored as.
+ *
+ * A festival day arrives as a row per stage pairing the scraper saw, and the
+ * attended list folds those into one night whose bands come from all of them.
+ * Built from the row the night is titled after, the playlist left out every
+ * act billed only on the others. Named and described as the lead row is.
+ *
+ * A band on two rows is taken once, keeping the copy that carries the set it
+ * actually played — the same rule the attended list folds by.
+ *
+ * @param {object} lead - The row the playlist is named after.
+ * @param {object[]} others - The night's other rows, in the same shape.
+ * @returns {object} a concert concertPerformers and unresolvedBillNames take
+ */
+function mergeNight(lead, others = []) {
+  const rows = [lead, ...others];
+  const bands = [];
+  const at = new Map();
+  for (const ref of rows.flatMap((c) => c?.bands ?? [])) {
+    const id = ref?.band_rel?.id;
+    if (!at.has(id)) {
+      at.set(id, bands.length);
+      bands.push(ref);
+    } else if (!bands[at.get(id)].setlist?.songs?.length && ref.setlist?.songs?.length) {
+      bands[at.get(id)] = ref;
+    }
+  }
+  const lineup = rows.flatMap((c) => parseLineup(c?.metadata));
+  return { ...lead, bands, metadata: JSON.stringify(lineup) };
+}
+
 function parseLineup(metadata) {
   try {
     const parsed = JSON.parse(metadata || '[]');
@@ -342,6 +374,7 @@ function playlistDescription(concert, tracks) {
 module.exports = {
   DEFAULT_MAX_TRACKS,
   concertPerformers,
+  mergeNight,
   unresolvedBillNames,
   buildPlaylistTracks,
   coverCredits,

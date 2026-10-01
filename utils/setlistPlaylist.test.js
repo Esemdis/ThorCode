@@ -10,6 +10,7 @@ import {
   unresolvedBillNames,
   formatConcertDay,
   coverCredits,
+  mergeNight,
 } from './setlistPlaylist.js';
 
 /** A ConcertBandReference row as the concert query returns it. */
@@ -188,6 +189,52 @@ describe('concertPerformers', () => {
   it('falls back to the linked bands when there is no lineup stored', () => {
     const c = { metadata: null, bands: [ref('THROWN', [song('On the Verge')])] };
     expect(concertPerformers(c).map((p) => p.band_rel.name)).toEqual(['THROWN']);
+  });
+});
+
+describe('mergeNight', () => {
+  // A festival day is stored as a concert row per stage pairing the scraper
+  // saw, and the attended list shows those as one night. Built from the row
+  // it is titled after alone, the playlist left out every act on the others.
+  const stage = (id, name, metadata, bands) => ({
+    id, name, venue: 'Refshaleøen', city: 'Copenhagen', concert_date: new Date('2026-06-18'),
+    metadata: metadata && JSON.stringify(metadata), bands,
+  });
+  const linked = (id, name, songs, played = null) => ({
+    setlist: played ? { songs: played } : null,
+    band_rel: { id, name, setlist: songs ? { songs } : null },
+  });
+
+  it('puts every stage\'s acts on the bill, and keeps the lead\'s name and place', () => {
+    const night = mergeNight(
+      stage(1, 'Copenhell', ['Korn'], [linked(10, 'Korn', [song('Blind')])]),
+      [stage(2, 'Copenhell', ['Gojira'], [linked(20, 'Gojira', [song('Stranded')])])],
+    );
+    expect(night.id).toBe(1);
+    expect(playlistName(night)).toBe('Copenhell — 18 Jun 2026');
+    expect(concertPerformers(night).map((p) => p.band_rel.name).sort()).toEqual(['Gojira', 'Korn']);
+  });
+
+  it('asks for the songs of acts billed only on the other rows', () => {
+    const night = mergeNight(
+      stage(1, 'Copenhell', ['Korn'], []),
+      [stage(2, 'Copenhell', ['Gojira'], [])],
+    );
+    expect(unresolvedBillNames(night).sort()).toEqual(['Gojira', 'Korn']);
+  });
+
+  it('takes a band on two rows once, keeping the copy with the set that was played', () => {
+    const night = mergeNight(
+      stage(1, 'Copenhell', null, [linked(10, 'Korn', [song('Recent')])]),
+      [stage(2, 'Copenhell', null, [linked(10, 'Korn', [song('Recent')], [song('Played')])])],
+    );
+    expect(night.bands).toHaveLength(1);
+    expect(setlistForRef(night.bands[0]).songs[0].name).toBe('Played');
+  });
+
+  it('is the lead row unchanged when there are no others', () => {
+    const lead = stage(1, 'Copenhell', ['Korn'], [linked(10, 'Korn', [song('Blind')])]);
+    expect(concertPerformers(mergeNight(lead, []))).toEqual(concertPerformers(lead));
   });
 });
 

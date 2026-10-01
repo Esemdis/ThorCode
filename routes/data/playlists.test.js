@@ -14,9 +14,24 @@ const app = buildApp(router, '/data/concerts');
 // The router's own copy, which it calls through the module.
 const require = createRequire(import.meta.url);
 const externalSetlists = require('../../utils/externalSetlists.js');
+const spotify = require('../../utils/spotify.js');
+
+// Five playlists a minute per caller, and every request here comes from one
+// address: the file as a whole has to stay inside that.
+const user = authHeader({ id: 'user-1' });
+
+// Spotify answering every search with a track named after the song.
+const connected = () => {
+  vi.spyOn(spotify, 'getValidToken').mockResolvedValue('token');
+  vi.spyOn(spotify, 'findTrack').mockImplementation(async (token, track) => ({ uri: `spotify:track:${track.title}` }));
+  vi.spyOn(spotify, 'createPlaylist').mockResolvedValue({ id: 'p1', url: 'https://open.spotify.com/playlist/p1' });
+  vi.spyOn(spotify, 'addItems').mockResolvedValue();
+};
+const songs = (...names) => ({ songs: names.map((name) => ({ name, tape: false, cover: null })) });
 
 beforeEach(() => {
   vi.clearAllMocks();
+  prisma.concert.findMany = vi.fn(async () => []);
   prisma.concert.findUnique.mockResolvedValue({
     id: 3, name: 'Copenhell', venue: 'Refshaleøen', city: 'Copenhagen', concert_date: new Date('2026-06-18'),
     // Two acts nobody follows: their songs would be fetched from setlist.fm.
@@ -31,10 +46,51 @@ describe('POST /data/concerts/:concertId/playlist', () => {
     // The setlists were fetched first, one setlist.fm search per act on the
     // shared key, and only then did the route find there was nowhere to put
     // the playlist.
-    const res = await request(app).post('/data/concerts/3/playlist').set(...authHeader({ id: 'user-1' }));
+    const res = await request(app).post('/data/concerts/3/playlist').set(...user);
 
     expect(res.status).toBe(409);
     expect(res.body.reconnect).toBe(true);
     expect(externalSetlists.fetchSetlistsForNames).not.toHaveBeenCalled();
+  });
+
+  it('builds a festival night from every stage row it is sent, not only the one it is named after', async () => {
+    // The attended list folds a festival day's rows into one night, and the
+    // button on it sent only the lead row: every act billed on the others was
+    // missing from the playlist.
+    connected();
+    prisma.concert.findMany = vi.fn(async () => [{
+      id: 4, name: 'Copenhell', venue: 'Refshaleøen', city: 'Copenhagen',
+      concert_date: new Date('2026-06-18'), metadata: '["Gojira"]', bands: [],
+    }]);
+    externalSetlists.fetchSetlistsForNames.mockResolvedValue(new Map([
+      ['korn', songs('Blind')], ['slipknot', songs('Duality')], ['gojira', songs('Stranded')],
+    ]));
+
+    const res = await request(app).post('/data/concerts/3/playlist').set(...user).send({ concert_ids: [3, 4] });
+
+    expect(res.status).toBe(201);
+    expect(prisma.concert.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { id: { in: [4] } } }));
+    expect(res.body.bands.sort()).toEqual(['Gojira', 'Korn', 'Slipknot']);
+    expect(res.body.name).toBe('Copenhell — 18 Jun 2026');
+  });
+
+  it('builds from the one concert when it is sent no others', async () => {
+    connected();
+    externalSetlists.fetchSetlistsForNames.mockResolvedValue(new Map([['korn', songs('Blind')]]));
+
+    const res = await request(app).post('/data/concerts/3/playlist').set(...user);
+
+    expect(res.status).toBe(201);
+    expect(prisma.concert.findMany).not.toHaveBeenCalled();
+    expect(res.body.bands).toEqual(['Korn']);
+  });
+
+  it('refuses concert_ids that are not a list of ids, before asking Spotify anything', async () => {
+    connected();
+    const res = await request(app).post('/data/concerts/3/playlist').set(...user).send({ concert_ids: ['4; drop'] });
+
+    expect(res.status).toBe(400);
+    expect(spotify.getValidToken).not.toHaveBeenCalled();
+    expect(prisma.concert.findUnique).not.toHaveBeenCalled();
   });
 });
