@@ -99,15 +99,23 @@ router.get(
       // Grouped rather than countMediaForAttendances' summed total: the History
       // view needs to know which shows have photos, not how many there are in
       // aggregate across the whole page.
+      //
+      // And by kind. has_photos used to mean any media at all, and the list
+      // draws it as "This night has photographs", so a night of clips alone
+      // claimed photographs it did not have.
       const attendanceIds = records.map((r) => r.id);
       const mediaCounts = attendanceIds.length
         ? await prisma.concertMedia.groupBy({
-            by: ["attendance_id"],
+            by: ["attendance_id", "kind"],
             where: { attendance_id: { in: attendanceIds } },
             _count: true,
           })
         : [];
-      const attendanceIdsWithPhotos = new Set(mediaCounts.map((m) => m.attendance_id));
+      const attendanceIdsWith = (kind) => new Set(
+        mediaCounts.filter((m) => m.kind === kind).map((m) => m.attendance_id),
+      );
+      const attendanceIdsWithPhotos = attendanceIdsWith("PHOTO");
+      const attendanceIdsWithVideos = attendanceIdsWith("VIDEO");
 
       const result = records.map((r) => {
         const missed = new Set(r.missed_bands.map((m) => m.band_id));
@@ -115,6 +123,7 @@ router.get(
           attendance_id: r.id,
           created_at: r.created_at,
           has_photos: attendanceIdsWithPhotos.has(r.id),
+          has_videos: attendanceIdsWithVideos.has(r.id),
           concert: {
             ...r.concert_rel,
             source: undefined,

@@ -567,18 +567,31 @@ describe('GET /wishlists/:id/attendance', () => {
     prisma.wishlist.findUnique.mockResolvedValue(WISHLIST);
   });
 
-  it('flags a show that has media attached, and leaves the others unflagged', async () => {
-    prisma.concertAttendance.findMany.mockResolvedValue([attendanceRow(1), attendanceRow(2)]);
+  it('flags a show that has photographs, and one that has only video as video', async () => {
+    // has_photos used to mean any media at all, and the list draws it as "This
+    // night has photographs" — a night with three clips and no photograph said
+    // it had photographs.
+    prisma.concertAttendance.findMany.mockResolvedValue([attendanceRow(1), attendanceRow(2), attendanceRow(3)]);
     // groupBy, not the raw rows: this is the same shape countMediaForAttendances
     // uses to decide whether a show has any media, just grouped per attendance
-    // instead of summed across all of them.
-    prisma.concertMedia.groupBy.mockResolvedValue([{ attendance_id: 1, _count: 3 }]);
+    // and kind instead of summed across all of them.
+    prisma.concertMedia.groupBy.mockResolvedValue([
+      { attendance_id: 1, kind: 'PHOTO', _count: 3 },
+      { attendance_id: 1, kind: 'VIDEO', _count: 1 },
+      { attendance_id: 2, kind: 'VIDEO', _count: 2 },
+    ]);
 
     const res = await request(app).get('/wishlists/7/attendance').set(...authHeader({ id: 'user-1' }));
 
     expect(res.status).toBe(200);
-    expect(res.body.attendance.find((a) => a.attendance_id === 1).has_photos).toBe(true);
-    expect(res.body.attendance.find((a) => a.attendance_id === 2).has_photos).toBe(false);
+    expect(prisma.concertMedia.groupBy).toHaveBeenCalledWith(expect.objectContaining({ by: ['attendance_id', 'kind'] }));
+    const flags = (id) => {
+      const { has_photos, has_videos } = res.body.attendance.find((a) => a.attendance_id === id);
+      return { has_photos, has_videos };
+    };
+    expect(flags(1)).toEqual({ has_photos: true, has_videos: true });
+    expect(flags(2)).toEqual({ has_photos: false, has_videos: true });
+    expect(flags(3)).toEqual({ has_photos: false, has_videos: false });
   });
 
   it('skips the media lookup entirely when there is no attendance', async () => {
