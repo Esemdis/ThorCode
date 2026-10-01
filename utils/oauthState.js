@@ -32,11 +32,13 @@ const AUDIENCE = 'oauth-state';
 
 // Derived rather than configured, so no deployment needs a new secret and the
 // state key rotates whenever JWT_SECRET does.
-function stateKey() {
+function derivedKey(label) {
   const secret = process.env.JWT_SECRET;
   if (!secret) throw new Error('JWT_SECRET is not set');
-  return crypto.createHmac('sha256', secret).update('thorcode:oauth-state:v1').digest();
+  return crypto.createHmac('sha256', secret).update(label).digest();
 }
+
+const stateKey = () => derivedKey('thorcode:oauth-state:v1');
 
 /**
  * Mint a state value for an OAuth flow.
@@ -82,4 +84,29 @@ function verifyOAuthState(state, purpose) {
   }
 }
 
-module.exports = { signOAuthState, verifyOAuthState, DEFAULT_TTL_S };
+/**
+ * The PKCE code verifier for a flow, derived from its state rather than kept.
+ *
+ * PKCE wants a secret that the authorize request does not carry and the token
+ * request does, which is normally held in a session between the two. There is
+ * no session to hold it in — see the top of this file — but the state makes the
+ * round trip and the server has a key, so the verifier is a keyed hash of the
+ * state: the same at both ends, and unknowable to anyone who only saw the URL.
+ *
+ * 43 base64url characters, the shortest verifier RFC 7636 allows.
+ *
+ * @param {string} state - A value from signOAuthState.
+ * @returns {string}
+ */
+function pkceVerifier(state) {
+  return crypto.createHmac('sha256', derivedKey('thorcode:oauth-pkce:v1')).update(String(state)).digest('base64url');
+}
+
+/** The S256 challenge the authorize request carries for a verifier. */
+function pkceChallenge(verifier) {
+  return crypto.createHash('sha256').update(verifier).digest('base64url');
+}
+
+module.exports = {
+  signOAuthState, verifyOAuthState, pkceVerifier, pkceChallenge, DEFAULT_TTL_S,
+};

@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeAll, vi, afterEach } from 'vitest';
+import crypto from 'node:crypto';
 import jwt from 'jsonwebtoken';
-import { signOAuthState, verifyOAuthState } from './oauthState.js';
+import {
+  signOAuthState, verifyOAuthState, pkceVerifier, pkceChallenge,
+} from './oauthState.js';
 
 beforeAll(() => {
   process.env.JWT_SECRET = 'test-secret';
@@ -67,5 +70,36 @@ describe('signOAuthState / verifyOAuthState', () => {
   it('refuses to mint a state with nothing to identify', () => {
     expect(() => signOAuthState({ purpose: 'spotify_oauth' })).toThrow();
     expect(() => signOAuthState({ user: 'user-1' })).toThrow();
+  });
+});
+
+describe('pkceVerifier / pkceChallenge', () => {
+  // Tidal's connect flow needs a PKCE secret held between the authorize
+  // redirect and the token exchange. There is no session to hold it in, so it
+  // is worked out from the state at both ends instead.
+
+  it('gives the same verifier for the same state, and a different one for another', () => {
+    const state = signOAuthState({ user: 'user-1', purpose: 'tidal_oauth' });
+    const other = signOAuthState({ user: 'user-2', purpose: 'tidal_oauth' });
+
+    expect(pkceVerifier(state)).toBe(pkceVerifier(state));
+    expect(pkceVerifier(state)).not.toBe(pkceVerifier(other));
+  });
+
+  it('cannot be worked out from the state alone', () => {
+    // The state travels in the authorize URL. A verifier that was a plain
+    // hash of it would be readable by anyone who saw that URL, which is the
+    // one thing PKCE exists to prevent.
+    const state = signOAuthState({ user: 'user-1', purpose: 'tidal_oauth' });
+
+    expect(pkceVerifier(state)).not.toBe(crypto.createHash('sha256').update(state).digest('base64url'));
+    expect(pkceVerifier(state)).not.toContain(state.slice(0, 10));
+  });
+
+  it('is a verifier RFC 7636 accepts, with its S256 challenge', () => {
+    const verifier = pkceVerifier(signOAuthState({ user: 'user-1', purpose: 'tidal_oauth' }));
+
+    expect(verifier).toMatch(/^[A-Za-z0-9\-._~]{43,128}$/);
+    expect(pkceChallenge(verifier)).toBe(crypto.createHash('sha256').update(verifier).digest('base64url'));
   });
 });

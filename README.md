@@ -21,7 +21,7 @@ The API runs as one Node process against Postgres through Prisma. Two other serv
 | Wishlists and attendance | `/data/concerts` | `routes/data/wishlists/`. Covers wishlists, the shows you went to and the ones you missed, and the ICS calendar feed. |
 | Notifications | `/data/concerts` | `routes/data/notifications.js` handles subscriptions to a band, a city or a festival. New shows go to the wishlist's Discord webhook as the scraper reports them, and a daily email digest goes out by cron. |
 | Photo and video archive | `/data/concerts` | `routes/data/media/`. Covers upload, tagging, 12-hour share links and byte serving. See [docs/concert-media-runbook.md](docs/concert-media-runbook.md). |
-| Setlist playlists | `/data/concerts`, `/oauth/spotify` | `routes/data/playlists.js` builds a Spotify playlist from a night's setlists. |
+| Setlist playlists | `/data/concerts`, `/oauth/spotify`, `/oauth/tidal` | `routes/data/playlists.js` builds a Spotify or Tidal playlist from a night's setlists, on whichever the user chose in Settings. |
 | Cities | `/data/cities` | City list, and weather written in bulk by the sync service. |
 | Health | `/data/concerts/health` | How much work each nightly job has waiting, for the admin panel. |
 | Travel | `/travel/*` | `routes/travel/`. Covers trips, places and day plans ([docs/day-planning.md](docs/day-planning.md)), todos, estimates, ECB exchange rates, gear, loadouts, reviews, a wishlist and a Gemini weather verdict. |

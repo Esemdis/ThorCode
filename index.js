@@ -22,6 +22,7 @@ app.use("/data/cities", require("./routes/data/cities"))
 app.use("/data/tmdb", require("./routes/data/tmdb"));
 app.use("/oauth/tmdb", require("./routes/oauth/tmdb"));
 app.use("/oauth/spotify", require("./routes/oauth/spotify"));
+app.use("/oauth/tidal", require("./routes/oauth/tidal"));
 // Every /travel/* route, read or write, passes the limiter first.
 app.use("/travel", require("./middlewares/travelLimits"));
 app.use("/travel/trips", require("./routes/travel/trips"));

@@ -1,4 +1,4 @@
-// Building a Spotify playlist from a concert's setlists.
+// Building a Spotify or Tidal playlist from a concert's setlists.
 //
 // A third router on /data/concerts alongside ticketmaster and notifications,
 // rather than more lines in bands.js, which is already 1,600 of them.
@@ -13,10 +13,15 @@ const {
   buildPlaylistTracks, concertPerformers, unresolvedBillNames, mergeNight,
   playlistName, playlistDescription, coverCredits,
 } = require('../../utils/setlistPlaylist');
-// Both through the module rather than destructured, so a test can stand in
-// for setlist.fm and Spotify on the router's own copies of them.
+// All through the module rather than destructured, so a test can stand in for
+// setlist.fm and the services on the router's own copies of them.
 const externalSetlists = require('../../utils/externalSetlists');
 const spotify = require('../../utils/spotify');
+const tidal = require('../../utils/tidal');
+
+// Where a playlist can go, keyed by the provider name the OAuth rows use. The
+// order is the tie-break when you have connected both and not said which.
+const SERVICES = { spotify, tidal };
 
 // Every track is a search, so this is the expensive route in the file.
 const rateLimit = rateLimiter({
@@ -56,17 +61,37 @@ function otherRowsAsked(body, concertId) {
 }
 
 /**
- * Resolve every track to a Spotify URI, a few at a time, preserving set order.
- * Returns the URIs found and the songs that came back with nothing.
+ * Which service this user's playlists go to: the one they chose in Settings
+ * if it is still connected, otherwise whichever one is. Null when neither is.
  */
-async function resolveTracks(token, tracks) {
+async function chooseService(userId) {
+  const [rows, user] = await Promise.all([
+    prisma.oAuth.findMany({
+      where: { user: userId, provider: { in: Object.keys(SERVICES) } },
+      select: { provider: true },
+    }),
+    prisma.user.findUnique({ where: { id: userId }, select: { settings: true } }),
+  ]);
+  const connected = Object.keys(SERVICES).filter((key) => rows.some((r) => r.provider === key));
+  const chosen = user?.settings?.playlistService;
+  return connected.includes(chosen) ? chosen : (connected[0] ?? null);
+}
+
+/** The services this server can connect, for a "connect one" prompt. */
+const configuredServices = () => Object.keys(SERVICES).filter((key) => SERVICES[key].isConfigured());
+
+/**
+ * Resolve every track on the service, a few at a time, preserving set order.
+ * Returns what to add and the songs that came back with nothing.
+ */
+async function resolveTracks(service, token, tracks) {
   const results = new Array(tracks.length).fill(null);
   let cursor = 0;
 
   const worker = async () => {
     while (cursor < tracks.length) {
       const index = cursor++;
-      results[index] = await spotify.findTrack(token, tracks[index]);
+      results[index] = await service.findTrack(token, tracks[index]);
     }
   };
 
@@ -86,8 +111,10 @@ async function resolveTracks(token, tracks) {
 /**
  * POST /data/concerts/:concertId/playlist
  *
- * Creates a private Spotify playlist from the setlists of the bands on this
- * concert and returns its URL, along with the songs that could not be found —
+ * Creates a playlist from the setlists of the bands on this concert, on
+ * whichever service chooseService picks — private on Spotify, unlisted on
+ * Tidal, which has no private ones. Returns its URL and service, along with the
+ * songs that could not be found —
  * live-only material and re-recordings will not all resolve, and a short
  * playlist with no explanation reads as a bug.
  *
@@ -101,6 +128,7 @@ router.post('/:concertId/playlist', auth, rateLimit, async (req, res) => {
   const otherIds = otherRowsAsked(req.body, concertId);
   if (!otherIds) return res.status(400).json({ error: 'concert_ids must be a list of concert ids' });
 
+  let serviceKey = null;
   try {
     const lead = await prisma.concert.findUnique({ where: { id: concertId }, select: CONCERT_SELECT });
     if (!lead) return res.status(404).json({ error: 'Concert not found' });
@@ -111,10 +139,19 @@ router.post('/:concertId/playlist', auth, rateLimit, async (req, res) => {
       : [];
     const concert = mergeNight(lead, others);
 
-    // Before anything is fetched: with no Spotify to put the playlist in, the
+    // Before anything is fetched: with nowhere to put the playlist, the
     // setlist.fm searches below — one per act, on the key every user shares —
     // were spent for nothing.
-    const token = await spotify.getValidToken(req.user.id);
+    serviceKey = await chooseService(req.user.id);
+    if (!serviceKey) {
+      return res.status(409).json({
+        error: 'Connect a music service to build playlists.',
+        reconnect: true,
+        services: configuredServices(),
+      });
+    }
+    const service = SERVICES[serviceKey];
+    const token = await service.getValidToken(req.user.id);
 
     // A concert is the whole bill, not just the acts you follow. The names of
     // the rest are in metadata; their songs have to be fetched.
@@ -128,23 +165,24 @@ router.post('/:concertId/playlist', auth, rateLimit, async (req, res) => {
       });
     }
 
-    const { uris, missed } = await resolveTracks(token, tracks);
+    const { uris, missed } = await resolveTracks(service, token, tracks);
 
     if (uris.length === 0) {
       return res.status(422).json({
-        error: 'None of the songs on this setlist could be found on Spotify.',
+        error: `None of the songs on this setlist could be found on ${service.LABEL}.`,
         missed,
       });
     }
 
-    const playlist = await spotify.createPlaylist(token, {
+    const playlist = await service.createPlaylist(token, {
       name: playlistName(concert),
       description: playlistDescription(concert, tracks),
     });
-    await spotify.addItems(token, playlist.id, uris);
+    await service.addItems(token, playlist.id, uris);
 
     res.status(201).json({
       url: playlist.url,
+      service: serviceKey,
       name: playlistName(concert),
       added: uris.length,
       requested: tracks.length,
@@ -162,8 +200,13 @@ router.post('/:concertId/playlist', auth, rateLimit, async (req, res) => {
     // Not connected, or a refresh token the user has revoked. Either way the fix
     // is to connect again, which is a different thing to tell them than "it
     // broke" — 409 so the client can offer that instead of an error.
-    if (error instanceof spotify.SpotifyAuthError) {
-      return res.status(409).json({ error: error.message, reconnect: true });
+    // `services` names the one to reconnect, so the client offers that one.
+    if (error instanceof spotify.SpotifyAuthError || error instanceof tidal.TidalAuthError) {
+      return res.status(409).json({
+        error: error.message,
+        reconnect: true,
+        services: serviceKey ? [serviceKey] : configuredServices(),
+      });
     }
     console.error(`[playlist] Concert ${concertId}:`, error.response?.data ?? error.message);
     res.status(500).json({ error: 'Could not build the playlist' });

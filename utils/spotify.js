@@ -8,13 +8,14 @@
 // and POST /playlists/{id}/items. The same change capped search results at 10.
 
 const axios = require('axios');
-const { retryDelayMs } = require('./spotifyRetry');
+const { requestWithBackoff: backoff } = require('./retryAfter');
 const prisma = require('./../prisma/client');
 const { searchQueries, pickBestTrack } = require('./setlistPlaylist');
 
 const ACCOUNTS_URL = 'https://accounts.spotify.com';
 const API_URL = 'https://api.spotify.com/v1';
 const PROVIDER = 'spotify';
+const LABEL = 'Spotify';
 
 // Creating a private playlist and putting songs in it. Nothing here reads the
 // user's library or listening history, so nothing else is asked for.
@@ -45,6 +46,11 @@ class SpotifyAuthError extends Error {
 
 const clientId = () => process.env.SPOTIFY_CLIENT_ID;
 const clientSecret = () => process.env.SPOTIFY_CLIENT_SECRET;
+
+/** Whether this server can offer Spotify at all. */
+function isConfigured() {
+  return !!(clientId() && clientSecret());
+}
 
 function basicAuthHeader() {
   const encoded = Buffer.from(`${clientId()}:${clientSecret()}`).toString('base64');
@@ -166,36 +172,11 @@ async function getAppToken() {
   return appToken.value;
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/**
- * A request that waits out a brief 429 rather than failing the whole playlist
- * for it, and gives up rather than sleeping through a long one.
- *
- * Writes go through it too. Adding a festival's worth of tracks is several
- * POSTs in a row, and the searches before them have usually just spent the
- * rate budget — a 429 on the second chunk used to fail the build and leave a
- * half-filled playlist in the user's account.
- */
-async function requestWithBackoff(config, attempts = 3) {
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    try {
-      return await axios.request(config);
-    } catch (error) {
-      const status = error.response?.status;
-      if (status === 401) throw new SpotifyAuthError('Spotify rejected the token');
-      if (status !== 429 || attempt === attempts) throw error;
-      const wait = retryDelayMs(error.response.headers['retry-after']);
-      if (wait === null) {
-        console.error(`[spotify] Rate limited for ${error.response.headers['retry-after']}s — giving up rather than waiting it out`);
-        throw error;
-      }
-      console.warn(`[spotify] Rate limited, waiting ${wait}ms (attempt ${attempt}/${attempts})`);
-      await sleep(wait);
-    }
-  }
-  throw new Error('unreachable');
-}
+const requestWithBackoff = (config, attempts) => backoff(config, {
+  label: 'spotify',
+  authError: () => new SpotifyAuthError('Spotify rejected the token'),
+  attempts,
+});
 
 const getWithBackoff = (url, config, attempts) => requestWithBackoff({ ...config, method: 'get', url }, attempts);
 
@@ -311,8 +292,10 @@ async function addItems(accessToken, playlistId, uris) {
 
 module.exports = {
   PROVIDER,
+  LABEL,
   SCOPES,
   SpotifyAuthError,
+  isConfigured,
   authorizeUrl,
   exchangeCode,
   expiryFrom,

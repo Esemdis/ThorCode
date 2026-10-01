@@ -84,9 +84,9 @@ describe('connecting Spotify', () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ connected: true, account: 'spotify-user' });
-    expect(spotify.exchangeCode).toHaveBeenCalledWith({
+    expect(spotify.exchangeCode).toHaveBeenCalledWith(expect.objectContaining({
       code: 'the-code', redirectUri: 'https://api.example.test/oauth/spotify/callback',
-    });
+    }));
     expect(prisma.oAuth.upsert).toHaveBeenCalledWith(expect.objectContaining({
       where: { user_provider: { user: 'user-1', provider: 'spotify' } },
     }));

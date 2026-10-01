@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { retryDelayMs, MAX_RETRY_WAIT_MS } from './spotifyRetry.js';
+import { retryDelayMs, MAX_RETRY_WAIT_MS } from './retryAfter.js';
 
 describe('retryDelayMs', () => {
   it('waits the number of seconds Spotify asked for', () => {
