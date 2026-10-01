@@ -1,76 +1,92 @@
-ThorCode Backend Toolbox API
+# ThorCode
 
-A modular and production-ready Node.js backend built with Express. This project serves as a showcase of backend consulting expertise, integrating modern authentication flows, 3rd-party APIs, data exporting, and performance optimizations using scalable infrastructure.
+The Express API behind two personal apps:
 
-✨ Features
+- **[concert-map](https://github.com/esemdis/concert-map)** tracks bands, their upcoming shows, the shows you went to, and the photos and videos from them.
+- **travel-bag** plans trips: places, day routes, packing, gear and reviews.
 
-  🧾 JWT & Role-based Authentication (Auth0-ready fallback)
+It also serves a few older endpoints for Steam and TMDB.
 
-  🔐 OAuth Integration Login via TMDB (with access token verification)
+The API runs as one Node process against Postgres through Prisma. Two other services do work for it:
 
-  🎮 Steam API Integration Fetch and persist top 5 most played games
+- **[python-crohn](https://github.com/esemdis/python-crohn)** scrapes concerts from Songkick and Bandsintown, and fetches setlists and weather. It posts the results back here.
+- **[route-planner](https://github.com/esemdis/route-planner)** solves a trip's day-by-day route.
 
-  ☁️ Weather API Integration For demonstrating third-party API integration
+## What is in it
 
-  📊 Excel & PDF Export (planned) Generate downloadable user reports
+| Area | Mounted at | Code |
+| --- | --- | --- |
+| Accounts | `/users` | `routes/users.js`. Covers register, login, settings and email change. Email verification goes through Resend. |
+| Bands and concerts | `/data/concerts` | `routes/data/bands/`. Covers ingest from the scraper, search, band pages, setlists and admin. |
+| Wishlists and attendance | `/data/concerts` | `routes/data/wishlists/`. Covers wishlists, the shows you went to and the ones you missed, and the ICS calendar feed. |
+| Notifications | `/data/concerts` | `routes/data/notifications.js` handles subscriptions to a band, a city or a festival. New shows go to the wishlist's Discord webhook as the scraper reports them, and a daily email digest goes out by cron. |
+| Photo and video archive | `/data/concerts` | `routes/data/media/`. Covers upload, tagging, 12-hour share links and byte serving. See [docs/concert-media-runbook.md](docs/concert-media-runbook.md). |
+| Setlist playlists | `/data/concerts`, `/oauth/spotify` | `routes/data/playlists.js` builds a Spotify playlist from a night's setlists. |
+| Cities | `/data/cities` | City list, and weather written in bulk by the sync service. |
+| Health | `/data/concerts/health` | How much work each nightly job has waiting, for the admin panel. |
+| Travel | `/travel/*` | `routes/travel/`. Covers trips, places and day plans ([docs/day-planning.md](docs/day-planning.md)), todos, estimates, ECB exchange rates, gear, loadouts, reviews, a wishlist and a Gemini weather verdict. |
+| Steam, TMDB | `/data/steam`, `/data/tmdb`, `/oauth/tmdb` | Linking a Steam account and its most-played games, and TMDB login. |
 
-  📦 Rate Limiting & Caching Built-in protection and Redis optimization
+Auth is a JWT in `Authorization: Bearer`. Roles are `USER`, `ADMIN` and `SYSTEM`. `SYSTEM` is the role of the machine user the sync service signs in as. `scripts/generate-service-token.js` mints its token.
 
-  🌍 Environment Variables Managed securely via Doppler
+`utils/cron.js` runs these jobs in-process:
 
-  🧵 Fully Modular Folder Structure Routes, middleware, and utilities
+| Job | When |
+| --- | --- |
+| Notification digest | 08:00 |
+| Spotify artist matching and photo warming | 04:00 |
+| Songkick/Bandsintown source URL backfill | 05:00 |
+| Setlist backfill for attended shows | 06:00 |
+| Expired email codes cleanup | hourly |
 
-🏗️ Tech Stack
-  Category	Technology
-  Language	JavaScript (ES6+) / TypeScript-ready
-  Framework	Express.js
-  Auth	JWT + Role-based + OAuth (TMDB)
-  Database	PostgreSQL (via Supabase or Prisma-ready)
-  ORM	(Optional) Prisma
-  API Hosting	Render
-  Database Hosting	Supabase / Neon
-  Cache	Upstash (Redis)
-  Env Management	Doppler
-  CI/CD	GitHub Actions (planned)
-  Monitoring	Datadog / OpenTelemetry (planned)
+Each schedule except the hourly cleanup can be overridden with a `*_CRON` variable.
 
-🛠 Setup Instructions
-1. Clone & Install
+Video renditions are made by a separate container in `services/rendition/`, which has its own [README](services/rendition/README.md).
 
-git clone https://github.com/your-username/thorcode.git
-cd thorcode
-npm install
+## Running it
 
-2. Configure Environment
+Secrets live in Doppler. With the Doppler CLI logged in:
 
-cp .env_example .env
-# Fill in your tokens, API keys, database URL, etc.
+```bash
+npm install          # also runs prisma generate
+npm run dev          # doppler run -c dev -- nodemon index.js, on port 4000
+```
 
-3. Create the database
+`npm run dev` connects to the dev database in Doppler, which holds real data.
 
-npx prisma migrate deploy
-# Builds an empty database from the migrations; on an existing one it applies
-# only what is new. `npm run test:integration` runs the Postgres-backed tests
-# when INTEGRATION_DATABASE_URL points at such a database.
+To run without Doppler, copy `.env_example` to `.env`, fill it in, and run `npm start`. The variables you need:
 
-4. Start the server
+- **Always:** `DATABASE_URL` and `JWT_SECRET`.
+- **For anything that builds a link back to the API**, such as media, calendar feeds or OAuth: `CALLBACK_URL`.
+- **For the archive:** `MEDIA_ROOT` and `MEDIA_URL_SECRET`.
 
-npm run dev
+Every other variable switches on one integration. When one is missing, that integration fails and the rest keep working. Redis is optional too: without `REDIS_URL` (or the Upstash REST pair) caching is off, and the server says so at boot.
 
-📤 Planned Features
+### Database
 
-  📁 Export to Excel / PDF
+The schema is `prisma/schema.prisma`. Changes go in as migrations under `prisma/migrations/`:
 
-  ✉️ Email export to users
+```bash
+npx prisma migrate deploy   # build an empty database, or apply what is new
+```
 
-  ⚙️ Add GitHub Actions CI/CD pipeline for testing
+`npm run db:migrate` and `npm run db:migrate:prd` run the same command through Doppler's dev and prd configs. The container runs `migrate deploy` on every boot before it starts the server. Never use `db push`; the Dockerfile explains why.
 
-  🌍 Add Swagger/OpenAPI docs
+## Tests
 
-🎯 Use Case
+```bash
+npm test                    # every route and util test, with Prisma faked (test/routeApp.js)
+npm run test:integration    # against a real Postgres at INTEGRATION_DATABASE_URL
+```
 
-This API can serve as:
+Point the integration tests at a throwaway database, because they write to it.
 
-  A portfolio project demonstrating backend architecture, auth flows, and API integration
+## Deploying
 
-  A modular boilerplate for future freelance/consulting projects
+A push to `main` triggers `.github/workflows/deploy.yml`. The workflow runs three jobs:
+
+1. It runs the unit suite.
+2. It builds a Postgres 16 database from the migrations and checks that it matches `schema.prisma` exactly. Then it runs the integration tests against that database.
+3. It builds `ghcr.io/esemdis/thorcode:latest`. This job runs only if both earlier jobs passed.
+
+The container gets one secret, `DOPPLER_TOKEN`, and fetches the rest from Doppler at boot. The [media runbook](docs/concert-media-runbook.md) covers the Unraid template, the reverse proxy and the offsite backup.
