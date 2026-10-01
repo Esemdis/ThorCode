@@ -1,7 +1,7 @@
 {
-  "name": "consultant",
+  "name": "thorcode",
   "version": "1.0.0",
-  "description": "This is a POC for potential consultant gigs",
+  "description": "API behind concert-map and travel-bag",
   "main": "index.js",
   "scripts": {
     "test": "vitest run",
@@ -13,18 +13,14 @@
     "dev": "doppler run -c dev -- npm start",
     "prd": "doppler run -c prd -- npm start",
     "db:migrate": "doppler run -- sh -c 'prisma migrate deploy && prisma generate'",
-    "db:migrate:prd": "doppler run -c prd -- sh -c 'prisma migrate deploy && prisma generate'",
-    "db:pull": "doppler run -- sh -c 'prisma db pull && prisma generate'"
+    "db:migrate:prd": "doppler run -c prd -- sh -c 'prisma migrate deploy && prisma generate'"
   },
-  "author": "",
   "license": "ISC",
   "dependencies": {
     "@google/genai": "^2.17.1",
     "@prisma/client": "^6.9.0",
-    "@supabase/supabase-js": "^2.50.0",
     "axios": "^1.9.0",
     "bcrypt": "^6.0.0",
-    "connect-redis": "^8.1.0",
     "cors": "^2.8.5",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
@@ -33,7 +29,6 @@
     "ioredis": "^5.6.1",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.0",
-    "nanoid": "^5.1.5",
     "node-cron": "^4.6.0",
     "prisma": "^6.9.0",
     "resend": "^4.0.1",
@@ -44,9 +39,6 @@
     "@types/node": "^22.15.21",
     "nodemon": "^3.1.10",
     "supertest": "^7.2.2",
-    "tsx": "^4.19.4",
-    "typescript": "^5.8.3",
     "vitest": "^4.1.10"
-  },
-  "keywords": []
+  }
 }

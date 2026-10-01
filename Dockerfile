@@ -1,10 +1,10 @@
 # node 24, matching the npm that writes package-lock.json here.
 #
 # This was node:20-slim, whose npm 10 refused the lock outright: vitest's bundled
-# vite declares a peer of esbuild ^0.27||^0.28, tsx depends on esbuild ~0.25.0,
-# and those ranges are disjoint, so the tree needs a second nested copy. npm 11
-# leaves the peer unsatisfied and calls it valid; npm 10 calls it a broken lock
-# and `npm ci` exits 1. Every image build failed on that from 30 July, which is
+# vite declared a peer of esbuild ^0.27||^0.28, tsx (since removed) depended on
+# esbuild ~0.25.0, and those ranges are disjoint, so the tree needed a second
+# nested copy. npm 11 left the peer unsatisfied and called it valid; npm 10
+# called it a broken lock and `npm ci` exited 1. Every image build failed on that from 30 July, which is
 # why the deployed container was still the one built on 26 July while the
 # database moved four migrations ahead of it.
 #
