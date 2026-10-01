@@ -1165,6 +1165,50 @@ describe('which folder a show lands in', () => {
     expect(plan.upserts.map((u) => [u.attendance_id, u.filename]).sort())
       .toEqual([[1, 'A.jpg'], [2, 'B.jpg']]);
   });
+
+  it('gives those two shows a folder each when their first uploads arrive at once', async () => {
+    // The show lock is per attendance, and these are two attendances, so it
+    // let both requests through together. Each read the empty folder's
+    // missing sidecar as free, both took it, and both chose IMG_1.jpg from
+    // the same empty listing: the second rename replaced the first's bytes,
+    // and its sidecar entry landed in a sidecar owned by the first concert.
+    stateful();
+    const create = prisma.concertMedia.create;
+    // Widened like a real insert, so neither request writes its sidecar
+    // before the other has chosen a folder.
+    prisma.concertMedia.create = vi.fn(async (args) => {
+      await sleep(15);
+      return create(args);
+    });
+    const second = {
+      ...attendanceRow,
+      id: 2,
+      concert_id: 9000,
+      concert_rel: { ...attendanceRow.concert_rel, id: 9000, venue: 'Rockefeller' },
+    };
+    prisma.concertAttendance.findUnique = vi.fn(async ({ where }) =>
+      (where.id === 2 ? second : attendanceRow));
+
+    const send = (attendanceId, seed) => request(app())
+      .post(`/data/concerts/attendances/${attendanceId}/media`)
+      .set(...authHeader(admin))
+      .attach('files', jpeg(seed), 'IMG_1.jpg');
+    const [a, b] = await Promise.all([send(1, 'first'), send(2, 'second')]);
+    expect([a.status, b.status]).toEqual([201, 201]);
+
+    const userDir = join(root, 'archive', 'user-1');
+    const folders = (await readdir(userDir)).sort();
+    expect(folders).toEqual(['2026-06-12 Oslo - Gojira', '2026-06-12 Oslo - Gojira (2)']);
+
+    // Each folder belongs to one concert and holds that concert's bytes.
+    const owners = {};
+    for (const folder of folders) {
+      const sidecar = JSON.parse(await readFile(join(userDir, folder, 'concert-media.json'), 'utf8'));
+      const bytes = await readFile(join(userDir, folder, 'IMG_1.jpg'));
+      owners[sidecar.concert_id] = bytes.subarray(baseJpeg.length).toString();
+    }
+    expect(owners).toEqual({ 8417: 'first', 9000: 'second' });
+  });
 });
 
 describe('GET /bands/:bandId/media', () => {
@@ -2013,6 +2057,33 @@ describe('PATCH /media — two requests over the same files', () => {
     ]);
     expect((await sidecarIn(other)).files).toEqual([]);
     expect(await exists(abs(`${folder[other]}/IMG_1.jpg`))).toBe(false);
+  });
+
+  it('waits on the folder lock before giving a show with no media a folder', async () => {
+    // Dayseeker's show has nothing yet, so the move chooses its folder, and
+    // an upload to another show deriving the same name may be choosing it
+    // too. Holding that show's lock alone does not keep that upload out.
+    const table = new Map([[5, photo(40)]]);
+    prisma.concertMedia.findMany = vi.fn(async ({ where }) => (where.id
+      ? where.id.in.filter((id) => table.has(id)).map((id) => withShow({ ...table.get(id) }))
+      : [...table.values()].filter((r) => r.attendance_id === where.attendance_id)));
+    await seed(40);
+
+    const release = await acquire('showdir:user-1');
+    let pending;
+    try {
+      pending = tag({ ids: [5], band_id: 501 }).then((r) => r);
+      await sleep(50);
+      expect(await exists(abs(`${folder[41]}/IMG_1.jpg`))).toBe(false);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    } finally {
+      release();
+    }
+
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({ moved: 1 });
+    expect(await exists(abs(`${folder[41]}/IMG_1.jpg`))).toBe(true);
   });
 
   it('works from the files as they are once the locks are held, not as first read', async () => {

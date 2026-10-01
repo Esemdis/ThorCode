@@ -30,7 +30,7 @@ const {
 const {
   uniqueFilename, resolveArchivePath, slugSegment, safeExtension,
 } = require('../../../utils/mediaPaths');
-const { showDirForAttendance } = require('../../../utils/mediaShowDir');
+const { showDirForAttendance, lockFolderChoice } = require('../../../utils/mediaShowDir');
 const { capturedAtFor } = require('../../../utils/mediaCapture');
 const { exifCapturedAtOfFile } = require('../../../utils/exifCapturedAt');
 const { emptySidecar, upsertFile, readSidecar, updateSidecar } = require('../../../utils/mediaSidecar');
@@ -127,9 +127,10 @@ router.post(
     // have to be swept on failure or a rejected batch leaks its temp files.
     const allTemp = () => [...(req.files?.files ?? []), ...(req.files?.posters ?? [])];
     const cleanup = () => Promise.all(allTemp().map((f) => unlink(f.path).catch(() => {})));
-    // Declared out here so the finally below can release it whichever way the
-    // handler leaves.
+    // Declared out here so the finally below can release them whichever way
+    // the handler leaves.
     let releaseShow = null;
+    let releaseFolders = null;
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) { await cleanup(); return badRequest(res, 'Validation failed'); }
@@ -257,6 +258,11 @@ router.post(
         select: { filename: true, rel_path: true, sha256: true },
         orderBy: { id: 'asc' },
       });
+
+      // A first upload chooses a folder, and the sidecar that claims it for
+      // this concert is not written until the files are in. Held until then,
+      // or another show deriving the same name takes the same folder.
+      if (!existing.length) releaseFolders = await lockFolderChoice(row.wishlist_rel.user_id);
 
       const relDir = await showDirForAttendance({
         existingRelPath: existing[0]?.rel_path ?? null,
@@ -449,6 +455,7 @@ router.post(
     } finally {
       // Must run on every path. A lock that is taken and not handed back
       // wedges that show's uploads for the life of the process.
+      if (releaseFolders) releaseFolders();
       if (releaseShow) releaseShow();
     }
   },

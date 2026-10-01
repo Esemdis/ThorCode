@@ -22,7 +22,7 @@ const {
   fail, badRequest, conflict, success,
 } = require('../../../utils/apiResponse');
 const { uniqueFilename, resolveArchivePath } = require('../../../utils/mediaPaths');
-const { showDirForAttendance } = require('../../../utils/mediaShowDir');
+const { showDirForAttendance, lockFolderChoice } = require('../../../utils/mediaShowDir');
 const {
   emptySidecar, upsertFile, removeFile, readSidecar, updateSidecar,
 } = require('../../../utils/mediaSidecar');
@@ -54,6 +54,7 @@ router.patch(
     // Declared out here so the finally below lets the shows go whichever way
     // the handler leaves.
     let locked = null;
+    let releaseFolders = null;
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) return badRequest(res, 'Validation failed');
@@ -254,6 +255,11 @@ router.patch(
             }
             if (clashes.length) return conflict(res, `Already in that show: ${clashes.join(', ')}`);
 
+            // A show with no media yet is given a folder here, which an upload
+            // to another show deriving the same name may be choosing too. Once,
+            // however many such shows: the lock is not reentrant.
+            if (!existing.length && !releaseFolders) releaseFolders = await lockFolderChoice(req.user.id);
+
             const relDir = await showDirForAttendance({
               existingRelPath: existing[0]?.rel_path ?? null,
               userId: req.user.id,
@@ -393,6 +399,7 @@ router.patch(
     } finally {
       // Every path out, refusals included. A show left locked wedges its
       // uploads and tags for the life of the process.
+      if (releaseFolders) releaseFolders();
       if (locked) locked.release();
     }
   },

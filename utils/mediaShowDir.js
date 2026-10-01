@@ -34,6 +34,30 @@
 const path = require('node:path');
 const { showFolderName, slugSegment, resolveArchivePath } = require('./mediaPaths');
 const { readSidecar } = require('./mediaSidecar');
+const { acquire } = require('./serialQueue');
+
+/**
+ * Held while a show without media is given a folder, until that folder's
+ * sidecar is written.
+ *
+ * A folder is claimed by its sidecar, and the sidecar is written only once the
+ * files are in. The callers' own locks are per show, so two shows deriving
+ * one name — rule 2 below — went through together: both found no sidecar,
+ * both took the folder, and both chose filenames from the same listing. The
+ * second rename overwrote the first's bytes, and its entry went into a sidecar
+ * owned by the other concert.
+ *
+ * One per user, since a folder is only ever contended within one user's
+ * subtree. Taken after the show locks and never the other way round, so it
+ * cannot deadlock against them. A show that already has media keeps its
+ * folder (rule 1) and needs none of this.
+ *
+ * @param {string} userId
+ * @returns {Promise<() => void>} the caller MUST release, in a finally
+ */
+function lockFolderChoice(userId) {
+  return acquire(`showdir:${slugSegment(userId)}`);
+}
 
 /**
  * A folder is free to adopt when it has no sidecar at all — it may not exist,
@@ -50,6 +74,8 @@ async function sidecarOwnerOf(relDir) {
 /**
  * The directory this attendance's next upload belongs in, relative to the
  * archive root.
+ *
+ * Without existingRelPath, the caller must hold lockFolderChoice.
  *
  * @param {object} args
  * @param {string|null} args.existingRelPath - rel_path of any file this
@@ -73,4 +99,4 @@ async function showDirForAttendance({ existingRelPath, userId, concertId, show }
   }
 }
 
-module.exports = { showDirForAttendance };
+module.exports = { showDirForAttendance, lockFolderChoice };
