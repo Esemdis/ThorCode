@@ -1,5 +1,5 @@
 /**
- * Discord embeds for a set of new concerts.
+ * Discord embeds for a set of new concerts, and for a week's recap of them.
  *
  * Extracted from routes/data/wishlists/notify.js when a second caller appeared:
  * the wishlist digest titles its embed after a band, while the subscription
@@ -10,6 +10,8 @@
  * POST rather than truncating it, so the splitting here is what keeps a busy
  * announcement from silently not arriving.
  */
+
+const { countryFlag } = require("./countries");
 
 // 6000 is the real cap across an embed; 5800 leaves room for the title and
 // footer that are added after the fields are measured.
@@ -69,4 +71,112 @@ function buildDiscordEmbeds({ title, concerts }) {
   return embeds;
 }
 
-module.exports = { buildDiscordEmbeds };
+// Room left for the "+N more cities" field that closes a long recap.
+const OVERFLOW_RESERVE = 80;
+// Long enough for a busy week's bands, short enough to leave the cities
+// most of the embed.
+const BAND_LIST_LIMIT = 1800;
+const CITY_LIST_LIMIT = 300;
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+// Discord reads band names as markdown: one with an asterisk or an underscore
+// in it would set the rest of the list in italics.
+const escapeMarkdown = (text) => String(text).replace(/([\\*_~`|>])/g, "\\$1");
+
+/**
+ * As many items as fit in `max` characters, with what did not fit counted at
+ * the end: "Ghost, Opeth and 12 more".
+ *
+ * @param {string[]} items
+ * @param {number} max
+ * @param {{sep?: string, more?: (n: number) => string}} [options]
+ */
+function listWithin(items, max, { sep = ", ", more = (n) => ` and ${n} more` } = {}) {
+  let out = "";
+  for (const [i, item] of items.entries()) {
+    const next = out ? `${out}${sep}${item}` : item;
+    const left = items.length - i - 1;
+    if (next.length + (left > 0 ? more(left).length : 0) > max) {
+      // The check one item back made room for exactly this tail.
+      return out ? `${out}${more(items.length - i)}` : `${item.slice(0, max - 1)}…`;
+    }
+    out = next;
+  }
+  return out;
+}
+
+// Spelled out rather than asked of Intl, whose en-GB says "Sep" or "Sept"
+// depending on the ICU the server's Node was built with.
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// "28 Sep – 4 Oct 2026", "5–11 Oct 2026", or across a new year in full. The
+// days are plain "YYYY-MM-DD" dates, read as written.
+function dayRange(first, last) {
+  const [a, b] = [first, last].map((day) => day.split("-").map(Number));
+  const dayMonth = ([, m, d]) => `${d} ${MONTHS[m - 1]}`;
+  const full = (date) => `${dayMonth(date)} ${date[0]}`;
+  if (a[0] !== b[0]) return `${full(a)} – ${full(b)}`;
+  if (a[1] !== b[1]) return `${dayMonth(a)} – ${full(b)}`;
+  return `${a[2]}–${full(b)}`;
+}
+
+// One show's day, read in UTC as concert_date is filed.
+function dayLabel(date) {
+  if (!date) return "Date TBA";
+  const d = new Date(date);
+  return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+}
+
+// "**12 Mar 2027** — Ghost, Opeth": when, and which of your bands.
+const showLine = (concert) =>
+  `**${dayLabel(concert.concert_date)}** — ${concert.bands.map((b) => escapeMarkdown(b.name)).join(", ")}`;
+
+// The flag says the country, so the city's name can stand alone after it.
+function cityLabel({ city, country }) {
+  return `${countryFlag(country)} ${escapeMarkdown(city || "Unknown city")}`.trim();
+}
+
+/**
+ * One embed for a week's recap (see utils/weeklyRecap.js): the total, every
+ * band with its count, and a field per city with its shows, one to a line.
+ *
+ * Cities are added biggest first until the embed is full, and the rest are
+ * summed in one last field, so a busy week is cut short rather than refused.
+ */
+function buildRecapEmbed(recap) {
+  const title = `Week ${recap.week}: ${plural(recap.total, "new concert", "new concerts")}`;
+  const counted = (b) => `**${escapeMarkdown(b.name)}**${b.count > 1 ? ` (${b.count})` : ""}`;
+
+  const where = plural(recap.cities.length, "city", "cities")
+    + (recap.country_count > 0 ? ` in ${plural(recap.country_count, "country", "countries")}` : "");
+  const heading = `${dayRange(recap.first_day, recap.last_day)} · ${where}`;
+  const bands = listWithin(recap.bands.map(counted), BAND_LIST_LIMIT);
+  const description = bands ? `${heading}\n\n${bands}` : heading;
+
+  const fields = [];
+  let used = title.length + description.length;
+  for (const [i, city] of recap.cities.entries()) {
+    const name = `${cityLabel(city)} · ${city.count}`;
+    const value = listWithin(city.concerts.map(showLine), CITY_LIST_LIMIT, {
+      sep: "\n", more: (n) => `\n+${plural(n, "more show", "more shows")}`,
+    }) || "—";
+    const last = i === recap.cities.length - 1;
+    const full = fields.length === MAX_FIELDS - 1 && !last;
+    if (full || used + name.length + value.length + (last ? 0 : OVERFLOW_RESERVE) > EMBED_CHAR_LIMIT) {
+      const rest = recap.cities.slice(i);
+      fields.push({
+        name: `+${plural(rest.length, "more city", "more cities")}`,
+        value: plural(rest.reduce((sum, c) => sum + c.count, 0), "concert", "concerts"),
+        inline: false,
+      });
+      break;
+    }
+    fields.push({ name, value, inline: false });
+    used += name.length + value.length;
+  }
+
+  return { title, description, color: 0x5865f2, fields };
+}
+
+module.exports = { buildDiscordEmbeds, buildRecapEmbed };

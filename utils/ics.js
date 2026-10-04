@@ -8,6 +8,7 @@
 // them.
 
 const { cleanLineupNames } = require('./lineupNames');
+const { countryName } = require('./countries');
 
 // Concerts are scraped without a running time, so a show with a real start gets
 // a nominal slot rather than a measured one. Three hours covers doors-to-encore
@@ -18,15 +19,8 @@ const EVENT_HOURS = 3;
 const MAX_OCTETS = 75;
 
 const encoder = new TextEncoder();
-const regionNames = new Intl.DisplayNames(['en'], { type: 'region' });
 
 const pad = (n) => String(n).padStart(2, '0');
-
-/** Expand an ISO country code; anything Intl rejects is handed back untouched. */
-function countryName(code) {
-  if (!code) return code;
-  try { return regionNames.of(code) ?? code; } catch { return code; }
-}
 
 /** `YYYYMMDD`, read in UTC. */
 function icsDay(date) {

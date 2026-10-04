@@ -3,6 +3,7 @@ const { runNotificationDigest } = require("./concertNotifyDigest");
 const { backfillSpotifyIds, warmBandImages } = require("./bandSpotifyMatch");
 const { backfillSourceUrls } = require("./bandSourceUrlBackfill");
 const { backfillSetlists } = require("./setlistBackfill");
+const { sendWeeklyRecaps } = require("./weeklyRecap");
 const prisma = require("../prisma/client");
 
 // Default: once a day at 08:00 server time.
@@ -30,6 +31,11 @@ const SOURCE_URL_BACKFILL_LIMIT = 100;
 // anything — this is what actually catches it up once the show has happened.
 const SETLIST_BACKFILL_CRON = process.env.SETLIST_BACKFILL_CRON || "0 6 * * *";
 const SETLIST_BACKFILL_LIMIT = 50;
+
+// Last week's recap to the Discord of everyone who turned it on, Monday
+// morning. Each owner's week ends on their own clock (see weeklyRecap.js), so
+// the hour only has to fall after midnight on Monday in Europe.
+const WEEKLY_RECAP_CRON = process.env.WEEKLY_RECAP_CRON || "0 9 * * 1";
 
 /**
  * Clean up expired email verification codes
@@ -94,6 +100,15 @@ function startCronJobs() {
       }
     } catch (err) {
       console.error("[cron] Source URL backfill failed:", err);
+    }
+  });
+
+  cron.schedule(WEEKLY_RECAP_CRON, async () => {
+    try {
+      const { sent, failed, quiet } = await sendWeeklyRecaps();
+      console.log(`[cron] Weekly recap: posted ${sent}, ${failed} failed, ${quiet} with nothing new.`);
+    } catch (err) {
+      console.error("[cron] Weekly recap failed:", err);
     }
   });
 

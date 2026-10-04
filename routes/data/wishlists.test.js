@@ -66,6 +66,9 @@ const EXPECTED_ROUTES = [
   'PUT /wishlists/:id/attendance/missed [8]',
   // One more than it was: the setlist.fm budget it shares with the band routes.
   'POST /wishlists/:id/attendance/from-setlist [7]',
+  'GET /wishlists/:id/weekly [6]',
+  // One more for its own limiter: a post goes to Discord, which has its own.
+  'POST /wishlists/:id/weekly/discord [7]',
 ];
 
 describe('the routing surface', () => {
@@ -133,6 +136,8 @@ describe('a wishlist that is someone else\'s', () => {
     ['get', '/wishlists/7/calendar-token', user],
     ['post', '/wishlists/7/calendar-token', user],
     ['delete', '/wishlists/7/calendar-token', user],
+    ['get', '/wishlists/7/weekly', user],
+    ['post', '/wishlists/7/weekly/discord', user],
   ];
 
   beforeEach(() => {
@@ -144,7 +149,11 @@ describe('a wishlist that is someone else\'s', () => {
   // for what these did.
   afterAll(async () => {
     const { rateLimit } = createRequire(import.meta.url)('./wishlists/shared.js');
-    for (const ip of ['::ffff:127.0.0.1', '127.0.0.1', '::1']) await rateLimit.resetKey(ip);
+    const { sendLimit } = createRequire(import.meta.url)('./wishlists/recap.js');
+    for (const ip of ['::ffff:127.0.0.1', '127.0.0.1', '::1']) {
+      await rateLimit.resetKey(ip);
+      await sendLimit.resetKey(ip);
+    }
   });
 
   it.each(routes)('%s %s answers 403 and goes no further', async (method, path, auth, body) => {
@@ -1403,6 +1412,122 @@ describe('GET /wishlists/:id/recent-concerts', () => {
       metadata: true, source: true, on_sale: true, ticket_sale_start: true,
       price_min: true, price_max: true, price_currency: true,
     });
+  });
+});
+
+describe('the weekly recap', () => {
+  // Served by a real socket, as the notify tests are: the recap posts through
+  // axios required by CommonJS, which vi.mock cannot reach.
+  let server;
+  let received;
+  let status;
+  const hook = (path) => `http://127.0.0.1:${server.address().port}${path}`;
+
+  beforeAll(async () => {
+    const { createServer } = await import('node:http');
+    server = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        received.push({ path: req.url, body: JSON.parse(body || '{}') });
+        res.writeHead(status);
+        res.end();
+      });
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  });
+
+  afterAll(() => new Promise((resolve) => server.close(resolve)));
+
+  const ADDED = [{
+    id: 10, name: null, venue: 'Avicii Arena', festival: false, city: 'Stockholm', country: 'SE', concert_date: new Date('2027-03-12'), created_at: new Date(),
+    bands: [{ band_rel: { id: 1, name: 'Ghost' } }],
+  }];
+  const wishlist = (extra = {}) => ({
+    id: 7, user_id: 'user-1', discord_webhook: hook('/mine'), bands: [{ band_id: 1, tier: 'LOVE' }], ...extra,
+  });
+
+  beforeEach(async () => {
+    received = [];
+    status = 204;
+    prisma.wishlist.findUnique.mockResolvedValue(wishlist());
+    prisma.concert.findMany.mockResolvedValue(ADDED);
+    const { sendLimit } = createRequire(import.meta.url)('./wishlists/recap.js');
+    for (const ip of ['::ffff:127.0.0.1', '127.0.0.1', '::1']) await sendLimit.resetKey(ip);
+  });
+
+  it("counts the week's new shows by city, in the viewer's zone", async () => {
+    const res = await request(app).get('/wishlists/7/weekly?tz=Europe/Stockholm&weeks_ago=1').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      total: 1, time_zone: 'Europe/Stockholm', country_count: 1,
+      cities: [{
+        city: 'Stockholm', country: 'SE', count: 1,
+        concerts: [{
+          id: 10, concert_date: '2027-03-12T00:00:00.000Z', name: null, venue: 'Avicii Arena', festival: false,
+          bands: [{ id: 1, name: 'Ghost', tier: 'LOVE' }],
+        }],
+      }],
+    });
+    expect(Date.parse(res.body.end) - Date.parse(res.body.start)).toBeGreaterThanOrEqual(167 * 3600 * 1000);
+  });
+
+  it('says whether there is a webhook, and never what it is', async () => {
+    // A webhook url is enough to post as it, so it stays on the server.
+    const res = await request(app).get('/wishlists/7/weekly').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.body.discord).toBe(true);
+    expect(JSON.stringify(res.body)).not.toContain('/mine');
+  });
+
+  it('refuses a zone it does not know, and a week out of range', async () => {
+    for (const q of ['tz=Mars/Olympus_Mons', 'weeks_ago=-1', 'weeks_ago=9999', 'weeks_ago=one']) {
+      const res = await request(app).get(`/wishlists/7/weekly?${q}`).set(...authHeader({ id: 'user-1' }));
+      expect([q, res.status]).toEqual([q, 400]);
+    }
+    expect(prisma.concert.findMany).not.toHaveBeenCalled();
+  });
+
+  it('posts the week to the wishlist\'s own webhook', async () => {
+    const res = await request(app).post('/wishlists/7/weekly/discord').set(...authHeader({ id: 'user-1' }))
+      .send({ tz: 'Europe/Stockholm', weeks_ago: 0 });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ sent: true, total: 1 });
+    expect(received).toHaveLength(1);
+    expect(received[0].path).toBe('/mine');
+    expect(received[0].body.embeds[0].title).toMatch(/^Week \d+: 1 new concert$/);
+    expect(received[0].body.embeds[0].description).toContain('**Ghost**');
+  });
+
+  it('says so when there is no webhook to post to', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue(wishlist({ discord_webhook: null }));
+
+    const res = await request(app).post('/wishlists/7/weekly/discord').set(...authHeader({ id: 'user-1' })).send({});
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/no Discord webhook/);
+    expect(prisma.concert.findMany).not.toHaveBeenCalled();
+  });
+
+  it('does not post an empty week', async () => {
+    prisma.concert.findMany.mockResolvedValue([]);
+
+    const res = await request(app).post('/wishlists/7/weekly/discord').set(...authHeader({ id: 'user-1' })).send({});
+
+    expect(res.status).toBe(409);
+    expect(received).toHaveLength(0);
+  });
+
+  it('answers 502 when Discord turns the post down', async () => {
+    status = 404;
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await request(app).post('/wishlists/7/weekly/discord').set(...authHeader({ id: 'user-1' })).send({});
+
+    expect(res.status).toBe(502);
+    expect(res.body.error).toMatch(/Discord did not take the post/);
   });
 });
 
