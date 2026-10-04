@@ -1087,6 +1087,60 @@ describe('POST /wishlists/:id/attendance/from-setlist', () => {
   });
 });
 
+describe('POST /wishlists', () => {
+  const create = () => request(app).post('/wishlists').set(...authHeader({ id: 'user-1' })).send({ name: 'My Wishlist' });
+
+  // These spend the shared write limiter too; see the sweep above.
+  afterAll(async () => {
+    const { rateLimit } = createRequire(import.meta.url)('./wishlists/shared.js');
+    for (const ip of ['::ffff:127.0.0.1', '127.0.0.1', '::1']) await rateLimit.resetKey(ip);
+  });
+
+  it('makes a wishlist for an account that has none', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue(null);
+    prisma.wishlist.create.mockResolvedValue({ id: 5, user_id: 'user-1', bands: [] });
+
+    const res = await create();
+
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe(5);
+  });
+
+  it('hands back the one you have rather than making another', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [] });
+
+    const res = await create();
+
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(7);
+    expect(prisma.wishlist.create).not.toHaveBeenCalled();
+  });
+
+  it('answers the loser of two overlapping creates with the wishlist the winner made', async () => {
+    // Both read "none yet" before either wrote; user_id is unique, so the
+    // second insert fails. That was a 500 on a wishlist that existed.
+    prisma.wishlist.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: 5, user_id: 'user-1', bands: [] });
+    prisma.wishlist.create.mockRejectedValue(Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }));
+
+    const res = await create();
+
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(5);
+  });
+
+  it('still fails a create that broke for any other reason', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue(null);
+    prisma.wishlist.create.mockRejectedValue(new Error('connection lost'));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await create();
+
+    expect(res.status).toBe(500);
+  });
+});
+
 describe('POST /wishlists/:id/bands', () => {
   // The router's own copy of band creation — see the from-setlist tests.
   const bandCreate = createRequire(import.meta.url)('../../utils/bandCreate.js');

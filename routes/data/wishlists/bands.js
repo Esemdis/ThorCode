@@ -130,21 +130,31 @@ router.post(
       }
 
       // Return existing wishlist if user already has one
-      const existing = await prisma.wishlist.findUnique({ where: { user_id: req.user.id }, include: { bands: true } });
+      const findExisting = () => prisma.wishlist.findUnique({ where: { user_id: req.user.id }, include: { bands: true } });
+      const existing = await findExisting();
       if (existing) return res.status(200).json(existing);
 
       const { name, discord_webhook } = req.body;
 
-      const newWishlist = await prisma.wishlist.create({
-        data: {
-          name: name.trim(),
-          user_id: req.user.id,
-          discord_webhook: discord_webhook || null,
-        },
-        include: { bands: true },
-      });
-
-      res.status(201).json(newWishlist);
+      try {
+        const newWishlist = await prisma.wishlist.create({
+          data: {
+            name: name.trim(),
+            user_id: req.user.id,
+            discord_webhook: discord_webhook || null,
+          },
+          include: { bands: true },
+        });
+        return res.status(201).json(newWishlist);
+      } catch (error) {
+        // Two creates that overlap both pass the read above, and user_id is
+        // unique, so the second insert fails. It was answered as a 500 on a
+        // wishlist that had just been made; the one that won is the answer.
+        if (error.code !== "P2002") throw error;
+        const winner = await findExisting();
+        if (!winner) throw error;
+        return res.status(200).json(winner);
+      }
     } catch (error) {
       console.error("Error creating wishlist:", error);
       return res.status(500).json(SERVER_ERROR);
