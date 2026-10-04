@@ -257,6 +257,12 @@ router.get(
               // ago each announcement landed rather than only that it did.
               created_at: true,
               name: true,
+              // The rest of the bill. "Show on map" pins this copy of the show
+              // when its date is outside the map's range, and the popup reads
+              // the acts you don't follow from here. Without it, Palaye Royale
+              // at COS Torwar showed only Badflower, the one band linked to it.
+              metadata: true,
+              source: true,
               city: true,
               country: true,
               venue: true,
@@ -352,10 +358,19 @@ router.get(
         select: {
           id: true,
           name: true,
+          // What "Show on map" pins, as /new sends it: the bill's other acts,
+          // whose listing it is, and the sale state and price the popup shows.
+          metadata: true,
+          source: true,
           city: true,
           country: true,
           venue: true,
           concert_date: true,
+          on_sale: true,
+          ticket_sale_start: true,
+          price_min: true,
+          price_max: true,
+          price_currency: true,
           url: true,
           festival: true,
           sold_out: true,

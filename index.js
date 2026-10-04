@@ -12,15 +12,12 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use("/users", require("./routes/users"));
-app.use("/data/steam", require("./routes/data/steam"));
 app.use("/data/concerts", require("./routes/data/concerts"))
 app.use("/data/concerts", require("./routes/data/notifications"))
 app.use("/data/concerts", require("./routes/data/playlists"))
 app.use("/data/concerts", require("./routes/data/media"))
 app.use("/data/concerts", require("./routes/data/health"))
 app.use("/data/cities", require("./routes/data/cities"))
-app.use("/data/tmdb", require("./routes/data/tmdb"));
-app.use("/oauth/tmdb", require("./routes/oauth/tmdb"));
 app.use("/oauth/spotify", require("./routes/oauth/spotify"));
 app.use("/oauth/tidal", require("./routes/oauth/tidal"));
 // Every /travel/* route, read or write, passes the limiter first.

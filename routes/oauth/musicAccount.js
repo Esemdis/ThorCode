@@ -2,7 +2,7 @@
 // setlist playlists land in it. One router per service, made here, mounted at
 // /oauth/<service>.
 //
-// Shaped like routes/oauth/tmdb.js with two deliberate differences.
+// Two choices here are deliberate.
 //
 // The callback runs without `auth`. It arrives as a top-level browser
 // navigation from the service, which cannot carry an Authorization header. So

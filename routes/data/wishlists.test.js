@@ -1291,6 +1291,29 @@ describe('GET /wishlists/:id/new', () => {
     expect(from.toISOString()).toBe(`${new Date().toISOString().slice(0, 10)}T00:00:00.000Z`);
     expect(filter.OR).toContainEqual({ concert_date: null });
   });
+
+  it('carries the rest of the bill, for the show it pins on the map', async () => {
+    // A show outside the map's dates is pinned from this copy, and the popup
+    // reads every act you don't follow from metadata. Without it, Palaye Royale
+    // at COS Torwar showed only Badflower, the one band linked to the show.
+    const show = {
+      id: 14000, created_at: new Date('2026-10-03'), name: 'Palaye Royale', city: 'Warsaw', country: 'PL',
+      venue: 'COS Torwar', concert_date: new Date('2027-03-09T19:00:00Z'), source: 'songkick',
+      metadata: '["Palaye Royale","Badflower","Winiary Bookings"]',
+      bands: [{ band_rel: { id: 128, name: 'Badflower' } }],
+    };
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', last_active_at: null, bands: [{ band_id: 128 }] });
+    prisma.concertBandReference.findMany.mockResolvedValue([{ band_rel: { name: 'Badflower' }, concert_rel: show }]);
+    prisma.activityLog.findMany.mockResolvedValue([]);
+    prisma.wishlist.update.mockResolvedValue({});
+
+    const res = await request(app).get('/wishlists/7/new').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    const { select } = prisma.concertBandReference.findMany.mock.calls[0][0].include.concert_rel;
+    expect(select).toMatchObject({ metadata: true, source: true });
+    expect(res.body.concerts[0]).toMatchObject({ metadata: show.metadata, source: 'songkick' });
+  });
 });
 
 describe('GET /wishlists/:id/recent-concerts', () => {
@@ -1310,6 +1333,22 @@ describe('GET /wishlists/:id/recent-concerts', () => {
     expect(res.status).toBe(200);
     expect(prisma.concert.findMany.mock.calls[0][0].select.sold_out).toBe(true);
     expect(res.body.groups[0].concerts[0].sold_out).toBe(true);
+  });
+
+  it('sends what the map popup reads, as /new does', async () => {
+    // "Show on map" pins a show from this feed exactly as it pins one from
+    // /new, so the two must carry the same show: its bill, its listing, its
+    // sale state and its price.
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [{ band_id: 128, tier: 'LIKE' }] });
+    prisma.concert.findMany.mockResolvedValue([]);
+
+    const res = await request(app).get('/wishlists/7/recent-concerts').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(prisma.concert.findMany.mock.calls[0][0].select).toMatchObject({
+      metadata: true, source: true, on_sale: true, ticket_sale_start: true,
+      price_min: true, price_max: true, price_currency: true,
+    });
   });
 });
 

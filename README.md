@@ -5,8 +5,6 @@ The Express API behind two personal apps:
 - **[concert-map](https://github.com/esemdis/concert-map)** tracks bands, their upcoming shows, the shows you went to, and the photos and videos from them.
 - **travel-bag** plans trips: places, day routes, packing, gear and reviews.
 
-It also serves a few older endpoints for Steam and TMDB.
-
 The API runs as one Node process against Postgres through Prisma. Two other services do work for it:
 
 - **[python-crohn](https://github.com/esemdis/python-crohn)** scrapes concerts from Songkick and Bandsintown, and fetches setlists and weather. It posts the results back here.
@@ -25,7 +23,6 @@ The API runs as one Node process against Postgres through Prisma. Two other serv
 | Cities | `/data/cities` | City list, and weather written in bulk by the sync service. |
 | Health | `/data/concerts/health` | How much work each nightly job has waiting, for the admin panel. |
 | Travel | `/travel/*` | `routes/travel/`. Covers trips, places and day plans ([docs/day-planning.md](docs/day-planning.md)), todos, estimates, ECB exchange rates, gear, loadouts, reviews, a wishlist and a Gemini weather verdict. |
-| Steam, TMDB | `/data/steam`, `/data/tmdb`, `/oauth/tmdb` | Linking a Steam account and its most-played games, and TMDB login. |
 
 Auth is a JWT in `Authorization: Bearer`. Roles are `USER`, `ADMIN` and `SYSTEM`. `SYSTEM` is the role of the machine user the sync service signs in as. `scripts/generate-service-token.js` mints its token.
 

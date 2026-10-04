@@ -14,24 +14,6 @@ const app = buildApp(router, '/users');
 
 beforeEach(() => { vi.clearAllMocks(); });
 
-describe('GET /users/:id (admin)', () => {
-  it('asks for the relations by their relation names', async () => {
-    // It selected `game` and `movie`, which are scalar id columns, with a
-    // nested select. Prisma refuses that (SelectionSetOnScalar), so the route
-    // answered 500 to every request — confirmed against Postgres.
-    prisma.user.findUnique.mockResolvedValue({ id: 'a'.repeat(32), email: 'x@y.z', game_times: [], movie_reviews: [] });
-
-    const res = await request(app).get(`/users/${'a'.repeat(32)}`).set(...authHeader({ role: 'ADMIN' }));
-
-    expect(res.status).toBe(200);
-    const { select } = prisma.user.findUnique.mock.calls[0][0];
-    expect(select.game_times.select).toHaveProperty('game_rel');
-    expect(select.game_times.select).not.toHaveProperty('game');
-    expect(select.movie_reviews.select).toHaveProperty('movie_rel');
-    expect(select.movie_reviews.select).not.toHaveProperty('movie');
-  });
-});
-
 describe('POST /users/login', () => {
   const body = { email: 'someone@example.test', password: 'Password1' };
 

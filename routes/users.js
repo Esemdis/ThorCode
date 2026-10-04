@@ -40,38 +40,13 @@ const registerLimit = rateLimiter({
   max: 5,
 });
 
-// The profile both /me and the admin lookup return. The admin route spelled
-// its own, selecting `game` and `movie` — scalar id columns — with a nested
-// select, which Prisma refuses, so it answered 500 to every request it got.
+// The profile both /me and the admin lookup return.
 const PROFILE_SELECT = {
   id: true,
   email: true,
   role: true,
   created_at: true,
-  game_times: {
-    select: {
-      play_time: true,
-      updated_at: true,
-      game_rel: { select: { id: true, name: true, appid: true } },
-    },
-  },
-  movie_reviews: {
-    select: {
-      id: true,
-      rating: true,
-      movie_rel: { select: { id: true, name: true } },
-    },
-  },
 };
-
-// Top 3 game_times and movie_reviews, trimmed in JS.
-function trimProfile(user) {
-  user.game_times = (user.game_times || [])
-    .sort((a, b) => b.play_time - a.play_time)
-    .slice(0, 3);
-  user.movie_reviews = (user.movie_reviews || []).slice(0, 3);
-  return user;
-}
 
 const UNIQUE_VIOLATION = 'P2002';
 
@@ -237,7 +212,7 @@ router.get('/me', auth, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    res.json({ user: trimProfile(user) });
+    res.json({ user });
   } catch (error) {
     console.error('Error fetching user:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -315,7 +290,7 @@ router.get(
         return res.status(404).json({ error: 'User not found' });
       }
 
-      res.json({ user: trimProfile(user) });
+      res.json({ user });
     } catch (error) {
       console.error('Error fetching user:', error);
       res.status(500).json({ error: 'Internal server error' });
