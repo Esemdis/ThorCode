@@ -1682,6 +1682,19 @@ describe('GET /wishlists/:id/festivals', () => {
     expect(res.body.festivals[0].watched).toBe(true);
   });
 
+  it('leaves out a tour Songkick files as a festival, unless something else says it is one', async () => {
+    const date = (id, city, over = {}) => ({
+      ...COPENHELL, id, city, name: 'Hollywood Undead: EU/UK 2027', venue: `Venue ${id}`, festival: false,
+      url: `http://www.songkick.com/festivals/3808399-hollywood-undead-euuk/id/${id}-hollywood-undead-euuk-2027`,
+      bands: [act(9, 'Hollywood Undead')], ...over,
+    });
+    prisma.concert.findMany.mockResolvedValue([date(1, 'Prague'), date(2, 'Warsaw'), date(3, 'Gothenburg', { festival: true }), COPENHELL]);
+
+    const res = await request(app).get('/wishlists/7/festivals').set(...me);
+
+    expect(res.body.festivals.map((f) => f.city)).toEqual(['Copenhagen', 'Gothenburg']);
+  });
+
   it('leaves out what has already happened, by calendar day', async () => {
     await request(app).get('/wishlists/7/festivals').set(...me);
 

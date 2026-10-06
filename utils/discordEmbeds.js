@@ -37,7 +37,10 @@ function buildDiscordEmbeds({ title, concerts }) {
     const added = Array.isArray(concert.new_acts) && concert.new_acts.length
       ? `\n**New on the bill:** ${concert.new_acts.map(escapeMarkdown).join(", ")}`
       : "";
-    const head = venueStr + (added.length > 300 ? `${added.slice(0, 299)}…` : added);
+    // What is being said about the show, for a post about more than one
+    // thing: "Sold out", "On sale today".
+    const note = typeof concert.note === "string" && concert.note ? `\n**${escapeMarkdown(concert.note.slice(0, 100))}**` : "";
+    const head = venueStr + note + (added.length > 300 ? `${added.slice(0, 299)}…` : added);
 
     let lineup = [];
     try { lineup = JSON.parse(concert.metadata || "[]"); } catch {}

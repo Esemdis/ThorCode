@@ -6,6 +6,8 @@ const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
 const { rateLimiter } = require("../../utils/rateLimiter");
+const { ticketState } = require("../../utils/ticketState");
+const { isTimeZone } = require("../../utils/weeklyRecap");
 
 const rateLimit = rateLimiter({
   message: "Too many requests to the notifications route, please try again later.",
@@ -129,6 +131,119 @@ router.delete(
       res.json({ message: "Subscription deleted" });
     } catch (error) {
       console.error("Error deleting notification subscription:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// A followed show as the app lists it, with where its tickets are.
+const FOLLOWED_CONCERT = {
+  id: true,
+  name: true,
+  venue: true,
+  city: true,
+  country: true,
+  concert_date: true,
+  url: true,
+  on_sale: true,
+  sold_out: true,
+  ticket_sale_start: true,
+  bands: { select: { band_rel: { select: { id: true, name: true } } } },
+};
+
+const concertIdParam = param("concertId").isInt({ min: 1 }).withMessage("Invalid concert id");
+
+// Its own budget: following a festival season's worth of shows is a burst of
+// small writes, not someone hammering the watch form.
+const followLimit = rateLimiter({ max: 60, message: "Too many follows at once, please try again shortly." });
+
+// GET /notifications/follows — the shows you follow for their tickets
+router.get(
+  "/notifications/follows",
+  [auth, roleCheck(["ADMIN", "USER"])],
+  async (req, res) => {
+    try {
+      const follows = await prisma.concertFollow.findMany({
+        where: { user_id: req.user.id },
+        select: { concert_id: true, created_at: true, concert_rel: { select: FOLLOWED_CONCERT } },
+        orderBy: { created_at: "desc" },
+      });
+      const now = new Date();
+      res.json(follows.map(({ concert_id, created_at, concert_rel }) => ({
+        concert_id,
+        created_at,
+        tickets: ticketState(concert_rel, now),
+        concert: { ...concert_rel, bands: concert_rel.bands.map((b) => b.band_rel) },
+      })));
+    } catch (error) {
+      console.error("Error fetching followed shows:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// PUT /notifications/follows/:concertId — follow a show's tickets. Idempotent:
+// following one you already follow keeps what you have been told so far.
+router.put(
+  "/notifications/follows/:concertId",
+  [auth, roleCheck(["ADMIN", "USER"]), concertIdParam],
+  followLimit,
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid concert id" });
+    const concertId = parseInt(req.params.concertId, 10);
+
+    try {
+      const concert = await prisma.concert.findUnique({
+        where: { id: concertId },
+        select: { id: true, on_sale: true, sold_out: true, ticket_sale_start: true },
+      });
+      if (!concert) return res.status(404).json({ error: "Concert not found" });
+
+      // Told what it is now: following a show that is on sale says nothing
+      // until it sells out.
+      const tickets = ticketState(concert);
+      await prisma.concertFollow.upsert({
+        where: { user_id_concert_id: { user_id: req.user.id, concert_id: concertId } },
+        create: { user_id: req.user.id, concert_id: concertId, told_state: tickets },
+        update: {},
+      });
+
+      // The sale-day reminder goes at eight on the follower's own clock, and
+      // the only zone saved was the weekly recap's. Without one it was eight
+      // UTC, which in Sweden is when the sales open. Kept once set: the zone
+      // is the account's, not this browser's.
+      if (isTimeZone(req.body?.tz)) {
+        const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { settings: true } });
+        const settings = user?.settings && typeof user.settings === "object" ? user.settings : {};
+        if (!isTimeZone(settings.timeZone)) {
+          await prisma.user.update({ where: { id: req.user.id }, data: { settings: { ...settings, timeZone: req.body.tz } } });
+        }
+      }
+      res.json({ concert_id: concertId, tickets });
+    } catch (error) {
+      console.error("Error following a show:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// DELETE /notifications/follows/:concertId — stop following a show
+router.delete(
+  "/notifications/follows/:concertId",
+  [auth, roleCheck(["ADMIN", "USER"]), concertIdParam],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid concert id" });
+
+    try {
+      // Only your own row can match, so there is nothing of anyone else's to refuse.
+      await prisma.concertFollow.deleteMany({
+        where: { user_id: req.user.id, concert_id: parseInt(req.params.concertId, 10) },
+      });
+      res.json({ message: "Unfollowed" });
+    } catch (error) {
+      console.error("Error unfollowing a show:", error);
       res.status(500).json({ error: "Internal server error" });
     }
   }

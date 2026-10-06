@@ -11,7 +11,7 @@ const { validationResult, param } = require("express-validator");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
-const { MIN_ACTS, SONGKICK_FESTIVAL, groupFestivals } = require("../../../utils/festivals");
+const { MIN_ACTS, SONGKICK_FESTIVAL, touringRows, groupFestivals } = require("../../../utils/festivals");
 const { ownWishlist } = require("./shared");
 
 const contains = (field, text) => ({ [field]: { contains: text, mode: "insensitive" } });
@@ -80,6 +80,14 @@ router.get(
           concert_date: true,
           url: true,
           metadata: true,
+          festival: true,
+          on_sale: true,
+          sold_out: true,
+          ticket_sale_start: true,
+          // Two rows of one festival are told apart from two festivals partly
+          // by where they are.
+          latitude: true,
+          longitude: true,
           bands: { select: { band_rel: { select: { id: true, name: true } } } },
         },
       });
@@ -89,8 +97,15 @@ router.get(
         (has(concert.name, w.tour_query) || has(concert.venue, w.tour_query))
         && (!w.venue_query || has(concert.venue, w.venue_query)));
 
+      // A Songkick festival link is the weakest of the signals above: Songkick
+      // files some tours as festivals. Where it is all a row has, and the row
+      // looks like a tour, it is left out.
+      const crowdedIds = new Set(crowded.map((r) => Number(r.id)));
+      const touring = touringRows(concerts);
+      const festivals = concerts.filter((c) => !touring.has(c.id) || c.festival || crowdedIds.has(c.id) || watched(c));
+
       const tiers = new Map(wishlist.bands.map((b) => [b.band_id, b.tier]));
-      res.json({ festivals: groupFestivals(concerts, { tiers, watched }) });
+      res.json({ festivals: groupFestivals(festivals, { tiers, watched }) });
     } catch (error) {
       console.error("Error listing festivals:", error);
       res.status(500).json({ error: "Internal server error" });

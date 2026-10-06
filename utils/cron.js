@@ -4,6 +4,7 @@ const { backfillSpotifyIds, warmBandImages } = require("./bandSpotifyMatch");
 const { backfillSourceUrls } = require("./bandSourceUrlBackfill");
 const { backfillSetlists } = require("./setlistBackfill");
 const { sendWeeklyRecaps } = require("./weeklyRecap");
+const { runTicketAlerts } = require("./ticketAlerts");
 const prisma = require("../prisma/client");
 
 // Default: once a day at 08:00 server time.
@@ -37,6 +38,12 @@ const SETLIST_BACKFILL_LIMIT = 50;
 // the hour only has to fall after midnight on Monday in Europe.
 const WEEKLY_RECAP_CRON = process.env.WEEKLY_RECAP_CRON || "0 9 * * 1";
 
+// Followed shows' tickets: on sale, sold out, back. A show's state only moves
+// when the scraper syncs, twice a day, so this mostly finds nothing; it runs
+// often for the morning-of-sale reminder, which is due at an hour on each
+// follower's own clock.
+const TICKET_ALERT_CRON = process.env.TICKET_ALERT_CRON || "*/15 * * * *";
+
 /**
  * Clean up expired email verification codes
  * Runs every hour
@@ -62,6 +69,18 @@ function startCronJobs() {
       console.log(`[cron] Notification digest: sent to ${result.sent} user(s), ${result.failed ?? 0} failed, ${result.concerts} new concert(s) scanned.`);
     } catch (err) {
       console.error("[cron] Notification digest failed:", err);
+    }
+  });
+
+  // Ticket alerts for followed shows
+  cron.schedule(TICKET_ALERT_CRON, async () => {
+    try {
+      const result = await runTicketAlerts();
+      if (result.alerted || result.failed) {
+        console.log(`[cron] Ticket alerts: told ${result.alerted} user(s), ${result.failed} failed, ${result.follows} follow(s) read.`);
+      }
+    } catch (err) {
+      console.error("[cron] Ticket alerts failed:", err);
     }
   });
 

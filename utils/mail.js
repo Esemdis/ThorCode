@@ -67,6 +67,41 @@ async function sendDigestEmail({ to, items }) {
   return result;
 }
 
+// One line per show a follower is being told about: what happened, then the show.
+function buildTicketAlertHtml(items) {
+  const rows = items
+    .map((c) => {
+      const href = c.url ? safeHref(c.url) : null;
+      const title = escapeHtml(c.title || "Concert");
+      const link = href ? `<a href="${escapeHtml(href)}">${title}</a>` : title;
+      const where = [c.venue, c.city, c.country].filter(Boolean).map(escapeHtml).join(", ");
+      return `<li><strong>${escapeHtml(c.alert)}:</strong> ${link} — ${fmtDate(c.date)} @ ${where}</li>`;
+    })
+    .join("");
+  return `<p>News about the tickets for shows you follow:</p><ul>${rows}</ul>`;
+}
+
+/**
+ * Tell a follower what the tickets for their shows are doing. Throws when it
+ * was not sent, as sendDigestEmail does.
+ */
+async function sendTicketAlertEmail({ to, items }) {
+  const [only] = items;
+  const subject = items.length === 1
+    ? `${only.alert}: ${only.title}`
+    : `Ticket news for ${items.length} shows you follow`;
+  const result = await getResend().emails.send({
+    from: process.env.NOTIFICATIONS_FROM_EMAIL,
+    to,
+    subject,
+    html: buildTicketAlertHtml(items),
+  });
+  if (result?.error) {
+    throw new Error(`Email service error: ${result.error.message ?? result.error.name ?? "unknown"}`);
+  }
+  return result;
+}
+
 /**
  * Send email verification code
  * @param {string} to - Recipient email
@@ -103,4 +138,4 @@ async function sendEmailVerificationCode({ to, code }) {
   }
 }
 
-module.exports = { sendDigestEmail, sendEmailVerificationCode, buildDigestHtml };
+module.exports = { sendDigestEmail, sendEmailVerificationCode, buildDigestHtml, sendTicketAlertEmail, buildTicketAlertHtml };
