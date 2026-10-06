@@ -19,11 +19,17 @@ function containsInsensitive(haystack, needle) {
 }
 
 // Which subscription kinds match a given concert:
-// - tour set              -> an event whose name contains it, optionally
-//                            narrowed to a venue whose name contains venue_query
+// - tour set              -> an event whose name or venue contains it,
+//                            optionally narrowed to a venue whose name contains
+//                            venue_query
 // - band + city both set  -> that band, playing that exact city
 // - band only             -> that band, any city
 // - city only             -> a band the subscriber follows, playing that city
+//
+// `bandIds` are the acts that are news on this concert, not its whole bill:
+// every act on a show just found, only the added ones on a show already known.
+// So a band watch fires when that band joins a festival, not again each time
+// someone else does, while a tour watch fires on every act that joins.
 //
 // `followedBandIds` is the subscriber's own wishlist, as a Set of band ids, and
 // only the city-only kind consults it. Naming a band in the watch is already
@@ -42,8 +48,14 @@ function subscriptionMatches(sub, concert, bandIds, followedBandIds) {
   // anything requiring a known band would fire months late or never. The POST
   // route keeps the kinds apart, so a row with both is malformed rather than a
   // combination this has to define.
+  //
+  // The venue counts as well as the name. Bandsintown files a festival's acts
+  // under the festival as the venue, and the row's name is whichever source's
+  // won, which can be an act's own name.
   if (sub.tour_query != null) {
-    if (!containsInsensitive(concert.name, sub.tour_query)) return false;
+    if (!containsInsensitive(concert.name, sub.tour_query) && !containsInsensitive(concert.venue, sub.tour_query)) {
+      return false;
+    }
     if (sub.venue_query != null) return containsInsensitive(concert.venue, sub.venue_query);
     return true;
   }
@@ -69,8 +81,9 @@ function subscriptionMatches(sub, concert, bandIds, followedBandIds) {
 /**
  * Groups concerts by the user whose subscriptions matched them.
  *
- * @param {Array} concerts - rows selecting at least id, city_id and
- *   bands.band_rel.id
+ * @param {Array} concerts - rows selecting at least id, name, venue, city_id
+ *   and bands.band_rel.id, where `bands` holds only the acts that are news (see
+ *   subscriptionMatches)
  * @param {Array} subscriptions - NotificationSubscription rows, each including
  *   user_rel with id and email
  * @param {Map<string, Set<number>>} followedByUser - user id -> the band ids on

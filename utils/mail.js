@@ -23,11 +23,17 @@ function fmtDate(date) {
 function buildDigestHtml(items) {
   const rows = items
     .map((c) => {
-      const title = escapeHtml(c.bandNames.length ? c.bandNames.join(", ") : c.name || "Concert");
+      // An act added to a show already known: the show goes by its own name,
+      // a festival's bill being far too long to head the line, and the acts
+      // that are new are named under it.
+      const added = c.newBandNames?.length ? c.newBandNames : null;
+      const heading = added && c.name ? c.name : c.bandNames.length ? c.bandNames.join(", ") : c.name || "Concert";
+      const title = escapeHtml(heading);
       const href = c.url ? safeHref(c.url) : null;
       const link = href ? `<a href="${escapeHtml(href)}">${title}</a>` : title;
       const where = [c.venue, c.city, c.country].filter(Boolean).map(escapeHtml).join(", ");
-      return `<li><strong>${link}</strong> — ${fmtDate(c.date)} @ ${where}</li>`;
+      const news = added ? `<br>New on the bill: ${escapeHtml(added.join(", "))}` : "";
+      return `<li><strong>${link}</strong> — ${fmtDate(c.date)} @ ${where}${news}</li>`;
     })
     .join("");
   return `<p>New concerts matching your subscriptions:</p><ul>${rows}</ul>`;
@@ -41,10 +47,13 @@ function buildDigestHtml(items) {
  * never looked, so every failure was counted as a digest delivered.
  */
 async function sendDigestEmail({ to, items }) {
+  const [only] = items;
   const subject =
-    items.length === 1
-      ? `New concert: ${items[0].bandNames[0] || items[0].name}`
-      : `${items.length} new concerts matching your subscriptions`;
+    items.length !== 1
+      ? `${items.length} new concerts matching your subscriptions`
+      : only.newBandNames?.length
+        ? `New on ${only.name || only.venue}: ${only.newBandNames.join(", ")}`
+        : `New concert: ${only.bandNames[0] || only.name}`;
 
   const result = await getResend().emails.send({
     from: process.env.NOTIFICATIONS_FROM_EMAIL,

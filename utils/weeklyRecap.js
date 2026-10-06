@@ -121,7 +121,8 @@ const bySoonest = (a, b) => {
  * town, and one for each band.
  *
  * @param {Array<{id: number, city: string, country: string, concert_date: Date|null,
- *   name: string|null, venue: string, festival: boolean, participating_bands: Array}>} concerts
+ *   name: string|null, venue: string, festival: boolean, url: string|null,
+ *   participating_bands: Array}>} concerts
  * @returns {{total: number, country_count: number, cities: Array, bands: Array}} biggest first
  */
 function summarizeWeek(concerts) {
@@ -145,6 +146,7 @@ function summarizeWeek(concerts) {
       name: concert.name ?? null,
       venue: concert.venue ?? null,
       festival: concert.festival === true,
+      url: concert.url ?? null,
       bands: [...concert.participating_bands].sort((a, b) => a.name.localeCompare(b.name)),
     });
     for (const band of concert.participating_bands) {
@@ -188,6 +190,7 @@ async function weeklyRecap(bandRefs, { now = new Date(), timeZone, weeksAgo = 0 
       name: true,
       venue: true,
       festival: true,
+      url: true,
       city: true,
       country: true,
       concert_date: true,
@@ -204,6 +207,7 @@ async function weeklyRecap(bandRefs, { now = new Date(), timeZone, weeksAgo = 0 
     name: c.name,
     venue: c.venue,
     festival: c.festival === true,
+    url: c.url,
     city: c.city,
     country: c.country,
     concert_date: c.concert_date,

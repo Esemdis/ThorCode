@@ -41,6 +41,22 @@ describe('buildDiscordEmbeds', () => {
     expect(embed.fields[0].value).toBe('Debaser\nOpeth, Katatonia');
   });
 
+  it('names the acts that joined a show already announced, ahead of its lineup', () => {
+    const [embed] = buildDiscordEmbeds({
+      title: 'x',
+      concerts: [concert({ venue: 'Copenhell', new_acts: ['Gojira', 'Bad_Omens'], metadata: JSON.stringify(['Opeth', 'Gojira']) })],
+    });
+    expect(embed.fields[0].value).toBe('Copenhell\n**New on the bill:** Gojira, Bad\\_Omens\nOpeth, Gojira');
+  });
+
+  it('keeps a field within its limit with added acts and a long lineup', () => {
+    const [embed] = buildDiscordEmbeds({
+      title: 'x',
+      concerts: [concert({ new_acts: ['z'.repeat(500)], metadata: JSON.stringify(['y'.repeat(2000)]) })],
+    });
+    expect(embed.fields[0].value.length).toBeLessThanOrEqual(1024);
+  });
+
   it('survives metadata that is not valid json', () => {
     // Scraped from several sources, so the column holds whatever they wrote.
     // A parse error here used to take the whole notification down.

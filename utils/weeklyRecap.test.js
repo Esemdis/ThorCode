@@ -77,7 +77,7 @@ describe('summarizeWeek', () => {
 
   it('counts a festival once in its town, and once for each of your bands on it', () => {
     const recap = summarizeWeek([
-      show('Sölvesborg', 'SE', '2027-06-05', [tool, ghost, opeth], { name: 'Sweden Rock 2027', festival: true }),
+      show('Sölvesborg', 'SE', '2027-06-05', [tool, ghost, opeth], { name: 'Sweden Rock 2027', festival: true, url: 'https://www.songkick.com/festivals/1-sweden-rock' }),
       show('Stockholm', 'SE', '2027-03-12', [ghost]),
       show('Stockholm', 'SE', '2027-03-13', [ghost]),
       show('Berlin', 'DE', '2027-03-20', [opeth]),
@@ -90,7 +90,7 @@ describe('summarizeWeek', () => {
     ]);
     expect(recap.cities[2].concerts).toEqual([{
       id: expect.any(Number), concert_date: new Date('2027-06-05'), name: 'Sweden Rock 2027', venue: 'Sölvesborg Arena',
-      festival: true, bands: [ghost, opeth, tool],
+      festival: true, url: 'https://www.songkick.com/festivals/1-sweden-rock', bands: [ghost, opeth, tool],
     }]);
     expect(recap.bands.map((b) => [b.name, b.count, b.tier])).toEqual([
       ['Ghost', 3, 'LOVE'], ['Opeth', 2, 'LIKE'], ['Tool', 1, 'FOLLOW'],

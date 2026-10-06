@@ -61,6 +61,7 @@ model Band {
   notification_subscriptions NotificationSubscription[] @relation("BandNotificationSubscriptions")
   media                      ConcertMedia[]             @relation("BandMedia")
   missed_at                  AttendanceMissedBand[]     @relation("BandMissedAt")
+  deliveries                 ConcertDelivery[]          @relation("BandDeliveries")
 }
 
 model Concert {
@@ -87,10 +88,11 @@ model Concert {
   sold_out          Boolean?               @default(false)
   reachable         String?
   setlist_checked_at DateTime?
-  // Set when a scheduled sync inserts the show, cleared once /wishlists/notify
-  // has posted it. A delivery that failed leaves it set, and the next sync's
-  // /bulk hands the show back to be sent again — the scraper only ever
-  // announced what it had just inserted, so a failed one was never retried.
+  // Set when a scheduled sync inserts the show or adds an act to it, cleared
+  // once /wishlists/notify has posted it. A delivery that failed leaves it set,
+  // and the next sync's /bulk hands the show back to be sent again — the
+  // scraper only ever announced what it had just inserted, so a failed one was
+  // never retried. Which acts are news is on ConcertBandReference.notify_pending.
   notify_pending    Boolean                @default(false)
   // When the activity feeds were told about the show. A post that failed keeps
   // notify_pending set and is sent again, and the feeds must not get a second
@@ -132,12 +134,20 @@ model Country {
 }
 
 model ConcertBandReference {
-  id          Int     @id @default(autoincrement())
-  concert     Int
-  band        Int
-  setlist     Json?
-  band_rel    Band    @relation("BandConcerts", fields: [band], references: [id])
-  concert_rel Concert @relation("ConcertBands", fields: [concert], references: [id])
+  id             Int       @id @default(autoincrement())
+  concert        Int
+  band           Int
+  setlist        Json?
+  // Set when a scheduled sync links this band to the show, whether the show is
+  // new or already known, and cleared once /wishlists/notify has posted it. A
+  // festival gains its acts one link at a time on the row it already has, so
+  // the show's own notify_pending only ever covered the first of them.
+  notify_pending Boolean   @default(false)
+  // When the band was put on the bill: the email digest reads a new act from
+  // this. Null on links from before it existed, which nothing announces again.
+  created_at     DateTime? @default(now())
+  band_rel       Band      @relation("BandConcerts", fields: [band], references: [id])
+  concert_rel    Concert   @relation("ConcertBands", fields: [concert], references: [id])
 
   @@unique([concert, band], name: "concert_band")
   @@index([band])
@@ -158,17 +168,20 @@ model Wishlist {
   deliveries         ConcertDelivery[]       @relation("WishlistDeliveries")
 }
 
-// One new show's announcement having reached one wishlist's Discord webhook.
-// A retried announcement goes only where there is no row, so the recipients
-// whose post went through are not sent it twice.
+// One act on one show having reached one wishlist's Discord webhook. Per act
+// rather than per show, because a show already posted is news again when an
+// act joins its bill. A retried announcement goes only where there is no row,
+// so the recipients whose post went through are not sent it twice.
 model ConcertDelivery {
   concert_id   Int
   wishlist_id  Int
+  band_id      Int
   delivered_at DateTime @default(now())
   concert_rel  Concert  @relation("ConcertDeliveries", fields: [concert_id], references: [id], onDelete: Cascade)
   wishlist_rel Wishlist @relation("WishlistDeliveries", fields: [wishlist_id], references: [id], onDelete: Cascade)
+  band_rel     Band     @relation("BandDeliveries", fields: [band_id], references: [id], onDelete: Cascade)
 
-  @@id([concert_id, wishlist_id])
+  @@id([concert_id, wishlist_id, band_id])
   @@index([wishlist_id])
 }
 

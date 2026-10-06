@@ -131,6 +131,23 @@ describe('subscriptionMatches', () => {
     ).toBe(false);
   });
 
+  it('matches a tour watch on the venue too, where Bandsintown files a festival\'s acts', () => {
+    // The row's name is whichever source's won, and can be an act's own.
+    const s = tourSub('u1', 'Copenhell');
+    expect(
+      subscriptionMatches(s, concert(1, 12, [5], { name: 'Motionless In White', venue: 'Copenhell' }), [5], follows()),
+    ).toBe(true);
+  });
+
+  it('fires a band watch only for an act that is news, not for its show gaining another', () => {
+    // Callers pass the acts just put on the bill. Band 5 was on this festival
+    // already; band 6 is the one that joined.
+    const festival = concert(1, 12, [5, 6], { name: 'Copenhell 2027' });
+    expect(subscriptionMatches(sub('u1', 5, null), festival, [6], follows())).toBe(false);
+    expect(subscriptionMatches(sub('u1', 6, null), festival, [6], follows())).toBe(true);
+    expect(subscriptionMatches(tourSub('u1', 'Copenhell'), festival, [6], follows())).toBe(true);
+  });
+
   it('matches nothing for a tour watch when the concert has no event name', () => {
     // Plenty of rows carry a null name, and a missing haystack must miss rather
     // than throw on the digest's behalf.

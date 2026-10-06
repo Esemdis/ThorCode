@@ -371,9 +371,133 @@ describe('POST /bulk', () => {
 
     expect(res.body.inserted).toBe(1);
     expect(prisma.concertBandReference.createMany).toHaveBeenCalledWith({
-      data: [{ concert: 100, band: 1 }],
+      data: [{ concert: 100, band: 1, notify_pending: false }],
       skipDuplicates: true,
     });
+  });
+
+  it('flags the acts on a show it inserts only when the sync will announce them', async () => {
+    await request(app).post('/bulk').set(...authHeader(system)).send({ concerts: [concert('Fållan')], notify: true });
+    await request(app).post('/bulk').set(...authHeader(system)).send({ concerts: [concert('Nalen')] });
+
+    expect(prisma.concertBandReference.createMany.mock.calls.map(([{ data }]) => data[0].notify_pending))
+      .toEqual([true, false]);
+  });
+
+  describe('an act joining a show it already has', () => {
+    // A festival is one row its acts join one scrape at a time. Each act after
+    // the first came back as a duplicate, which the scraper never announces,
+    // so a festival watch heard of the first act and none of the rest.
+    beforeEach(() => {
+      prisma.concert.update.mockResolvedValue({});
+      prisma.concertBandReference.findMany.mockResolvedValue([]);
+    });
+
+    it('by event id: flags the act and the show, and hands the show back as owed', async () => {
+      prisma.concert.findUnique.mockResolvedValue({
+        id: 55, event_id: 'sk_1', name: 'Copenhell 2027', venue: 'Refshaleøen', city: 'Copenhagen', country: 'DK',
+        concert_date: new Date('2027-06-17T00:00:00Z'), sold_out: false, notify_pending: false, _count: { bands: 1 },
+      });
+      const incoming = {
+        ...concert('Refshaleøen', [{ band_id: 2 }]), city: 'Copenhagen', country: 'DK',
+        concert_date: '2027-06-17T00:00:00Z', event_id: 'sk_1', name: 'Copenhell 2027',
+      };
+
+      const res = await request(app).post('/bulk').set(...authHeader(system)).send({ concerts: [incoming], notify: true });
+
+      expect(prisma.concertBandReference.createMany).toHaveBeenCalledWith({
+        data: [{ concert: 55, band: 2, notify_pending: true }], skipDuplicates: true,
+      });
+      expect(prisma.concert.update).toHaveBeenCalledWith({
+        where: { id: 55 }, data: expect.objectContaining({ notify_pending: true }),
+      });
+      expect(res.body.details.updatedConcerts[0].notifyPending).toBe(true);
+    });
+
+    it('merged into a festival row: flags the act and says which scraped show it was', async () => {
+      // Bandsintown lists each act at a festival as its own event, so the
+      // second act's show has an event id of its own and is matched by name.
+      prisma.concert.findMany.mockResolvedValue([{
+        id: 77, event_id: 'bit_9', name: 'Opeth @ Copenhell', venue: 'Copenhell', city: 'Copenhagen', country: 'DK',
+        concert_date: new Date('2027-06-17T00:00:00Z'), latitude: '55.69', longitude: '12.61',
+        festival: false, source: 'bandsintown', notify_pending: false,
+        bands: [{ band: 1, band_rel: { name: 'Opeth' } }],
+      }]);
+      const incoming = {
+        country: 'DK', city: 'Copenhagen', venue: 'Copenhell', concert_date: '2027-06-17T00:00:00Z',
+        latitude: '55.69', longitude: '12.61', event_id: 'bit_10', name: 'Gojira @ Copenhell',
+        source: 'bandsintown', bands: [{ band_id: 2 }],
+      };
+
+      const res = await request(app).post('/bulk').set(...authHeader(system)).send({ concerts: [incoming], notify: true });
+
+      expect(res.body.inserted).toBe(0);
+      expect(prisma.concertBandReference.createMany).toHaveBeenCalledWith({
+        data: [{ concert: 77, band: 2, notify_pending: true }], skipDuplicates: true,
+      });
+      expect(prisma.concert.update).toHaveBeenCalledWith({ where: { id: 77 }, data: { notify_pending: true } });
+      expect(res.body.details.duplicateConcerts[0]).toMatchObject({
+        concertId: 77, event_id: 'bit_9', incoming_event_id: 'bit_10', notifyPending: true,
+      });
+    });
+
+    it('stays quiet for a sync that will not announce it', async () => {
+      prisma.concert.findMany.mockResolvedValue([{
+        id: 77, event_id: 'bit_9', name: 'Opeth @ Copenhell', venue: 'Copenhell', city: 'Copenhagen', country: 'DK',
+        concert_date: new Date('2027-06-17T00:00:00Z'), latitude: '55.69', longitude: '12.61',
+        festival: false, source: 'bandsintown', notify_pending: false,
+        bands: [{ band: 1, band_rel: { name: 'Opeth' } }],
+      }]);
+      const incoming = {
+        country: 'DK', city: 'Copenhagen', venue: 'Copenhell', concert_date: '2027-06-17T00:00:00Z',
+        latitude: '55.69', longitude: '12.61', event_id: 'bit_10', name: 'Gojira @ Copenhell',
+        source: 'bandsintown', bands: [{ band_id: 2 }],
+      };
+
+      const res = await request(app).post('/bulk').set(...authHeader(system)).send({ concerts: [incoming] });
+
+      expect(prisma.concertBandReference.createMany).toHaveBeenCalledWith({
+        data: [{ concert: 77, band: 2, notify_pending: false }], skipDuplicates: true,
+      });
+      expect(prisma.concert.update).not.toHaveBeenCalledWith(expect.objectContaining({ data: { notify_pending: true } }));
+      expect(res.body.details.duplicateConcerts[0]).not.toHaveProperty('notifyPending');
+    });
+  });
+});
+
+describe('POST /:concertId/enrich-lineup', () => {
+  // The lineup pass links a festival's acts from its event page. An act linked
+  // here first finds itself already on the bill when its own scrape comes in,
+  // so this is the one chance to announce it.
+  const enrich = (body) => request(app).post('/77/enrich-lineup')
+    .set(...authHeader({ id: 'scraper', role: 'SYSTEM' })).send(body);
+
+  beforeEach(() => {
+    prisma.band.findMany.mockResolvedValue([{ id: 1, name: 'Opeth' }, { id: 2, name: 'Gojira' }]);
+    prisma.concertBandReference.findMany.mockResolvedValue([{ band: 1 }]);
+    prisma.concertBandReference.createMany.mockResolvedValue({ count: 1 });
+    prisma.concert.update.mockResolvedValue({});
+  });
+
+  it('flags the acts it links when the scheduled sync will announce them', async () => {
+    const res = await enrich({ band_names: ['Opeth', 'Gojira'], notify: true });
+
+    expect(res.body.linked).toBe(1);
+    expect(prisma.concertBandReference.createMany).toHaveBeenCalledWith({
+      data: [{ concert: 77, band: 2, notify_pending: true }], skipDuplicates: true,
+    });
+    expect(prisma.concert.update).toHaveBeenCalledWith({
+      where: { id: 77 }, data: expect.objectContaining({ notify_pending: true }),
+    });
+  });
+
+  it('stays quiet for any other caller', async () => {
+    await enrich({ band_names: ['Opeth', 'Gojira'] });
+
+    expect(prisma.concertBandReference.createMany).toHaveBeenCalledWith({
+      data: [{ concert: 77, band: 2, notify_pending: false }], skipDuplicates: true,
+    });
+    expect(prisma.concert.update.mock.calls[0][0].data).not.toHaveProperty('notify_pending');
   });
 });
 

@@ -452,11 +452,13 @@ describe('POST /wishlists/notify subscription delivery', () => {
   });
 
   // Band 9 plays Stockholm, which is city_id 12. The row as the endpoint
-  // re-reads it, so city_id is resolved and the lineup is whole.
+  // re-reads it, so city_id is resolved and the lineup is whole. A new show:
+  // every act on it is still owed its announcement.
+  const link = (id, name, pending = true) => ({ id: 500 + id, notify_pending: pending, band_rel: { id, name } });
   const CONCERT = {
     id: 100, name: null, venue: 'Debaser', city: 'Stockholm', country: 'SE',
     concert_date: new Date('2026-11-02T19:00:00Z'), url: null, metadata: null,
-    city_id: 12, bands: [{ band_rel: { id: 9, name: 'Someone Elses Band' } }],
+    city_id: 12, bands: [link(9, 'Someone Elses Band')],
   };
 
   const payload = (bandId, name, concertId = 100) => ({
@@ -480,7 +482,8 @@ describe('POST /wishlists/notify subscription delivery', () => {
     prisma.concertDelivery.findMany.mockResolvedValue([]);
     prisma.concertDelivery.createMany.mockResolvedValue({ count: 0 });
     prisma.wishlist.findMany.mockResolvedValue([MINE(), THEIRS()]);
-    prisma.concert.findMany.mockResolvedValue([CONCERT]);
+    // Whichever shows the request names, each one the row above.
+    prisma.concert.findMany.mockImplementation(async ({ where }) => where.id.in.map((id) => ({ ...CONCERT, id })));
     prisma.notificationSubscription.findMany.mockResolvedValue([]);
     prisma.activityLog.findMany.mockResolvedValue([]);
     prisma.activityLog.create.mockResolvedValue({});
@@ -523,9 +526,7 @@ describe('POST /wishlists/notify subscription delivery', () => {
   it('sends one message for a concert that is both wishlisted and watched', async () => {
     // Subscribing to a band already on your wishlist is the ordinary case, and
     // it must not double every notification.
-    prisma.concert.findMany.mockResolvedValue([
-      { ...CONCERT, bands: [{ band_rel: { id: 1, name: 'Opeth' } }] },
-    ]);
+    prisma.concert.findMany.mockResolvedValue([{ ...CONCERT, bands: [link(1, 'Opeth')] }]);
     prisma.notificationSubscription.findMany.mockResolvedValue([
       { user_id: 'user-1', band_id: 1, city_id: null, user_rel: { id: 'user-1', email: 'me@example.com', settings: null } },
     ]);
@@ -570,7 +571,7 @@ describe('POST /wishlists/notify subscription delivery', () => {
     expect(res.status).toBe(500);
     expect(received.filter((r) => r.path === '/theirs')).toHaveLength(1);
     expect(prisma.concertDelivery.createMany).toHaveBeenCalledWith({
-      data: [{ concert_id: 100, wishlist_id: 8 }], skipDuplicates: true,
+      data: [{ concert_id: 100, band_id: 9, wishlist_id: 8 }], skipDuplicates: true,
     });
     expect(prisma.concert.updateMany).not.toHaveBeenCalledWith(expect.objectContaining({
       data: { notify_pending: false },
@@ -601,12 +602,12 @@ describe('POST /wishlists/notify subscription delivery', () => {
       expect(res.status).toBe(200);
       expect(cleared()).not.toContain(100);
       expect(prisma.concertDelivery.createMany).toHaveBeenCalledWith({
-        data: [{ concert_id: 100, wishlist_id: 8 }], skipDuplicates: true,
+        data: [{ concert_id: 100, band_id: 9, wishlist_id: 8 }], skipDuplicates: true,
       });
     });
 
     it('sends the retry only to the recipient that did not get it', async () => {
-      prisma.concertDelivery.findMany.mockResolvedValue([{ concert_id: 100, wishlist_id: 8 }]);
+      prisma.concertDelivery.findMany.mockResolvedValue([{ concert_id: 100, band_id: 9, wishlist_id: 8 }]);
 
       await post(payload(9, 'Someone Elses Band'));
 
@@ -644,7 +645,7 @@ describe('POST /wishlists/notify subscription delivery', () => {
 
     it('adds no second activity entry for a show the feeds were already told about', async () => {
       prisma.concert.findMany.mockResolvedValue([{ ...CONCERT, announced_at: new Date('2026-10-01') }]);
-      prisma.concertDelivery.findMany.mockResolvedValue([{ concert_id: 100, wishlist_id: 8 }]);
+      prisma.concertDelivery.findMany.mockResolvedValue([{ concert_id: 100, band_id: 9, wishlist_id: 8 }]);
 
       await post(payload(9, 'Someone Elses Band'));
 
@@ -659,6 +660,97 @@ describe('POST /wishlists/notify subscription delivery', () => {
         where: { id: { in: [100] }, announced_at: null },
         data: { announced_at: expect.any(Date) },
       });
+    });
+  });
+
+  describe('an act joining a show already announced', () => {
+    // Copenhell: one row, its first act posted long ago, a second act merged
+    // into it by this sync. Each act after the first used to be filed as a
+    // duplicate and reach no one, the festival watch included.
+    const FESTIVAL = {
+      ...CONCERT, id: 300, name: 'Motionless In White @ Copenhell', venue: 'Copenhell', city: 'Copenhagen', city_id: 40,
+      bands: [link(1, 'Opeth', false), link(9, 'Someone Elses Band')],
+    };
+    const watch = (over) => ({
+      user_id: 'user-1', band_id: null, city_id: null, tour_query: null, venue_query: null,
+      user_rel: { id: 'user-1', email: 'me@example.com', settings: null }, ...over,
+    });
+    const to = (path) => received.filter((r) => r.path === path);
+
+    beforeEach(() => {
+      prisma.concert.findMany.mockResolvedValue([FESTIVAL]);
+    });
+
+    it('tells a festival watch about each act that joins, and which one it is', async () => {
+      prisma.notificationSubscription.findMany.mockResolvedValue([watch({ tour_query: 'copenhell' })]);
+
+      await post(payload(9, 'Someone Elses Band', 300));
+
+      expect(to('/mine')).toHaveLength(1);
+      expect(to('/mine')[0].body.embeds[0].fields[0].value).toContain('**New on the bill:** Someone Elses Band');
+    });
+
+    it('tells whoever follows the act that joined', async () => {
+      await post(payload(9, 'Someone Elses Band', 300));
+
+      expect(to('/theirs')).toHaveLength(1);
+      expect(to('/theirs')[0].body.embeds[0].title).toBe('New concerts: Someone Elses Band');
+      // Opeth was on the bill before: following it is not news of this.
+      expect(to('/mine')).toHaveLength(0);
+    });
+
+    it('does not tell a band watch again about a show its band was already on', async () => {
+      prisma.notificationSubscription.findMany.mockResolvedValue([watch({ band_id: 1 })]);
+
+      await post(payload(9, 'Someone Elses Band', 300));
+
+      expect(to('/mine')).toHaveLength(0);
+    });
+
+    it('does not post the show to a city watch for an act it has nothing to do with', async () => {
+      // Both join at once. The wishlist post covers Opeth, which this wishlist
+      // follows; the city watch must not then post the show again for band 9.
+      prisma.concert.findMany.mockResolvedValue([{
+        ...FESTIVAL, bands: [link(1, 'Opeth'), link(9, 'Someone Elses Band'), link(4, 'An Old Act', false)],
+      }]);
+      prisma.notificationSubscription.findMany.mockResolvedValue([watch({ city_id: 40 })]);
+
+      await post(payload(9, 'Someone Elses Band', 300));
+
+      expect(to('/mine')).toHaveLength(1);
+      expect(to('/mine')[0].body.embeds[0].title).toBe('New concerts: Opeth');
+    });
+
+    it('records each delivery per act, and clears only the links it read', async () => {
+      prisma.notificationSubscription.findMany.mockResolvedValue([watch({ tour_query: 'copenhell' })]);
+
+      await post(payload(9, 'Someone Elses Band', 300));
+
+      expect(prisma.concertDelivery.createMany).toHaveBeenCalledWith({
+        data: [{ concert_id: 300, band_id: 9, wishlist_id: 7 }], skipDuplicates: true,
+      });
+      expect(prisma.concertBandReference.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: [509] } }, data: { notify_pending: false },
+      });
+    });
+
+    it('adds no new-concert entry to the feeds for a show that only gained an act', async () => {
+      // Rows from before announced_at have none, and the batch the act rides
+      // in can be another band's.
+      await post(payload(9, 'Someone Elses Band', 300));
+
+      expect(prisma.activityLog.create).not.toHaveBeenCalled();
+    });
+
+    it('posts nothing about a show whose acts have all been announced', async () => {
+      prisma.concert.findMany.mockResolvedValue([{
+        ...FESTIVAL, bands: FESTIVAL.bands.map((l) => ({ ...l, notify_pending: false })),
+      }]);
+      prisma.notificationSubscription.findMany.mockResolvedValue([watch({ tour_query: 'copenhell' })]);
+
+      await post(payload(9, 'Someone Elses Band', 300));
+
+      expect(received).toHaveLength(0);
     });
   });
 
@@ -1440,7 +1532,7 @@ describe('the weekly recap', () => {
   afterAll(() => new Promise((resolve) => server.close(resolve)));
 
   const ADDED = [{
-    id: 10, name: null, venue: 'Avicii Arena', festival: false, city: 'Stockholm', country: 'SE', concert_date: new Date('2027-03-12'), created_at: new Date(),
+    id: 10, name: null, venue: 'Avicii Arena', festival: false, url: 'https://tickets.example/10', city: 'Stockholm', country: 'SE', concert_date: new Date('2027-03-12'), created_at: new Date(),
     bands: [{ band_rel: { id: 1, name: 'Ghost' } }],
   }];
   const wishlist = (extra = {}) => ({
@@ -1466,6 +1558,7 @@ describe('the weekly recap', () => {
         city: 'Stockholm', country: 'SE', count: 1,
         concerts: [{
           id: 10, concert_date: '2027-03-12T00:00:00.000Z', name: null, venue: 'Avicii Arena', festival: false,
+          url: 'https://tickets.example/10',
           bands: [{ id: 1, name: 'Ghost', tier: 'LOVE' }],
         }],
       }],

@@ -8,7 +8,7 @@ const prisma = installFakePrisma({
     create: vi.fn(),
     update: vi.fn(async () => ({})),
   },
-  concert: { findMany: vi.fn() },
+  concertBandReference: { findMany: vi.fn() },
   notificationSubscription: { findMany: vi.fn() },
   wishlist: { findMany: vi.fn(async () => []) },
 });
@@ -19,15 +19,23 @@ const require = createRequire(import.meta.url);
 const mail = require('./mail.js');
 const { runNotificationDigest } = require('./concertNotifyDigest.js');
 
-const concert = (id) => ({
+const OPETH = { id: 9, name: 'Opeth' };
+const GOJIRA = { id: 2, name: 'Gojira' };
+// Created inside the window the run reads (it last ran 2026-09-25 08:00).
+const concert = (id, over = {}) => ({
   id, name: null, venue: 'Debaser', city: 'Stockholm', country: 'SE', city_id: 12,
-  concert_date: new Date('2026-11-02T19:00:00Z'), url: null,
-  bands: [{ band_rel: { id: 9, name: 'Opeth' } }],
+  concert_date: new Date('2026-11-02T19:00:00Z'), url: null, created_at: new Date('2026-09-25T09:00:00Z'),
+  bands: [{ band_rel: OPETH }], ...over,
 });
-const subscriber = (id) => ({ id, user_id: `user-${id}`, band_id: 9, city_id: null, user_rel: { id: `user-${id}`, email: `u${id}@example.test` } });
+// One act put on a show's bill, as the digest reads it.
+const linked = (show, band = show.bands[0].band_rel) => ({ band_rel: band, concert_rel: show });
+const subscriber = (id, over = {}) => ({
+  id, user_id: `user-${id}`, band_id: 9, city_id: null, tour_query: null, venue_query: null,
+  user_rel: { id: `user-${id}`, email: `u${id}@example.test` }, ...over,
+});
 
 beforeEach(() => {
-  prisma.concert.findMany.mockResolvedValue([concert(100)]);
+  prisma.concertBandReference.findMany.mockResolvedValue([linked(concert(100))]);
   prisma.notificationSubscription.findMany.mockResolvedValue([subscriber(1), subscriber(2)]);
 });
 
@@ -61,11 +69,52 @@ describe('runNotificationDigest', () => {
 
     await runNotificationDigest();
 
-    const { where } = prisma.concert.findMany.mock.calls[0][0];
-    const from = where.OR.find((clause) => clause.concert_date?.gte).concert_date.gte;
+    const { where } = prisma.concertBandReference.findMany.mock.calls[0][0];
+    const from = where.concert_rel.OR.find((clause) => clause.concert_date?.gte).concert_date.gte;
     expect(from.toISOString()).toBe(`${new Date().toISOString().slice(0, 10)}T00:00:00.000Z`);
     // "Date TBA" is how the email already prints one without a date.
-    expect(where.OR).toContainEqual({ concert_date: null });
+    expect(where.concert_rel.OR).toContainEqual({ concert_date: null });
+  });
+
+  describe('an act added to a show mailed before', () => {
+    // Copenhell, found with Opeth on it weeks ago. Gojira joined it since the
+    // last run. Read by when the row was created, it was never news again.
+    const festival = concert(300, {
+      name: 'Copenhell 2027', venue: 'Refshaleøen', city: 'Copenhagen', city_id: 40,
+      created_at: new Date('2026-09-01T09:00:00Z'), bands: [{ band_rel: OPETH }, { band_rel: GOJIRA }],
+    });
+
+    beforeEach(() => {
+      prisma.concertBandReference.findMany.mockResolvedValue([linked(festival, GOJIRA)]);
+    });
+
+    it('mails a festival watch, naming the act that joined', async () => {
+      const send = vi.spyOn(mail, 'sendDigestEmail').mockResolvedValue({ data: { id: 'a' } });
+      prisma.notificationSubscription.findMany.mockResolvedValue([subscriber(1, { band_id: null, tour_query: 'copenhell' })]);
+
+      await runNotificationDigest();
+
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0][0].items).toEqual([expect.objectContaining({
+        name: 'Copenhell 2027', bandNames: ['Opeth', 'Gojira'], newBandNames: ['Gojira'],
+      })]);
+    });
+
+    it('does not mail a band watch about another act joining its band\'s show', async () => {
+      const send = vi.spyOn(mail, 'sendDigestEmail').mockResolvedValue({ data: { id: 'a' } });
+
+      await runNotificationDigest();
+
+      expect(send).not.toHaveBeenCalled();
+    });
+  });
+
+  it('presents a show new in this window as new, not as acts added to it', async () => {
+    const send = vi.spyOn(mail, 'sendDigestEmail').mockResolvedValue({ data: { id: 'a' } });
+
+    await runNotificationDigest();
+
+    expect(send.mock.calls[0][0].items[0].newBandNames).toBeNull();
   });
 });
 
@@ -89,5 +138,15 @@ describe('buildDigestHtml', () => {
     }]);
 
     expect(html).toContain('<a href="https://www.songkick.com/concerts/1?a=1&amp;b=2">Opeth</a>');
+  });
+
+  it('heads an added act with the show it joined, and names the act', () => {
+    const html = mail.buildDigestHtml([{
+      name: 'Copenhell 2027', bandNames: ['Opeth', 'Gojira'], newBandNames: ['Gojira'],
+      venue: 'Refshaleøen', city: 'Copenhagen', country: 'DK', date: '2027-06-17T00:00:00Z', url: null,
+    }]);
+
+    expect(html).toContain('<strong>Copenhell 2027</strong>');
+    expect(html).toContain('New on the bill: Gojira');
   });
 });

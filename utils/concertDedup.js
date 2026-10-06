@@ -186,7 +186,9 @@ function deduplicateByCoords(concerts) {
 
 /**
  * Checks whether an incoming concert already exists in the DB and merges it if so.
- * Returns { isDuplicate, existingConcert }.
+ * Returns { isDuplicate, existingConcert, linked }, where linked is the band ids
+ * the merge put on the stored row's bill. With notify set, those links and the
+ * row are flagged as owed a notification.
  *
  * Duplicate detection rules:
  * 1. Band-schedule conflict — same band, same city area, same calendar day
@@ -194,7 +196,7 @@ function deduplicateByCoords(concerts) {
  * 3. Venue fuzzy match — venue similarity ≥ 70%, within date window
  * 4. City fuzzy match fallback — city similarity ≥ 70%, within date window
  */
-async function checkDuplicateConcert({ concert, bandIds, bandNames = [], tx }) {
+async function checkDuplicateConcert({ concert, bandIds, bandNames = [], tx, notify = false }) {
   let existingConcert = null;
 
   if (concert.concert_date) {
@@ -348,6 +350,7 @@ async function checkDuplicateConcert({ concert, bandIds, bandNames = [], tx }) {
     }
   }
 
+  let linked = [];
   if (existingConcert) {
     const incomingWins = bandIds.length > existingConcert.bands.length;
     const existingIsAtFormat = isFallbackName(existingConcert.name);
@@ -389,13 +392,20 @@ async function checkDuplicateConcert({ concert, bandIds, bandNames = [], tx }) {
       // unique violation is not one failed statement but an aborted
       // transaction for everything after it.
       await tx.concertBandReference.createMany({
-        data: toLink.map((band) => ({ concert: existingConcert.id, band })),
+        data: toLink.map((band) => ({ concert: existingConcert.id, band, notify_pending: notify })),
         skipDuplicates: true,
       });
+      // This is how a festival's acts after the first arrive: each one its
+      // own scrape, merged into the row the first one made. Flagged, the act
+      // is announced like a new show; unflagged it reached no one.
+      if (notify && !existingConcert.notify_pending) {
+        await tx.concert.update({ where: { id: existingConcert.id }, data: { notify_pending: true } });
+      }
+      linked = toLink;
     }
   }
 
-  return { isDuplicate: !!existingConcert, existingConcert };
+  return { isDuplicate: !!existingConcert, existingConcert, linked };
 }
 
 // ─── Response-time deduplication (in-memory) ─────────────────────────────────

@@ -24,6 +24,10 @@ router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), a
   const concertId = parseInt(req.params.concertId, 10);
   if (Number.isNaN(concertId)) return res.status(400).json({ error: 'Invalid concert id' });
   const { band_names, event_name } = req.body;
+  // The scheduled sync's lineup pass announces the acts it links, as /bulk
+  // does: an act found on a festival's page is linked here first, and the
+  // act's own scrape then finds itself already on the bill and adds nothing.
+  const notify = req.body.notify === true;
 
   if ((!Array.isArray(band_names) || band_names.length === 0) && !event_name) {
     return res.json({ linked: 0, matches: [] });
@@ -73,6 +77,7 @@ router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), a
     // write "[]" over whatever the JSON-LD scrape had already found.
     const concertUpdate = {};
     if (lineup.length > 0) concertUpdate.metadata = JSON.stringify(lineup);
+    if (notify && toLink.length > 0) concertUpdate.notify_pending = true;
     if (event_name) {
       const existing = await prisma.concert.findUnique({ where: { id: concertId }, select: { name: true } });
       const currentName = existing?.name || '';
@@ -84,7 +89,7 @@ router.post('/:concertId/enrich-lineup', auth, roleCheck(['ADMIN', 'SYSTEM']), a
 
     await Promise.all([
       toLink.length > 0 && prisma.concertBandReference.createMany({
-        data: toLink.map((bandId) => ({ concert: concertId, band: bandId })),
+        data: toLink.map((bandId) => ({ concert: concertId, band: bandId, notify_pending: notify })),
         skipDuplicates: true,
       }),
       Object.keys(concertUpdate).length > 0 && prisma.concert.update({

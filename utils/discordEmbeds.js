@@ -32,6 +32,12 @@ function buildDiscordEmbeds({ title, concerts }) {
     const rawLabel = `${date} — ${location}`;
     const label = rawLabel.length > FIELD_NAME_LIMIT ? rawLabel.slice(0, FIELD_NAME_LIMIT - 1) + "…" : rawLabel;
     const venueStr = concert.url ? `[${venue}](${concert.url})` : venue;
+    // An act joining a show already announced: which acts are the news, ahead
+    // of a festival's lineup that can run to the field's limit.
+    const added = Array.isArray(concert.new_acts) && concert.new_acts.length
+      ? `\n**New on the bill:** ${concert.new_acts.map(escapeMarkdown).join(", ")}`
+      : "";
+    const head = venueStr + (added.length > 300 ? `${added.slice(0, 299)}…` : added);
 
     let lineup = [];
     try { lineup = JSON.parse(concert.metadata || "[]"); } catch {}
@@ -40,10 +46,10 @@ function buildDiscordEmbeds({ title, concerts }) {
     if (!Array.isArray(lineup)) lineup = [];
     lineup = lineup.filter((n) => typeof n === "string");
     const fullLineup = lineup.length ? `\n${lineup.join(", ")}` : "";
-    const maxLineup = FIELD_VALUE_LIMIT - venueStr.length - 1;
+    const maxLineup = FIELD_VALUE_LIMIT - head.length - 1;
     const lineupStr = fullLineup.length > maxLineup ? fullLineup.slice(0, maxLineup) + "…" : fullLineup;
 
-    fields.push({ name: label, value: venueStr + lineupStr, inline: false });
+    fields.push({ name: label, value: head + lineupStr, inline: false });
   }
 
   const footer = `${fields.length} new concert${fields.length !== 1 ? "s" : ""}`;

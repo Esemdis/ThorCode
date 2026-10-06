@@ -11,6 +11,13 @@
  * NotificationSubscription rows, and replaced a single global webhook in the
  * scraper that pinged one person about every band in the database — including
  * bands only other users had ever asked for.
+ *
+ * What is news is an act put on a show's bill: every act on a show just found,
+ * and an act joining a show already known. The second is how a festival fills
+ * up — one row, its acts linked to it a scrape at a time — and when only new
+ * rows were news, every act after a festival's first reached no one. The
+ * scraper says which shows to look at; which of their acts are news is read
+ * from the links /bulk flagged.
  */
 const express = require("express");
 const router = express.Router();
@@ -19,13 +26,14 @@ const axios = require("axios");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
-const { matchesByUser, followedBandsByUser } = require("../../../utils/notificationMatch");
+const { subscriptionMatches, followedBandsByUser } = require("../../../utils/notificationMatch");
 const { buildDiscordEmbeds } = require("../../../utils/discordEmbeds");
 const { logActivity } = require("./shared");
 
-// The concert row the subscription pass matches against. Deliberately the same
-// selection runNotificationDigest makes, because the two share the matcher and
-// a field missing here would silently stop matching rather than fail.
+// The concert row both passes post, and the subscription pass matches against.
+// Read back rather than taken from the payload: the scraper sends city as the
+// string it scraped, and a city watch is a City row /bulk resolved at insert.
+// The links say which acts are news.
 const CONCERT_SELECT = {
   id: true,
   name: true,
@@ -36,8 +44,43 @@ const CONCERT_SELECT = {
   url: true,
   metadata: true,
   city_id: true,
-  bands: { select: { band_rel: { select: { id: true, name: true } } } },
+  bands: { select: { id: true, notify_pending: true, band_rel: { select: { id: true, name: true } } } },
 };
+
+/**
+ * The shows in this request with an act still owed its announcement.
+ *
+ * `added` marks a show some of whose bill was there before, so the post can say
+ * which acts are the new ones rather than presenting a known festival as new.
+ *
+ * @returns {Promise<Array<{concert: object, acts: {id: number, name: string}[], linkIds: number[], added: boolean}>>}
+ */
+async function readNews(concertIds) {
+  if (concertIds.length === 0) return [];
+  const concerts = await prisma.concert.findMany({
+    where: { id: { in: concertIds } },
+    select: CONCERT_SELECT,
+  });
+  return concerts.flatMap((concert) => {
+    const pending = (concert.bands ?? []).filter((ref) => ref.notify_pending);
+    if (pending.length === 0) return [];
+    return [{
+      concert,
+      acts: pending.map((ref) => ref.band_rel),
+      linkIds: pending.map((ref) => ref.id),
+      added: pending.length < concert.bands.length,
+    }];
+  });
+}
+
+// One field in a post: the show, the acts this post is telling its recipient
+// about (which is what gets recorded as delivered), and, when the show was
+// already known, their names to print.
+const entry = (item, acts) => ({
+  ...item.concert,
+  acts,
+  new_acts: item.added ? acts.map((a) => a.name) : null,
+});
 
 /**
  * Post concerts to a webhook and say which of them arrived.
@@ -77,8 +120,12 @@ function failedForGood(error) {
 
 const concertIdsOf = (concerts) => concerts.map((c) => c.concert_id ?? c.id).filter((id) => Number.isInteger(id));
 
+// A show and one act on it, the unit a delivery is recorded in.
+const actKey = (concertId, bandId) => `${concertId}:${bandId}`;
+
 /**
- * Who has had which show, and which shows are still owed to someone.
+ * Who has been told about which act on which show, and which shows are still
+ * owed to someone.
  *
  * A show stays pending while any recipient's post of it failed in a way worth
  * retrying, and the retry goes only where there is no delivery on record.
@@ -89,31 +136,32 @@ async function deliveryLedger(concertIds) {
   const rows = concertIds.length
     ? await prisma.concertDelivery.findMany({
         where: { concert_id: { in: concertIds } },
-        select: { concert_id: true, wishlist_id: true },
+        select: { concert_id: true, wishlist_id: true, band_id: true },
       })
     : [];
-  const had = new Set(rows.map((r) => `${r.concert_id}:${r.wishlist_id}`));
+  const had = new Set(rows.map((r) => `${actKey(r.concert_id, r.band_id)}:${r.wishlist_id}`));
   const held = new Set();
 
   return {
     held,
-    /** The concerts this wishlist has not had yet. */
-    unsent: (wishlistId, concerts) => concerts.filter((c) => {
-      const id = c.concert_id ?? c.id;
-      return !Number.isInteger(id) || !had.has(`${id}:${wishlistId}`);
-    }),
+    /** The acts on this show this wishlist has not been told about yet. */
+    unsent: (wishlistId, concertId, acts) => acts.filter((a) => !had.has(`${actKey(concertId, a.id)}:${wishlistId}`)),
     /** Posts them, records what arrived, and holds what failed for a retry. */
     async send(wishlistId, webhook, post) {
       const { delivered, undelivered, error } = await postConcerts(webhook, post);
-      const arrived = concertIdsOf(delivered);
+      const arrived = delivered
+        .filter((c) => Number.isInteger(c.id))
+        .flatMap((c) => (c.acts ?? []).map((a) => ({ concert_id: c.id, band_id: a.id })));
       if (arrived.length) {
         await prisma.concertDelivery.createMany({
-          data: arrived.map((id) => ({ concert_id: id, wishlist_id: wishlistId })),
+          data: arrived.map((d) => ({ ...d, wishlist_id: wishlistId })),
           skipDuplicates: true,
         });
-        for (const id of arrived) had.add(`${id}:${wishlistId}`);
+        for (const d of arrived) had.add(`${actKey(d.concert_id, d.band_id)}:${wishlistId}`);
       }
-      if (error && !failedForGood(error)) for (const id of concertIdsOf(undelivered)) held.add(id);
+      if (error && !failedForGood(error)) {
+        for (const c of undelivered) if (Number.isInteger(c.id)) held.add(c.id);
+      }
       return error;
     },
   };
@@ -127,6 +175,12 @@ function mentionFor(settings) {
   return typeof id === "string" && /^\d+$/.test(id) ? `<@${id}>` : null;
 }
 
+// "New concerts: Ghost, Opeth", short enough for Discord's 256-character title.
+function titleFor(names) {
+  const list = [...new Set(names)].join(", ");
+  return `New concerts: ${list.length > 200 ? `${list.slice(0, 199)}…` : list}`;
+}
+
 // POST /wishlists/notify — Discord notifications for new concerts (SYSTEM/ADMIN)
 router.post(
   "/wishlists/notify",
@@ -138,6 +192,7 @@ router.post(
 
       const { bands } = req.body;
       const requestIds = [...new Set(concertIdsOf(bands.flatMap((b) => b.concerts ?? [])))];
+      const news = await readNews(requestIds);
       const ledger = await deliveryLedger(requestIds);
 
       // All wishlists — needed for activity logs regardless of webhook
@@ -149,63 +204,83 @@ router.post(
         },
       });
 
-      // Discord notifications — only wishlists with a webhook
-      const notifications = allWishlists
-        .filter((w) => w.discord_webhook)
-        .map((wishlist) => {
-          const matchedBands = bands.filter((b) =>
-            wishlist.bands.some((ref) => ref.band_rel.id === b.band_id),
-          );
-          return { wishlist, matchedBands };
-        })
-        .filter(({ matchedBands }) => matchedBands.length > 0);
+      // Shows from scraper builds older than concert_id, which cannot be read
+      // back: posted under the band whose scrape found them, as they always were.
+      const legacyFor = (follows) => bands
+        .filter((b) => follows.has(b.band_id))
+        .map((b) => ({ name: b.name, concerts: (b.concerts ?? []).filter((c) => !Number.isInteger(c.concert_id)) }))
+        .filter((b) => b.concerts.length > 0);
 
-      // Log wishlists that matched bands but have no webhook configured
-      const noWebhookCount = allWishlists.filter((w) => !w.discord_webhook && bands.some((b) =>
-        w.bands.some((ref) => ref.band_rel.id === b.band_id)
-      )).length;
+      // What each wishlist follows that this request has news of.
+      const followedNews = (wishlist) => {
+        const follows = new Set(wishlist.bands.map((ref) => ref.band_rel.id));
+        const items = news
+          .map((item) => ({ item, acts: item.acts.filter((a) => follows.has(a.id)) }))
+          .filter(({ acts }) => acts.length > 0);
+        return { items, legacy: legacyFor(follows) };
+      };
+
+      const noWebhookCount = allWishlists.filter((w) => {
+        if (w.discord_webhook) return false;
+        const { items, legacy } = followedNews(w);
+        return items.length > 0 || legacy.length > 0;
+      }).length;
       if (noWebhookCount > 0) {
         console.log(`[Discord] ${noWebhookCount} wishlist(s) matched but have no webhook configured — skipping`);
       }
 
-      // What the wishlist pass already told each wishlist about, so the
-      // subscription pass below does not repeat it. Subscribing to a band that
-      // is also on your wishlist is the ordinary case, not an edge one.
+      // The acts the wishlist pass told each wishlist about, so the
+      // subscription pass below does not repeat them. Subscribing to a band
+      // that is also on your wishlist is the ordinary case, not an edge one.
       const reportedByWishlist = new Map();
+      let notified = 0;
 
       await Promise.all(
-        notifications.map(async ({ wishlist, matchedBands }) => {
+        allWishlists.filter((w) => w.discord_webhook).map(async (wishlist) => {
+          const { items, legacy } = followedNews(wishlist);
           const reported = new Set();
           reportedByWishlist.set(wishlist.id, reported);
-          for (const band of matchedBands) {
-            for (const concert of band.concerts ?? []) {
-              if (Number.isInteger(concert.concert_id)) reported.add(concert.concert_id);
-            }
+
+          // One post for everything this wishlist follows, rather than one per
+          // act: a festival announced with five of your bands is one show.
+          const concerts = [];
+          for (const { item, acts } of items) {
+            for (const a of acts) reported.add(actKey(item.concert.id, a.id));
             // A retried show goes only to the wishlists that did not get it.
-            const concerts = ledger.unsent(wishlist.id, band.concerts ?? []);
-            if (concerts.length === 0) continue;
-            const e = await ledger.send(wishlist.id, wishlist.discord_webhook, {
-              title: `New concerts: ${band.name}`, concerts,
-            });
-            if (e) {
-              console.error(`[Discord] Failed to notify wishlist ${wishlist.id} for band "${band.name}":`, e.response?.status ?? e.message);
-            }
+            const unsent = ledger.unsent(wishlist.id, item.concert.id, acts);
+            if (unsent.length > 0) concerts.push(entry(item, unsent));
+          }
+          for (const band of legacy) concerts.push(...band.concerts);
+          if (concerts.length === 0) return;
+
+          notified++;
+          const names = [...concerts.flatMap((c) => (c.acts ?? []).map((a) => a.name)), ...legacy.map((b) => b.name)];
+          const e = await ledger.send(wishlist.id, wishlist.discord_webhook, { title: titleFor(names), concerts });
+          if (e) {
+            console.error(`[Discord] Failed to notify wishlist ${wishlist.id}:`, e.response?.status ?? e.message);
           }
         }),
       );
 
-      const subscriptionNotified = await notifySubscribers(bands, allWishlists, reportedByWishlist, ledger);
+      const subscriptionNotified = await notifySubscribers(news, allWishlists, reportedByWishlist, ledger);
 
       // Activity logs — all wishlists that have the band, only when concerts
       // were inserted. A show whose post failed somewhere comes back on the
       // next sync, and the feeds already have it: only the shows they have
       // not been told about are logged.
-      const announced = new Set(requestIds.length
-        ? (await prisma.concert.findMany({
-            where: { id: { in: requestIds }, announced_at: { not: null } },
-            select: { id: true, announced_at: true },
-          })).filter((c) => c.announced_at != null).map((c) => c.id)
-        : []);
+      //
+      // An act joining a known show is not a new show, and the batch it rides
+      // in can be another act's: logged here, it would read as a new concert
+      // for whichever band the scraper filed it under.
+      const announced = new Set([
+        ...news.filter((item) => item.added).map((item) => item.concert.id),
+        ...(requestIds.length
+          ? (await prisma.concert.findMany({
+              where: { id: { in: requestIds }, announced_at: { not: null } },
+              select: { id: true, announced_at: true },
+            })).filter((c) => c.announced_at != null).map((c) => c.id)
+          : []),
+      ]);
       for (const wishlist of allWishlists) {
         const matchedBands = bands.filter(
           (b) => b.inserted > 0 && wishlist.bands.some((ref) => ref.band_rel.id === b.band_id),
@@ -233,15 +308,26 @@ router.post(
       // another go: those stay pending, and the next sync's /bulk hands them
       // back. Last, so a failure anywhere above leaves them pending too — the
       // deliveries on record keep the retry from posting anything twice.
+      //
+      // The links are cleared by id, the ones read above: an act linked since
+      // is still owed, and stays flagged for the next run.
       const settled = requestIds.filter((id) => !ledger.held.has(id));
       if (settled.length > 0) {
+        const settledSet = new Set(settled);
+        const settledLinks = news.filter((item) => settledSet.has(item.concert.id)).flatMap((item) => item.linkIds);
+        if (settledLinks.length > 0) {
+          await prisma.concertBandReference.updateMany({
+            where: { id: { in: settledLinks } },
+            data: { notify_pending: false },
+          });
+        }
         await prisma.concert.updateMany({
           where: { id: { in: settled }, notify_pending: true },
           data: { notify_pending: false },
         });
       }
 
-      res.json({ notified: notifications.length, subscription_notified: subscriptionNotified });
+      res.json({ notified, subscription_notified: subscriptionNotified });
     } catch (error) {
       console.error("Error sending Discord notifications:", error);
       res.status(500).json({ error: "Failed to send notifications" });
@@ -250,33 +336,20 @@ router.post(
 );
 
 /**
- * Posts to everyone whose NotificationSubscription rows match this batch.
+ * Posts to everyone whose NotificationSubscription rows match this request's
+ * news.
  *
- * The concerts are re-read rather than taken from the payload: the scraper
- * sends city as the string it scraped, and a city watch is a City row. /bulk
- * has already resolved that mapping at insert, so reading the ids back is both
- * cheaper and more truthful than matching names here.
+ * Matched per user against only what that user has not been told about yet,
+ * in this request or before. Otherwise a city watch would fire on a show
+ * because of an act the wishlist pass had just posted, and then post the
+ * show again for some other act on it the watch has nothing to do with.
  *
  * @returns {Promise<number>} how many users were posted to
  */
-async function notifySubscribers(bands, allWishlists, reportedByWishlist, ledger) {
-  const concertIds = [
-    ...new Set(
-      bands
-        .flatMap((b) => b.concerts ?? [])
-        .map((c) => c.concert_id)
-        .filter((id) => Number.isInteger(id)),
-    ),
-  ];
+async function notifySubscribers(news, allWishlists, reportedByWishlist, ledger) {
   // Scraper builds older than the concert_id field send nothing to match on.
   // The wishlist pass above still works, so this is a skip, not an error.
-  if (concertIds.length === 0) return 0;
-
-  const concerts = await prisma.concert.findMany({
-    where: { id: { in: concertIds } },
-    select: CONCERT_SELECT,
-  });
-  if (concerts.length === 0) return 0;
+  if (news.length === 0) return 0;
 
   const subscriptions = await prisma.notificationSubscription.findMany({
     include: { user_rel: { select: { id: true, email: true, settings: true } } },
@@ -289,22 +362,35 @@ async function notifySubscribers(bands, allWishlists, reportedByWishlist, ledger
   // City-only watches only fire for bands the watcher follows. allWishlists is
   // already loaded with its band references, so this costs no extra query.
   const followed = followedBandsByUser(allWishlists);
-  const settingsByUser = new Map(
-    subscriptions.filter((s) => s.user_rel).map((s) => [s.user_rel.id, s.user_rel.settings]),
-  );
+  const subsByUser = new Map();
+  for (const sub of subscriptions) {
+    const uid = sub.user_rel?.id ?? sub.user_id;
+    if (!subsByUser.has(uid)) subsByUser.set(uid, []);
+    subsByUser.get(uid).push(sub);
+  }
 
   let notified = 0;
   await Promise.all(
-    [...matchesByUser(concerts, subscriptions, followed)].map(async ([userId, { concerts: matched }]) => {
+    [...subsByUser].map(async ([userId, subs]) => {
       const wishlist = webhookByUser.get(userId);
       if (!wishlist) return;
 
       const already = reportedByWishlist.get(wishlist.id) ?? new Set();
-      const fresh = ledger.unsent(wishlist.id, matched.filter((c) => !already.has(c.id)));
-      if (fresh.length === 0) return;
+      const concerts = [];
+      for (const item of news) {
+        const fresh = ledger
+          .unsent(wishlist.id, item.concert.id, item.acts)
+          .filter((a) => !already.has(actKey(item.concert.id, a.id)));
+        if (fresh.length === 0) continue;
+        const ids = fresh.map((a) => a.id);
+        if (subs.some((sub) => subscriptionMatches(sub, item.concert, ids, followed.get(userId)))) {
+          concerts.push(entry(item, fresh));
+        }
+      }
+      if (concerts.length === 0) return;
 
       const e = await ledger.send(wishlist.id, wishlist.discord_webhook, {
-        title: "New concerts you're watching", concerts: fresh, content: mentionFor(settingsByUser.get(userId)),
+        title: "New concerts you're watching", concerts, content: mentionFor(subs[0].user_rel?.settings),
       });
       if (e) {
         console.error(`[Discord] Failed to notify subscriber ${userId}:`, e.response?.status ?? e.message);

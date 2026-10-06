@@ -182,10 +182,16 @@ router.post(
 
               const becameSoldOut = concert.sold_out === true && !existingByEventId.sold_out;
 
+              // An act joining a show already stored is news the way a new
+              // show is: a festival's second act arrives exactly like this.
+              const owesNotice = notify && toLink.length > 0;
+              if (owesNotice && !existingByEventId.notify_pending) concertFieldUpdate.notify_pending = true;
+              const notifyPending = existingByEventId.notify_pending || owesNotice;
+
               if (toLink.length > 0 || Object.keys(concertFieldUpdate).length > 0) {
                 await Promise.all([
                   toLink.length > 0 && tx.concertBandReference.createMany({
-                    data: toLink.map((band) => ({ concert: existingByEventId.id, band })),
+                    data: toLink.map((band) => ({ concert: existingByEventId.id, band, notify_pending: notify })),
                     skipDuplicates: true,
                   }),
                   Object.keys(concertFieldUpdate).length > 0 && tx.concert.update({
@@ -202,8 +208,9 @@ router.post(
                     name: betterName || existingByEventId.name,
                     bandCount: existingByEventId._count.bands + toLink.length,
                     ...(Object.keys(moved).length && { moved: Object.keys(moved) }),
-                    // Still owed its notification: the scraper sends it again.
-                    ...(existingByEventId.notify_pending && { notifyPending: true }),
+                    // Owed a notification, for an act just added or one that
+                    // did not go out before: the scraper sends it.
+                    ...(notifyPending && { notifyPending: true }),
                   },
                   soldOut: becameSoldOut ? {
                     concertId: existingByEventId.id,
@@ -244,7 +251,7 @@ router.post(
           const bandIds = resolved.map((b) => b.id);
           const bandNames = resolved.map((b) => b.name);
 
-          const { isDuplicate, existingConcert } = await checkDuplicateConcert({ concert, bandIds, bandNames, tx });
+          const { isDuplicate, existingConcert, linked } = await checkDuplicateConcert({ concert, bandIds, bandNames, tx, notify });
 
           if (isDuplicate) {
             return {
@@ -253,9 +260,13 @@ router.post(
                 reason: concert.festival ? 'festival duplicate (merged bands)' : 'duplicate concert_date + venue + band combination',
                 concertId: existingConcert.id,
                 event_id: existingConcert.event_id || '',
+                // The stored row keeps the event id of whichever scrape made it,
+                // so this is how the scraper finds which of its own concerts
+                // this one is.
+                incoming_event_id: concert.event_id || null,
                 name: existingConcert.name,
                 bandCount: existingConcert.bands.length,
-                ...(existingConcert.notify_pending && { notifyPending: true }),
+                ...((existingConcert.notify_pending || (notify && linked.length > 0)) && { notifyPending: true }),
               },
             };
           }
@@ -310,7 +321,7 @@ router.post(
           });
 
           await tx.concertBandReference.createMany({
-            data: bandIds.map((band) => ({ concert: newConcert.id, band })),
+            data: bandIds.map((band) => ({ concert: newConcert.id, band, notify_pending: notify })),
             skipDuplicates: true,
           });
 
@@ -319,7 +330,7 @@ router.post(
           const extraIds = lineupBandIds(metadata).filter((id) => !linkedSet.has(id));
           if (extraIds.length > 0) {
             await tx.concertBandReference.createMany({
-              data: extraIds.map((band) => ({ concert: newConcert.id, band })),
+              data: extraIds.map((band) => ({ concert: newConcert.id, band, notify_pending: notify })),
               skipDuplicates: true,
             });
           }

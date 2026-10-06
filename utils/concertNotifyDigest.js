@@ -7,8 +7,13 @@ const mail = require("./mail");
 // rule cannot live in either caller.
 const { matchesByUser, followedBandsByUser } = require("./notificationMatch");
 
-// Scans concerts created since the last run, matches them against all
+// Scans the acts put on a bill since the last run, matches them against all
 // NotificationSubscription rows, and sends one digest email per affected user.
+//
+// Acts rather than concerts: a festival is one row that gains its acts over
+// months, and reading rows by created_at told a watcher about the first act
+// and never the rest. A new show's acts are all put on its bill as it is
+// created, so one rule covers both.
 async function runNotificationDigest() {
   const now = new Date();
 
@@ -23,24 +28,44 @@ async function runNotificationDigest() {
   const startOfToday = new Date(now);
   startOfToday.setUTCHours(0, 0, 0, 0);
 
-  const concerts = await prisma.concert.findMany({
+  const links = await prisma.concertBandReference.findMany({
     where: {
       created_at: { gt: since, lte: now },
-      city_id: { not: null },
-      OR: [{ concert_date: null }, { concert_date: { gte: startOfToday } }],
+      concert_rel: {
+        city_id: { not: null },
+        OR: [{ concert_date: null }, { concert_date: { gte: startOfToday } }],
+      },
     },
     select: {
-      id: true,
-      name: true,
-      venue: true,
-      city: true,
-      country: true,
-      concert_date: true,
-      url: true,
-      city_id: true,
-      bands: { select: { band_rel: { select: { id: true, name: true } } } },
+      band_rel: { select: { id: true, name: true } },
+      concert_rel: {
+        select: {
+          id: true,
+          name: true,
+          venue: true,
+          city: true,
+          country: true,
+          concert_date: true,
+          url: true,
+          city_id: true,
+          created_at: true,
+          bands: { select: { band_rel: { select: { id: true, name: true } } } },
+        },
+      },
     },
   });
+
+  // One entry per show. `bands` is what the matcher reads, so it holds only
+  // the acts that are news; the whole bill rides along for the email.
+  const byConcert = new Map();
+  for (const { band_rel, concert_rel } of links) {
+    if (!byConcert.has(concert_rel.id)) {
+      const { bands: bill, created_at, ...concert } = concert_rel;
+      byConcert.set(concert_rel.id, { ...concert, bill, added: created_at <= since, bands: [] });
+    }
+    byConcert.get(concert_rel.id).bands.push({ band_rel });
+  }
+  const concerts = [...byConcert.values()];
 
   if (concerts.length === 0) {
     await prisma.notificationDigestRun.update({ where: { id: run.id }, data: { last_run_at: now } });
@@ -74,7 +99,9 @@ async function runNotificationDigest() {
     if (!email || matched.length === 0) continue;
     const items = matched.map((c) => ({
       name: c.name,
-      bandNames: c.bands.map((b) => b.band_rel.name),
+      bandNames: c.bill.map((b) => b.band_rel.name),
+      // On a show the email has been about before, which acts are the news.
+      newBandNames: c.added ? c.bands.map((b) => b.band_rel.name) : null,
       venue: c.venue,
       city: c.city,
       country: c.country,
