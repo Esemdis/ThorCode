@@ -558,6 +558,7 @@ module.exports = {
   // Primitives (used by other modules for fuzzy matching)
   haversineKm,
   stringSimilarity,
+  normalizeEventName,
   venueContains,
   detectFestivalCluster,
   // Insert-time

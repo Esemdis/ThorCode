@@ -24,6 +24,7 @@ const prisma = installFakePrisma({
   city: model(),
   notificationSubscription: model(),
   concertDelivery: model(),
+  $queryRaw: vi.fn(async () => []),
   $transaction: vi.fn(async (arg) => (typeof arg === 'function' ? arg(prisma) : Promise.all(arg))),
 });
 
@@ -69,6 +70,7 @@ const EXPECTED_ROUTES = [
   'GET /wishlists/:id/weekly [6]',
   // One more for its own limiter: a post goes to Discord, which has its own.
   'POST /wishlists/:id/weekly/discord [7]',
+  'GET /wishlists/:id/festivals [4]',
 ];
 
 describe('the routing surface', () => {
@@ -138,6 +140,7 @@ describe('a wishlist that is someone else\'s', () => {
     ['delete', '/wishlists/7/calendar-token', user],
     ['get', '/wishlists/7/weekly', user],
     ['post', '/wishlists/7/weekly/discord', user],
+    ['get', '/wishlists/7/festivals', user],
   ];
 
   beforeEach(() => {
@@ -1621,6 +1624,69 @@ describe('the weekly recap', () => {
 
     expect(res.status).toBe(502);
     expect(res.body.error).toMatch(/Discord did not take the post/);
+  });
+});
+
+describe('GET /wishlists/:id/festivals', () => {
+  const me = authHeader({ id: 'user-1', role: 'USER' });
+  const act = (id, name) => ({ band_rel: { id, name } });
+  const COPENHELL = {
+    id: 300, name: 'Gojira @ Copenhell', venue: 'Copenhell', city: 'Copenhagen', country: 'DK',
+    concert_date: new Date('2027-06-17T00:00:00Z'), url: null, metadata: null,
+    bands: [act(1, 'Opeth'), act(2, 'Gojira')],
+  };
+  const where = () => prisma.concert.findMany.mock.calls[0][0].where;
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [{ band_id: 2, tier: 'LOVE' }] });
+    prisma.notificationSubscription.findMany.mockResolvedValue([]);
+    prisma.$queryRaw.mockResolvedValue([]);
+    prisma.concert.findMany.mockResolvedValue([COPENHELL]);
+  });
+
+  it('lists each festival with your bands on it', async () => {
+    const res = await request(app).get('/wishlists/7/festivals').set(...me);
+
+    expect(res.status).toBe(200);
+    expect(res.body.festivals).toEqual([expect.objectContaining({
+      name: 'Copenhell', first: '2027-06-17', acts: 2, watched: false,
+      bands: [{ id: 2, name: 'Gojira', tier: 'LOVE' }],
+    })]);
+  });
+
+  it('asks for what is flagged a festival, listed as one by Songkick, or crowded enough to be one', async () => {
+    prisma.$queryRaw.mockResolvedValue([{ id: 300 }]);
+
+    await request(app).get('/wishlists/7/festivals').set(...me);
+
+    const signals = where().AND[1].OR;
+    expect(signals).toContainEqual({ festival: true });
+    expect(signals).toContainEqual({ url: { contains: 'songkick.com/festivals/', mode: 'insensitive' } });
+    expect(signals).toContainEqual({ id: { in: [300] } });
+  });
+
+  it('counts a festival you watch, before anything else would mark it one', async () => {
+    // Copenhell's first act is one Bandsintown page: no flag, no Songkick
+    // page, one act on the bill.
+    prisma.notificationSubscription.findMany.mockResolvedValue([{ tour_query: 'copenhell', venue_query: null }]);
+
+    const res = await request(app).get('/wishlists/7/festivals').set(...me);
+
+    expect(where().AND[1].OR).toContainEqual({ AND: [{ OR: [
+      { name: { contains: 'copenhell', mode: 'insensitive' } },
+      { venue: { contains: 'copenhell', mode: 'insensitive' } },
+    ] }] });
+    expect(prisma.notificationSubscription.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { user_id: 'user-1', tour_query: { not: null } },
+    }));
+    expect(res.body.festivals[0].watched).toBe(true);
+  });
+
+  it('leaves out what has already happened, by calendar day', async () => {
+    await request(app).get('/wishlists/7/festivals').set(...me);
+
+    const from = where().AND[0].OR.find((c) => c.concert_date?.gte).concert_date.gte;
+    expect(from.toISOString()).toBe(`${new Date().toISOString().slice(0, 10)}T00:00:00.000Z`);
   });
 });
 

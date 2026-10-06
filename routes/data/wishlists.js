@@ -15,5 +15,6 @@ router.use(require("./wishlists/notify"));
 router.use(require("./wishlists/calendar"));
 router.use(require("./wishlists/attendance"));
 router.use(require("./wishlists/recap"));
+router.use(require("./wishlists/festivals"));
 
 module.exports = router;
