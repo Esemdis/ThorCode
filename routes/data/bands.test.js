@@ -465,9 +465,10 @@ describe('POST /bulk', () => {
   });
 
   describe('a scrape of a show it already has by event id', () => {
-    // This branch wrote the scrape's ticket fields straight onto the row, so
-    // it had none of the safeguards the duplicate path grew: a source's
-    // default "in stock" overwrote a sale day another source had found.
+    // This branch wrote the scrape's ticket fields and bill straight onto the
+    // row, so it had neither of the safeguards the duplicate path grew: a
+    // source's default "in stock" overwrote a sale day, and the bill was read
+    // for bands to link and then dropped.
     const row = (over = {}) => ({
       id: 55, event_id: 'sk_1', name: 'Ghost @ Annexet', venue: 'Annexet', city: 'Stockholm', country: 'SE',
       concert_date: new Date('2027-05-01T19:00:00Z'), latitude: null, longitude: null,
@@ -504,6 +505,24 @@ describe('POST /bulk', () => {
         where: { id: 55 }, data: { sold_out: true, on_sale: false },
       });
       expect(res.body.newlySoldOut).toHaveLength(1);
+    });
+
+    it('stores the bill when the scrape saw more of it, cleaned', async () => {
+      prisma.concert.findUnique.mockResolvedValue(row({ metadata: '["Ghost"]' }));
+
+      await send({ metadata: '["Ghost","Hexvessel11.2K Followers"]' });
+
+      expect(prisma.concert.update).toHaveBeenCalledWith({
+        where: { id: 55 }, data: { metadata: '["Ghost","Hexvessel"]' },
+      });
+    });
+
+    it('keeps the bill it has when the scrape saw less of it', async () => {
+      prisma.concert.findUnique.mockResolvedValue(row({ metadata: '["Ghost","Hexvessel","Tribulation"]' }));
+
+      await send({ metadata: '["Ghost"]' });
+
+      expect(prisma.concert.update).not.toHaveBeenCalled();
     });
   });
 });

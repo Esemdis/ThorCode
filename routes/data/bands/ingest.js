@@ -10,7 +10,7 @@ const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
 const { checkDuplicateConcert, deduplicateByCoords, haversineKm } = require('../../../utils/concertDedup');
-const { cleanLineupJson, canonicalBandName } = require('../../../utils/lineupNames');
+const { cleanLineupJson, canonicalBandName, lineupGrew } = require('../../../utils/lineupNames');
 const { mergeTicketFields } = require('../../../utils/ticketState');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
@@ -183,6 +183,12 @@ router.post(
               if (concert.price_min != null) concertFieldUpdate.price_min = concert.price_min;
               if (concert.price_max != null) concertFieldUpdate.price_max = concert.price_max;
               if (concert.price_currency != null) concertFieldUpdate.price_currency = concert.price_currency;
+              // The bill as this scrape saw it, when it saw more of it than the
+              // row holds. The lineup was read above to link what it could and
+              // then thrown away, so an act joining a show with no Band row of
+              // its own — most of a festival's acts — reached nothing that a
+              // follower's lineup alert reads.
+              if (lineupGrew(existingByEventId.metadata, metadata)) concertFieldUpdate.metadata = metadata;
               const moved = movedFields(existingByEventId, concert);
               Object.assign(concertFieldUpdate, moved);
 

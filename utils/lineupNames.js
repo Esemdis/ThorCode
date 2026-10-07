@@ -121,4 +121,41 @@ function canonicalBandName(name) {
     .replace(/[^\p{L}\p{N}]/gu, '');
 }
 
-module.exports = { cleanLineupName, cleanLineupNames, cleanLineupJson, canonicalBandName };
+// How many distinct acts a stored lineup names. A column holding something
+// other than a lineup — metadata is free-form text and older rows do — names
+// none, rather than something to guess at.
+function lineupSize(json) {
+  if (!json) return 0;
+  let parsed;
+  try { parsed = JSON.parse(json); } catch { return 0; }
+  if (!Array.isArray(parsed)) return 0;
+  return new Set(parsed.map(canonicalBandName).filter(Boolean)).size;
+}
+
+/**
+ * Whether a scraped lineup names more acts than the one already stored.
+ *
+ * Both of /bulk's merge paths see partial bills: Bandsintown files a festival's
+ * acts stage by stage, so one scrape of a forty-act bill can name three, and
+ * such a scrape must not overwrite the row. The unlinked names are the only
+ * record of a support act nobody has ever wishlisted, and the bill they make is
+ * what a follower's lineup alert is measured against.
+ *
+ * So the longer bill wins — counted on the names themselves, rather than on how
+ * many of them matched a Band row, which is what the duplicate check used to
+ * compare. An act joining a festival arrives without a Band row as often as
+ * not, which left that count unchanged, so the row kept a lineup that never
+ * mentioned the act and the alert had nothing to find.
+ *
+ * Counted canonically, so a source writing "Architects (UK)" where another
+ * writes "Architects" is not a longer bill.
+ *
+ * @param {string|null|undefined} existingJson - the stored metadata column
+ * @param {string|null|undefined} incomingJson - the scraped lineup
+ * @returns {boolean}
+ */
+function lineupGrew(existingJson, incomingJson) {
+  return lineupSize(incomingJson) > lineupSize(existingJson);
+}
+
+module.exports = { cleanLineupName, cleanLineupNames, cleanLineupJson, canonicalBandName, lineupGrew };

@@ -1,4 +1,4 @@
-const { canonicalBandName } = require('./lineupNames');
+const { canonicalBandName, cleanLineupJson, lineupGrew } = require('./lineupNames');
 const { mergeTicketFields } = require('./ticketState');
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
@@ -370,16 +370,23 @@ async function checkDuplicateConcert({ concert, bandIds, bandNames = [], tx, not
     // when the scrape that found them also happened to list more bands.
     const tickets = mergeTicketFields(existingConcert, concert);
 
-    if (incomingWins || hasBetterName || Object.keys(tickets).length > 0) {
+    // The lineup likewise, and on the length of the bill it names rather than
+    // on how many of those names have a Band row — see lineupGrew. Cleaned
+    // here because this path stored the scrape as it arrived, follower counts
+    // welded onto the names and all, where every other writer cleans first.
+    const lineup = cleanLineupJson(concert.metadata);
+    const billWins = lineupGrew(existingConcert.metadata, lineup);
+
+    if (incomingWins || hasBetterName || billWins || Object.keys(tickets).length > 0) {
       await tx.concert.update({
         where: { id: existingConcert.id },
         data: {
           name: bestName,
           ...tickets,
+          ...(billWins && { metadata: lineup }),
           ...(incomingWins && {
             concert_date: concert.concert_date ? new Date(concert.concert_date) : existingConcert.concert_date,
             url: concert.url || existingConcert.url,
-            metadata: concert.metadata || existingConcert.metadata,
             festival: concert.festival || existingConcert.festival,
           }),
         },

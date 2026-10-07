@@ -447,6 +447,64 @@ describe('checkDuplicateConcert and what the tickets are doing', () => {
   });
 });
 
+describe('checkDuplicateConcert and the bill it merges in', () => {
+  // The lineup used to ride along with the band count, like the ticket fields
+  // above: a scrape that named a new act went unstored unless it also happened
+  // to have more of those acts matched to a Band row. A festival's new acts
+  // mostly have no Band row, so the bill a follower's alert reads never moved.
+  const stored = (metadata) => ({
+    id: 55, name: 'Copenhell 2027', venue: 'Refshaleøen', city: 'Copenhagen', country: 'DK',
+    concert_date: new Date('2027-06-17T00:00:00Z'), latitude: '55.69', longitude: '12.61',
+    festival: true, source: 'songkick', on_sale: true, sold_out: false, ticket_sale_start: null,
+    metadata,
+    bands: [{ band: 1, band_rel: { name: 'Opeth' } }, { band: 2, band_rel: { name: 'Gojira' } }],
+  });
+  const incoming = (metadata) => ({
+    name: 'Copenhell 2027', venue: 'Refshaleøen', city: 'Copenhagen', country: 'DK',
+    concert_date: '2027-06-17T00:00:00Z', latitude: '55.69', longitude: '12.61', festival: true,
+    source: 'songkick', on_sale: true, sold_out: false, metadata,
+  });
+  const fakeTx = (row) => ({
+    concert: { findMany: vi.fn(async () => [row]), update: vi.fn(async () => ({})) },
+    concertBandReference: { findMany: vi.fn(async () => []), createMany: vi.fn(async () => ({})) },
+  });
+  const written = (tx) => tx.concert.update.mock.calls.map(([{ data }]) => data);
+
+  it('stores an act joining the bill though it has no Band row to count', async () => {
+    const tx = fakeTx(stored('["Opeth","Gojira"]'));
+
+    // One band id: fewer than the two the row already has, so nothing here
+    // wins on the old count.
+    await checkDuplicateConcert({ concert: incoming('["Opeth","Gojira","Alcest"]'), bandIds: [1], tx });
+
+    expect(written(tx)[0]).toMatchObject({ metadata: '["Opeth","Gojira","Alcest"]' });
+  });
+
+  it('keeps the longer bill when the scrape with more linked bands saw less of it', async () => {
+    const tx = fakeTx(stored('["Opeth","Gojira","Alcest","Mgla"]'));
+
+    await checkDuplicateConcert({ concert: incoming('["Opeth"]'), bandIds: [1, 2, 3], tx });
+
+    expect(written(tx)[0].metadata).toBeUndefined();
+  });
+
+  it('cleans the scrape before storing it, as every other writer does', async () => {
+    const tx = fakeTx(stored(null));
+
+    await checkDuplicateConcert({ concert: incoming('["Counterparts266K Followers"]'), bandIds: [1], tx });
+
+    expect(written(tx)[0]).toMatchObject({ metadata: '["Counterparts"]' });
+  });
+
+  it('writes nothing for the same bill spelled differently', async () => {
+    const tx = fakeTx(stored('["Architects"]'));
+
+    await checkDuplicateConcert({ concert: incoming('["Architects (UK)"]'), bandIds: [1], tx });
+
+    expect(tx.concert.update).not.toHaveBeenCalled();
+  });
+});
+
 describe('checkDuplicateConcert upgrading a festival flag it can only see from outside', () => {
   // The stage rows arrive flagged festival: false — Bandsintown's per-band
   // page lists too few acts for the scraper's own rule to fire — so the flag

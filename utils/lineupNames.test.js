@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { cleanLineupName, cleanLineupNames, cleanLineupJson, canonicalBandName } from './lineupNames.js';
+import { cleanLineupName, cleanLineupNames, cleanLineupJson, canonicalBandName, lineupGrew } from './lineupNames.js';
 
 describe('cleanLineupName', () => {
   it('strips a follower count welded onto the end of a name', () => {
@@ -133,5 +133,45 @@ describe('cleanLineupJson', () => {
     // and keeping it beats discarding it.
     expect(cleanLineupJson('not json')).toBe('not json');
     expect(cleanLineupJson('{"a":1}')).toBe('{"a":1}');
+  });
+});
+
+describe('lineupGrew', () => {
+  const bill = (...names) => JSON.stringify(names);
+
+  it('is true when the scrape names an act the row has never heard of', () => {
+    expect(lineupGrew(bill('Ghost', 'Opeth'), bill('Ghost', 'Opeth', 'Gojira'))).toBe(true);
+  });
+
+  it('lets a festival scrape that saw three of forty acts keep its hands off', () => {
+    // Which is every Bandsintown scrape of a festival: it files the acts stage
+    // by stage, and the row is the only record of the ones with no Band row.
+    const forty = bill(...Array.from({ length: 40 }, (_, i) => `Act ${i}`));
+    expect(lineupGrew(forty, bill('Act 0', 'Act 1', 'Act 2'))).toBe(false);
+  });
+
+  it('is false for the same bill, however the sources spell it', () => {
+    expect(lineupGrew(bill('Ghost', 'Opeth'), bill('Ghost', 'Opeth'))).toBe(false);
+    expect(lineupGrew(bill('Architects'), bill('Architects (UK)'))).toBe(false);
+    expect(lineupGrew(bill('Counterparts'), bill('Counterparts266K Followers'))).toBe(false);
+  });
+
+  it('counts an act listed twice once', () => {
+    expect(lineupGrew(bill('Ghost'), bill('Ghost', 'Ghost'))).toBe(false);
+  });
+
+  it('is true for a first bill on a row that has none', () => {
+    expect(lineupGrew(null, bill('Ghost'))).toBe(true);
+    expect(lineupGrew(bill(), bill('Ghost'))).toBe(true);
+  });
+
+  it('is false when the scrape saw no bill at all', () => {
+    expect(lineupGrew(bill('Ghost'), null)).toBe(false);
+    expect(lineupGrew(null, null)).toBe(false);
+  });
+
+  it('reads a column holding something other than a lineup as no bill', () => {
+    expect(lineupGrew('not json', bill('Ghost'))).toBe(true);
+    expect(lineupGrew(bill('Ghost'), 'not json')).toBe(false);
   });
 });
