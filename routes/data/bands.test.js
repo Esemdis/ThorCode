@@ -463,6 +463,49 @@ describe('POST /bulk', () => {
       expect(res.body.details.duplicateConcerts[0]).not.toHaveProperty('notifyPending');
     });
   });
+
+  describe('a scrape of a show it already has by event id', () => {
+    // This branch wrote the scrape's ticket fields straight onto the row, so
+    // it had none of the safeguards the duplicate path grew: a source's
+    // default "in stock" overwrote a sale day another source had found.
+    const row = (over = {}) => ({
+      id: 55, event_id: 'sk_1', name: 'Ghost @ Annexet', venue: 'Annexet', city: 'Stockholm', country: 'SE',
+      concert_date: new Date('2027-05-01T19:00:00Z'), latitude: null, longitude: null,
+      on_sale: false, sold_out: false, ticket_sale_start: null, metadata: null, notify_pending: false,
+      _count: { bands: 1 }, ...over,
+    });
+    const send = (over) => request(app).post('/bulk').set(...authHeader(system))
+      .send({ concerts: [{ ...concert('Annexet'), event_id: 'sk_1', ...over }] });
+
+    beforeEach(() => {
+      prisma.concert.update.mockResolvedValue({});
+      // The one band is already on the bill, so nothing here is about links.
+      prisma.concertBandReference.findMany.mockResolvedValue([{ band: 1 }]);
+    });
+
+    it('lets a bare "in stock" neither clear a sale day nor contradict it', async () => {
+      // Songkick and Bandsintown both mark a listing in stock by default. Taken
+      // at its word, that fired "on sale now" to every follower of the show
+      // months before the sale opened.
+      prisma.concert.findUnique.mockResolvedValue(row({ ticket_sale_start: new Date('2099-10-09T00:00:00Z') }));
+
+      const res = await send({ on_sale: true, sold_out: false });
+
+      expect(prisma.concert.update).not.toHaveBeenCalled();
+      expect(res.body.details.duplicateConcerts[0]).toMatchObject({ concertId: 55 });
+    });
+
+    it('records a sell-out, and hands the show back as newly sold out once', async () => {
+      prisma.concert.findUnique.mockResolvedValue(row({ on_sale: true }));
+
+      const res = await send({ sold_out: true, on_sale: true });
+
+      expect(prisma.concert.update).toHaveBeenCalledWith({
+        where: { id: 55 }, data: { sold_out: true, on_sale: false },
+      });
+      expect(res.body.newlySoldOut).toHaveLength(1);
+    });
+  });
 });
 
 describe('POST /:concertId/enrich-lineup', () => {

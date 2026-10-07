@@ -11,6 +11,7 @@ const router = express.Router();
 const { validationResult, body } = require('express-validator');
 const { checkDuplicateConcert, deduplicateByCoords, haversineKm } = require('../../../utils/concertDedup');
 const { cleanLineupJson, canonicalBandName } = require('../../../utils/lineupNames');
+const { mergeTicketFields } = require('../../../utils/ticketState');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
@@ -171,16 +172,21 @@ router.post(
 
               const concertFieldUpdate = {};
               if (betterName) concertFieldUpdate.name = betterName;
-              if (concert.on_sale !== undefined) concertFieldUpdate.on_sale = concert.on_sale;
-              if (concert.ticket_sale_start !== undefined) concertFieldUpdate.ticket_sale_start = concert.ticket_sale_start ? new Date(concert.ticket_sale_start) : null;
+              // The ticket fields through the same merge the duplicate path
+              // uses. Written straight off the scrape, as they were, a source
+              // that marks every listing in stock by default cleared the sale
+              // day another source had found and said the show was selling —
+              // which is an "on sale now" to every follower of it, days before
+              // the sale opens.
+              const tickets = mergeTicketFields(existingByEventId, concert);
+              Object.assign(concertFieldUpdate, tickets);
               if (concert.price_min != null) concertFieldUpdate.price_min = concert.price_min;
               if (concert.price_max != null) concertFieldUpdate.price_max = concert.price_max;
               if (concert.price_currency != null) concertFieldUpdate.price_currency = concert.price_currency;
-              if (concert.sold_out !== undefined) concertFieldUpdate.sold_out = concert.sold_out ?? false;
               const moved = movedFields(existingByEventId, concert);
               Object.assign(concertFieldUpdate, moved);
 
-              const becameSoldOut = concert.sold_out === true && !existingByEventId.sold_out;
+              const becameSoldOut = tickets.sold_out === true;
 
               // An act joining a show already stored is news the way a new
               // show is: a festival's second act arrives exactly like this.
