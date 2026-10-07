@@ -147,8 +147,74 @@ function detectFestivalCluster(concert, bandIds, candidates, bandNames = []) {
 // ─── Insert-time deduplication (DB) ──────────────────────────────────────────
 
 /**
+ * One of two same-day, same-place rows from different sources, carrying what
+ * the other knew that it did not.
+ *
+ * Both scrapers file a show with the one band whose page they were reading, so
+ * the bill length that picks a survivor below is usually a tie, and a tie goes
+ * to whichever source ran first — Songkick. What the dropped row knew went
+ * with it: Bandsintown is the source that lists a festival's bill, and either
+ * can be the only one to have seen a show sold out or name the day its sale
+ * opens. None of that reached the stored row's merge in
+ * checkDuplicateConcert, because the row holding it was gone before the
+ * payload got there.
+ *
+ * Deliberately not merged: concert_date and source. A date means a true UTC
+ * instant from one source and the venue's wall clock from another, and which
+ * it is is read back off `source`, so taking the other row's time would
+ * relabel it. event_id likewise stays the survivor's — it is that source's
+ * handle on the show, and the dropped row's own sync finds the stored row
+ * again through the duplicate check.
+ *
+ * @param {object} keep - the row the bucket keeps
+ * @param {object} drop - the row being dropped into it
+ * @returns {object} a copy of `keep`, nothing mutated in place
+ */
+function foldSourceInto(keep, drop) {
+  const merged = { ...keep };
+
+  // What the tickets are doing is the state of the world, not something one
+  // row owns: whatever either source saw of them counts, and only silence is
+  // overruled. Both mark a listing in stock by default, so neither row's
+  // nothing-to-say may clear the other's sold out — the one state no source
+  // reports unless it means it.
+  merged.sold_out = Boolean(keep.sold_out || drop.sold_out);
+  merged.on_sale = Boolean(keep.on_sale || drop.on_sale) && !merged.sold_out;
+  merged.ticket_sale_start = keep.ticket_sale_start ?? drop.ticket_sale_start ?? null;
+
+  // The price trio moves as a unit. A minimum from one source beside a
+  // currency from the other reads as a price in money nobody quoted.
+  if (keep.price_min == null && drop.price_min != null) {
+    Object.assign(merged, {
+      price_min: drop.price_min,
+      price_max: drop.price_max ?? null,
+      price_currency: drop.price_currency ?? null,
+    });
+  }
+
+  // The longer bill, counted on the names it holds rather than on how many of
+  // them have a Band row — see lineupGrew. Cleaned, as every other writer of
+  // this column cleans.
+  const dropLineup = cleanLineupJson(drop.metadata);
+  if (lineupGrew(cleanLineupJson(keep.metadata), dropLineup)) merged.metadata = dropLineup;
+  merged.festival = Boolean(keep.festival || drop.festival);
+
+  // A real event name over "<band> @ <venue>", the same preference the stored
+  // row's merge makes: the festival rules read these names, and a fallback
+  // name tells them nothing.
+  if (drop.name && (!keep.name || (isFallbackName(keep.name) && !isFallbackName(drop.name)))) {
+    merged.name = drop.name;
+  }
+  if (!keep.url && drop.url) merged.url = drop.url;
+  if (!keep.venue && drop.venue) merged.venue = drop.venue;
+
+  return merged;
+}
+
+/**
  * Pre-deduplicates an incoming bulk concert payload by coordinates before DB insert.
- * For each coordinate bucket, keeps the entry with the most bands.
+ * For each coordinate bucket, keeps the entry with the most bands, with what the
+ * others knew folded into it — see foldSourceInto.
  * Concerts without coordinates are passed through unchanged.
  */
 function deduplicateByCoords(concerts) {
@@ -184,9 +250,11 @@ function deduplicateByCoords(concerts) {
       const key = coordKey(concert);
       if (!key) { acc.noCoord.push(concert); return acc; }
       const existing = acc.coordMap.get(key);
-      if (!existing || (concert.bands?.length ?? 0) > (existing.bands?.length ?? 0)) {
-        acc.coordMap.set(key, concert);
-      }
+      if (!existing) { acc.coordMap.set(key, concert); return acc; }
+      const incomingWins = (concert.bands?.length ?? 0) > (existing.bands?.length ?? 0);
+      acc.coordMap.set(key, incomingWins
+        ? foldSourceInto(concert, existing)
+        : foldSourceInto(existing, concert));
       return acc;
     },
     { coordMap: new Map(), noCoord: [] },

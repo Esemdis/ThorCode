@@ -201,6 +201,64 @@ describe('deduplicateByCoords', () => {
     expect(result[0].bands).toEqual([1, 2, 3]);
   });
 
+  it('folds the dropped source\'s tickets, bill and name into the survivor', () => {
+    // One band on each row, so the bill length ties and the first — Songkick,
+    // which the job scrapes first — survives. Everything Bandsintown saw of
+    // the show used to go with the row it was on.
+    const concerts = [
+      {
+        source: 'songkick', name: 'Slipknot @ Festivalgelände', bands: [1], url: null,
+        latitude: 54.0247, longitude: 9.3733, concert_date: '2026-07-30T18:00:00Z',
+        on_sale: true, sold_out: false, ticket_sale_start: '2026-02-01T00:00:00Z',
+        price_min: null, metadata: null, festival: false,
+      },
+      {
+        source: 'bandsintown', name: 'Wacken Open Air 2026', bands: [1], url: 'https://bit/e/1',
+        latitude: 54.0247, longitude: 9.3733, concert_date: '2026-07-30T20:00:00Z',
+        on_sale: false, sold_out: true, ticket_sale_start: null,
+        price_min: 280, price_max: 320, price_currency: 'EUR',
+        metadata: JSON.stringify(['Slipknot', 'Megadeth', 'Testament']), festival: true,
+      },
+    ];
+    const [merged, ...rest] = deduplicateByCoords(concerts);
+    expect(rest).toEqual([]);
+    // The survivor's own date and source, untouched: which of the two a stored
+    // time means is read back off the source.
+    expect(merged.source).toBe('songkick');
+    expect(merged.concert_date).toBe('2026-07-30T18:00:00Z');
+    expect(merged.sold_out).toBe(true);
+    expect(merged.on_sale).toBe(false);
+    expect(merged.ticket_sale_start).toBe('2026-02-01T00:00:00Z');
+    expect(merged.price_min).toBe(280);
+    expect(merged.price_currency).toBe('EUR');
+    expect(JSON.parse(merged.metadata)).toEqual(['Slipknot', 'Megadeth', 'Testament']);
+    expect(merged.festival).toBe(true);
+    expect(merged.name).toBe('Wacken Open Air 2026');
+    expect(merged.url).toBe('https://bit/e/1');
+  });
+
+  it('does not let a source with nothing to say clear what the other saw', () => {
+    const concerts = [
+      {
+        name: 'Graspop Metal Meeting 2026', bands: [1], latitude: 51.24, longitude: 5.11,
+        concert_date: '2026-06-18T12:00:00Z', on_sale: true, sold_out: false,
+        ticket_sale_start: '2026-01-10T00:00:00Z',
+        metadata: JSON.stringify(['Korn', 'Gojira']),
+      },
+      {
+        name: 'Korn @ Festivalpark', bands: [1], latitude: 51.24, longitude: 5.11,
+        concert_date: '2026-06-18T14:00:00Z', on_sale: false, sold_out: false,
+        ticket_sale_start: null, metadata: JSON.stringify(['Korn']),
+      },
+    ];
+    const [merged] = deduplicateByCoords(concerts);
+    expect(merged.on_sale).toBe(true);
+    expect(merged.sold_out).toBe(false);
+    expect(merged.ticket_sale_start).toBe('2026-01-10T00:00:00Z');
+    expect(JSON.parse(merged.metadata)).toEqual(['Korn', 'Gojira']);
+    expect(merged.name).toBe('Graspop Metal Meeting 2026');
+  });
+
   it('keeps two shows apart when neither has a usable coordinate', () => {
     // Non-null nonsense used to round to one "NaN:NaN" cell, so two unrelated
     // shows on a day shared a bucket and one of them never reached the DB.
