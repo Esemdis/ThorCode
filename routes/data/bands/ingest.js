@@ -286,23 +286,44 @@ router.post(
           // Find or create city record
           let cityId = null;
           if (concert.city && concert.country) {
+            const coord = (v) => {
+              const n = parseFloat(v);
+              return Number.isFinite(n) ? n : null;
+            };
+            const latitude = coord(concert.latitude);
+            const longitude = coord(concert.longitude);
+            const hasCoords = latitude != null && longitude != null;
+
             const cityRecord = await tx.city.upsert({
               where: { name_country: { name: concert.city, country: concert.country } },
               create: {
                 name: concert.city,
                 country: concert.country,
-                latitude:  concert.latitude  ? parseFloat(concert.latitude)  : null,
-                longitude: concert.longitude ? parseFloat(concert.longitude) : null,
+                latitude: hasCoords ? latitude : null,
+                longitude: hasCoords ? longitude : null,
                 reachable: concert.reachable ?? null,
               },
               update: {
-                // Only backfill missing coordinate data; never overwrite manually set flight_price
-                ...(concert.latitude  && { latitude:  parseFloat(concert.latitude)  }),
-                ...(concert.longitude && { longitude: parseFloat(concert.longitude) }),
+                // Never overwrite manually set flight_price. Coordinates are
+                // backfilled below rather than here: what to write depends on
+                // what the row already holds, which an upsert's update cannot
+                // read.
                 ...(concert.reachable && { reachable: concert.reachable }),
               },
+              select: { id: true, latitude: true, longitude: true },
             });
             cityId = cityRecord.id;
+
+            // Backfill only — which is what the update above always claimed to
+            // do, while in fact writing whatever arrived. A city's stored point
+            // moved to the venue of whichever show was scraped last, so two
+            // rooms on opposite sides of a city kept dragging it between them,
+            // and with it every distance and map pin drawn from the city rather
+            // than the show. Written as a second statement, the way the
+            // setlist.fm attendance route writes it.
+            if (hasCoords && (cityRecord.latitude == null || cityRecord.longitude == null)) {
+              await tx.city.update({ where: { id: cityId }, data: { latitude, longitude } });
+            }
           }
 
           const newConcert = await tx.concert.create({

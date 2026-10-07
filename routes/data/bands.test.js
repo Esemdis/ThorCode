@@ -14,7 +14,7 @@ const prisma = installFakePrisma({
     findMany: vi.fn(), count: vi.fn(), findUnique: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(),
     create: vi.fn(), update: vi.fn(), updateMany: vi.fn(),
   },
-  city: { upsert: vi.fn() },
+  city: { upsert: vi.fn(), update: vi.fn() },
   wishlist: { findUnique: vi.fn(), findFirst: vi.fn() },
   wishlistBandReference: { findMany: vi.fn(), create: vi.fn(), findUnique: vi.fn(), deleteMany: vi.fn() },
   concertBandReference: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn() },
@@ -211,6 +211,37 @@ describe('POST /bulk', () => {
     let nextId = 100;
     prisma.concert.create.mockImplementation(async ({ data }) => ({ id: nextId++, ...data }));
     prisma.concertBandReference.createMany.mockResolvedValue({ count: 1 });
+  });
+
+  describe('the city a show is in', () => {
+    const placed = (over = {}) => ({
+      ...concert('Annexet'), latitude: '59.2937', longitude: '18.0810', ...over,
+    });
+
+    it('fills in coordinates a stored city has none of', async () => {
+      prisma.city.upsert.mockResolvedValue({ id: 7, latitude: null, longitude: null });
+
+      const res = await request(app)
+        .post('/bulk').set(...authHeader(system)).send({ concerts: [placed()] });
+
+      expect(res.status).toBe(200);
+      expect(prisma.city.update).toHaveBeenCalledWith({
+        where: { id: 7 }, data: { latitude: 59.2937, longitude: 18.0810 },
+      });
+    });
+
+    it('leaves a city that already has a point where it is', async () => {
+      // Every ingest used to write the scraped venue's position onto the city,
+      // so two rooms across town kept moving it between them.
+      prisma.city.upsert.mockResolvedValue({ id: 7, latitude: 59.3293, longitude: 18.0686 });
+
+      const res = await request(app)
+        .post('/bulk').set(...authHeader(system)).send({ concerts: [placed()] });
+
+      expect(res.status).toBe(200);
+      expect(prisma.city.update).not.toHaveBeenCalled();
+      expect(prisma.city.upsert.mock.calls[0][0].update).toEqual({});
+    });
   });
 
   it('gives each concert a savepoint, and rolls back only the one that failed', async () => {
