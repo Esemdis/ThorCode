@@ -163,9 +163,19 @@ function deduplicateByCoords(concerts) {
     const parsed = new Date(value);
     return Number.isNaN(parsed.getTime()) ? 'undated' : toUtcDay(parsed).toISOString().slice(0, 10);
   };
+  // Read as numbers, not merely tested for null. Coordinates arrive as strings,
+  // and anything in them that is not a number — "", "N/A", a venue name —
+  // divided to NaN and rounded to the literal key "NaN:NaN", which every such
+  // row shared: two unrelated shows on one day, in cities neither row placed,
+  // were collapsed to one here on a position neither of them has. A row with no
+  // usable position now passes through like one with no position at all, for the
+  // DB rules below to match on venue, city and bill. parseFloat for the same
+  // reading as sameArea's, so a bucket holds what that would call one place.
   const coordKey = (c) => {
-    if (c.latitude == null || c.longitude == null) return null;
-    const cell = `${Math.round(c.latitude / 0.001)}:${Math.round(c.longitude / 0.001)}`;
+    const lat = parseFloat(c.latitude);
+    const lng = parseFloat(c.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+    const cell = `${Math.round(lat / 0.001)}:${Math.round(lng / 0.001)}`;
     return `${cell}@${dayKey(c.concert_date)}`;
   };
 

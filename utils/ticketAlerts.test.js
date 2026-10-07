@@ -10,7 +10,7 @@ const prisma = installFakePrisma({
 const require = createRequire(import.meta.url);
 const mail = require('./mail.js');
 const { ticketState, mergeTicketFields } = require('./ticketState.js');
-const { alertFor, saleInstant, billJoined, billLabel, runTicketAlerts } = require('./ticketAlerts.js');
+const { alertFor, saleInstant, billJoined, billLabel, ticketLink, runTicketAlerts } = require('./ticketAlerts.js');
 
 const NOW = new Date('2026-10-09T06:30:00Z'); // 08:30 in Stockholm, the sale day
 
@@ -21,6 +21,17 @@ describe('ticketState', () => {
     expect(ticketState({ ticket_sale_start: new Date('2026-10-09T00:00:00Z') }, NOW)).toBe('on_sale_soon');
     expect(ticketState({ ticket_sale_start: new Date('2026-10-01T00:00:00Z') }, NOW)).toBe('unknown');
     expect(ticketState({}, NOW)).toBe('unknown');
+  });
+
+  it('believes the day a sale opens over a flag saying it already has', () => {
+    // How the Hollywood Undead row read "On sale" three days before its sale:
+    // Bandsintown marks every listing in stock, Songkick's own page said the
+    // 9th, and the flag was being read first.
+    const soon = { on_sale: true, ticket_sale_start: new Date('2026-10-11T00:00:00Z') };
+
+    expect(ticketState(soon, NOW)).toBe('on_sale_soon');
+    // On the morning of the sale the flag is the newer news again.
+    expect(ticketState({ ...soon, ticket_sale_start: new Date('2026-10-09T00:00:00Z') }, NOW)).toBe('on_sale');
   });
 });
 
@@ -65,6 +76,29 @@ describe('mergeTicketFields', () => {
   it('writes nothing when the scrape says nothing, or only what the row already holds', () => {
     expect(merge(pending, {})).toEqual({});
     expect(merge(stored(), { on_sale: true, sold_out: false })).toEqual({});
+  });
+
+  it('leaves the flag alone for a scrape that read nothing about the tickets', () => {
+    // A null is how the scrapers say nobody looked, and on_sale cannot be
+    // null in the database — writing one through would throw.
+    expect(merge(stored(), { on_sale: null, sold_out: false })).toEqual({});
+    expect(merge(stored({ on_sale: false }), { on_sale: null, sold_out: false })).toEqual({});
+  });
+});
+
+describe('ticketLink', () => {
+  it('names the site a show was listed on', () => {
+    expect(ticketLink({ url: 'https://www.songkick.com/concerts/1', source: 'songkick' }))
+      .toEqual({ url: 'https://www.songkick.com/concerts/1', label: 'Tickets on Songkick' });
+    expect(ticketLink({ url: 'https://www.bandsintown.com/e/1', source: 'bandsintown' }).label)
+      .toBe('Tickets on Bandsintown');
+    expect(ticketLink({ url: 'https://tickets.example.test/1', source: null }).label).toBe('Tickets');
+  });
+
+  it('is nothing at all for a row with no link, or one that is not a link', () => {
+    expect(ticketLink({ url: null })).toBeNull();
+    // These went into an email as an href and into Discord as markdown.
+    expect(ticketLink({ url: 'javascript:alert(1)' })).toBeNull();
   });
 });
 
@@ -156,7 +190,7 @@ describe('runTicketAlerts', () => {
   const show = (over = {}) => ({
     id: 300, name: 'Hollywood Undead: EU/UK 2027', venue: 'Fållan', city: 'Stockholm', country: 'SE',
     concert_date: new Date('2027-02-13T18:45:00Z'), url: 'https://www.songkick.com/festivals/3808399/id/43451188',
-    metadata: null, on_sale: false, sold_out: false, ticket_sale_start: null,
+    source: 'songkick', metadata: null, on_sale: false, sold_out: false, ticket_sale_start: null,
     bands: [{ band_rel: { name: 'Hollywood Undead' } }], ...over,
   });
   // `bill` is the bill this follower was last told about, which for most of
@@ -207,6 +241,24 @@ describe('runTicketAlerts', () => {
 
     expect(received[0].embeds[0].title).toBe('On sale today: Hollywood Undead: EU/UK 2027');
     expect(updates()).toEqual([{ told_state: 'on_sale_soon', reminded_at: soon }]);
+  });
+
+  it('sends the listing to buy from with every alert, named after its site', async () => {
+    const soon = new Date('2026-10-09T07:50:00Z');
+    prisma.concertFollow.findMany.mockResolvedValue([
+      follow('on_sale_soon', show({ ticket_sale_start: new Date('2026-10-09T00:00:00Z') })),
+    ]);
+
+    await runTicketAlerts({ now: soon });
+
+    expect(received[0].embeds[0].fields[0].value)
+      .toContain('🎟 [Tickets on Songkick](https://www.songkick.com/festivals/3808399/id/43451188)');
+    expect(mail.sendTicketAlertEmail).toHaveBeenCalledWith({
+      to: 'me@example.test',
+      items: [expect.objectContaining({
+        tickets: { url: 'https://www.songkick.com/festivals/3808399/id/43451188', label: 'Tickets on Songkick' },
+      })],
+    });
   });
 
   it('names a sale time it was given, rather than the hour it assumes', async () => {

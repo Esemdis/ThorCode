@@ -67,9 +67,10 @@ async function sendDigestEmail({ to, items }) {
   return result;
 }
 
-// One line per show a follower is being told about: what happened, then the show.
-// `alert` is the line's own words — "Sold out", or "New on the bill: Ghost,
-// Opeth" — and need not be one of a fixed set.
+// One line per show a follower is being told about: what happened, then the
+// show, then where to buy. `alert` is the line's own words — "Sold out", or
+// "New on the bill: Ghost, Opeth" — and need not be one of a fixed set;
+// `tickets` is the listing to link to, named after its site.
 function buildTicketAlertHtml(items) {
   const rows = items
     .map((c) => {
@@ -77,7 +78,11 @@ function buildTicketAlertHtml(items) {
       const title = escapeHtml(c.title || "Concert");
       const link = href ? `<a href="${escapeHtml(href)}">${title}</a>` : title;
       const where = [c.venue, c.city, c.country].filter(Boolean).map(escapeHtml).join(", ");
-      return `<li><strong>${escapeHtml(c.alert)}:</strong> ${link} — ${fmtDate(c.date)} @ ${where}</li>`;
+      const ticketHref = c.tickets?.url ? safeHref(c.tickets.url) : null;
+      const tickets = ticketHref
+        ? ` — <a href="${escapeHtml(ticketHref)}">${escapeHtml(c.tickets.label || "Tickets")} →</a>`
+        : "";
+      return `<li><strong>${escapeHtml(c.alert)}:</strong> ${link} — ${fmtDate(c.date)} @ ${where}${tickets}</li>`;
     })
     .join("");
   return `<p>News about the shows you follow:</p><ul>${rows}</ul>`;

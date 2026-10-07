@@ -26,6 +26,7 @@ const { isTimeZone, zonedInstant } = require("./weeklyRecap");
 const { ticketState, saleDay, saleHasTime } = require("./ticketState");
 const { billForConcert } = require("./concertBill");
 const { canonicalBandName } = require("./lineupNames");
+const { safeHref } = require("./html");
 
 // Long enough to have the page open and be signed in when the sale opens.
 const REMIND_BEFORE_MIN = 10;
@@ -175,6 +176,27 @@ const showTitle = (concert) => concert.name
   || (concert.bands ?? []).map((b) => b.band_rel.name).join(", ")
   || concert.venue;
 
+// What the listing a show was scraped from is called, for the link's words.
+const SOURCE_NAMES = { songkick: "Songkick", bandsintown: "Bandsintown" };
+
+/**
+ * Where to go and buy, for an alert that is about tickets.
+ *
+ * Concert.url is the show's own listing — Songkick's event page or
+ * Bandsintown's — which is as close to a box office as anything stored here
+ * gets: it carries the vendor links, and on a sale day it is the page that
+ * opens them. Named after its site, so the link says where it goes.
+ *
+ * @param {{url?: string|null, source?: string|null}} concert
+ * @returns {{url: string, label: string}|null} null when the row has no usable link
+ */
+function ticketLink(concert) {
+  const url = safeHref(concert.url);
+  if (!url) return null;
+  const site = SOURCE_NAMES[concert.source];
+  return { url, label: site ? `Tickets on ${site}` : "Tickets" };
+}
+
 // The zone the weekly recap saved, or UTC as it falls back to.
 function zoneOf(settings) {
   const zone = settings && typeof settings === "object" ? settings.timeZone : null;
@@ -190,7 +212,7 @@ function mentionFor(settings) {
 async function postToDiscord(webhook, alerts, settings) {
   const embeds = buildDiscordEmbeds({
     title: alerts.length === 1 ? alerts[0].headline : "News about shows you follow",
-    concerts: alerts.map(({ concert, label }) => ({ ...concert, note: label })),
+    concerts: alerts.map(({ concert, label }) => ({ ...concert, note: label, tickets: ticketLink(concert) })),
   });
   const content = mentionFor(settings);
   for (const [i, embed] of embeds.entries()) {
@@ -220,6 +242,8 @@ async function runTicketAlerts({ now = new Date() } = {}) {
       concert_rel: {
         select: {
           id: true, name: true, venue: true, city: true, country: true, concert_date: true, url: true,
+          // The listing the alert links to, and the site to name it after.
+          source: true,
           metadata: true, on_sale: true, sold_out: true, ticket_sale_start: true,
           bands: { select: { band_rel: { select: { name: true } } } },
         },
@@ -312,6 +336,10 @@ async function runTicketAlerts({ now = new Date() } = {}) {
             country: concert.country,
             date: concert.concert_date,
             url: concert.url,
+            // The link to go and buy by, spelled out: the title above is a
+            // link too, but an alert that tickets are open wants one that
+            // says so.
+            tickets: ticketLink(concert),
           })),
         });
         delivered = true;
@@ -336,4 +364,4 @@ async function runTicketAlerts({ now = new Date() } = {}) {
   return { follows: follows.length, alerted, failed };
 }
 
-module.exports = { alertFor, saleInstant, billJoined, billLabel, runTicketAlerts, REMIND_BEFORE_MIN, ASSUMED_SALE_HOUR };
+module.exports = { alertFor, saleInstant, billJoined, billLabel, ticketLink, runTicketAlerts, REMIND_BEFORE_MIN, ASSUMED_SALE_HOUR };

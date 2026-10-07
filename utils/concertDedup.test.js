@@ -201,6 +201,16 @@ describe('deduplicateByCoords', () => {
     expect(result[0].bands).toEqual([1, 2, 3]);
   });
 
+  it('keeps two shows apart when neither has a usable coordinate', () => {
+    // Non-null nonsense used to round to one "NaN:NaN" cell, so two unrelated
+    // shows on a day shared a bucket and one of them never reached the DB.
+    const concerts = [
+      { name: 'Paris', latitude: '', longitude: '', concert_date: '2026-06-01T20:00:00Z', bands: [1] },
+      { name: 'Oslo', latitude: 'N/A', longitude: 'N/A', concert_date: '2026-06-01T19:00:00Z', bands: [2, 3] },
+    ];
+    expect(deduplicateByCoords(concerts).map((c) => c.name)).toEqual(['Paris', 'Oslo']);
+  });
+
   it('treats an unparseable date as undated rather than throwing', () => {
     const concerts = [
       { latitude: 48.8566, longitude: 2.3522, concert_date: 'not a date', bands: [1] },

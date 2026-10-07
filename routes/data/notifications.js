@@ -145,7 +145,9 @@ const FOLLOWED_CONCERT = {
   city: true,
   country: true,
   concert_date: true,
+  // The listing to open from the row, and the site to name it after.
   url: true,
+  source: true,
   on_sale: true,
   sold_out: true,
   ticket_sale_start: true,

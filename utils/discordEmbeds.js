@@ -40,7 +40,11 @@ function buildDiscordEmbeds({ title, concerts }) {
     // What is being said about the show, for a post about more than one
     // thing: "Sold out", "On sale today".
     const note = typeof concert.note === "string" && concert.note ? `\n**${escapeMarkdown(concert.note.slice(0, 100))}**` : "";
-    const head = venueStr + note + (added.length > 300 ? `${added.slice(0, 299)}…` : added);
+    // A line of its own for the listing, where the caller asked for one: the
+    // venue above links to the same page, but an alert about tickets should
+    // not make someone work out that the venue's name is the way to them.
+    const tickets = concert.tickets?.url ? `\n🎟 [${escapeMarkdown(concert.tickets.label)}](${concert.tickets.url})` : "";
+    const head = venueStr + note + tickets + (added.length > 300 ? `${added.slice(0, 299)}…` : added);
 
     let lineup = [];
     try { lineup = JSON.parse(concert.metadata || "[]"); } catch {}

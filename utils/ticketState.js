@@ -13,14 +13,23 @@ const saleDay = (concert) => (concert.ticket_sale_start ? new Date(concert.ticke
  * 'sold_out', 'on_sale', 'on_sale_soon' (a sale day today or still to come)
  * or 'unknown'.
  *
+ * A sale day still ahead outranks `on_sale`, which is where the two can
+ * disagree: both scrapers mark a listing in stock by default, so a row can
+ * carry a stale "in stock" from one source beside the day another source
+ * actually read off the vendor list. A dated sale is something a source said;
+ * the flag need not be. On the day itself the flag wins again, because that is
+ * the morning it turns true for real.
+ *
  * @param {{sold_out?: boolean|null, on_sale?: boolean|null, ticket_sale_start?: Date|string|null}} concert
  * @param {Date} [now]
  */
 function ticketState(concert, now = new Date()) {
   if (concert.sold_out) return "sold_out";
-  if (concert.on_sale) return "on_sale";
   const day = saleDay(concert);
-  if (day && day >= now.toISOString().slice(0, 10)) return "on_sale_soon";
+  const today = now.toISOString().slice(0, 10);
+  if (day && day > today) return "on_sale_soon";
+  if (concert.on_sale) return "on_sale";
+  if (day === today) return "on_sale_soon";
   return "unknown";
 }
 
@@ -33,7 +42,9 @@ function ticketState(concert, now = new Date()) {
  *
  * - Songkick and Bandsintown each mark a listing in stock by default, so a
  *   row with nothing specific to say must not overwrite one that named the
- *   day the sale opens, nor clear that day.
+ *   day the sale opens, nor clear that day. A scrape that read nothing about
+ *   the tickets at all leaves `on_sale` null or absent, and neither sets nor
+ *   clears the flag — only a source that looked says anything here.
  * - A sold-out show comes back only when a source says it is selling again,
  *   rather than whenever one merely fails to mention it.
  *
@@ -57,7 +68,9 @@ function mergeTicketFields(existing, incoming, now = new Date()) {
       Object.assign(wanted, { ticket_sale_start: new Date(incoming.ticket_sale_start), on_sale: false });
     } else {
       const pending = saleDay(existing);
-      if (!(pending && pending >= today) && incoming.on_sale !== undefined) wanted.on_sale = incoming.on_sale;
+      // Null, not only absent: the scrapers send null for "nobody said", and
+      // on_sale is a non-null column — writing it through would throw.
+      if (!(pending && pending >= today) && incoming.on_sale != null) wanted.on_sale = incoming.on_sale;
     }
   }
 
