@@ -9,9 +9,8 @@
 const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
-const { checkDuplicateConcert, deduplicateByCoords, haversineKm } = require('../../../utils/concertDedup');
-const { cleanLineupJson, canonicalBandName, lineupGrew } = require('../../../utils/lineupNames');
-const { mergeTicketFields } = require('../../../utils/ticketState');
+const { checkDuplicateConcert, deduplicateByCoords, mergedFields, haversineKm } = require('../../../utils/concertDedup');
+const { cleanLineupJson, canonicalBandName } = require('../../../utils/lineupNames');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
@@ -30,12 +29,16 @@ const VENUE_MOVE_KM = 1;
  * and venue here for good: only prices, sale state and sold-out were updated,
  * and reconcile matches it by event id and looks no further.
  *
+ * Only this path can be sure of a move. An event id is one listing, so another
+ * date on it is that show moving, where the rules in utils/concertDedup.js
+ * match two listings that may always have disagreed. A time filled in for the
+ * same day is not a move and belongs to both paths — see adoptedTime there.
+ *
  * Only a show still to come moves, and only to a date still to come: a night
- * already been to has photographs filed under its date and venue. A time
- * of day is taken for the same date, but a bare date never replaces one. A
- * venue changes only with a position more than VENUE_MOVE_KM from the stored
- * one, so a stage name at the same grounds is not a move, and a new name with
- * no position cannot be told from one.
+ * already been to has photographs filed under its date and venue. A venue
+ * changes only with a position more than VENUE_MOVE_KM from the stored one, so
+ * a stage name at the same grounds is not a move, and a new name with no
+ * position cannot be told from one.
  *
  * @returns {object} fields for concert.update, empty when nothing moved
  */
@@ -47,12 +50,8 @@ function movedFields(existing, incoming, now = new Date()) {
   const next = incoming.concert_date ? new Date(incoming.concert_date) : null;
   if (next && !Number.isNaN(next.getTime())) {
     const day = (d) => Math.floor(d.getTime() / DAY_MS);
-    const untimed = (d) => d.getTime() % DAY_MS === 0;
     const startOfToday = day(now) * DAY_MS;
-    if (next.getTime() >= startOfToday
-      && (day(next) !== day(was) || (untimed(was) && !untimed(next)))) {
-      moved.concert_date = next;
-    }
+    if (next.getTime() >= startOfToday && day(next) !== day(was)) moved.concert_date = next;
   }
 
   const venue = typeof incoming.venue === 'string' ? incoming.venue.trim() : '';
@@ -163,36 +162,21 @@ router.post(
               const linked = new Set(existingRefs.map((r) => r.band));
               const toLink = validIds.filter((id) => !linked.has(id));
 
-              // Upgrade name if incoming has a better one (existing is "Band @ Venue" fallback)
-              const isAtFormat = (s) => s.includes(' @ ') || / at /i.test(s);
-              const existingIsAtFormat = isAtFormat(existingByEventId.name || '');
-              const incomingIsAtFormat = isAtFormat(concert.name || '');
-              const betterName = concert.name && existingIsAtFormat && !incomingIsAtFormat
-                ? concert.name : null;
-
-              const concertFieldUpdate = {};
-              if (betterName) concertFieldUpdate.name = betterName;
-              // The ticket fields through the same merge the duplicate path
-              // uses. Written straight off the scrape, as they were, a source
+              // The name, the ticket fields, the bill and the prices through
+              // the same merge the duplicate path uses, so a show already
+              // stored is updated the same way however it was recognised.
+              // Written straight off the scrape, as they were here, a source
               // that marks every listing in stock by default cleared the sale
               // day another source had found and said the show was selling —
-              // which is an "on sale now" to every follower of it, days before
-              // the sale opens.
-              const tickets = mergeTicketFields(existingByEventId, concert);
-              Object.assign(concertFieldUpdate, tickets);
-              if (concert.price_min != null) concertFieldUpdate.price_min = concert.price_min;
-              if (concert.price_max != null) concertFieldUpdate.price_max = concert.price_max;
-              if (concert.price_currency != null) concertFieldUpdate.price_currency = concert.price_currency;
-              // The bill as this scrape saw it, when it saw more of it than the
-              // row holds. The lineup was read above to link what it could and
-              // then thrown away, so an act joining a show with no Band row of
-              // its own — most of a festival's acts — reached nothing that a
-              // follower's lineup alert reads.
-              if (lineupGrew(existingByEventId.metadata, metadata)) concertFieldUpdate.metadata = metadata;
+              // an "on sale now" to every follower, days before the sale opens.
               const moved = movedFields(existingByEventId, concert);
-              Object.assign(concertFieldUpdate, moved);
+              const concertFieldUpdate = {
+                ...mergedFields(existingByEventId, concert),
+                ...moved,
+              };
 
-              const becameSoldOut = tickets.sold_out === true;
+              const betterName = concertFieldUpdate.name ?? null;
+              const becameSoldOut = concertFieldUpdate.sold_out === true;
 
               // An act joining a show already stored is news the way a new
               // show is: a festival's second act arrives exactly like this.
@@ -263,10 +247,20 @@ router.post(
           const bandIds = resolved.map((b) => b.id);
           const bandNames = resolved.map((b) => b.name);
 
-          const { isDuplicate, existingConcert, linked } = await checkDuplicateConcert({ concert, bandIds, bandNames, tx, notify });
+          const { isDuplicate, existingConcert, linked, merged } = await checkDuplicateConcert({ concert, bandIds, bandNames, tx, notify });
 
           if (isDuplicate) {
             return {
+              // A festival is matched by its name rather than by an event id,
+              // so this is the path a festival selling out comes in on, and
+              // the feeds were told about it only on the other one.
+              soldOut: merged.sold_out === true ? {
+                concertId: existingConcert.id,
+                name: existingConcert.name,
+                city: existingConcert.city,
+                country: existingConcert.country,
+                concert_date: existingConcert.concert_date,
+              } : null,
               duplicate: {
                 index: i,
                 reason: concert.festival ? 'festival duplicate (merged bands)' : 'duplicate concert_date + venue + band combination',

@@ -1,17 +1,57 @@
+/**
+ * Deciding when two concert listings are one show.
+ *
+ * The same night reaches us in several shapes: Songkick's "Zenith de Nancy" is
+ * Bandsintown's "Amphitheatre Plein Air", a festival is one page per artist, a
+ * late set is filed as the next morning. Three places need an answer, and they
+ * all read the rules in this file:
+ *
+ *   deduplicateByCoords    one /bulk payload against itself, before any DB work
+ *   checkDuplicateConcert  one incoming concert against the stored rows
+ *   deduplicateConcerts    stored rows against each other, on the way out
+ *
+ * They share one bias, deliberately: a merge that does not happen leaves two
+ * rows for one night, which is visible and can be fixed, where a merge that
+ * should not have happened destroys a concert nobody will know was there.
+ */
 const { canonicalBandName, cleanLineupJson, lineupGrew } = require('./lineupNames');
 const { mergeTicketFields } = require('./ticketState');
 
-const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
-// ─── Primitive helpers ────────────────────────────────────────────────────────
+// How far apart two rows can be and still be one place. AREA_KM is a city and
+// its outskirts, the line nothing is merged across; GROUND_KM is the tighter
+// one for two festival rows whose grounds are named differently.
+const AREA_KM = 20;
+const GROUND_KM = 8;
 
-// Normalize a date to midnight UTC on its calendar day
-function toUtcDay(date) {
-  const d = new Date(date);
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-}
+// Dice coefficients, 0–1. VENUE_SAME is "the same room, spelled the same way".
+const NAME_SIM = 0.8;
+const VENUE_SIM = 0.7;
+const VENUE_SAME = 0.95;
+const CITY_SIM = 0.7;
 
-// Haversine distance in km between two lat/lng points
+// The window of stored rows a merge may reach across: a festival's days. A
+// named event with no festival about it reaches NAMED_DAYS, one source dating
+// the same show differently from another reaches SLIP_DAYS.
+const WINDOW_DAYS = 7;
+const NAMED_DAYS = 3;
+const SLIP_DAYS = 1;
+
+// Below this, a normalized event name ("fest", "live") is too generic to
+// cluster rows on.
+const MIN_EVENT_NAME = 6;
+
+// What a bill shared across rows under one event name has to add up to before
+// it is a festival rather than a support act.
+const CLUSTER_BANDS = 5;
+
+// Three or more acts on one row is a bill, not a tour date.
+const MULTI_BAND = 3;
+
+// ─── Place, time and text ────────────────────────────────────────────────────
+
+/** Haversine distance in km between two lat/lng points. */
 function haversineKm(lat1, lng1, lat2, lng2) {
   const R = 6371;
   const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -21,143 +61,214 @@ function haversineKm(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Returns true if both concerts have coordinates and are within 20km of each other
-function sameArea(incoming, existing) {
-  const iLat = parseFloat(incoming.latitude), iLng = parseFloat(incoming.longitude);
-  const eLat = parseFloat(existing.latitude), eLng = parseFloat(existing.longitude);
-  if (isNaN(iLat) || isNaN(iLng) || isNaN(eLat) || isNaN(eLng)) return false;
-  return haversineKm(iLat, iLng, eLat, eLng) <= 20;
+/** Midnight UTC on a date's calendar day, as ms. NaN for no date, or a bad one. */
+function dayOf(value) {
+  if (!value) return NaN;
+  const d = new Date(value);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
 }
 
-// Normalize a venue string for substring containment checks (strips accents, punctuation, case)
-function normalizeVenueFlat(s) {
-  return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+/** `YYYY-MM-DD`, or 'undated'. */
+function dayKey(value) {
+  const day = dayOf(value);
+  return Number.isNaN(day) ? 'undated' : new Date(day).toISOString().slice(0, 10);
 }
 
-// Strips year numbers and "Artist @ " prefix so festival name variants compare cleanly.
-// "Resurrection Fest 2026" and "Imminence @ Resurrection Fest" both reduce to "resurrectionfest".
-function normalizeEventName(s) {
-  return s
-    .replace(/^[^@]+@\s*/i, '')        // strip "Artist @ " prefix
-    .replace(/\b\d{4}\b/g, '')         // strip 4-digit years
-    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+/**
+ * Whole days between two calendar days, either way round. NaN when either date
+ * is missing, which fails every comparison made against it.
+ */
+function dayGap(a, b) {
+  return Math.abs(dayOf(a) - dayOf(b)) / DAY_MS;
+}
+
+/** Accents off, down to a-z0-9, for comparing names as labels. */
+function flatten(value) {
+  return (value || '')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
     .toLowerCase()
     .replace(/[^a-z0-9]/g, '');
 }
 
-// Returns true if one venue name is substantially contained within the other.
-// Catches cases like "Zenith De Nancy - Amphitheatre Plein Air" containing "Amphitheatre Plein Air".
-// Requires the shorter fragment to be at least 10 chars to avoid trivial matches.
-function venueContains(a, b) {
-  const na = normalizeVenueFlat(a), nb = normalizeVenueFlat(b);
-  const shorter = na.length <= nb.length ? na : nb;
-  const longer  = na.length <= nb.length ? nb : na;
-  return shorter.length >= 10 && longer.includes(shorter);
+/**
+ * An event name with the "Artist @ " prefix and any year stripped, so
+ * "Resurrection Fest 2026" and "Imminence @ Resurrection Fest" are one name.
+ */
+function normalizeEventName(value) {
+  return flatten((value || '').replace(/^[^@]+@\s*/i, '').replace(/\b\d{4}\b/g, ''));
 }
 
-// Bigram Dice coefficient — returns 0.0–1.0. Unicode-safe: keeps all letters/numbers.
+/** Bigram Dice coefficient, 0–1. Unicode-safe: keeps letters and digits of any script. */
 function stringSimilarity(a, b) {
-  const norm = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
-  const na = norm(a), nb = norm(b);
-  if (na === nb) return 1;
+  const squeeze = (s) => (s || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  const na = squeeze(a), nb = squeeze(b);
+  if (na === nb) return na ? 1 : 0;
   if (!na || !nb) return 0;
-  const bigrams = (s) => Array.from({ length: Math.max(s.length - 1, 0) }, (_, i) => s.slice(i, i + 2));
+  const bigrams = (s) => Array.from({ length: s.length - 1 }, (_, i) => s.slice(i, i + 2));
   const ba = bigrams(na), bb = bigrams(nb);
   if (!ba.length || !bb.length) return 0;
-  const bbCount = new Map();
-  for (const g of bb) bbCount.set(g, (bbCount.get(g) || 0) + 1);
+  const counts = new Map();
+  for (const g of bb) counts.set(g, (counts.get(g) || 0) + 1);
   let matches = 0;
-  for (const g of ba) if (bbCount.get(g) > 0) { matches++; bbCount.set(g, bbCount.get(g) - 1); }
+  for (const g of ba) if (counts.get(g) > 0) { matches++; counts.set(g, counts.get(g) - 1); }
   return (2 * matches) / (ba.length + bb.length);
 }
 
 /**
- * Whether a concert's event name, read together with every other stored
- * concert nearby that shares it, is a festival — even when the scraper's own
- * single-page guess (bill length on the one event it saw) says no.
- *
- * Bandsintown scrapes a festival as one page per artist, so a stage-specific
- * "Artist @ Graspop Metal Meeting" page usually lists just that one act;
- * len(lineup) > 6 never fires for it even though the event is unmistakably a
- * festival, and neither does anything else about that one row. This instead
- * looks across every already-stored show sharing the event name: together
- * spanning more than one calendar day, or the bands across them adding up
- * past five, is what no single artist-centric listing can show on its own.
- *
- * @param {object} concert - the incoming concert (name, concert_date, city, coords)
- * @param {number[]} bandIds - the incoming concert's resolved band ids
- * @param {object[]} candidates - other stored concerts already fetched for this
- *   date window, each carrying its bands' names as `bands[].band_rel.name`
- * @param {string[]} bandNames - the incoming concert's own band names
- * @returns {{ isFestival: boolean, matches: object[] }} matches are the
- *   candidates sharing the event name — the caller upgrades their stored
- *   festival flag too when isFestival is true, since they are the other
- *   rows a single-page scrape could never have flagged on their own.
+ * Whether one venue name is substantially contained in the other — "Zenith De
+ * Nancy - Amphitheatre Plein Air" holds "Amphitheatre Plein Air". The shorter
+ * fragment must be 10 characters or more, or every "The Hall" matches.
  */
-function detectFestivalCluster(concert, bandIds, candidates, bandNames = []) {
-  // The scraper's own fallback name is literally "<band> @ <venue>", so what
-  // marks a label with no real event behind it is the part after the "@"
-  // being the venue itself. Excluding those is what keeps this signal honest:
-  // normalizeEventName strips the artist prefix, so two unrelated tour stops
-  // at one room on different nights — the very case isSeparateNight below
-  // exists to keep apart — would otherwise normalize to the same string and
-  // read as a single multi-day festival. "Slipknot @ Graspop Metal Meeting
-  // 2025" survives it, because what follows the "@" is the festival, not the
-  // field it is held on. A "<band> at <venue>" name is dropped outright; that
-  // costs the signal a real festival named like "Live at Leeds", which the
-  // scraper's own bill-length rule can still catch, and a false negative here
-  // only leaves rows split, where a false positive would merge two genuinely
-  // different concerts into one row.
-  const eventName = (row, ownBandNames) => {
-    if (!row.name || / at /i.test(row.name)) return null;
-    const after = row.name.replace(/^[^@]+@\s*/i, '').trim();
-    if (!after) return null;
-    if (row.venue && (stringSimilarity(after, row.venue) >= 0.7 || venueContains(after, row.venue))) return null;
-    // Named for a band on its own bill — "Citizen", "A$AP Rocky" — is an
-    // artist's show titled after the artist, not an event. Without this the
-    // two-day rule fired for any band playing a city twice in a week, which
-    // is a tour, and the rows would have been merged into one festival day.
-    // A real festival is never called after one of the acts on it.
-    const canonical = canonicalBandName(after);
-    if (canonical && ownBandNames.some((n) => canonicalBandName(n) === canonical)) return null;
-    return after;
-  };
-
-  const incomingName = eventName(concert, bandNames);
-  if (!incomingName) return { isFestival: false, matches: [] };
-  const normIncoming = normalizeEventName(incomingName);
-  if (normIncoming.length < 6) return { isFestival: false, matches: [] };
-
-  const matches = candidates.filter((c) => {
-    const candidateName = eventName(c, (c.bands ?? []).map((b) => b.band_rel?.name).filter(Boolean));
-    if (!candidateName) return false;
-    if (stringSimilarity(normIncoming, normalizeEventName(candidateName)) < 0.8) return false;
-    return sameArea(concert, c) || (concert.city && c.city && stringSimilarity(concert.city, c.city) >= 0.7);
-  });
-
-  const days = new Set([
-    toUtcDay(concert.concert_date).toISOString(),
-    ...matches.map((c) => toUtcDay(c.concert_date).toISOString()),
-  ]);
-  const bandSet = new Set([...bandIds, ...matches.flatMap((c) => c.bands.map((b) => b.band))]);
-
-  return { isFestival: days.size >= 2 || bandSet.size >= 5, matches };
+function venueContains(a, b) {
+  const na = flatten(a), nb = flatten(b);
+  const [shorter, longer] = na.length <= nb.length ? [na, nb] : [nb, na];
+  return shorter.length >= 10 && longer.includes(shorter);
 }
 
-// ─── Insert-time deduplication (DB) ──────────────────────────────────────────
+/**
+ * How far two venue names agree, 0–1: containment counts as agreement, since
+ * one source names the room and another the building it is in.
+ */
+function venueSimilarity(a, b) {
+  if (!a || !b) return 0;
+  return venueContains(a, b) ? 1 : stringSimilarity(a, b);
+}
+
+/** Both rows carry coordinates, and they are within `km` of each other. */
+function withinKm(a, b, km) {
+  const [aLat, aLng, bLat, bLng] = [a.latitude, a.longitude, b.latitude, b.longitude].map(parseFloat);
+  if (![aLat, aLng, bLat, bLng].every(Number.isFinite)) return false;
+  return haversineKm(aLat, aLng, bLat, bLng) <= km;
+}
+
+/**
+ * One place: close enough by position, or the same city by name.
+ *
+ * Every rule below is confined to this. A venue brand with a room in each city
+ * — "O2 Academy", "Zenith" — otherwise matched on its name alone, and a tour
+ * playing two of them on consecutive nights lost one of the two concerts.
+ */
+function nearby(a, b) {
+  return withinKm(a, b, AREA_KM)
+    || (!!a.city && !!b.city && stringSimilarity(a.city, b.city) >= CITY_SIM);
+}
+
+/**
+ * Whether a concert date carries a time of day rather than just a day. A show
+ * scraped with no start time is stored at exactly midnight UTC, so midnight
+ * reads as "no time published" rather than a show at 00:00.
+ */
+function hasTimeOfDay(value) {
+  if (!value) return false;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return false;
+  return d.getUTCHours() !== 0 || d.getUTCMinutes() !== 0 || d.getUTCSeconds() !== 0;
+}
+
+/**
+ * Whether a name is the "Band @ Venue" shape a scraper falls back to when the
+ * event published none. A row carrying a real event name is the better record.
+ */
+function isFallbackName(name) {
+  const s = name || '';
+  return s.includes(' @ ') || / at /i.test(s);
+}
+
+/**
+ * The better of two event names: a real one over a scraper's fallback, and
+ * between two real ones the shorter, which is the festival rather than the
+ * festival plus a day number. Two fallbacks say the same thing, so the stored
+ * one stays — a festival row would otherwise be renamed after whichever of its
+ * acts was scraped last, every sync.
+ */
+function bestEventName(current, incoming) {
+  if (!incoming) return current;
+  if (!current) return incoming;
+  if (isFallbackName(current) !== isFallbackName(incoming)) {
+    return isFallbackName(current) ? incoming : current;
+  }
+  if (isFallbackName(current)) return current;
+  return incoming.length < current.length ? incoming : current;
+}
+
+// ─── What a row is an event of ───────────────────────────────────────────────
+
+/**
+ * The event a row is listed under, or null when it names none.
+ *
+ * Bandsintown's fallback title is "<band> @ <venue>", and stripping the "@"
+ * prefix off that leaves the venue — so two tour stops in one room on
+ * different nights would read as one multi-day event. Three titles are
+ * therefore dropped: one whose "@" leads back to the row's own venue, one with
+ * " at " in it (a real "Live at Leeds" is left to the scraper's own bill-length
+ * rule), and one named after an act on the bill, which is a band's own show.
+ * "Slipknot @ Graspop Metal Meeting 2025" survives all three.
+ */
+function eventLabel(row, bandNames = []) {
+  if (!row.name || / at /i.test(row.name)) return null;
+  const label = row.name.replace(/^[^@]+@\s*/i, '').trim();
+  if (!label) return null;
+  if (row.venue && venueSimilarity(label, row.venue) >= VENUE_SIM) return null;
+  const canonical = canonicalBandName(label);
+  if (canonical && bandNames.some((name) => canonicalBandName(name) === canonical)) return null;
+  return label;
+}
+
+/** The band names on a stored row, for eventLabel. */
+function storedBandNames(row) {
+  return (row.bands ?? []).map((ref) => ref.band_rel?.name).filter(Boolean);
+}
+
+/**
+ * Whether a row is a festival, read from the stored rows around it rather than
+ * from the row itself.
+ *
+ * Bandsintown files a festival as one page per artist, so a stage-specific
+ * "Artist @ Graspop Metal Meeting" page lists that one act and the scraper's
+ * own rule — a bill over six — never fires for it. What no single page can
+ * show is what the rows sharing its event name add up to: more than one
+ * calendar day, or five bands between them.
+ *
+ * @param {object} concert - the incoming concert (name, venue, concert_date, city, coords)
+ * @param {number[]} bandIds - its resolved band ids
+ * @param {object[]} candidates - stored rows for the date window, each carrying
+ *   its bands as `bands[].band` and their names as `bands[].band_rel.name`
+ * @param {string[]} bandNames - the incoming concert's own band names
+ * @returns {{isFestival: boolean, matches: object[]}} matches are the rows
+ *   sharing the name; the caller flags those too, since each is just as blind
+ *   to this on its own.
+ */
+function detectFestivalCluster(concert, bandIds, candidates, bandNames = []) {
+  const label = eventLabel(concert, bandNames);
+  const name = normalizeEventName(label);
+  if (name.length < MIN_EVENT_NAME) return { isFestival: false, matches: [] };
+
+  const matches = candidates.filter((row) => {
+    const other = eventLabel(row, storedBandNames(row));
+    return other
+      && stringSimilarity(name, normalizeEventName(other)) >= NAME_SIM
+      && nearby(concert, row);
+  });
+
+  const days = new Set([concert, ...matches].map((row) => dayOf(row.concert_date)));
+  const bands = new Set([...bandIds, ...matches.flatMap((row) => (row.bands ?? []).map((ref) => ref.band))]);
+  return { isFestival: days.size >= 2 || bands.size >= CLUSTER_BANDS, matches };
+}
+
+// ─── One payload against itself ──────────────────────────────────────────────
 
 /**
  * One of two same-day, same-place rows from different sources, carrying what
  * the other knew that it did not.
  *
  * Both scrapers file a show with the one band whose page they were reading, so
- * the bill length that picks a survivor below is usually a tie, and a tie goes
- * to whichever source ran first — Songkick. What the dropped row knew went
- * with it: Bandsintown is the source that lists a festival's bill, and either
- * can be the only one to have seen a show sold out or name the day its sale
- * opens. None of that reached the stored row's merge in
- * checkDuplicateConcert, because the row holding it was gone before the
- * payload got there.
+ * the bill length that picks a survivor is usually a tie, and a tie goes to
+ * whichever source ran first — Songkick. What the dropped row knew went with
+ * it: Bandsintown is the source that lists a festival's bill, and either can
+ * be the only one to have seen a show sold out or name the day its sale opens.
+ * None of that reached the stored row's merge in checkDuplicateConcert,
+ * because the row holding it was gone before the payload got there.
  *
  * Deliberately not merged: concert_date and source. A date means a true UTC
  * instant from one source and the venue's wall clock from another, and which
@@ -203,12 +314,10 @@ function foldSourceInto(keep, drop) {
   if (lineupGrew(cleanLineupJson(keep.metadata), dropLineup)) merged.metadata = dropLineup;
   merged.festival = Boolean(keep.festival || drop.festival);
 
-  // A real event name over "<band> @ <venue>", the same preference the stored
-  // row's merge makes: the festival rules read these names, and a fallback
-  // name tells them nothing.
-  if (drop.name && (!keep.name || (isFallbackName(keep.name) && !isFallbackName(drop.name)))) {
-    merged.name = drop.name;
-  }
+  // The better event name, by the same preference the stored row's merge
+  // makes: the festival rules read these names, and a fallback name tells
+  // them nothing.
+  merged.name = bestEventName(keep.name, drop.name);
   if (!keep.url && drop.url) merged.url = drop.url;
   if (!keep.venue && drop.venue) merged.venue = drop.venue;
 
@@ -216,448 +325,421 @@ function foldSourceInto(keep, drop) {
 }
 
 /**
- * Pre-deduplicates an incoming bulk concert payload by coordinates before DB insert.
- * For each coordinate bucket, keeps the entry with the most bands, with what the
- * others knew folded into it — see foldSourceInto.
- * Concerts without coordinates are passed through unchanged.
+ * Collapses an incoming /bulk payload by position and day before any DB work,
+ * keeping the entry with the most bands and folding what the others knew into
+ * it — see foldSourceInto. Concerts with no usable position pass through for
+ * the rules below to match on venue, city and bill instead.
+ *
+ * The day is part of the key: keyed on position alone, a band's second night in
+ * one room was dropped here, before any of those rules saw it.
  */
 function deduplicateByCoords(concerts) {
-  // The calendar day is part of the key, not just the coordinates. Without it a
-  // band playing the same room two nights running — or twice in a year — lost
-  // one of them here, before any of the DB rules below got a look: same venue,
-  // same bucket, one survivor. Undated concerts key on the coordinates alone,
-  // which is the old behaviour and the best available when there is no day to
-  // compare.
-  const dayKey = (value) => {
-    if (!value) return 'undated';
-    const parsed = new Date(value);
-    return Number.isNaN(parsed.getTime()) ? 'undated' : toUtcDay(parsed).toISOString().slice(0, 10);
-  };
-  // Read as numbers, not merely tested for null. Coordinates arrive as strings,
-  // and anything in them that is not a number — "", "N/A", a venue name —
-  // divided to NaN and rounded to the literal key "NaN:NaN", which every such
-  // row shared: two unrelated shows on one day, in cities neither row placed,
-  // were collapsed to one here on a position neither of them has. A row with no
-  // usable position now passes through like one with no position at all, for the
-  // DB rules below to match on venue, city and bill. parseFloat for the same
-  // reading as sameArea's, so a bucket holds what that would call one place.
-  const coordKey = (c) => {
-    const lat = parseFloat(c.latitude);
-    const lng = parseFloat(c.longitude);
+  // Coordinates are read as numbers, not merely tested for null: they arrive
+  // as strings, and anything in them that is not a number — "", "N/A", a venue
+  // name — divided to NaN and rounded to the literal key "NaN:NaN", which
+  // every such row shared. Two unrelated shows on one day, in cities neither
+  // row placed, were collapsed to one here on a position neither of them has.
+  // parseFloat for the same reading withinKm makes, so a bucket holds what
+  // that would call one place.
+  const key = (concert) => {
+    const [lat, lng] = [concert.latitude, concert.longitude].map(parseFloat);
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-    const cell = `${Math.round(lat / 0.001)}:${Math.round(lng / 0.001)}`;
-    return `${cell}@${dayKey(c.concert_date)}`;
+    return `${Math.round(lat / 0.001)}:${Math.round(lng / 0.001)}@${dayKey(concert.concert_date)}`;
   };
 
-  const { coordMap, noCoord } = concerts.reduce(
-    (acc, concert) => {
-      const key = coordKey(concert);
-      if (!key) { acc.noCoord.push(concert); return acc; }
-      const existing = acc.coordMap.get(key);
-      if (!existing) { acc.coordMap.set(key, concert); return acc; }
-      const incomingWins = (concert.bands?.length ?? 0) > (existing.bands?.length ?? 0);
-      acc.coordMap.set(key, incomingWins
-        ? foldSourceInto(concert, existing)
-        : foldSourceInto(existing, concert));
-      return acc;
-    },
-    { coordMap: new Map(), noCoord: [] },
-  );
+  const byCell = new Map();
+  const noCoords = [];
+  for (const concert of concerts) {
+    const cell = key(concert);
+    if (!cell) { noCoords.push(concert); continue; }
+    const kept = byCell.get(cell);
+    if (!kept) { byCell.set(cell, concert); continue; }
+    const incomingWins = (concert.bands?.length ?? 0) > (kept.bands?.length ?? 0);
+    byCell.set(cell, incomingWins ? foldSourceInto(concert, kept) : foldSourceInto(kept, concert));
+  }
+  return [...byCell.values(), ...noCoords];
+}
 
-  return [...coordMap.values(), ...noCoord];
+// ─── One concert against the stored rows ─────────────────────────────────────
+
+// Everything the rules and the merge below read off a stored row, plus what
+// routes/data/bands/ingest.js reports back to the scraper. Selected rather than
+// included: this runs once per incoming concert and would otherwise pull every
+// column of every row in a fifteen-day window.
+const CANDIDATE_FIELDS = {
+  id: true, event_id: true, name: true, venue: true, city: true, country: true,
+  latitude: true, longitude: true, concert_date: true, festival: true, source: true,
+  metadata: true, url: true, on_sale: true, sold_out: true, ticket_sale_start: true,
+  price_min: true, price_max: true, price_currency: true, notify_pending: true,
+  // Band names ride along for eventLabel, which has to know whether a row is
+  // named after one of its own acts.
+  bands: { select: { band: true, band_rel: { select: { name: true } } } },
+};
+
+/**
+ * The stored row an incoming concert belongs to, or null.
+ *
+ * Four rules, tried in order of how much they take on trust, each one confined
+ * to candidates in the same place. Within a rule the longest bill wins, and the
+ * lowest id breaks a tie, so the answer does not depend on the order Postgres
+ * happened to return the rows in.
+ *
+ * @param {Set<number>} [upgraded] - ids the cluster check has just found to be
+ *   a festival, which the rows themselves do not say yet
+ */
+function findStoredMatch(concert, bandIds, candidates, upgraded = new Set()) {
+  const gap = (row) => dayGap(concert.concert_date, row.concert_date);
+  const sharesABand = (row) => row.bands.some((ref) => bandIds.includes(ref.band));
+  const isFestival = (row) => !!row.festival || upgraded.has(row.id);
+  const isBill = (row) => isFestival(row) || row.bands.length >= MULTI_BAND;
+  const incomingIsBill = concert.festival || bandIds.length >= MULTI_BAND;
+  const eitherIsBill = (row) => incomingIsBill || isBill(row);
+  const venueAgrees = (row) => venueSimilarity(concert.venue, row.venue);
+
+  /**
+   * One source never lists the same show on two days, so when both sides name
+   * the same source and the days differ, that is a second night at the same
+   * room and merging it would lose a real concert. The day-apart windows below
+   * exist for one show that two sources date differently — a late set filed as
+   * the next morning, a timezone slip. Days of one festival are exempt:
+   * `oneEvent` is for the rows that say so without the flag being set yet.
+   */
+  const separateNight = (row, oneEvent = false) =>
+    !!concert.source && concert.source === row.source && gap(row) > 0
+    && !oneEvent && !(concert.festival && isFestival(row));
+
+  const rules = [
+    // The same band cannot be in two places on one night.
+    (row) => gap(row) === 0 && sharesABand(row),
+
+    // One named event, by either spelling of its name.
+    (row) => {
+      if (!concert.name || !row.name) return false;
+      const raw = stringSimilarity(concert.name, row.name);
+      const normalized = normalizeEventName(concert.name);
+      const norm = normalized.length >= MIN_EVENT_NAME
+        ? stringSimilarity(normalized, normalizeEventName(row.name))
+        : 0;
+      if (Math.max(raw, norm) < NAME_SIM) return false;
+      // Only the normalized forms matching means two "Artist @ Festival" pages
+      // of one event, which spans its days — where two nights of one tour carry
+      // the identical fallback name and score 1.0 on the raw one.
+      const oneEvent = norm >= NAME_SIM && raw < NAME_SIM;
+      if (separateNight(row, oneEvent)) return false;
+      return gap(row) <= (oneEvent ? WINDOW_DAYS : NAMED_DAYS);
+    },
+
+    // One venue.
+    (row) => {
+      const venue = venueAgrees(row);
+      if (venue < VENUE_SIM || separateNight(row)) return false;
+      // The same room spelled the same way on one day is one show whether the
+      // bills overlap or not, and so are two days of one festival on one
+      // ground. Anything softer than that has to share a band.
+      const certain = venue >= VENUE_SAME
+        && (gap(row) === 0 || (concert.festival && isFestival(row)));
+      if (bandIds.length > 0 && !sharesABand(row) && !certain) return false;
+      return gap(row) <= SLIP_DAYS || eitherIsBill(row) || certain;
+    },
+
+    // One city, for rows that name no venue in common.
+    (row) => {
+      if (separateNight(row)) return false;
+      const bill = eitherIsBill(row);
+      if (bandIds.length > 0 && !sharesABand(row) && !bill) return false;
+      if (gap(row) > (bill ? WINDOW_DAYS : SLIP_DAYS)) return false;
+      // Two rooms that clearly disagree are two events — unless both rows are
+      // festivals, where each source names the same ground differently
+      // ("Wacken Open Air" against "Wacken Festivalgelände"), and then only
+      // within a few kilometres of each other.
+      if (concert.venue && row.venue && venueAgrees(row) < VENUE_SIM) {
+        return incomingIsBill && isBill(row) && withinKm(concert, row, GROUND_KM);
+      }
+      return true;
+    },
+  ];
+
+  const here = candidates.filter((row) => nearby(concert, row));
+  for (const rule of rules) {
+    const [best] = here.filter(rule).sort((a, b) => b.bands.length - a.bands.length || a.id - b.id);
+    if (best) return best;
+  }
+  return null;
 }
 
 /**
- * Checks whether an incoming concert already exists in the DB and merges it if so.
- * Returns { isDuplicate, existingConcert, linked }, where linked is the band ids
- * the merge put on the stored row's bill. With notify set, those links and the
- * row are flagged as owed a notification.
+ * The fields to write when a scrape merges into a stored row: only those it
+ * actually changes, since this runs for every row of every sync, twice a day,
+ * and a write that changes nothing still looks like news to anything watching.
  *
- * Duplicate detection rules:
- * 1. Band-schedule conflict — same band, same city area, same calendar day
- * 2. Named event match — name similarity ≥ 80%, same area, within 3 days
- * 3. Venue fuzzy match — venue similarity ≥ 70%, within date window
- * 4. City fuzzy match fallback — city similarity ≥ 70%, within date window
+ * Used by both merge paths — the one that matched on an event id and the one
+ * that matched on the rules above — so a show already stored is updated the
+ * same way however it was recognised.
+ *
+ * @param {object} stored - the row as it is
+ * @param {object} incoming - the scraped concert
+ * @param {Date} [now]
+ * @returns {object} fields for concert.update, which may be none
+ */
+function mergedFields(stored, incoming, now = new Date()) {
+  const lineup = cleanLineupJson(incoming.metadata);
+  // The price a row shows belongs to a listing, so only that listing's own
+  // source may change it. Any source may fill one in where there is none.
+  const ownsListing = !stored.source || stored.source === incoming.source;
+
+  const wanted = {
+    name: bestEventName(stored.name, incoming.name),
+    // On the length of the bill it names rather than on how many of those
+    // names have a Band row: an act joining a festival mostly has none, and
+    // the bill is what a follower's lineup alert is measured against.
+    ...(lineupGrew(stored.metadata, lineup) && { metadata: lineup }),
+    // A flag is only ever raised. detectFestivalCluster can tell a festival
+    // from the rows around it that none of them could tell alone.
+    ...(incoming.festival && { festival: true }),
+    ...adoptedTime(stored, incoming),
+  };
+  for (const key of ['price_min', 'price_max', 'price_currency']) {
+    if (incoming[key] != null && (stored[key] == null || ownsListing)) wanted[key] = incoming[key];
+  }
+
+  const changed = ([key, value]) => {
+    const was = stored[key];
+    if (value === undefined) return false;
+    if (value instanceof Date) return !(was && new Date(was).getTime() === value.getTime());
+    return (was ?? null) !== value;
+  };
+  return {
+    ...Object.fromEntries(Object.entries(wanted).filter(changed)),
+    // Already narrowed to what is new, and to what a source is entitled to say
+    // — a listing marked in stock by default must not clear a sale day.
+    ...mergeTicketFields(stored, incoming, now),
+  };
+}
+
+/**
+ * A start time for a row that has only a day, or a date for one that has none.
+ *
+ * Songkick leaves 182 of its rows at midnight, so whether a show has a time at
+ * all comes down to which scraper reached it first. The source and the ticket
+ * link come along with the time, because `source` is what says whether a
+ * stored time is a real instant or the venue's wall clock (utils/ics.js): read
+ * under the wrong one, the show renders hours out.
+ *
+ * Only ever the same day. A show moved to another date is a different thing,
+ * and only the path that matched on an event id knows the listing well enough
+ * to follow it there.
+ */
+function adoptedTime(stored, incoming) {
+  if (!incoming.concert_date) return null;
+  const when = new Date(incoming.concert_date);
+  if (Number.isNaN(when.getTime())) return null;
+  if (stored.concert_date) {
+    if (dayGap(stored.concert_date, when) !== 0) return null;
+    if (hasTimeOfDay(stored.concert_date) || !hasTimeOfDay(when)) return null;
+  }
+  return {
+    concert_date: when,
+    ...(incoming.source && { source: incoming.source }),
+    ...(incoming.url && { url: incoming.url }),
+  };
+}
+
+/**
+ * Whether an incoming concert is already stored, merging it in if it is.
+ *
+ * Mutates `concert.festival`: the cluster check can tell a festival that the
+ * scrape itself could not, and the caller goes on to use the flag — for the
+ * insert, if this turns out not to be a duplicate, and to say which kind of
+ * duplicate it was.
+ *
+ * @returns {{isDuplicate: boolean, existingConcert: object|null, linked: number[], merged: object}}
+ *   `linked` is the band ids this merge put on the stored row's bill and
+ *   `merged` the fields it wrote to the row. With `notify` set, those links and
+ *   the row are flagged as owed a notification.
  */
 async function checkDuplicateConcert({ concert, bandIds, bandNames = [], tx, notify = false }) {
-  let existingConcert = null;
+  const nothing = { isDuplicate: false, existingConcert: null, linked: [], merged: {} };
+  if (!concert.concert_date) return nothing;
 
-  if (concert.concert_date) {
-    const dayStart = toUtcDay(concert.concert_date);
-    const oneDayMs = 24 * 60 * 60 * 1000;
-
-    const candidates = await tx.concert.findMany({
-      where: {
-        concert_date: {
-          gte: new Date(dayStart.getTime() - 7 * oneDayMs),
-          lte: new Date(dayStart.getTime() + 7 * oneDayMs),
-        },
+  const day = dayOf(concert.concert_date);
+  const candidates = await tx.concert.findMany({
+    where: {
+      concert_date: {
+        gte: new Date(day - WINDOW_DAYS * DAY_MS),
+        lte: new Date(day + WINDOW_DAYS * DAY_MS),
       },
-      // Band names ride along for detectFestivalCluster, which has to know
-      // whether a row is named after one of its own acts.
-      include: { bands: { include: { band_rel: { select: { name: true } } } } },
-    });
+    },
+    select: CANDIDATE_FIELDS,
+  });
 
-    // Multi-day / big-bill signal, independent of which candidate (if any)
-    // this concert ends up merging into below — see detectFestivalCluster's
-    // own comment for why a single scraped page can't tell this on its own.
-    // Computed before incomingIsMultiBand so an upgrade here also widens this
-    // insert's own duplicate-matching windows further down.
-    const { isFestival, matches: nameCluster } = detectFestivalCluster(concert, bandIds, candidates, bandNames);
-    if (isFestival) {
-      concert.festival = true;
-      const staleIds = nameCluster.filter((c) => !c.festival).map((c) => c.id);
-      if (staleIds.length) {
-        await tx.concert.updateMany({ where: { id: { in: staleIds } }, data: { festival: true } });
-      }
-    }
-
-    const incomingIsMultiBand = concert.festival || bandIds.length >= 3;
-
-    const diffDays = (c) => Math.abs(toUtcDay(c.concert_date).getTime() - dayStart.getTime()) / oneDayMs;
-    const isMultiBand = (c) => c.festival || c.bands.length >= 3;
-    const sharesABand = (c) => c.bands.some((ref) => bandIds.includes(ref.band));
-
-    // The day-apart windows below exist for one show that two sources date
-    // differently — a late set filed as the next morning, a timezone slip. One
-    // source never lists the same show on two days, so when both sides name the
-    // same source and the days differ, that is a second night at the same room
-    // and merging it loses a real concert. Multi-day festivals are exempt: they
-    // genuinely are one event spanning several days.
-    const isSeparateNight = (c) => {
-      if (!concert.source || !c.source || concert.source !== c.source) return false;
-      if (concert.festival && c.festival) return false;
-      return diffDays(c) > 0;
-    };
-
-    // 0. Band-schedule conflict
-    if (bandIds.length > 0) {
-      const sameDayCandidates = candidates.filter((c) => diffDays(c) === 0);
-      for (const c of sameDayCandidates) {
-        if (!sharesABand(c)) continue;
-        const inSameArea = sameArea(concert, c) ||
-          (concert.city && c.city && stringSimilarity(concert.city, c.city) >= 0.7);
-        if (inSameArea) { existingConcert = c; break; }
-      }
-    }
-
-    // 0.5. Named event match
-    // Also checks normalized names (strips "Artist @ " prefix and year numbers) so that
-    // "Resurrection Fest 2026" and "Imminence @ Resurrection Fest" are treated as the same event.
-    if (!existingConcert && concert.name) {
-      const normIncoming = normalizeEventName(concert.name);
-      const nameCandidates = candidates
-        .filter((c) => {
-          if (!c.name) return false;
-          const rawSim = stringSimilarity(concert.name, c.name);
-          const normSim = normIncoming.length >= 6
-            ? stringSimilarity(normIncoming, normalizeEventName(c.name))
-            : 0;
-          const bestSim = Math.max(rawSim, normSim);
-          if (bestSim < 0.8) return false;
-          // When only the normalized form matches (different "Artist @ Festival" variants),
-          // extend the day window to 7 to cover multi-day festivals.
-          const onlyNormalized = normSim >= 0.8 && rawSim < 0.8;
-          const maxDays = onlyNormalized ? 7 : 3;
-          // Two nights of the same tour carry the identical "Band @ Venue"
-          // fallback name, which used to score 1.0 here and merge them. The
-          // normalized path is exempt: that is the one matching festival name
-          // variants across the days of a single event.
-          if (!onlyNormalized && isSeparateNight(c)) return false;
-          if (diffDays(c) > maxDays) return false;
-          return sameArea(concert, c) ||
-            (concert.city && c.city && stringSimilarity(concert.city, c.city) >= 0.7);
-        })
-        .sort((a, b) => b.bands.length - a.bands.length);
-      existingConcert = nameCandidates[0] ?? null;
-    }
-
-    // 1. Venue fuzzy match
-    if (!existingConcert && concert.venue) {
-      const venueMatches = candidates
-        .filter((c) => c.venue)
-        .map((c) => ({ c, sim: stringSimilarity(concert.venue, c.venue) }))
-        .filter(({ c, sim }) => {
-          const venueMatch = sim >= 0.7 || venueContains(concert.venue, c.venue);
-          if (!venueMatch) return false;
-          if (isSeparateNight(c)) return false;
-          const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
-          const d = diffDays(c);
-          // Both flagged as festival + same venue = multi-day festival. Safe to merge
-          // across days without band sharing; two separate festivals rarely share a venue
-          // within the same 7-day window.
-          const bothFestivals = concert.festival && c.festival;
-          const venueIdentical = sim >= 0.95 || venueContains(concert.venue, c.venue);
-          const highConfidence = venueIdentical && (d === 0 || bothFestivals);
-          if (bandIds.length > 0 && !sharesABand(c) && !highConfidence) return false;
-          return d <= 1.5 || eitherIsMultiBand || highConfidence;
-        })
-        .filter(({ c }) => diffDays(c) <= 7)
-        .sort((a, b) => b.c.bands.length - a.c.bands.length || b.sim - a.sim);
-      existingConcert = venueMatches[0]?.c ?? null;
-    }
-
-    // 2. City fuzzy match fallback
-    if (!existingConcert && concert.city) {
-      const cityMatches = candidates
-        .filter((c) => {
-          if (isSeparateNight(c)) return false;
-          const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
-          if (bandIds.length > 0 && !sharesABand(c) && !eitherIsMultiBand) return false;
-          const d = diffDays(c);
-          return d <= (eitherIsMultiBand ? 7 : 1.5);
-        })
-        .filter((c) => {
-          // If both have venues that clearly don't match, treat as distinct events.
-          // Exception: when BOTH are multi-band/festival, the same grounds can be named
-          // differently by different sources (e.g. "Wacken Open Air" vs "Wacken Festivalgelände").
-          // In that case allow a tight 8km coordinate fallback. A single-band concert must
-          // always match by venue name to prevent it being absorbed by a nearby festival.
-          if (concert.venue && c.venue) {
-            const vSim = stringSimilarity(concert.venue, c.venue);
-            if (vSim < 0.7 && !venueContains(concert.venue, c.venue)) {
-              const bothMultiBand = incomingIsMultiBand && isMultiBand(c);
-              if (!bothMultiBand) return false;
-              if (haversineKm(
-                parseFloat(concert.latitude), parseFloat(concert.longitude),
-                parseFloat(c.latitude),        parseFloat(c.longitude),
-              ) > 8) return false;
-            }
-          }
-          const eitherIsMultiBand = incomingIsMultiBand || isMultiBand(c);
-          return (eitherIsMultiBand && sameArea(concert, c)) ||
-            (c.city && stringSimilarity(concert.city, c.city) >= 0.7);
-        })
-        .sort((a, b) => b.bands.length - a.bands.length);
-      existingConcert = cityMatches[0] ?? null;
+  // Before the rules run, so an upgrade here widens this concert's own windows
+  // too. The flag is written back to the rows that could not see it either,
+  // and carried to the rules below, which it tells that these are the days of
+  // one festival rather than separate nights at one place.
+  const { isFestival, matches } = detectFestivalCluster(concert, bandIds, candidates, bandNames);
+  const upgraded = new Set();
+  if (isFestival) {
+    concert.festival = true;
+    for (const row of matches) upgraded.add(row.id);
+    const stale = matches.filter((row) => !row.festival).map((row) => row.id);
+    if (stale.length > 0) {
+      await tx.concert.updateMany({ where: { id: { in: stale } }, data: { festival: true } });
     }
   }
 
-  let linked = [];
-  if (existingConcert) {
-    const incomingWins = bandIds.length > existingConcert.bands.length;
-    const existingIsAtFormat = isFallbackName(existingConcert.name);
-    const incomingIsAtFormat = isFallbackName(concert.name);
-    const bestName = (!existingIsAtFormat && incomingIsAtFormat)
-      ? existingConcert.name
-      : (existingIsAtFormat && !incomingIsAtFormat && concert.name)
-        ? concert.name
-        : (concert.name && existingConcert.name && !incomingIsAtFormat && !existingIsAtFormat)
-          ? (concert.name.length <= existingConcert.name.length ? concert.name : existingConcert.name)
-          : concert.name || existingConcert.name;
-    const hasBetterName = bestName !== existingConcert.name;
+  const stored = findStoredMatch(concert, bandIds, candidates, upgraded);
+  if (!stored) return nothing;
 
-    // Whatever this scrape saw of the tickets, whoever has the longer bill:
-    // a festival's sale date and its selling out used to be recorded only
-    // when the scrape that found them also happened to list more bands.
-    const tickets = mergeTicketFields(existingConcert, concert);
+  const data = mergedFields(stored, concert);
+  if (Object.keys(data).length > 0) {
+    await tx.concert.update({ where: { id: stored.id }, data });
+  }
 
-    // The lineup likewise, and on the length of the bill it names rather than
-    // on how many of those names have a Band row — see lineupGrew. Cleaned
-    // here because this path stored the scrape as it arrived, follower counts
-    // welded onto the names and all, where every other writer cleans first.
-    const lineup = cleanLineupJson(concert.metadata);
-    const billWins = lineupGrew(existingConcert.metadata, lineup);
-
-    if (incomingWins || hasBetterName || billWins || Object.keys(tickets).length > 0) {
-      await tx.concert.update({
-        where: { id: existingConcert.id },
-        data: {
-          name: bestName,
-          ...tickets,
-          ...(billWins && { metadata: lineup }),
-          ...(incomingWins && {
-            concert_date: concert.concert_date ? new Date(concert.concert_date) : existingConcert.concert_date,
-            url: concert.url || existingConcert.url,
-            festival: concert.festival || existingConcert.festival,
-          }),
-        },
-      });
-    }
-
-    const existingRefs = await tx.concertBandReference.findMany({
-      where: { concert: existingConcert.id, band: { in: bandIds } },
-      select: { band: true },
+  const alreadyOnBill = await tx.concertBandReference.findMany({
+    where: { concert: stored.id, band: { in: bandIds } },
+    select: { band: true },
+  });
+  const linked = [...new Set(bandIds)].filter(
+    (id) => !alreadyOnBill.some((ref) => ref.band === id),
+  );
+  if (linked.length > 0) {
+    // skipDuplicates because this runs inside /bulk's transaction, where a
+    // unique violation is not one failed statement but an aborted transaction
+    // for everything after it.
+    await tx.concertBandReference.createMany({
+      data: linked.map((band) => ({ concert: stored.id, band, notify_pending: notify })),
+      skipDuplicates: true,
     });
-    const linkedBandIds = new Set(existingRefs.map((r) => r.band));
-    const toLink = [...new Set(bandIds)].filter((id) => !linkedBandIds.has(id));
-    if (toLink.length > 0) {
-      // skipDuplicates because this runs inside /bulk's transaction, where a
-      // unique violation is not one failed statement but an aborted
-      // transaction for everything after it.
-      await tx.concertBandReference.createMany({
-        data: toLink.map((band) => ({ concert: existingConcert.id, band, notify_pending: notify })),
-        skipDuplicates: true,
-      });
-      // This is how a festival's acts after the first arrive: each one its
-      // own scrape, merged into the row the first one made. Flagged, the act
-      // is announced like a new show; unflagged it reached no one.
-      if (notify && !existingConcert.notify_pending) {
-        await tx.concert.update({ where: { id: existingConcert.id }, data: { notify_pending: true } });
-      }
-      linked = toLink;
+    // This is how a festival's acts after the first arrive: each one its own
+    // scrape, merged into the row the first one made. Flagged, the act is
+    // announced like a new show; unflagged, it reached no one.
+    if (notify && !stored.notify_pending) {
+      await tx.concert.update({ where: { id: stored.id }, data: { notify_pending: true } });
     }
   }
 
-  return { isDuplicate: !!existingConcert, existingConcert, linked };
+  return { isDuplicate: true, existingConcert: stored, linked, merged: data };
 }
 
-// ─── Response-time deduplication (in-memory) ─────────────────────────────────
+// ─── Stored rows against each other, on the way out ──────────────────────────
+
+/** A lineup column as an array of names. Anything else in it counts as none. */
+function billNames(json) {
+  if (!json) return [];
+  try {
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed.filter((name) => typeof name === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Two rows that are one event: one name, one room, one place, inside a week. */
+function sameEvent(a, b) {
+  if (!a.name || !b.name || !a.venue || !b.venue) return false;
+  if (!(dayGap(a.concert_date, b.concert_date) <= WINDOW_DAYS)) return false;
+  return venueSimilarity(a.venue, b.venue) >= VENUE_SIM
+    && stringSimilarity(a.name, b.name) >= NAME_SIM
+    && nearby(a, b);
+}
 
 /**
- * Pass 1 — remove same-event duplicates stored as separate DB records.
- * Two concerts are considered the same event if venue similarity ≥ 70%,
- * name similarity ≥ 80%, and dates are within 7 days.
+ * Two rows that are one night: one day, one place, a band on both bills. Named
+ * differently and in different rooms — a support act's own listing beside the
+ * headline show it belongs to.
+ *
+ * Festivals are left out. Two of them on one weekend share bands as a matter of
+ * course, and folding them together would lose one whole festival.
  */
-function deduplicateByNameVenue(concerts) {
+function sameNight(a, b) {
+  if (a.festival || b.festival) return false;
+  if (dayGap(a.concert_date, b.concert_date) !== 0) return false;
+  if (!nearby(a, b)) return false;
+  const ids = new Set((a.participating_bands ?? []).map((band) => band.id));
+  return (b.participating_bands ?? []).some((band) => ids.has(band.id));
+}
+
+/**
+ * Two rows folded into one.
+ *
+ * Which of them survives cannot be left to arrival order, which is whatever
+ * the caller's wishlist iteration produced: a support act's own Bandsintown
+ * listing — "As December Falls @ SWG3 Garden", the room next door — arriving
+ * first used to title the gig after the support act and move it to the wrong
+ * room. A row carrying a real event name is the better record of the two.
+ */
+function mergeRows(base, other) {
+  const winner = isFallbackName(base.name) && !isFallbackName(other.name) ? other : base;
+  const loser = winner === base ? other : base;
+
+  const bands = [...(winner.participating_bands ?? [])];
+  const seen = new Set(bands.map((band) => band.id));
+  for (const band of loser.participating_bands ?? []) {
+    if (!seen.has(band.id)) { seen.add(band.id); bands.push(band); }
+  }
+
+  const names = [...new Set([...billNames(winner.metadata), ...billNames(loser.metadata)])];
+  const merged = {
+    ...winner,
+    participating_bands: bands,
+    metadata: names.length > 0 ? JSON.stringify(names) : winner.metadata ?? loser.metadata ?? null,
+  };
+
+  // A published time beats no time, and brings its source with it for the same
+  // reason the insert-time merge does — see adoptedTime.
+  if (!hasTimeOfDay(merged.concert_date) && hasTimeOfDay(loser.concert_date)) {
+    merged.concert_date = loser.concert_date;
+    merged.source = loser.source;
+  }
+  return merged;
+}
+
+/**
+ * Folds the stored rows of one response together.
+ *
+ * Input: concerts already deduplicated by DB id. A row is merged into the first
+ * kept row it is one event or one night with, rather than dropped, so a band
+ * linked only to the row that loses still appears on the bill.
+ */
+function deduplicateConcerts(concerts) {
   const kept = [];
+  // Indexed by day, since nothing merges across more than WINDOW_DAYS of them.
+  const byDay = new Map();
+  const around = (key) => {
+    if (key === 'undated') return [];
+    const day = Date.parse(key);
+    const out = [];
+    for (let offset = -WINDOW_DAYS; offset <= WINDOW_DAYS; offset++) {
+      out.push(...(byDay.get(dayKey(day + offset * DAY_MS)) ?? []));
+    }
+    return out;
+  };
+
   for (const concert of concerts) {
-    const name  = concert.name?.trim();
-    const venue = concert.venue?.trim();
-    const time  = concert.concert_date ? new Date(concert.concert_date).getTime() : null;
-
-    if (!name || !venue || !time) { kept.push(concert); continue; }
-
-    const isDup = kept.some((k) => {
-      if (!k.name || !k.venue) return false;
-      const kt = k.concert_date ? new Date(k.concert_date).getTime() : null;
-      if (!kt || Math.abs(kt - time) > SEVEN_DAYS_MS) return false;
-      if (!(stringSimilarity(venue, k.venue) >= 0.7 || venueContains(venue, k.venue))) return false;
-      if (stringSimilarity(name, k.name) < 0.8) return false;
-      return sameArea(concert, k) || (concert.city && k.city && stringSimilarity(concert.city, k.city) >= 0.7);
-    });
-
-    if (!isDup) kept.push(concert);
+    const key = dayKey(concert.concert_date);
+    const at = around(key).find((index) => sameEvent(kept[index], concert) || sameNight(kept[index], concert));
+    if (at !== undefined) {
+      kept[at] = mergeRows(kept[at], concert);
+      continue;
+    }
+    if (!byDay.has(key)) byDay.set(key, []);
+    byDay.get(key).push(kept.length);
+    kept.push({ ...concert });
   }
   return kept;
 }
 
-/**
- * Pass 2 — merge concerts on the same calendar day that share at least one
- * participating band. Bands and metadata names from duplicates are merged in.
- */
-/**
- * Whether a concert date carries a time of day rather than just a day.
- *
- * A concert scraped without a start time is stored at exactly midnight UTC, so
- * midnight is the marker for "no time published" rather than a real 00:00 show.
- *
- * @param {string|Date|null|undefined} concertDate
- * @returns {boolean}
- */
-function hasTimeOfDay(concertDate) {
-  if (!concertDate) return false;
-  const d = new Date(concertDate);
-  if (Number.isNaN(d.getTime())) return false;
-  return d.getUTCHours() !== 0 || d.getUTCMinutes() !== 0 || d.getUTCSeconds() !== 0;
-}
-
-/**
- * Whether a name is the "Band @ Venue" shape a scraper falls back to when the
- * event published none. The same test picks the better name at insert time.
- *
- * @param {string|null|undefined} name
- * @returns {boolean}
- */
-function isFallbackName(name) {
-  const s = name || '';
-  return s.includes(' @ ') || / at /i.test(s);
-}
-
-function mergeByDayAndBands(concerts) {
-  const dayBuckets = new Map();
-  const result = [];
-
-  for (const concert of concerts) {
-    const dateKey = concert.concert_date
-      ? new Date(concert.concert_date).toISOString().slice(0, 10)
-      : null;
-    const bandIds = new Set((concert.participating_bands || []).map((b) => b.id));
-
-    let mergedIdx = null;
-    if (dateKey && bandIds.size > 0) {
-      for (const idx of (dayBuckets.get(dateKey) || [])) {
-        const ex = result[idx];
-        const sameCity = concert.city && ex.city
-          ? stringSimilarity(concert.city, ex.city) >= 0.7
-          : false;
-        if (!sameCity) continue;
-        const exIds = new Set((ex.participating_bands || []).map((b) => b.id));
-        if ([...bandIds].some((id) => exIds.has(id))) { mergedIdx = idx; break; }
-      }
-    }
-
-    if (mergedIdx !== null && !concert.festival && !result[mergedIdx].festival) {
-      const base = result[mergedIdx];
-      const baseIds = new Set((base.participating_bands || []).map((b) => b.id));
-      const bands = [
-        ...(base.participating_bands || []),
-        ...(concert.participating_bands || []).filter((b) => !baseIds.has(b.id)),
-      ];
-      let baseMeta = []; try { baseMeta = JSON.parse(base.metadata || '[]'); } catch {}
-      let concMeta = []; try { concMeta = JSON.parse(concert.metadata || '[]'); } catch {}
-
-      // Which row survives is otherwise decided by arrival order, and the order
-      // is whatever the caller's wishlist iteration produced. A support act's
-      // own scraped listing — "As December Falls @ SWG3 Garden", the room next
-      // door — arriving before the headline row it belongs to therefore titled
-      // the gig after the support act and moved it to the wrong room.
-      //
-      // The tie-break is the one insert-time dedup already uses: "Band @ Venue"
-      // is the name a scraper falls back to when the event had none, so a row
-      // carrying a real event name is the better record of the two.
-      const winner = isFallbackName(base.name) && !isFallbackName(concert.name) ? concert : base;
-      const merged = { ...winner, participating_bands: bands };
-      merged.metadata = JSON.stringify([...new Set([...baseMeta, ...concMeta])]);
-
-      // A published time beats no time. The surviving record is not necessarily
-      // whichever knows most: Songkick runs first and 182 of its rows sit at
-      // midnight, so a Bandsintown duplicate carrying a real 19:00 used to lose
-      // it purely on scrape order.
-      //
-      // The source moves with the time deliberately. concert_date does not mean
-      // the same thing for every source — Songkick stores a true UTC instant,
-      // Bandsintown a local wall clock — so a row holding a Bandsintown time
-      // while still labelled songkick would be read as UTC and render the gig
-      // hours out. Whoever supplied the time owns how it is interpreted.
-      const other = winner === base ? concert : base;
-      if (!hasTimeOfDay(merged.concert_date) && hasTimeOfDay(other.concert_date)) {
-        merged.concert_date = other.concert_date;
-        merged.source = other.source;
-      }
-
-      result[mergedIdx] = merged;
-    } else {
-      const idx = result.length;
-      result.push({ ...concert });
-      if (dateKey) {
-        if (!dayBuckets.has(dateKey)) dayBuckets.set(dateKey, []);
-        dayBuckets.get(dateKey).push(idx);
-      }
-    }
-  }
-
-  return result;
-}
-
-/**
- * Run all in-memory deduplication passes over a flat concert array.
- * Input: concerts already deduplicated by DB id.
- */
-function deduplicateConcerts(concerts) {
-  return mergeByDayAndBands(deduplicateByNameVenue(concerts));
-}
-
 module.exports = {
-  // Primitives (used by other modules for fuzzy matching)
+  // Shared by other modules for fuzzy matching
   haversineKm,
   stringSimilarity,
-  normalizeEventName,
   venueContains,
+  venueSimilarity,
   detectFestivalCluster,
   // Insert-time
   deduplicateByCoords,
   checkDuplicateConcert,
+  mergedFields,
   // Response-time
   deduplicateConcerts,
 };

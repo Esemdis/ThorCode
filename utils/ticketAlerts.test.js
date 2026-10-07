@@ -66,6 +66,16 @@ describe('mergeTicketFields', () => {
     expect(merge(was, { on_sale: true, sold_out: false })).toEqual({ on_sale: true });
   });
 
+  it('lets a sale be recorded on the day it opens', () => {
+    // The stored day is today: a source that has looked and says the show is
+    // selling is the newer news, or "on sale now" waits until tomorrow.
+    const today = stored({ on_sale: false, ticket_sale_start: new Date('2026-10-07T00:00:00Z') });
+
+    expect(merge(today, { on_sale: true, sold_out: false })).toEqual({ on_sale: true });
+    // A scrape that still reads "on sale today" off the vendor list holds.
+    expect(merge(today, { on_sale: false, sold_out: false, ticket_sale_start: '2026-10-07' })).toEqual({});
+  });
+
   it('brings a sold-out show back only when a source says it is selling again', () => {
     const gone = stored({ on_sale: false, sold_out: true });
 

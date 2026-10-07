@@ -472,6 +472,26 @@ describe('POST /bulk', () => {
       });
     });
 
+    it('merged into a festival row: hands back a sell-out, which only the event-id path used to report', async () => {
+      // A festival is matched by its name, so the SOLD_OUT entry the feeds show
+      // was written only for shows recognised by their event id.
+      prisma.concert.findMany.mockResolvedValue([{
+        id: 77, event_id: 'bit_9', name: 'Opeth @ Copenhell', venue: 'Copenhell', city: 'Copenhagen', country: 'DK',
+        concert_date: new Date('2027-06-17T00:00:00Z'), latitude: '55.69', longitude: '12.61',
+        festival: false, source: 'bandsintown', notify_pending: false, sold_out: false,
+        bands: [{ band: 1, band_rel: { name: 'Opeth' } }],
+      }]);
+      const incoming = {
+        country: 'DK', city: 'Copenhagen', venue: 'Copenhell', concert_date: '2027-06-17T00:00:00Z',
+        latitude: '55.69', longitude: '12.61', event_id: 'bit_10', name: 'Gojira @ Copenhell',
+        source: 'bandsintown', sold_out: true, bands: [{ band_id: 2 }],
+      };
+
+      const res = await request(app).post('/bulk').set(...authHeader(system)).send({ concerts: [incoming] });
+
+      expect(res.body.newlySoldOut).toMatchObject([{ concertId: 77, city: 'Copenhagen' }]);
+    });
+
     it('stays quiet for a sync that will not announce it', async () => {
       prisma.concert.findMany.mockResolvedValue([{
         id: 77, event_id: 'bit_9', name: 'Opeth @ Copenhell', venue: 'Copenhell', city: 'Copenhagen', country: 'DK',

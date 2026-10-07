@@ -11,7 +11,7 @@ const router = express.Router();
 const { validationResult, body } = require('express-validator');
 const { pythonServicePost, pythonServiceFailure } = require('../../../utils/pythonService');
 const { error: sendError } = require('../../../utils/apiResponse');
-const { haversineKm, stringSimilarity, venueContains } = require('../../../utils/concertDedup');
+const { haversineKm, stringSimilarity, venueSimilarity } = require('../../../utils/concertDedup');
 const { backlinkBandToConcerts } = require('../../../utils/bandBacklink');
 // Called through the module rather than destructured, so a test can stand in
 // for band creation (which reaches MusicBrainz) on the router's own copy.
@@ -172,7 +172,7 @@ router.post(
         // enough (e.g. two different venues in the same city would otherwise match).
         // 5km fallback handles same venue with a localised name on one side.
         if (dbConcert.venue && fresh.venue) {
-          if (stringSimilarity(dbConcert.venue, fresh.venue) >= 0.7 || venueContains(dbConcert.venue, fresh.venue)) return true;
+          if (venueSimilarity(dbConcert.venue, fresh.venue) >= 0.7) return true;
           const freshLat = parseFloat(fresh.latitude);
           const freshLng = parseFloat(fresh.longitude);
           if (!isNaN(dbLat) && !isNaN(dbLng) && !isNaN(freshLat) && !isNaN(freshLng)) {

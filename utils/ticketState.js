@@ -67,10 +67,14 @@ function mergeTicketFields(existing, incoming, now = new Date()) {
       // A sale day still to come carries its own "not on sale yet".
       Object.assign(wanted, { ticket_sale_start: new Date(incoming.ticket_sale_start), on_sale: false });
     } else {
+      // A stored sale day only outranks a claim while it is still ahead. On
+      // the day itself the sale does open, and a source that has looked and
+      // says it is selling is the newer news — otherwise "on sale now" could
+      // not be recorded until the day after.
       const pending = saleDay(existing);
       // Null, not only absent: the scrapers send null for "nobody said", and
       // on_sale is a non-null column — writing it through would throw.
-      if (!(pending && pending >= today) && incoming.on_sale != null) wanted.on_sale = incoming.on_sale;
+      if (!(pending && pending > today) && incoming.on_sale != null) wanted.on_sale = incoming.on_sale;
     }
   }
 

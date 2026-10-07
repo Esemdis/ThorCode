@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { haversineKm, stringSimilarity, venueContains, detectFestivalCluster, deduplicateByCoords, deduplicateConcerts, checkDuplicateConcert } from './concertDedup.js';
+import { haversineKm, stringSimilarity, venueContains, detectFestivalCluster, deduplicateByCoords, deduplicateConcerts, checkDuplicateConcert, mergedFields } from './concertDedup.js';
 
 describe('haversineKm', () => {
   it('is 0 for the same point', () => {
@@ -563,11 +563,13 @@ describe('checkDuplicateConcert and the bill it merges in', () => {
   });
 
   it('keeps the longer bill when the scrape with more linked bands saw less of it', async () => {
+    // And writes nothing at all for it: a scrape with more bands than the row
+    // used to rewrite the row's date, link and flag on that alone.
     const tx = fakeTx(stored('["Opeth","Gojira","Alcest","Mgla"]'));
 
     await checkDuplicateConcert({ concert: incoming('["Opeth"]'), bandIds: [1, 2, 3], tx });
 
-    expect(written(tx)[0].metadata).toBeUndefined();
+    expect(tx.concert.update).not.toHaveBeenCalled();
   });
 
   it('cleans the scrape before storing it, as every other writer does', async () => {
@@ -698,5 +700,185 @@ describe('deduplicateConcerts — adopting a time from a duplicate', () => {
       participating_bands: [{ id: 1 }, { id: 2 }],
     }));
     expect(merged.participating_bands.map((b) => b.id).sort()).toEqual([1, 2]);
+  });
+});
+
+describe('checkDuplicateConcert and one venue name in two cities', () => {
+  // A venue brand with a room in each city — "Zenith", "O2 Academy" — used to
+  // be matched on its name alone, with nothing asking whether the two rows were
+  // anywhere near each other. A tour playing two of them on consecutive nights
+  // lost one of the two concerts.
+  const tx = (rows) => ({
+    concert: { findMany: async () => rows, update: async () => ({}), updateMany: async () => ({}) },
+    concertBandReference: { findMany: async () => [], createMany: async () => ({}) },
+  });
+
+  // No names on either row, so this is the venue rule and nothing else, and
+  // the two sources differ: one source listing two days is a second night,
+  // which is a rule of its own.
+  const zenith = (over) => ({ name: null, venue: 'Zenith', festival: false, ...over });
+  const paris = {
+    id: 1, city: 'Paris', latitude: '48.8936', longitude: '2.3930', source: 'songkick',
+    concert_date: new Date('2026-03-10T19:00:00Z'), bands: [{ band: 5 }],
+  };
+
+  it('keeps two nights of one tour at that name, 280km apart', async () => {
+    const { isDuplicate } = await checkDuplicateConcert({
+      concert: zenith({
+        city: 'Nancy', latitude: '48.6921', longitude: '6.1844', source: 'bandsintown',
+        concert_date: '2026-03-11T19:00:00Z',
+      }),
+      bandIds: [5],
+      tx: tx([zenith(paris)]),
+    });
+    expect(isDuplicate).toBe(false);
+  });
+
+  it('still merges two sources\' reports of one night at that venue', async () => {
+    const { isDuplicate, existingConcert } = await checkDuplicateConcert({
+      concert: zenith({
+        city: 'Paris', latitude: '48.8936', longitude: '2.3930', source: 'bandsintown',
+        concert_date: '2026-03-10T20:00:00Z',
+      }),
+      bandIds: [5],
+      tx: tx([zenith(paris)]),
+    });
+    expect(isDuplicate).toBe(true);
+    expect(existingConcert.id).toBe(1);
+  });
+
+  it('merges into the fullest bill rather than the first row the query returned', async () => {
+    // Postgres returns these in no particular order, and the first match won.
+    const row = (id, bands) => zenith({
+      id, city: 'Paris', latitude: '48.8936', longitude: '2.3930', source: 'songkick',
+      concert_date: new Date('2026-03-10T19:00:00Z'), bands,
+    });
+    const { existingConcert } = await checkDuplicateConcert({
+      concert: zenith({
+        city: 'Paris', latitude: '48.8936', longitude: '2.3930', source: 'bandsintown',
+        concert_date: '2026-03-10T19:00:00Z',
+      }),
+      bandIds: [5],
+      tx: tx([row(2, [{ band: 5 }]), row(9, [{ band: 5 }, { band: 6 }, { band: 7 }])]),
+    });
+    expect(existingConcert.id).toBe(9);
+  });
+});
+
+describe('mergedFields', () => {
+  const stored = (over = {}) => ({
+    id: 1, name: 'Copenhell 2027', venue: 'Refshaleøen', city: 'Copenhagen',
+    concert_date: new Date('2027-06-17T00:00:00Z'), source: 'songkick', url: null,
+    festival: false, on_sale: false, sold_out: false, ticket_sale_start: null, metadata: null,
+    price_min: null, price_max: null, price_currency: null, ...over,
+  });
+  const scrape = (over = {}) => ({
+    name: 'Copenhell 2027', concert_date: '2027-06-17T00:00:00Z', source: 'songkick', ...over,
+  });
+
+  it('writes nothing when the scrape has nothing new to say', () => {
+    expect(mergedFields(stored(), scrape())).toEqual({});
+  });
+
+  it('keeps the stored name when both are the scraper\'s fallback', () => {
+    // Each act's own page is titled "<act> @ <festival>", so the row was
+    // renamed after whichever of them was scraped last, every sync.
+    expect(mergedFields(stored({ name: 'Opeth @ Copenhell' }), scrape({ name: 'Gojira @ Copenhell' }))).toEqual({});
+  });
+
+  it('takes a real event name over a fallback', () => {
+    expect(mergedFields(stored({ name: 'Opeth @ Copenhell' }), scrape({ name: 'Copenhell 2027' })))
+      .toEqual({ name: 'Copenhell 2027' });
+  });
+
+  it('raises the festival flag however short the scrape\'s bill, and never lowers it', () => {
+    // The flag used to ride along with the band count, so a festival the
+    // cluster check had just recognised stayed unflagged on the stored row
+    // unless that same scrape also had more bands than it.
+    expect(mergedFields(stored(), scrape({ festival: true }))).toEqual({ festival: true });
+    expect(mergedFields(stored({ festival: true }), scrape({ festival: false }))).toEqual({});
+  });
+
+  it('fills in a missing start time, with the source and link that time belongs to', () => {
+    // `source` is what says whether a stored time is a real instant or a wall
+    // clock, so a time read under the wrong one renders hours out.
+    expect(mergedFields(stored(), scrape({
+      concert_date: '2027-06-17T19:00:00Z', source: 'bandsintown', url: 'https://bandsintown.test/e/1',
+    }))).toEqual({
+      concert_date: new Date('2027-06-17T19:00:00Z'),
+      source: 'bandsintown',
+      url: 'https://bandsintown.test/e/1',
+    });
+  });
+
+  it('keeps the time it has, and never moves the day', () => {
+    // Two sources dating one show a day apart is why the windows reach across
+    // days at all; it is not a reason to move the show.
+    const row = stored({ concert_date: new Date('2027-06-17T19:00:00Z') });
+    expect(mergedFields(row, scrape({ concert_date: '2027-06-17T20:00:00Z' }))).toEqual({});
+    expect(mergedFields(row, scrape({ concert_date: '2027-06-18T20:00:00Z' }))).toEqual({});
+  });
+
+  it('lets any source fill a price in, and only the row\'s own change one', () => {
+    // Both sources scrape the same show twice a day, and a price each of them
+    // quotes differently would otherwise be rewritten back and forth for good.
+    expect(mergedFields(stored(), scrape({ source: 'bandsintown', price_min: 280, price_currency: 'EUR' })))
+      .toEqual({ price_min: 280, price_currency: 'EUR' });
+    expect(mergedFields(stored({ price_min: 280 }), scrape({ source: 'bandsintown', price_min: 410 })))
+      .toEqual({});
+    expect(mergedFields(stored({ price_min: 280 }), scrape({ price_min: 410 })))
+      .toEqual({ price_min: 410 });
+  });
+});
+
+describe('deduplicateConcerts folding rather than dropping', () => {
+  const row = (over) => ({
+    name: 'Copenhell 2027', venue: 'Refshaleøen', city: 'Copenhagen',
+    latitude: '55.69', longitude: '12.61', concert_date: '2027-06-17T18:00:00Z',
+    participating_bands: [], ...over,
+  });
+
+  it('keeps a band only the dropped row was linked to', () => {
+    // Two sources' rows for one festival, each linked to the one band whose
+    // page it was scraped from. The duplicate was dropped whole, and with it
+    // the only record that the other band plays this show at all.
+    const merged = deduplicateConcerts([
+      row({ id: 1, participating_bands: [{ id: 1 }] }),
+      row({ id: 2, participating_bands: [{ id: 2 }] }),
+    ]);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].participating_bands.map((b) => b.id)).toEqual([1, 2]);
+  });
+
+  it('folds the bills of both rows together', () => {
+    const merged = deduplicateConcerts([
+      row({ id: 1, metadata: '["Opeth","Gojira"]' }),
+      row({ id: 2, metadata: '["Gojira","Alcest"]' }),
+    ]);
+
+    expect(JSON.parse(merged[0].metadata)).toEqual(['Opeth', 'Gojira', 'Alcest']);
+  });
+
+  it('survives a metadata column holding something that is not a bill', () => {
+    // metadata is free-form text and older rows hold other things in it.
+    // Spreading one of those threw a TypeError out of the wishlist read, for
+    // every wishlist holding such a row. The support act's own listing beside
+    // its headline show, which is the shape that reaches the merge.
+    const merged = deduplicateConcerts([
+      {
+        id: 1, name: 'As December Falls @ SWG3 Garden', venue: 'SWG3 Garden', city: 'Glasgow',
+        concert_date: '2026-09-08T17:00:00Z', metadata: '{"note":"moved indoors"}',
+        participating_bands: [{ id: 226 }],
+      },
+      {
+        id: 2, name: 'Dance Gavin Dance', venue: 'Galvanizers SWG3', city: 'Glasgow',
+        concert_date: '2026-09-08T19:00:00Z', metadata: '["Opeth"]',
+        participating_bands: [{ id: 75 }, { id: 226 }],
+      },
+    ]);
+
+    expect(merged).toHaveLength(1);
+    expect(JSON.parse(merged[0].metadata)).toEqual(['Opeth']);
   });
 });
