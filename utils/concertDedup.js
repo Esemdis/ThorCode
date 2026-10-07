@@ -1,4 +1,5 @@
 const { canonicalBandName } = require('./lineupNames');
+const { mergeTicketFields } = require('./ticketState');
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -364,17 +365,21 @@ async function checkDuplicateConcert({ concert, bandIds, bandNames = [], tx, not
           : concert.name || existingConcert.name;
     const hasBetterName = bestName !== existingConcert.name;
 
-    if (incomingWins || hasBetterName) {
+    // Whatever this scrape saw of the tickets, whoever has the longer bill:
+    // a festival's sale date and its selling out used to be recorded only
+    // when the scrape that found them also happened to list more bands.
+    const tickets = mergeTicketFields(existingConcert, concert);
+
+    if (incomingWins || hasBetterName || Object.keys(tickets).length > 0) {
       await tx.concert.update({
         where: { id: existingConcert.id },
         data: {
           name: bestName,
+          ...tickets,
           ...(incomingWins && {
             concert_date: concert.concert_date ? new Date(concert.concert_date) : existingConcert.concert_date,
             url: concert.url || existingConcert.url,
             metadata: concert.metadata || existingConcert.metadata,
-            on_sale: concert.on_sale !== undefined ? concert.on_sale : existingConcert.on_sale,
-            ticket_sale_start: concert.ticket_sale_start ? new Date(concert.ticket_sale_start) : existingConcert.ticket_sale_start,
             festival: concert.festival || existingConcert.festival,
           }),
         },

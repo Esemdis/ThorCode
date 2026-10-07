@@ -68,6 +68,8 @@ async function sendDigestEmail({ to, items }) {
 }
 
 // One line per show a follower is being told about: what happened, then the show.
+// `alert` is the line's own words — "Sold out", or "New on the bill: Ghost,
+// Opeth" — and need not be one of a fixed set.
 function buildTicketAlertHtml(items) {
   const rows = items
     .map((c) => {
@@ -78,18 +80,21 @@ function buildTicketAlertHtml(items) {
       return `<li><strong>${escapeHtml(c.alert)}:</strong> ${link} — ${fmtDate(c.date)} @ ${where}</li>`;
     })
     .join("");
-  return `<p>News about the tickets for shows you follow:</p><ul>${rows}</ul>`;
+  return `<p>News about the shows you follow:</p><ul>${rows}</ul>`;
 }
 
 /**
- * Tell a follower what the tickets for their shows are doing. Throws when it
- * was not sent, as sendDigestEmail does.
+ * Tell a follower what their shows are doing — tickets, or an act joining a
+ * bill. Throws when it was not sent, as sendDigestEmail does.
+ *
+ * A single item's subject is its `headline` where it has one: a line that
+ * already names the acts that joined would make a subject nothing could read.
  */
 async function sendTicketAlertEmail({ to, items }) {
   const [only] = items;
   const subject = items.length === 1
-    ? `${only.alert}: ${only.title}`
-    : `Ticket news for ${items.length} shows you follow`;
+    ? (only.headline ?? `${only.alert}: ${only.title}`)
+    : `News about ${items.length} shows you follow`;
   const result = await getResend().emails.send({
     from: process.env.NOTIFICATIONS_FROM_EMAIL,
     to,

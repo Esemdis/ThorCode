@@ -50,13 +50,27 @@ function offsetAt(instant, timeZone) {
   return read - Math.floor(instant.getTime() / 1000) * 1000;
 }
 
-// The instant a zone's clocks strike midnight on a calendar day, given as UTC
-// midnight of that day. Asked twice: when the clocks change between the first
-// guess and the answer, the offset at the guess is the wrong one.
-function midnightIn(dayMs, timeZone) {
-  const guess = dayMs - offsetAt(new Date(dayMs), timeZone);
-  return new Date(dayMs - offsetAt(new Date(guess), timeZone));
+/**
+ * The instant a zone's clocks read a time of day on a calendar day.
+ *
+ * Asked twice: when the clocks change between the first guess and the answer,
+ * the offset at the guess is the wrong one.
+ *
+ * @param {number} dayMs - UTC midnight of the calendar day
+ * @param {string} timeZone
+ * @param {number} [hour] - on the zone's clocks
+ * @param {number} [minute]
+ * @returns {Date}
+ */
+function zonedInstant(dayMs, timeZone, hour = 0, minute = 0) {
+  const target = dayMs + (hour * 60 + minute) * 60 * 1000;
+  const guess = target - offsetAt(new Date(target), timeZone);
+  return new Date(target - offsetAt(new Date(guess), timeZone));
 }
+
+// The instant a zone's clocks strike midnight on a calendar day, given as UTC
+// midnight of that day.
+const midnightIn = (dayMs, timeZone) => zonedInstant(dayMs, timeZone);
 
 // ISO 8601: a week is numbered in the year its Thursday falls in.
 function isoWeek(mondayMs) {
@@ -268,4 +282,4 @@ async function sendWeeklyRecaps(now = new Date()) {
   return result;
 }
 
-module.exports = { isTimeZone, weekBounds, summarizeWeek, weeklyRecap, postRecap, sendWeeklyRecaps };
+module.exports = { isTimeZone, zonedInstant, weekBounds, summarizeWeek, weeklyRecap, postRecap, sendWeeklyRecaps };

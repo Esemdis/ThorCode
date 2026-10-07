@@ -39,10 +39,11 @@ const SETLIST_BACKFILL_LIMIT = 50;
 const WEEKLY_RECAP_CRON = process.env.WEEKLY_RECAP_CRON || "0 9 * * 1";
 
 // Followed shows' tickets: on sale, sold out, back. A show's state only moves
-// when the scraper syncs, twice a day, so this mostly finds nothing; it runs
-// often for the morning-of-sale reminder, which is due at an hour on each
-// follower's own clock.
-const TICKET_ALERT_CRON = process.env.TICKET_ALERT_CRON || "*/15 * * * *";
+// when the scraper syncs, twice a day, so this mostly finds nothing. The pace
+// is set by the reminder, which is due ten minutes before a sale opens on the
+// follower's own clock: every five minutes puts it between five and ten
+// minutes ahead, and a quarter of an hour could miss it entirely.
+const TICKET_ALERT_CRON = process.env.TICKET_ALERT_CRON || "*/5 * * * *";
 
 /**
  * Clean up expired email verification codes

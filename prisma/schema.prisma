@@ -170,10 +170,11 @@ model Wishlist {
   deliveries         ConcertDelivery[]       @relation("WishlistDeliveries")
 }
 
-// A show someone wants to hear about the tickets for: the morning they go on
-// sale, when they are on sale, when they sell out and if they come back. The
-// alert job compares the show's ticket state with told_state, the one this
-// follower was last told, and says so when it has moved on.
+// A show someone wants to hear about: the morning its tickets go on sale, when
+// they are on sale, when they sell out, if they come back, and any act that
+// joins its bill. The alert job compares the show as it is now with what this
+// follower was last told — told_state and lineup_told — and says so when it
+// has moved on.
 model ConcertFollow {
   user_id     String
   concert_id  Int
@@ -183,6 +184,11 @@ model ConcertFollow {
   told_state  String
   // When the "on sale today" reminder went out, so it goes once.
   reminded_at DateTime?
+  // The bill this follower was last told about: a JSON array of names, the
+  // whole bill as utils/concertBill.js reads it, acts with a Band row and the
+  // plain strings in metadata alike. Null until the first pass records one,
+  // which says nothing — only what joins a bill after that is news.
+  lineup_told String?
   created_at  DateTime  @default(now())
   user_rel    User      @relation("UserConcertFollows", fields: [user_id], references: [id], onDelete: Cascade)
   concert_rel Concert   @relation("ConcertFollows", fields: [concert_id], references: [id], onDelete: Cascade)

@@ -19,7 +19,11 @@ beforeEach(() => { vi.clearAllMocks(); });
 
 describe('following a show for its tickets', () => {
   it('starts from where the tickets are now, so an on-sale show says nothing until it changes', async () => {
-    prisma.concert.findUnique.mockResolvedValue({ id: 300, on_sale: true, sold_out: false, ticket_sale_start: null });
+    prisma.concert.findUnique.mockResolvedValue({
+      id: 300, on_sale: true, sold_out: false, ticket_sale_start: null,
+      metadata: JSON.stringify(['Ghost', 'Uncle Acid']),
+      bands: [{ band_rel: { name: 'Opeth' } }],
+    });
 
     const res = await request(app).put('/notifications/follows/300').set(...me);
 
@@ -27,14 +31,19 @@ describe('following a show for its tickets', () => {
     expect(res.body).toEqual({ concert_id: 300, tickets: 'on_sale' });
     expect(prisma.concertFollow.upsert).toHaveBeenCalledWith({
       where: { user_id_concert_id: { user_id: 'user-1', concert_id: 300 } },
-      create: { user_id: 'user-1', concert_id: 300, told_state: 'on_sale' },
+      create: {
+        user_id: 'user-1', concert_id: 300, told_state: 'on_sale',
+        // The bill as it stands, so only what joins it later is news — the
+        // acts with a Band row and the plain names in metadata alike.
+        lineup_told: JSON.stringify(['Opeth', 'Ghost', 'Uncle Acid']),
+      },
       // Following again keeps what you have been told.
       update: {},
     });
   });
 
   it('saves the browser\'s time zone for the sale-day reminder, when the account has none yet', async () => {
-    prisma.concert.findUnique.mockResolvedValue({ id: 300, on_sale: false, sold_out: false, ticket_sale_start: null });
+    prisma.concert.findUnique.mockResolvedValue({ id: 300, on_sale: false, sold_out: false, ticket_sale_start: null, metadata: null, bands: [] });
     prisma.user.findUnique.mockResolvedValue({ settings: { discord_user_id: '42' } });
 
     await request(app).put('/notifications/follows/300').set(...me).send({ tz: 'Europe/Stockholm' });
@@ -71,7 +80,8 @@ describe('following a show for its tickets', () => {
       concert_rel: {
         id: 300, name: 'Hollywood Undead: EU/UK 2027', venue: 'Fållan', city: 'Stockholm', country: 'SE',
         concert_date: new Date('2027-02-13T18:45:00Z'), url: null, on_sale: false, sold_out: false,
-        ticket_sale_start: new Date('2099-10-09T00:00:00Z'), bands: [{ band_rel: { id: 9, name: 'Hollywood Undead' } }],
+        ticket_sale_start: new Date('2099-10-09T00:00:00Z'), metadata: null,
+        bands: [{ band_rel: { id: 9, name: 'Hollywood Undead' } }],
       },
     }]);
 
@@ -80,8 +90,35 @@ describe('following a show for its tickets', () => {
     expect(prisma.concertFollow.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { user_id: 'user-1' } }));
     expect(res.body).toEqual([expect.objectContaining({
       concert_id: 300, tickets: 'on_sale_soon',
-      concert: expect.objectContaining({ venue: 'Fållan', bands: [{ id: 9, name: 'Hollywood Undead' }] }),
+      concert: expect.objectContaining({
+        venue: 'Fållan',
+        bands: [expect.objectContaining({ id: 9, name: 'Hollywood Undead', linked: true })],
+      }),
     })]);
+  });
+
+  it('lists the whole bill, including the acts with no band row, and keeps the raw lineup out of the answer', async () => {
+    prisma.concertFollow.findMany.mockResolvedValue([{
+      concert_id: 300, created_at: new Date('2026-10-06T12:00:00Z'),
+      concert_rel: {
+        id: 300, name: 'Wacken 2027', venue: 'Wacken', city: 'Wacken', country: 'DE',
+        concert_date: new Date('2027-07-29T10:00:00Z'), url: null, on_sale: true, sold_out: false,
+        ticket_sale_start: null,
+        // "Hollywood Undead (US)" is the same act as the linked row: the
+        // scraper's disambiguator must not list it a second time.
+        metadata: JSON.stringify(['Hollywood Undead (US)', 'Sleep Token', 'Ghost']),
+        bands: [{ band_rel: { id: 9, name: 'Hollywood Undead' } }],
+      },
+    }]);
+
+    const res = await request(app).get('/notifications/follows').set(...me);
+
+    expect(res.body[0].concert.bands).toEqual([
+      expect.objectContaining({ id: 9, name: 'Hollywood Undead', linked: true }),
+      expect.objectContaining({ id: null, name: 'Sleep Token', linked: false }),
+      expect.objectContaining({ id: null, name: 'Ghost', linked: false }),
+    ]);
+    expect(res.body[0].concert).not.toHaveProperty('metadata');
   });
 
   it('turns away a caller with no token', async () => {

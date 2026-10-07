@@ -398,6 +398,55 @@ describe('checkDuplicateConcert and a second night at the same venue', () => {
   });
 });
 
+describe('checkDuplicateConcert and what the tickets are doing', () => {
+  // A festival is one stored row that each act's scrape merges into. The
+  // ticket fields used to ride along with the band count, so the scrape that
+  // saw "on sale 9 Oct" only recorded it when it also had the longer bill.
+  const stored = {
+    id: 55, name: 'Copenhell 2027', venue: 'Refshaleøen', city: 'Copenhagen', country: 'DK',
+    concert_date: new Date('2027-06-17T00:00:00Z'), latitude: '55.69', longitude: '12.61',
+    festival: true, source: 'songkick', on_sale: true, sold_out: false, ticket_sale_start: null,
+    bands: [{ band: 1, band_rel: { name: 'Opeth' } }, { band: 2, band_rel: { name: 'Gojira' } }],
+  };
+  const incoming = (over) => ({
+    name: 'Copenhell 2027', venue: 'Refshaleøen', city: 'Copenhagen', country: 'DK',
+    concert_date: '2027-06-17T00:00:00Z', latitude: '55.69', longitude: '12.61', festival: true,
+    source: 'songkick', ...over,
+  });
+  const written = (tx) => tx.concert.update.mock.calls.map(([{ data }]) => data);
+
+  const fakeTx = () => ({
+    concert: { findMany: vi.fn(async () => [stored]), update: vi.fn(async () => ({})) },
+    concertBandReference: { findMany: vi.fn(async () => []), createMany: vi.fn(async () => ({})) },
+  });
+
+  it('records a sell-out found by a scrape with a shorter bill', async () => {
+    const tx = fakeTx();
+
+    await checkDuplicateConcert({ concert: incoming({ sold_out: true, on_sale: false }), bandIds: [1], tx });
+
+    expect(written(tx)[0]).toMatchObject({ sold_out: true, on_sale: false });
+  });
+
+  it('records the day a sale opens, from the one scrape that saw it', async () => {
+    const tx = fakeTx();
+
+    await checkDuplicateConcert({
+      concert: incoming({ on_sale: false, sold_out: false, ticket_sale_start: '2099-10-09' }), bandIds: [1], tx,
+    });
+
+    expect(written(tx)[0]).toMatchObject({ ticket_sale_start: new Date('2099-10-09T00:00:00Z'), on_sale: false });
+  });
+
+  it('writes nothing at all when there is no news of any kind', async () => {
+    const tx = fakeTx();
+
+    await checkDuplicateConcert({ concert: incoming({ on_sale: true, sold_out: false }), bandIds: [1], tx });
+
+    expect(tx.concert.update).not.toHaveBeenCalled();
+  });
+});
+
 describe('checkDuplicateConcert upgrading a festival flag it can only see from outside', () => {
   // The stage rows arrive flagged festival: false — Bandsintown's per-band
   // page lists too few acts for the scraper's own rule to fire — so the flag

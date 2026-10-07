@@ -8,6 +8,7 @@ const prisma = require("../../prisma/client");
 const { rateLimiter } = require("../../utils/rateLimiter");
 const { ticketState } = require("../../utils/ticketState");
 const { isTimeZone } = require("../../utils/weeklyRecap");
+const { billForConcert } = require("../../utils/concertBill");
 
 const rateLimit = rateLimiter({
   message: "Too many requests to the notifications route, please try again later.",
@@ -148,6 +149,9 @@ const FOLLOWED_CONCERT = {
   on_sale: true,
   sold_out: true,
   ticket_sale_start: true,
+  // The whole bill, not only the acts you wishlisted: the rest of the lineup
+  // lives in metadata as plain names, and billForConcert puts the two together.
+  metadata: true,
   bands: { select: { band_rel: { select: { id: true, name: true } } } },
 };
 
@@ -169,12 +173,20 @@ router.get(
         orderBy: { created_at: "desc" },
       });
       const now = new Date();
-      res.json(follows.map(({ concert_id, created_at, concert_rel }) => ({
-        concert_id,
-        created_at,
-        tickets: ticketState(concert_rel, now),
-        concert: { ...concert_rel, bands: concert_rel.bands.map((b) => b.band_rel) },
-      })));
+      res.json(follows.map(({ concert_id, created_at, concert_rel }) => {
+        // metadata is read for the bill and then dropped: the list has no use
+        // for the raw column, and on a festival it is the biggest field here.
+        const { metadata, ...concert } = concert_rel;
+        return {
+          concert_id,
+          created_at,
+          tickets: ticketState(concert_rel, now),
+          concert: {
+            ...concert,
+            bands: billForConcert({ bands: concert_rel.bands.map((b) => b.band_rel), metadata }),
+          },
+        };
+      }));
     } catch (error) {
       console.error("Error fetching followed shows:", error);
       res.status(500).json({ error: "Internal server error" });
@@ -196,16 +208,30 @@ router.put(
     try {
       const concert = await prisma.concert.findUnique({
         where: { id: concertId },
-        select: { id: true, on_sale: true, sold_out: true, ticket_sale_start: true },
+        select: {
+          id: true, on_sale: true, sold_out: true, ticket_sale_start: true,
+          // For the bill to remember, below.
+          metadata: true, bands: { select: { band_rel: { select: { name: true } } } },
+        },
       });
       if (!concert) return res.status(404).json({ error: "Concert not found" });
 
       // Told what it is now: following a show that is on sale says nothing
-      // until it sells out.
+      // until it sells out, and following a festival says nothing about the
+      // hundred acts already on its bill — only about what joins it after.
       const tickets = ticketState(concert);
+      const bill = billForConcert({
+        bands: (concert.bands ?? []).map((ref) => ref.band_rel),
+        metadata: concert.metadata,
+      }).map((act) => act.name);
       await prisma.concertFollow.upsert({
         where: { user_id_concert_id: { user_id: req.user.id, concert_id: concertId } },
-        create: { user_id: req.user.id, concert_id: concertId, told_state: tickets },
+        create: {
+          user_id: req.user.id,
+          concert_id: concertId,
+          told_state: tickets,
+          lineup_told: JSON.stringify(bill),
+        },
         update: {},
       });
 
