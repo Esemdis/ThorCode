@@ -259,6 +259,20 @@ describe('deduplicateByCoords', () => {
     expect(merged.name).toBe('Graspop Metal Meeting 2026');
   });
 
+  it('leaves the tickets unsaid when neither source said anything', () => {
+    // null is not "no": both sites mark a listing in stock by default, so a
+    // scraper with nothing specific to report sends nothing, and the stored
+    // row must keep what it had rather than be told false.
+    const concerts = [
+      { bands: [1], latitude: 51.24, longitude: 5.11, concert_date: '2026-06-18T12:00:00Z', on_sale: null, sold_out: null },
+      { bands: [1], latitude: 51.24, longitude: 5.11, concert_date: '2026-06-18T14:00:00Z', on_sale: null, sold_out: null },
+    ];
+    const [merged] = deduplicateByCoords(concerts);
+    expect(merged.on_sale).toBeNull();
+    expect(merged.sold_out).toBeNull();
+    expect(merged.ticket_sale_start).toBeNull();
+  });
+
   it('keeps two shows apart when neither has a usable coordinate', () => {
     // Non-null nonsense used to round to one "NaN:NaN" cell, so two unrelated
     // shows on a day shared a bucket and one of them never reached the DB.

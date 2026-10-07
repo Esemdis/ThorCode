@@ -175,11 +175,15 @@ function foldSourceInto(keep, drop) {
 
   // What the tickets are doing is the state of the world, not something one
   // row owns: whatever either source saw of them counts, and only silence is
-  // overruled. Both mark a listing in stock by default, so neither row's
-  // nothing-to-say may clear the other's sold out — the one state no source
-  // reports unless it means it.
-  merged.sold_out = Boolean(keep.sold_out || drop.sold_out);
-  merged.on_sale = Boolean(keep.on_sale || drop.on_sale) && !merged.sold_out;
+  // overruled. Said by neither stays unsaid — null is not "no", and both sites
+  // mark a listing in stock by default, so a scraper with nothing specific to
+  // report sends nothing and the stored row keeps what it had.
+  const either = (a, b) => {
+    if (a || b) return true;
+    return (a == null && b == null) ? null : false;
+  };
+  merged.sold_out = either(keep.sold_out, drop.sold_out);
+  merged.on_sale = merged.sold_out === true ? false : either(keep.on_sale, drop.on_sale);
   merged.ticket_sale_start = keep.ticket_sale_start ?? drop.ticket_sale_start ?? null;
 
   // The price trio moves as a unit. A minimum from one source beside a
