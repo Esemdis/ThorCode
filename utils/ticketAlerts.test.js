@@ -4,6 +4,9 @@ import { installFakePrisma } from '../test/routeApp.js';
 
 const prisma = installFakePrisma({
   concertFollow: { findMany: vi.fn(), update: vi.fn(async () => ({})) },
+  // Read for the followers being told, so the email can mark the acts on a
+  // bill that they actually follow.
+  wishlist: { findMany: vi.fn(async () => []) },
 });
 
 // This file's own copies — CommonJS, loaded through Node's require.
@@ -344,7 +347,15 @@ describe('runTicketAlerts', () => {
     expect(received[0].embeds[0].fields[0].value).toContain('**New on the bill: Opeth, Uncle Acid & the Deadbeats**');
     expect(mail.sendTicketAlertEmail).toHaveBeenCalledWith({
       to: 'me@example.test',
-      items: [expect.objectContaining({ alert: 'New on the bill: Opeth, Uncle Acid & the Deadbeats' })],
+      items: [expect.objectContaining({
+        alert: 'New on the bill: Opeth, Uncle Acid & the Deadbeats',
+        // The email sets the acts that joined apart from the bill they joined,
+        // so it needs both rather than the one line Discord gets.
+        acts: {
+          joined: ['Opeth', 'Uncle Acid & the Deadbeats'],
+          bill: ['Hollywood Undead', 'Opeth', 'Ghost', 'Uncle Acid & the Deadbeats'],
+        },
+      })],
     });
     // The whole bill, so the next act to join is the only news next time.
     expect(updates()).toEqual([{
@@ -432,5 +443,61 @@ describe('runTicketAlerts', () => {
 
     const { where } = prisma.concertFollow.findMany.mock.calls[0][0];
     expect(where.concert_rel.OR).toContainEqual({ concert_date: { gte: new Date('2026-10-09T00:00:00Z') } });
+  });
+
+  it('sends the follower their own wishlist, for the email to mark the bill with', async () => {
+    const bill = show({ metadata: JSON.stringify(['Ghost']) });
+    prisma.concertFollow.findMany.mockResolvedValue([follow('unknown', bill, {}, ['Hollywood Undead'])]);
+    prisma.wishlist.findMany.mockResolvedValue([{ user_id: 'me', bands: [{ band_rel: { name: 'Ghost' } }] }]);
+
+    await runTicketAlerts({ now: NOW });
+
+    expect(prisma.wishlist.findMany.mock.calls[0][0].where).toEqual({ user_id: { in: ['me'] } });
+    expect(mail.sendTicketAlertEmail).toHaveBeenCalledWith({
+      to: 'me@example.test',
+      items: [expect.objectContaining({ yourBandNames: ['Ghost'] })],
+    });
+  });
+
+  it('asks nothing of the wishlist table when there is nobody to tell', async () => {
+    prisma.concertFollow.findMany.mockResolvedValue([follow('unknown', show(), {}, null)]);
+
+    await runTicketAlerts({ now: NOW });
+
+    expect(prisma.wishlist.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('buildTicketAlertHtml', () => {
+  const item = (over = {}) => ({
+    title: 'Copenhell 2027', alert: 'Sold out', headline: 'Sold out: Copenhell 2027',
+    venue: 'Refshaleøen', city: 'Copenhagen', country: 'DK', date: '2027-06-17T00:00:00Z',
+    url: 'https://www.songkick.com/festivals/1', tickets: { url: 'https://www.songkick.com/festivals/1', label: 'Tickets on Songkick' },
+    ...over,
+  });
+
+  it('shows a ticket alert as what happened, with the way to buy', () => {
+    const html = mail.buildTicketAlertHtml([item()]);
+
+    expect(html).toContain('Sold out');
+    expect(html).toContain('Tickets on Songkick');
+    expect(html).not.toContain('On the bill');
+  });
+
+  it('splits the acts that joined from the bill they joined, and marks your own', () => {
+    const html = mail.buildTicketAlertHtml([item({
+      alert: 'New on the bill: Opeth',
+      headline: 'New on the bill: Copenhell 2027',
+      acts: { joined: ['Opeth'], bill: ['Hollywood Undead', 'Opeth', 'Ghost'] },
+      yourBandNames: ['Opeth'],
+    })]);
+
+    expect(html).toContain('New on the bill &middot; 1');
+    expect(html).toContain('★ Opeth');
+    expect(html).toContain('Already announced &middot; 2');
+    expect(html).toContain('Ghost');
+    // The one-line form is for Discord, the subject and the inbox preview; the
+    // card names the acts itself, so it is not repeated as a pill above them.
+    expect(html).not.toContain('class="pill"');
   });
 });

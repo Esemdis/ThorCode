@@ -100,6 +100,25 @@ describe('runNotificationDigest', () => {
       })]);
     });
 
+    it('sends the whole bill the act joined, and which of it the watcher follows', async () => {
+      // Most of a festival's bill has no Band row — it is scraped names in
+      // metadata — and the email is where "what is this joining?" is answered.
+      const send = vi.spyOn(mail, 'sendDigestEmail').mockResolvedValue({ data: { id: 'a' } });
+      prisma.concertBandReference.findMany.mockResolvedValue([
+        linked({ ...festival, metadata: JSON.stringify(['Ghost', 'Uncle Acid & the Deadbeats']) }, GOJIRA),
+      ]);
+      prisma.notificationSubscription.findMany.mockResolvedValue([subscriber(1, { band_id: null, tour_query: 'copenhell' })]);
+      prisma.wishlist.findMany.mockResolvedValue([{ user_id: 'user-1', bands: [{ band_id: OPETH.id }] }]);
+
+      await runNotificationDigest();
+
+      expect(send.mock.calls[0][0].items[0]).toMatchObject({
+        bandNames: ['Opeth', 'Gojira', 'Ghost', 'Uncle Acid & the Deadbeats'],
+        newBandNames: ['Gojira'],
+        yourBandNames: ['Opeth'],
+      });
+    });
+
     it('does not mail a band watch about another act joining its band\'s show', async () => {
       const send = vi.spyOn(mail, 'sendDigestEmail').mockResolvedValue({ data: { id: 'a' } });
 
@@ -137,16 +156,54 @@ describe('buildDigestHtml', () => {
       date: '2026-11-02T19:00:00Z', url: 'https://www.songkick.com/concerts/1?a=1&b=2',
     }]);
 
-    expect(html).toContain('<a href="https://www.songkick.com/concerts/1?a=1&amp;b=2">Opeth</a>');
+    expect(html).toContain('href="https://www.songkick.com/concerts/1?a=1&amp;b=2"');
+    expect(html).toContain('>Opeth</a>');
   });
 
-  it('heads an added act with the show it joined, and names the act', () => {
-    const html = mail.buildDigestHtml([{
-      name: 'Copenhell 2027', bandNames: ['Opeth', 'Gojira'], newBandNames: ['Gojira'],
-      venue: 'Refshaleøen', city: 'Copenhagen', country: 'DK', date: '2027-06-17T00:00:00Z', url: null,
-    }]);
+  // The complaint this layout answers: an act joining a festival arrived as one
+  // line of names, with no sign of the bill it was joining.
+  const festival = (over = {}) => ({
+    name: 'Copenhell 2027', bandNames: ['Opeth', 'Gojira'], newBandNames: ['Gojira'],
+    venue: 'Refshaleøen', city: 'Copenhagen', country: 'DK', date: '2027-06-17T00:00:00Z', url: null, ...over,
+  });
 
-    expect(html).toContain('<strong>Copenhell 2027</strong>');
-    expect(html).toContain('New on the bill: Gojira');
+  it('heads an added act with the show it joined, and sets the new acts apart from the bill', () => {
+    const html = mail.buildDigestHtml([festival()]);
+
+    expect(html).toContain('Copenhell 2027');
+    expect(html).toContain('New on the bill &middot; 1');
+    expect(html).toContain('Gojira');
+    // The acts that were already on it, named rather than left out, and not
+    // counted among the news.
+    expect(html).toContain('Already announced &middot; 1');
+    expect(html).toContain('Opeth');
+    expect(html).not.toContain('New on the bill &middot; 2');
+  });
+
+  it('marks the acts you follow, wherever they sit on the bill', () => {
+    const html = mail.buildDigestHtml([festival({
+      // Stored as the scraper wrote it; followed under the band row's name.
+      bandNames: ['Opeth (SWE)', 'Gojira', 'Ghost'], newBandNames: ['Gojira'], yourBandNames: ['Opeth'],
+    })]);
+
+    expect(html).toContain('★ Opeth (SWE)');
+    expect(html).toContain('on your wishlist');
+    expect(html).not.toContain('★ Ghost');
+  });
+
+  it('counts a long bill rather than printing all of it', () => {
+    const rest = Array.from({ length: 45 }, (_, i) => `Act ${i + 1}`);
+    const html = mail.buildDigestHtml([festival({ bandNames: ['Gojira', ...rest], newBandNames: ['Gojira'] })]);
+
+    expect(html).toContain('Already announced &middot; 45');
+    expect(html).toContain('and 5 more');
+    expect(html).not.toContain('Act 41');
+  });
+
+  it('says nothing about an act being new on a show nobody has been told about', () => {
+    const html = mail.buildDigestHtml([festival({ newBandNames: null })]);
+
+    expect(html).toContain('On the bill &middot; 2');
+    expect(html).not.toContain('Already announced');
   });
 });

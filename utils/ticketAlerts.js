@@ -282,7 +282,16 @@ async function runTicketAlerts({ now = new Date() } = {}) {
     if (joined.length > 0) {
       // The acts are named in the line itself, so the headline of a message
       // about nothing else names the show instead.
-      alerts.push({ concert, label: billLabel(joined), headline: `${ALERTS.lineup}: ${showTitle(concert)}` });
+      //
+      // `acts` carries the bill as well as the acts that joined it: the line is
+      // all Discord gets, but the email sets the two apart, so the names that
+      // are news are not read off the same list as the forty that are not.
+      alerts.push({
+        concert,
+        label: billLabel(joined),
+        headline: `${ALERTS.lineup}: ${showTitle(concert)}`,
+        acts: { joined, bill },
+      });
     }
 
     if (alerts.length === 0) {
@@ -307,6 +316,21 @@ async function runTicketAlerts({ now = new Date() } = {}) {
     });
   }
 
+  // The acts each follower being told about actually follows, so a bill can
+  // mark them. Read here rather than with the follows: this query is one row
+  // per user being mailed, where joining the wishlist onto the follows above
+  // would carry every wishlisted band on every follow of every show, every few
+  // minutes, to say nothing for most of them.
+  const wishlists = byUser.size > 0
+    ? await prisma.wishlist.findMany({
+        where: { user_id: { in: [...byUser.keys()] } },
+        select: { user_id: true, bands: { select: { band_rel: { select: { name: true } } } } },
+      })
+    : [];
+  const followedNames = new Map(
+    wishlists.map((w) => [w.user_id, (w.bands ?? []).map((b) => b.band_rel?.name).filter(Boolean)]),
+  );
+
   let alerted = 0;
   let failed = 0;
   for (const [userId, { user, alerts, writes }] of byUser) {
@@ -327,10 +351,14 @@ async function runTicketAlerts({ now = new Date() } = {}) {
       try {
         await mail.sendTicketAlertEmail({
           to: user.email,
-          items: alerts.map(({ concert, label, headline }) => ({
+          items: alerts.map(({ concert, label, headline, acts }) => ({
             title: showTitle(concert),
             alert: label,
             headline,
+            // Set apart in the email: what joined the bill, and the bill it
+            // joined. Absent on an alert that is about tickets.
+            acts,
+            yourBandNames: followedNames.get(userId) ?? [],
             venue: concert.venue,
             city: concert.city,
             country: concert.country,

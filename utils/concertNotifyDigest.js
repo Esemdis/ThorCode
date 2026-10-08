@@ -6,6 +6,10 @@ const mail = require("./mail");
 // the moment the scraper reports them. See notificationMatch.js for why the
 // rule cannot live in either caller.
 const { matchesByUser, followedBandsByUser } = require("./notificationMatch");
+// The whole bill, Band rows and scraped names alike: on a festival most of what
+// is already announced has no row at all, and the email is where you read what
+// the acts that just joined are joining.
+const { billForConcert } = require("./concertBill");
 
 // Scans the acts put on a bill since the last run, matches them against all
 // NotificationSubscription rows, and sends one digest email per affected user.
@@ -49,6 +53,8 @@ async function runNotificationDigest() {
           url: true,
           city_id: true,
           created_at: true,
+          // The scraped lineup, which is the rest of the bill.
+          metadata: true,
           bands: { select: { band_rel: { select: { id: true, name: true } } } },
         },
       },
@@ -97,11 +103,18 @@ async function runNotificationDigest() {
   let attempted = 0;
   for (const [userId, { email, concerts: matched }] of byUser) {
     if (!email || matched.length === 0) continue;
+    const mine = followed.get(userId);
     const items = matched.map((c) => ({
       name: c.name,
-      bandNames: c.bill.map((b) => b.band_rel.name),
+      // Everyone on the bill, so an act joining a festival is read against the
+      // acts already on it rather than on its own.
+      bandNames: billForConcert({ bands: c.bill.map((ref) => ref.band_rel), metadata: c.metadata }).map((act) => act.name),
       // On a show the email has been about before, which acts are the news.
       newBandNames: c.added ? c.bands.map((b) => b.band_rel.name) : null,
+      // Which of them this watcher follows — marked in the email, because on a
+      // forty-act bill that is the thing being looked for. Only the acts with a
+      // Band row can be on a wishlist, which is exactly what `bill` holds.
+      yourBandNames: mine ? c.bill.filter((b) => mine.has(b.band_rel.id)).map((b) => b.band_rel.name) : [],
       venue: c.venue,
       city: c.city,
       country: c.country,

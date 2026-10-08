@@ -1,5 +1,8 @@
 const { Resend } = require("resend");
-const { escapeHtml, safeHref } = require("./html");
+const { canonicalBandName } = require("./lineupNames");
+// What the two notification emails look like, shared so they look like one
+// another and like the app. See utils/emailTemplate.js for the dialect.
+const { emailShell, showCard, nameSummary } = require("./emailTemplate");
 
 let resend;
 function getResend() {
@@ -7,36 +10,61 @@ function getResend() {
   return resend;
 }
 
-function fmtDate(date) {
-  if (!date) return "Date TBA";
-  return new Date(date).toLocaleDateString("en-GB", {
-    weekday: "short",
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-  });
+// Why this email arrived, in the small print under the cards.
+const WATCH_FOOTER = "You're getting this because of the artists, cities and festivals you watch on Concert Map.";
+const FOLLOW_FOOTER = "You're getting this because you follow these shows on Concert Map.";
+
+/**
+ * The bill, split into what is news for this reader and what is not.
+ *
+ * Compared on the canonical name rather than the literal string: the acts that
+ * joined come off the Band rows that were linked, the bill carries whatever
+ * each source wrote, and "Architects" against "Architects (UK)" would otherwise
+ * be listed as both new and already announced.
+ */
+function splitBill(bill, added) {
+  const news = (added ?? []).filter(Boolean);
+  if (news.length === 0) return { news, kept: bill };
+  const keys = new Set(news.map(canonicalBandName).filter(Boolean));
+  return { news, kept: bill.filter((name) => !keys.has(canonicalBandName(name))) };
 }
 
 // Every field here comes from a scraper — band names, venues, event links —
 // and went into the email as raw HTML: an event name with a tag in it was
 // markup in someone's inbox, and a link was whatever the page said it was.
+// showCard escapes all of it.
 function buildDigestHtml(items) {
-  const rows = items
-    .map((c) => {
-      // An act added to a show already known: the show goes by its own name,
-      // a festival's bill being far too long to head the line, and the acts
-      // that are new are named under it.
-      const added = c.newBandNames?.length ? c.newBandNames : null;
-      const heading = added && c.name ? c.name : c.bandNames.length ? c.bandNames.join(", ") : c.name || "Concert";
-      const title = escapeHtml(heading);
-      const href = c.url ? safeHref(c.url) : null;
-      const link = href ? `<a href="${escapeHtml(href)}">${title}</a>` : title;
-      const where = [c.venue, c.city, c.country].filter(Boolean).map(escapeHtml).join(", ");
-      const news = added ? `<br>New on the bill: ${escapeHtml(added.join(", "))}` : "";
-      return `<li><strong>${link}</strong> — ${fmtDate(c.date)} @ ${where}${news}</li>`;
-    })
-    .join("");
-  return `<p>New concerts matching your subscriptions:</p><ul>${rows}</ul>`;
+  const cards = items.map((c) => {
+    const { news, kept } = splitBill(c.bandNames ?? [], c.newBandNames);
+    // An act added to a show already known: the show goes by its own name, a
+    // festival's bill being far too long to head the line, and the acts that
+    // are new are named under it.
+    const title = news.length > 0 && c.name ? c.name : nameSummary(c.bandNames ?? [], 4) || c.name || "Concert";
+    return showCard({
+      title,
+      url: c.url,
+      date: c.date,
+      venue: c.venue,
+      city: c.city,
+      country: c.country,
+      newActs: news,
+      keptActs: kept,
+      yourActs: c.yourBandNames,
+    });
+  });
+
+  const [only] = items;
+  const added = items.length === 1 ? (only.newBandNames ?? []).filter(Boolean) : [];
+  const heading = items.length !== 1
+    ? `${items.length} shows matching your watches`
+    : added.length > 0
+      ? `${added.length === 1 ? "An act has" : `${added.length} acts have`} joined a show you watch`
+      : "A new show matching your watches";
+  const preheader = items.length === 1 && added.length > 0
+    ? `${nameSummary(added)} — ${only.name || only.venue || "a show you watch"}`
+    : undefined;
+
+  return emailShell({ heading, preheader, cards, footnote: WATCH_FOOTER });
 }
 
 /**
@@ -52,7 +80,7 @@ async function sendDigestEmail({ to, items }) {
     items.length !== 1
       ? `${items.length} new concerts matching your subscriptions`
       : only.newBandNames?.length
-        ? `New on ${only.name || only.venue}: ${only.newBandNames.join(", ")}`
+        ? `New on ${only.name || only.venue}: ${nameSummary(only.newBandNames)}`
         : `New concert: ${only.bandNames[0] || only.name}`;
 
   const result = await getResend().emails.send({
@@ -67,25 +95,39 @@ async function sendDigestEmail({ to, items }) {
   return result;
 }
 
-// One line per show a follower is being told about: what happened, then the
-// show, then where to buy. `alert` is the line's own words — "Sold out", or
-// "New on the bill: Ghost, Opeth" — and need not be one of a fixed set;
-// `tickets` is the listing to link to, named after its site.
+// One card per show a follower is being told about: what happened, the show,
+// and where to buy. `alert` is the line's own words — "Sold out", or "New on
+// the bill: Ghost, Opeth" — and need not be one of a fixed set; `tickets` is
+// the listing to link to, named after its site.
+//
+// An item about the bill carries `acts` as well, and then the card names those
+// acts itself, under the bill they joined and beside the bill they joined it on
+// — so `alert`, which says the same thing in one line, is left to Discord and
+// to the subject.
 function buildTicketAlertHtml(items) {
-  const rows = items
-    .map((c) => {
-      const href = c.url ? safeHref(c.url) : null;
-      const title = escapeHtml(c.title || "Concert");
-      const link = href ? `<a href="${escapeHtml(href)}">${title}</a>` : title;
-      const where = [c.venue, c.city, c.country].filter(Boolean).map(escapeHtml).join(", ");
-      const ticketHref = c.tickets?.url ? safeHref(c.tickets.url) : null;
-      const tickets = ticketHref
-        ? ` — <a href="${escapeHtml(ticketHref)}">${escapeHtml(c.tickets.label || "Tickets")} →</a>`
-        : "";
-      return `<li><strong>${escapeHtml(c.alert)}:</strong> ${link} — ${fmtDate(c.date)} @ ${where}${tickets}</li>`;
-    })
-    .join("");
-  return `<p>News about the shows you follow:</p><ul>${rows}</ul>`;
+  const cards = items.map((c) => {
+    const { news, kept } = splitBill(c.acts?.bill ?? [], c.acts?.joined);
+    return showCard({
+      title: c.title || "Concert",
+      url: c.url,
+      date: c.date,
+      venue: c.venue,
+      city: c.city,
+      country: c.country,
+      note: news.length > 0 ? null : c.alert,
+      newActs: news,
+      keptActs: news.length > 0 ? kept : [],
+      yourActs: c.yourBandNames,
+      tickets: c.tickets,
+    });
+  });
+
+  const [only] = items;
+  const heading = items.length === 1
+    ? (only.headline ?? `${only.alert}: ${only.title}`)
+    : `News about ${items.length} shows you follow`;
+
+  return emailShell({ heading, preheader: items.length === 1 ? only.alert : undefined, cards, footnote: FOLLOW_FOOTER });
 }
 
 /**
