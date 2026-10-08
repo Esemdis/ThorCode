@@ -82,7 +82,18 @@ function buildTicketAlertHtml(items) {
       const tickets = ticketHref
         ? ` — <a href="${escapeHtml(ticketHref)}">${escapeHtml(c.tickets.label || "Tickets")} →</a>`
         : "";
-      return `<li><strong>${escapeHtml(c.alert)}:</strong> ${link} — ${fmtDate(c.date)} @ ${where}${tickets}</li>`;
+      // The vendors by name, and what it costs and when it opened, on a line
+      // of their own under the show.
+      const vendors = (c.links ?? [])
+        .map((l) => ({ href: safeHref(l?.url), label: l?.label }))
+        .filter((l) => l.href && l.label)
+        .map((l) => `<a href="${escapeHtml(l.href)}">${escapeHtml(l.label)}</a>`);
+      const more = [
+        ...(c.details ?? []).filter((d) => typeof d === "string" && d).map(escapeHtml),
+        ...(vendors.length ? [`Buy from ${vendors.join(", ")}`] : []),
+      ];
+      const extra = more.length ? `<br>${more.join(" · ")}` : "";
+      return `<li><strong>${escapeHtml(c.alert)}:</strong> ${link} — ${fmtDate(c.date)} @ ${where}${tickets}${extra}</li>`;
     })
     .join("");
   return `<p>News about the shows you follow:</p><ul>${rows}</ul>`;

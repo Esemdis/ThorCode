@@ -3,7 +3,7 @@ import request from 'supertest';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 
 const model = () => ({
-  findMany: vi.fn(), findUnique: vi.fn(), count: vi.fn(),
+  findMany: vi.fn(), findUnique: vi.fn(), findFirst: vi.fn(), count: vi.fn(), aggregate: vi.fn(),
   create: vi.fn(), update: vi.fn(),
 });
 
@@ -25,7 +25,7 @@ beforeEach(() => {
   // Answered in the order the route asks, so a number moving between fields
   // shows up here as a wrong number rather than as nothing at all.
   const bandCounts = [900, 12, 34, 56, 78];
-  const concertCounts = [4000, 7, 19, 210, 40, 31, 3];
+  const concertCounts = [4000, 7, 19, 210, 40, 31, 3, 25, 2, 4, 1];
   prisma.band.count.mockImplementation(async () => bandCounts.shift() ?? 0);
   prisma.concert.count.mockImplementation(async () => concertCounts.shift() ?? 0);
 });
@@ -61,7 +61,7 @@ describe('GET /health', () => {
     await request(app).get('/health').set(...authHeader(admin)).expect(200);
 
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-    expect(prisma.$transaction.mock.calls[0][0]).toHaveLength(12);
+    expect(prisma.$transaction.mock.calls[0][0]).toHaveLength(18);
   });
 
   it('only counts a setlist gap a run could actually close', async () => {
@@ -71,8 +71,9 @@ describe('GET /health', () => {
     await request(app).get('/health').set(...authHeader(admin)).expect(200);
 
     const queries = prisma.$transaction.mock.calls[0][0];
-    // The queue counts are the last three, in the order the route lists them.
-    const [queue] = queries.slice(-3);
+    // The queue counts are the three after the weather's, in the order the
+    // route lists them.
+    const [queue] = queries.slice(9, 12);
     expect(prisma.concert.count).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
@@ -82,6 +83,25 @@ describe('GET /health', () => {
       }),
     );
     expect(queue).toBeDefined();
+  });
+
+  it('says whether the followed-show checker is keeping up, and what it cannot read', async () => {
+    prisma.concert.aggregate.mockResolvedValue({ _max: { tickets_checked_at: new Date('2026-10-09T08:00:00Z') } });
+    prisma.concert.findFirst.mockResolvedValue({
+      name: 'Copenhell 2027', venue: 'Refshaleøen', ticket_check_error: 'no event data on the page',
+    });
+
+    const res = await request(app).get('/health').set(...authHeader(admin)).expect(200);
+
+    expect(res.body.follow_checks).toEqual({
+      followed: 25, never_checked: 2, stale: 4, failing: 1,
+      last_checked_at: '2026-10-09T08:00:00.000Z',
+      last_error: { show: 'Copenhell 2027', error: 'no event data on the page' },
+    });
+    // Counted over followed shows still to come, as the checker's queue is.
+    expect(prisma.concert.count).toHaveBeenCalledWith({
+      where: expect.objectContaining({ follows: { some: {} }, ticket_check_failures: { gte: 3 } }),
+    });
   });
 
   it('turns a plain user away', async () => {

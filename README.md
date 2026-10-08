@@ -17,7 +17,8 @@ The API runs as one Node process against Postgres through Prisma. Two other serv
 | Accounts | `/users` | `routes/users.js`. Covers register, login, settings and email change. Email verification goes through Resend. |
 | Bands and concerts | `/data/concerts` | `routes/data/bands/`. Covers ingest from the scraper, search, band pages, setlists and admin. |
 | Wishlists and attendance | `/data/concerts` | `routes/data/wishlists/`. Covers wishlists, the shows you went to and the ones you missed, and the ICS calendar feed. |
-| Notifications | `/data/concerts` | `routes/data/notifications.js` handles subscriptions to a band, a city or a festival. New shows go to the wishlist's Discord webhook as the scraper reports them, and a daily email digest goes out by cron. |
+| Notifications | `/data/concerts` | `routes/data/notifications.js` handles subscriptions to a band, a city or a festival. New shows go to the wishlist's Discord webhook as the scraper reports them, and a daily email digest goes out by cron. It also handles following a single show (`/notifications/follows`), whose alerts are in `utils/ticketAlerts.js`. |
+| Followed-show checker | `/data/concerts` | `routes/data/followChecks.js` is the sync service's side of it: `GET /follows/check-pending` says which followed shows are due a read (`utils/followChecks.js` sets the cadence), and `POST /follows/checks` takes what it read — vendors, prices, sale state, cancellations, moves — and runs the ticket alerts at once. |
 | Photo and video archive | `/data/concerts` | `routes/data/media/`. Covers upload, tagging, 12-hour share links and byte serving. See [docs/concert-media-runbook.md](docs/concert-media-runbook.md). |
 | Setlist playlists | `/data/concerts`, `/oauth/spotify`, `/oauth/tidal` | `routes/data/playlists.js` builds a Spotify or Tidal playlist from a night's setlists, on whichever the user chose in Settings. |
 | Cities | `/data/cities` | City list, and weather written in bulk by the sync service. |
@@ -31,6 +32,7 @@ Auth is a JWT in `Authorization: Bearer`. Roles are `USER`, `ADMIN` and `SYSTEM`
 | Job | When |
 | --- | --- |
 | Notification digest | 08:00 |
+| Ticket alerts for followed shows | every 5 minutes |
 | Spotify artist matching and photo warming | 04:00 |
 | Songkick/Bandsintown source URL backfill | 05:00 |
 | Setlist backfill for attended shows | 06:00 |

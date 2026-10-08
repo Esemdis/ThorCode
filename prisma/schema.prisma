@@ -100,6 +100,28 @@ model Concert {
   // BAND_ADDED entry for it each time. Null on rows from before it existed,
   // which nothing announces again.
   announced_at      DateTime?
+  // The followed-show checker (python-crohn's jobs/follows.py), which reads a
+  // followed show's own listing far more often than the full sync reaches it.
+  // utils/followChecks.js decides when it is due from these.
+  //
+  // The last read that came back, and the last one tried. The two are apart so
+  // a page that keeps failing is retried on the cadence, not every tick, and
+  // the admin panel can tell a show that is failing from one never checked.
+  tickets_checked_at        DateTime?
+  ticket_check_attempted_at DateTime?
+  ticket_check_failures     Int       @default(0)
+  ticket_check_error        String?
+  // Someone pressed "Check now": due on the next tick, whatever the cadence.
+  ticket_check_requested_at DateTime?
+  // Who sells it, as the listing names them: a JSON array of
+  // { name, state, sale_date, url, price }, newest read wins.
+  ticket_vendors            Json?
+  // 'cancelled' or 'postponed' when the listing says so; null for a show going
+  // ahead, or one whose listing has never said either way.
+  event_status              String?
+  // When the checker first saw tickets selling after they were not: the sale's
+  // real opening, to within a check, where the sources only ever name the day.
+  tickets_opened_at         DateTime?
   city_id           Int?
   city_rel          City?                  @relation(fields: [city_id], references: [id])
   bands             ConcertBandReference[] @relation("ConcertBands")
@@ -189,6 +211,13 @@ model ConcertFollow {
   // plain strings in metadata alike. Null until the first pass records one,
   // which says nothing — only what joins a bill after that is news.
   lineup_told String?
+  // Whether the show was going ahead when this follower was last told:
+  // Concert.event_status, with 'scheduled' for null. And the day and venue they
+  // were last told it is on. Null until recorded, as lineup_told is, which
+  // says nothing — only a change after that is news.
+  status_told String?
+  date_told   DateTime?
+  venue_told  String?
   created_at  DateTime  @default(now())
   user_rel    User      @relation("UserConcertFollows", fields: [user_id], references: [id], onDelete: Cascade)
   concert_rel Concert   @relation("ConcertFollows", fields: [concert_id], references: [id], onDelete: Cascade)

@@ -118,6 +118,30 @@ describe('runNotificationDigest', () => {
   });
 });
 
+describe('buildTicketAlertHtml', () => {
+  it('names the vendors and the price under the show, escaped and only as links that are links', () => {
+    const html = mail.buildTicketAlertHtml([{
+      title: 'Hollywood Undead', alert: 'On sale now', venue: 'Fållan', city: 'Stockholm', country: 'SE',
+      date: '2027-02-13T18:45:00Z', url: 'https://www.songkick.com/concerts/1',
+      tickets: { url: 'https://www.songkick.com/concerts/1', label: 'Tickets on Songkick' },
+      links: [
+        { label: '<b>Ticketmaster</b>', url: 'https://www.ticketmaster.se/1' },
+        { label: 'Evil', url: 'javascript:alert(1)' },
+      ],
+      details: ['€45–89', 'Spotted on sale at 10:02'],
+    }]);
+
+    expect(html).toContain('<br>€45–89 · Spotted on sale at 10:02 · Buy from '
+      + '<a href="https://www.ticketmaster.se/1">&lt;b&gt;Ticketmaster&lt;/b&gt;</a></li>');
+    expect(html).not.toContain('javascript:');
+  });
+
+  it('reads as it did for an alert with nothing more to say', () => {
+    const html = mail.buildTicketAlertHtml([{ title: 'Ghost', alert: 'Sold out', venue: 'Annexet', date: null }]);
+    expect(html).toBe('<p>News about the shows you follow:</p><ul><li><strong>Sold out:</strong> Ghost — Date TBA @ Annexet</li></ul>');
+  });
+});
+
 describe('buildDigestHtml', () => {
   it('escapes scraped text and drops links that are not http', () => {
     const html = mail.buildDigestHtml([{

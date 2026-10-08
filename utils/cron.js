@@ -4,7 +4,7 @@ const { backfillSpotifyIds, warmBandImages } = require("./bandSpotifyMatch");
 const { backfillSourceUrls } = require("./bandSourceUrlBackfill");
 const { backfillSetlists } = require("./setlistBackfill");
 const { sendWeeklyRecaps } = require("./weeklyRecap");
-const { runTicketAlerts } = require("./ticketAlerts");
+const { runTicketAlertsSerially } = require("./ticketAlerts");
 const prisma = require("../prisma/client");
 
 // Default: once a day at 08:00 server time.
@@ -38,9 +38,12 @@ const SETLIST_BACKFILL_LIMIT = 50;
 // the hour only has to fall after midnight on Monday in Europe.
 const WEEKLY_RECAP_CRON = process.env.WEEKLY_RECAP_CRON || "0 9 * * 1";
 
-// Followed shows' tickets: on sale, sold out, back. A show's state only moves
-// when the scraper syncs, twice a day, so this mostly finds nothing. The pace
-// is set by the reminder, which is due ten minutes before a sale opens on the
+// Followed shows' tickets: on sale, sold out, back. A show's state moves when
+// the full sync reaches it, three times a day, and when python-crohn's
+// followed-show checker reads its listing, every half hour and every five
+// minutes on the morning of a sale — and that checker runs this pass itself
+// the moment it has written, so this one mostly finds nothing. The pace is set
+// by the reminder, which is due ten minutes before a sale opens on the
 // follower's own clock: every five minutes puts it between five and ten
 // minutes ahead, and a quarter of an hour could miss it entirely.
 const TICKET_ALERT_CRON = process.env.TICKET_ALERT_CRON || "*/5 * * * *";
@@ -76,7 +79,9 @@ function startCronJobs() {
   // Ticket alerts for followed shows
   cron.schedule(TICKET_ALERT_CRON, async () => {
     try {
-      const result = await runTicketAlerts();
+      // Serially: the checker's POST runs the same pass, and two at once
+      // would both send what neither had yet recorded as sent.
+      const result = await runTicketAlertsSerially();
       if (result.alerted || result.failed) {
         console.log(`[cron] Ticket alerts: told ${result.alerted} user(s), ${result.failed} failed, ${result.follows} follow(s) read.`);
       }

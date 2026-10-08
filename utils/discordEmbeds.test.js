@@ -28,6 +28,25 @@ describe('buildDiscordEmbeds', () => {
     expect(embed.fields[0].value).toBe('[Debaser](https://tickets.example/1)');
   });
 
+  it('links each vendor ahead of the listing, with the price and opening above them', () => {
+    const [embed] = buildDiscordEmbeds({
+      title: 'x',
+      concerts: [concert({
+        note: 'On sale now',
+        details: ['€45–89', 'Spotted on sale at 10:02'],
+        links: [{ label: 'Ticket*master', url: 'https://www.ticketmaster.se/1' }, { label: '', url: 'https://x.test' }],
+        tickets: { label: 'Tickets on Songkick', url: 'https://www.songkick.com/concerts/1' },
+      })],
+    });
+    expect(embed.fields[0].value).toBe([
+      'Debaser',
+      '**On sale now**',
+      '€45–89 · Spotted on sale at 10:02',
+      // A vendor's name is read as markdown, so it is escaped like a band's.
+      '🎟 [Ticket\\*master](https://www.ticketmaster.se/1) · [Tickets on Songkick](https://www.songkick.com/concerts/1)',
+    ].join('\n'));
+  });
+
   it('says the date is TBA when there is none', () => {
     const [embed] = buildDiscordEmbeds({ title: 'x', concerts: [concert({ concert_date: null })] });
     expect(embed.fields[0].name).toBe('TBA — Stockholm, SE');

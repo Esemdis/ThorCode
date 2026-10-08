@@ -1,7 +1,8 @@
 /**
  * Telling the people who follow a show what it is doing: the morning its
  * tickets go on sale, when they are on sale, when they sell out, if they come
- * back, and which acts have joined its bill.
+ * back, which acts have joined its bill, and whether it is still going ahead
+ * where and when it was.
  *
  * The bill is here rather than in the scrape digest (routes/data/wishlists/
  * notify.js) because that digest is about acts — it reaches you because an act
@@ -59,6 +60,11 @@ const ALERTS = {
   back: "Tickets are back on sale",
   on_sale: "On sale now",
   sale_today: "On sale today",
+  // The same goes for a move, which says from where to where.
+  moved: "Moved",
+  cancelled: "Cancelled",
+  postponed: "Postponed",
+  reinstated: "Going ahead again",
 };
 
 // What a reminder says. A time we were given is worth naming; one we assumed
@@ -114,6 +120,147 @@ function billTold(told) {
   } catch {
     return null;
   }
+}
+
+// Whether the show is going ahead, as status_told records it: the checker
+// stores only the two states that are news, and null for the rest.
+const statusOf = (concert) => concert.event_status ?? "scheduled";
+
+/**
+ * What to tell a follower about whether a show is going ahead, if anything.
+ *
+ * Null for a follow that has never recorded one, for the reason billTold
+ * gives: what the show was doing when this shipped is not news.
+ *
+ * @param {string|null} told - ConcertFollow.status_told
+ * @param {string} status - statusOf(concert)
+ * @returns {'cancelled'|'postponed'|'reinstated'|null}
+ */
+function statusAlert(told, status) {
+  if (told == null || told === status) return null;
+  if (status === "cancelled" || status === "postponed") return status;
+  return status === "scheduled" ? "reinstated" : null;
+}
+
+// A show's calendar day, read in UTC as concert_date is filed.
+const dayOf = (value) => {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
+};
+
+/**
+ * Where and when a show has gone since this follower was last told, if it has.
+ *
+ * By the day, not the instant: a start time filled in for the same night is
+ * not a move. A follow that never recorded either is told nothing about it.
+ *
+ * @param {{date_told: Date|null, venue_told: string|null}} follow
+ * @param {{concert_date: Date|null, venue: string}} concert
+ * @returns {{date?: {from: Date, to: Date}, venue?: {from: string, to: string}}}
+ */
+function movedSince(follow, concert) {
+  const moved = {};
+  const day = dayOf(concert.concert_date);
+  if (follow.date_told && day && day !== dayOf(follow.date_told)) {
+    moved.date = { from: new Date(follow.date_told), to: new Date(concert.concert_date) };
+  }
+  if (follow.venue_told && concert.venue && concert.venue !== follow.venue_told) {
+    moved.venue = { from: follow.venue_told, to: concert.venue };
+  }
+  return moved;
+}
+
+// Spelled out for the reason discordEmbeds.js gives: ICU's en-GB month names
+// depend on how the server's Node was built.
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const dayLabel = (date) => `${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]} ${date.getUTCFullYear()}`;
+
+// "Moved to 14 Mar 2027 (was 13 Mar 2027)", "Moved to Annexet (was Fållan)",
+// or both, joined.
+function movedLabel(moved) {
+  const parts = [];
+  if (moved.date) parts.push(`to ${dayLabel(moved.date.to)} (was ${dayLabel(moved.date.from)})`);
+  if (moved.venue) parts.push(`to ${moved.venue.to} (was ${moved.venue.from})`);
+  return `${ALERTS.moved} ${parts.join(" and ")}`;
+}
+
+const CURRENCY_SIGNS = { EUR: "€", GBP: "£", USD: "$" };
+
+/**
+ * A show's price as a line in an alert: "€45–89", "From £30", "450–690 SEK".
+ *
+ * "From" where only the bottom is known, because that is what the page said:
+ * Songkick's text reads "From €34.50" and nothing about the top.
+ *
+ * @param {{price_min?: number|null, price_max?: number|null, price_currency?: string|null}} concert
+ * @returns {string|null}
+ */
+function priceLabel({ price_min: min, price_max: max, price_currency: currency }) {
+  if (min == null && max == null) return null;
+  const amount = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2));
+  const sign = CURRENCY_SIGNS[currency];
+  const money = (text) => (sign ? `${sign}${text}` : currency ? `${text} ${currency}` : text);
+  if (min == null) return `Up to ${money(amount(max))}`;
+  if (max == null) return `From ${money(amount(min))}`;
+  return money(min === max ? amount(min) : `${amount(min)}–${amount(max)}`);
+}
+
+// Which vendors are worth a link, for the alerts that are about buying: the
+// ones selling, or for the reminder the ones about to.
+const VENDOR_STATES_FOR = {
+  on_sale: ["on_sale"],
+  back: ["on_sale"],
+  sale_today: ["on_sale_soon", "on_sale"],
+};
+// A festival can list a dozen sellers; three is a choice, a dozen is a page.
+const MAX_VENDOR_LINKS = 3;
+
+/**
+ * Where to buy, vendor by vendor, as the checker read them off the listing.
+ *
+ * @param {{ticket_vendors?: object[]|null}} concert
+ * @param {string} kind - the alert
+ * @returns {{label: string, url: string}[]}
+ */
+function vendorLinks(concert, kind) {
+  const states = VENDOR_STATES_FOR[kind];
+  if (!states || !Array.isArray(concert.ticket_vendors)) return [];
+  const seen = new Set();
+  const links = [];
+  for (const vendor of concert.ticket_vendors) {
+    const url = vendor && states.includes(vendor.state) ? safeHref(vendor.url) : null;
+    const label = typeof vendor?.name === "string" && vendor.name.trim() ? vendor.name.trim() : "Tickets";
+    if (!url || seen.has(label.toLowerCase())) continue;
+    seen.add(label.toLowerCase());
+    links.push({ label, url });
+    if (links.length === MAX_VENDOR_LINKS) break;
+  }
+  return links;
+}
+
+// How recent a sale's opening has to be for the alert to say when it was
+// spotted. Older than this it is not the news, merely a fact about the show.
+const SPOTTED_WITHIN_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * The lines under an alert that say more than the alert itself: what the
+ * tickets cost, and when the sale was seen to open.
+ *
+ * @returns {string[]}
+ */
+function alertDetails(concert, kind, { timeZone, now }) {
+  const details = [];
+  if (VENDOR_STATES_FOR[kind]) {
+    const price = priceLabel(concert);
+    if (price) details.push(price);
+  }
+  const opened = concert.tickets_opened_at ? new Date(concert.tickets_opened_at) : null;
+  if ((kind === "on_sale" || kind === "back") && opened && now.getTime() - opened.getTime() <= SPOTTED_WITHIN_MS) {
+    const at = new Intl.DateTimeFormat("en-GB", { timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(opened);
+    details.push(`Spotted on sale at ${at}`);
+  }
+  return details;
 }
 
 // Everyone on the bill now, by name: the acts with a Band row and the plain
@@ -212,7 +359,9 @@ function mentionFor(settings) {
 async function postToDiscord(webhook, alerts, settings) {
   const embeds = buildDiscordEmbeds({
     title: alerts.length === 1 ? alerts[0].headline : "News about shows you follow",
-    concerts: alerts.map(({ concert, label }) => ({ ...concert, note: label, tickets: ticketLink(concert) })),
+    concerts: alerts.map(({ concert, label, links, details }) => ({
+      ...concert, note: label, tickets: ticketLink(concert), links, details,
+    })),
   });
   const content = mentionFor(settings);
   for (const [i, embed] of embeds.entries()) {
@@ -222,6 +371,10 @@ async function postToDiscord(webhook, alerts, settings) {
 
 /**
  * One pass over every follow of a show still to come.
+ *
+ * Not to be run twice at once: two passes reading the same follows before
+ * either has written would both send the same news. runTicketAlertsSerially
+ * is the way in for anything but a test.
  *
  * @param {{now?: Date}} [options]
  * @returns {Promise<{follows: number, alerted: number, failed: number}>}
@@ -239,12 +392,20 @@ async function runTicketAlerts({ now = new Date() } = {}) {
       told_state: true,
       reminded_at: true,
       lineup_told: true,
+      status_told: true,
+      date_told: true,
+      venue_told: true,
       concert_rel: {
         select: {
           id: true, name: true, venue: true, city: true, country: true, concert_date: true, url: true,
           // The listing the alert links to, and the site to name it after.
           source: true,
           metadata: true, on_sale: true, sold_out: true, ticket_sale_start: true,
+          // What the followed-show checker read off the listing: who sells it
+          // and for how much, when the sale was seen to open, and whether the
+          // show is still going ahead.
+          price_min: true, price_max: true, price_currency: true,
+          ticket_vendors: true, tickets_opened_at: true, event_status: true,
           bands: { select: { band_rel: { select: { name: true } } } },
         },
       },
@@ -259,10 +420,17 @@ async function runTicketAlerts({ now = new Date() } = {}) {
     const state = ticketState(concert, now);
     const zone = zoneOf(follow.user_rel.settings);
     const sale = saleInstant(concert, zone);
-    const kind = alertFor(follow, state, { sale, now });
+    const status = statusOf(concert);
+    const statusKind = statusAlert(follow.status_told, status);
+    // A cancelled show's tickets and bill are not news any more, only that it
+    // is off. They are still recorded below, so nothing is owed if it returns.
+    const cancelled = status === "cancelled";
+    const kind = cancelled ? null : alertFor(follow, state, { sale, now });
     const bill = billNow(concert);
     const told = billTold(follow.lineup_told);
-    const joined = billJoined(told, bill);
+    const joined = cancelled ? [] : billJoined(told, bill);
+    const shift = movedSince(follow, concert);
+    const day = dayOf(concert.concert_date);
 
     // What has moved since this follower was last told. Only the fields that
     // actually changed: with nothing to say this is the whole write, and it
@@ -270,19 +438,34 @@ async function runTicketAlerts({ now = new Date() } = {}) {
     const moved = {
       ...(state !== follow.told_state && { told_state: state }),
       ...(billMoved(told, bill) && { lineup_told: JSON.stringify(bill) }),
+      ...(status !== follow.status_told && { status_told: status }),
+      ...(day && day !== dayOf(follow.date_told) && { date_told: new Date(concert.concert_date) }),
+      ...(concert.venue && concert.venue !== follow.venue_told && { venue_told: concert.venue }),
     };
 
-    // A show can have news of both kinds in one pass — a sell-out and an act
-    // joining — and each is its own line in the message.
+    // A show can have news of several kinds in one pass — a sell-out and an
+    // act joining — and each is its own line in the message. Whether it is on
+    // at all comes first, then where and when, then its tickets.
     const alerts = [];
+    const title = showTitle(concert);
+    if (statusKind) {
+      alerts.push({ concert, label: ALERTS[statusKind], headline: `${ALERTS[statusKind]}: ${title}` });
+    }
+    if (shift.date || shift.venue) {
+      alerts.push({ concert, label: movedLabel(shift), headline: `${ALERTS.moved}: ${title}` });
+    }
     if (kind) {
       const label = labelFor(kind, sale, zone);
-      alerts.push({ concert, label, headline: `${label}: ${showTitle(concert)}` });
+      alerts.push({
+        concert, label, headline: `${label}: ${title}`,
+        links: vendorLinks(concert, kind),
+        details: alertDetails(concert, kind, { timeZone: zone, now }),
+      });
     }
     if (joined.length > 0) {
       // The acts are named in the line itself, so the headline of a message
       // about nothing else names the show instead.
-      alerts.push({ concert, label: billLabel(joined), headline: `${ALERTS.lineup}: ${showTitle(concert)}` });
+      alerts.push({ concert, label: billLabel(joined), headline: `${ALERTS.lineup}: ${title}` });
     }
 
     if (alerts.length === 0) {
@@ -327,7 +510,7 @@ async function runTicketAlerts({ now = new Date() } = {}) {
       try {
         await mail.sendTicketAlertEmail({
           to: user.email,
-          items: alerts.map(({ concert, label, headline }) => ({
+          items: alerts.map(({ concert, label, headline, links, details }) => ({
             title: showTitle(concert),
             alert: label,
             headline,
@@ -340,6 +523,10 @@ async function runTicketAlerts({ now = new Date() } = {}) {
             // link too, but an alert that tickets are open wants one that
             // says so.
             tickets: ticketLink(concert),
+            // The vendors themselves, where the checker has read them, and
+            // what the tickets cost.
+            links: links ?? [],
+            details: details ?? [],
           })),
         });
         delivered = true;
@@ -364,4 +551,27 @@ async function runTicketAlerts({ now = new Date() } = {}) {
   return { follows: follows.length, alerted, failed };
 }
 
-module.exports = { alertFor, saleInstant, billJoined, billLabel, ticketLink, runTicketAlerts, REMIND_BEFORE_MIN, ASSUMED_SALE_HOUR };
+// The pass in progress, or the last one: each run waits for the one before.
+let lastRun = Promise.resolve();
+
+/**
+ * runTicketAlerts, one at a time.
+ *
+ * Two callers: the cron, every five minutes, and the followed-show checker's
+ * POST, the moment it has written what it read — which is the point of
+ * checking every five minutes, rather than waiting up to five more to tell
+ * anyone. One process, so a promise chain is enough to keep them apart.
+ *
+ * @param {{now?: Date}} [options]
+ */
+function runTicketAlertsSerially(options) {
+  const run = lastRun.then(() => runTicketAlerts(options));
+  lastRun = run.catch(() => {});
+  return run;
+}
+
+module.exports = {
+  alertFor, saleInstant, billJoined, billLabel, ticketLink, statusAlert, movedSince, movedLabel,
+  priceLabel, vendorLinks, alertDetails, runTicketAlerts, runTicketAlertsSerially,
+  REMIND_BEFORE_MIN, ASSUMED_SALE_HOUR,
+};

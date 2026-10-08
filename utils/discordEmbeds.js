@@ -43,8 +43,20 @@ function buildDiscordEmbeds({ title, concerts }) {
     // A line of its own for the listing, where the caller asked for one: the
     // venue above links to the same page, but an alert about tickets should
     // not make someone work out that the venue's name is the way to them.
-    const tickets = concert.tickets?.url ? `\n🎟 [${escapeMarkdown(concert.tickets.label)}](${concert.tickets.url})` : "";
-    const head = venueStr + note + tickets + (added.length > 300 ? `${added.slice(0, 299)}…` : added);
+    //
+    // Ahead of it, the vendors themselves, where the followed-show checker has
+    // read them off the listing: the listing is a page of links, these are
+    // the links. And under the note, what the tickets cost and when the sale
+    // was seen to open.
+    const links = [
+      ...(Array.isArray(concert.links) ? concert.links : []).filter((l) => l?.url && l?.label),
+      ...(concert.tickets?.url ? [concert.tickets] : []),
+    ].map((l) => `[${escapeMarkdown(String(l.label).slice(0, 60))}](${l.url})`);
+    const tickets = links.length ? `\n🎟 ${links.join(" · ")}` : "";
+    const details = Array.isArray(concert.details) && concert.details.length
+      ? `\n${concert.details.filter((d) => typeof d === "string" && d).map((d) => escapeMarkdown(d.slice(0, 80))).join(" · ")}`
+      : "";
+    const head = venueStr + note + details + tickets + (added.length > 300 ? `${added.slice(0, 299)}…` : added);
 
     let lineup = [];
     try { lineup = JSON.parse(concert.metadata || "[]"); } catch {}

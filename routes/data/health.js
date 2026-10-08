@@ -38,6 +38,12 @@ const FORECAST_DAYS = 16;
 // thread back to the other.
 const SETLIST_STALE_DAYS = 3;
 
+// A followed show the checker has not read in this long is one it is behind
+// on: its cadence is half an hour, so two hours is four reads missed.
+const FOLLOW_STALE_MS = 2 * 60 * 60 * 1000;
+// The run of failures utils/followChecks.js starts backing off at.
+const FOLLOW_FAILING = 3;
+
 /**
  * GET /data/concerts/health — how much work each nightly job has waiting.
  *
@@ -53,6 +59,15 @@ router.get(
       const forecastEnd = new Date(now.getTime() + FORECAST_DAYS * DAY_MS);
       const setlistStale = new Date(now.getTime() - SETLIST_STALE_DAYS * DAY_MS);
       const aDayAgo = new Date(now.getTime() - DAY_MS);
+      const followStale = new Date(now.getTime() - FOLLOW_STALE_MS);
+      const startOfToday = new Date(now);
+      startOfToday.setUTCHours(0, 0, 0, 0);
+      // The checker's queue as GET /follows/check-pending reads it, less the
+      // cadence: every followed show still to come.
+      const followed = {
+        follows: { some: {} },
+        OR: [{ concert_date: null }, { concert_date: { gte: startOfToday } }],
+      };
 
       // The backfill's queue, spelled exactly as utils/setlistBackfill.js
       // spells it: a past show someone attended, still missing a setlist for a
@@ -69,6 +84,7 @@ router.get(
         bandsTotal, bandsNoSetlist, bandsStaleSetlist, bandsNoSpotifyId, bandsPhotoStale,
         upcoming, upcomingNoCoords, weatherMissing, weatherRefreshable,
         setlistQueue, setlistNeverChecked, setlistCheckedToday,
+        followedShows, followNeverChecked, followStaleCount, followFailing, followLatest, followFailure,
       ] = await prisma.$transaction([
         prisma.band.count(),
         prisma.band.count({ where: { setlist: { equals: Prisma.DbNull } } }),
@@ -115,6 +131,20 @@ router.get(
         prisma.concert.count({
           where: { ...backfillQueue, setlist_checked_at: { gte: aDayAgo } },
         }),
+
+        // The followed-show checker, which has no button but the per-show
+        // "Check now": whether it is keeping up, and what it cannot read.
+        prisma.concert.count({ where: followed }),
+        prisma.concert.count({ where: { ...followed, tickets_checked_at: null } }),
+        prisma.concert.count({ where: { ...followed, tickets_checked_at: { lt: followStale } } }),
+        prisma.concert.count({ where: { ...followed, ticket_check_failures: { gte: FOLLOW_FAILING } } }),
+        prisma.concert.aggregate({ where: followed, _max: { tickets_checked_at: true } }),
+        // The latest failure, so the line can say why rather than only how many.
+        prisma.concert.findFirst({
+          where: { ...followed, ticket_check_failures: { gte: FOLLOW_FAILING } },
+          orderBy: { ticket_check_attempted_at: "desc" },
+          select: { name: true, venue: true, ticket_check_error: true },
+        }),
       ]);
 
       // Not a queue like everything else here, and deliberately included
@@ -148,6 +178,16 @@ router.get(
           queue: setlistQueue,
           never_checked: setlistNeverChecked,
           checked_today: setlistCheckedToday,
+        },
+        follow_checks: {
+          followed: followedShows,
+          never_checked: followNeverChecked,
+          stale: followStaleCount,
+          failing: followFailing,
+          last_checked_at: followLatest?._max?.tickets_checked_at ?? null,
+          last_error: followFailure
+            ? { show: followFailure.name || followFailure.venue, error: followFailure.ticket_check_error }
+            : null,
         },
         archive,
       });

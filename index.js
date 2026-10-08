@@ -17,6 +17,7 @@ app.use("/data/concerts", require("./routes/data/notifications"))
 app.use("/data/concerts", require("./routes/data/playlists"))
 app.use("/data/concerts", require("./routes/data/media"))
 app.use("/data/concerts", require("./routes/data/health"))
+app.use("/data/concerts", require("./routes/data/followChecks"))
 app.use("/data/cities", require("./routes/data/cities"))
 app.use("/oauth/spotify", require("./routes/oauth/spotify"));
 app.use("/oauth/tidal", require("./routes/oauth/tidal"));
