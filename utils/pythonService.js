@@ -84,6 +84,39 @@ async function pythonServicePost(path, body = {}, config = {}, client = axios) {
 }
 
 /**
+ * GET from the Python sync service, falling back to a second host if the first
+ * cannot be reached.
+ *
+ * The fallback rule is the opposite way round from `pythonServicePost`'s, and
+ * for the same reason: a POST there is a worker being told to scrape, so a
+ * host that answered has already done the work and must never be asked twice.
+ * A GET only reads, so falling back is free — and an unreachable primary is
+ * exactly when a reader wants the other host's answer.
+ *
+ * @param {string} path - Leading slash, e.g. '/sync-history'.
+ * @param {object} [config] - Passed to axios; timeouts belong here.
+ * @param {{ get: Function }} [client] - HTTP client; injectable for the same
+ *   reason as above — vitest externalises axios for this CommonJS module.
+ * @returns {Promise<import('axios').AxiosResponse>}
+ */
+async function pythonServiceGet(path, config = {}, client = axios) {
+  const primary = process.env.PYTHON_SERVICE_URL;
+  const fallback = process.env.PYTHON_SERVICE_FALLBACK_URL;
+
+  const authConfig = {
+    ...config,
+    headers: { ...config.headers, Authorization: `Bearer ${process.env.SCRAPER_TOKEN}` },
+  };
+
+  try {
+    return await client.get(`${primary}${path}`, authConfig);
+  } catch (error) {
+    if (!shouldFallBack(error) || !fallback || fallback === primary) throw error;
+    return client.get(`${fallback}${path}`, authConfig);
+  }
+}
+
+/**
  * The client-facing status and message for a failed call to the sync service.
  *
  * Every one of these used to become `500 { error: err.message }`, which put
@@ -99,9 +132,12 @@ async function pythonServicePost(path, body = {}, config = {}, client = axios) {
  * costs nothing.
  *
  * @param {Error} error - The error thrown by `pythonServicePost`.
+ * @param {{ read?: boolean }} [options] - `read: true` for a call that only
+ *   reads, where the two messages about a job having been started would be
+ *   untrue: nothing ran, and nothing is still running.
  * @returns {{ status: number, message: string }}
  */
-function pythonServiceFailure(error) {
+function pythonServiceFailure(error, { read = false } = {}) {
   const upstream = error?.response?.status;
 
   if (upstream === 401 || upstream === 403) {
@@ -126,10 +162,15 @@ function pythonServiceFailure(error) {
   // Sent, and no answer: not safe to call a failure, since the job may be
   // running, and not a fault on this side either.
   if (NO_ANSWER.has(error?.code) || error?.request) {
-    return { status: 504, message: 'The sync service did not answer in time. The job may still be running.' };
+    return {
+      status: 504,
+      message: read
+        ? 'The sync service did not answer in time.'
+        : 'The sync service did not answer in time. The job may still be running.',
+    };
   }
 
-  return { status: 500, message: 'The sync request could not be sent.' };
+  return { status: 500, message: read ? 'The sync service could not be asked.' : 'The sync request could not be sent.' };
 }
 
-module.exports = { shouldFallBack, pythonServicePost, pythonServiceFailure };
+module.exports = { shouldFallBack, pythonServicePost, pythonServiceGet, pythonServiceFailure };

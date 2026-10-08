@@ -21,7 +21,7 @@ The API runs as one Node process against Postgres through Prisma. Two other serv
 | Photo and video archive | `/data/concerts` | `routes/data/media/`. Covers upload, tagging, 12-hour share links and byte serving. See [docs/concert-media-runbook.md](docs/concert-media-runbook.md). |
 | Setlist playlists | `/data/concerts`, `/oauth/spotify`, `/oauth/tidal` | `routes/data/playlists.js` builds a Spotify or Tidal playlist from a night's setlists, on whichever the user chose in Settings. |
 | Cities | `/data/cities` | City list, and weather written in bulk by the sync service. |
-| Health | `/data/concerts/health` | How much work each nightly job has waiting, for the admin panel. |
+| Health | `/data/concerts/health` | How much work each nightly job has waiting, for the admin panel. `/data/concerts/scraper-health` proxies the sync service's own `/sync-history` next to it — per band and source, when Songkick and Bandsintown last worked, what changed and anything that looks wrong. Separate from `/health` because it depends on another host being up, and a sync service that is down must not take the local counts with it. |
 | Travel | `/travel/*` | `routes/travel/`. Covers trips, places and day plans ([docs/day-planning.md](docs/day-planning.md)), todos, estimates, ECB exchange rates, gear, loadouts, reviews, a wishlist and a Gemini weather verdict. |
 
 Auth is a JWT in `Authorization: Bearer`. Roles are `USER`, `ADMIN` and `SYSTEM`. `SYSTEM` is the role of the machine user the sync service signs in as. `scripts/generate-service-token.js` mints its token.

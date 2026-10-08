@@ -1,12 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import { shouldFallBack, pythonServicePost, pythonServiceFailure } from './pythonService.js';
+import { shouldFallBack, pythonServicePost, pythonServiceGet, pythonServiceFailure } from './pythonService.js';
 
 // A stand-in client rather than a module mock: vitest externalises axios for
 // this CommonJS module, so vi.mock silently does nothing and the tests reach
 // the real network.
 const post = vi.fn();
-const client = { post };
+const get = vi.fn();
+const client = { post, get };
 
 const connectionError = (code) => Object.assign(new Error(code), { code, request: {} });
 const httpError = (status) => Object.assign(new Error(`Request failed with status ${status}`), {
@@ -103,6 +104,48 @@ describe('pythonServicePost', () => {
   });
 });
 
+describe('pythonServiceGet', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.PYTHON_SERVICE_URL = 'http://127.0.0.1:8000';
+    process.env.PYTHON_SERVICE_FALLBACK_URL = 'https://sync.example.dev';
+  });
+
+  afterEach(() => {
+    delete process.env.PYTHON_SERVICE_FALLBACK_URL;
+  });
+
+  it('sends the shared secret, since the read is behind it too', async () => {
+    get.mockResolvedValue({ data: { bands: [] } });
+
+    await pythonServiceGet('/sync-history', {}, client);
+
+    expect(get.mock.calls[0][0]).toBe('http://127.0.0.1:8000/sync-history');
+    expect(get.mock.calls[0][1].headers.Authorization).toMatch(/^Bearer /);
+  });
+
+  it('falls back whenever the first host could not be reached', async () => {
+    // The opposite way round from the POST rule, and for the same reason: a
+    // read does no work, so asking the other host costs nothing — where a
+    // POST that arrived has already started a scrape.
+    get
+      .mockRejectedValueOnce(connectionError('ECONNREFUSED'))
+      .mockResolvedValueOnce({ data: { bands: [] } });
+
+    const res = await pythonServiceGet('/sync-history', {}, client);
+
+    expect(res.data).toEqual({ bands: [] });
+    expect(get.mock.calls[1][0]).toBe('https://sync.example.dev/sync-history');
+  });
+
+  it('does not fall back when the service answered', async () => {
+    get.mockRejectedValue(httpError(401));
+
+    await expect(pythonServiceGet('/sync-history', {}, client)).rejects.toThrow();
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('pythonServiceFailure', () => {
   it('names the shared secret when the sync service rejects our credentials', () => {
     // The failure this exists for: the service started requiring SCRAPER_TOKEN,
@@ -145,6 +188,19 @@ describe('pythonServiceFailure', () => {
     const { status, message } = pythonServiceFailure(connectionError('ECONNABORTED'));
     expect(status).toBe(504);
     expect(message).toMatch(/may still be running/);
+  });
+
+  it('does not tell a reader that a job may still be running', () => {
+    // Nothing was started by a read, so both of the messages about a job are
+    // untrue there — and "may still be running" would send someone looking
+    // for a sync that never began.
+    const timedOut = pythonServiceFailure(connectionError('ECONNABORTED'), { read: true });
+    expect(timedOut.status).toBe(504);
+    expect(timedOut.message).not.toMatch(/still be running/);
+
+    const neverSent = pythonServiceFailure(new TypeError('bad argument'), { read: true });
+    expect(neverSent.status).toBe(500);
+    expect(neverSent.message).not.toMatch(/sync request/);
   });
 
   it('keeps a bug on our own side a plain server error', () => {

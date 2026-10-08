@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 
@@ -99,8 +99,70 @@ describe('GET /health', () => {
   });
 });
 
+describe('GET /scraper-health', () => {
+  // Served by a real socket rather than a stubbed client: the router requires
+  // pythonService through CommonJS, so vi.mock cannot reach it — the same
+  // reason installFakePrisma exists.
+  let server;
+  let answer = () => [200, { bands: [], alerts: [] }];
+
+  beforeAll(async () => {
+    const { createServer } = await import('node:http');
+    server = createServer((req, res) => {
+      const [status, body] = answer(req);
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    process.env.PYTHON_SERVICE_URL = `http://127.0.0.1:${server.address().port}`;
+    delete process.env.PYTHON_SERVICE_FALLBACK_URL;
+  });
+
+  afterAll(() => new Promise((resolve) => server.close(resolve)));
+
+  it('hands the sync service’s own report straight through', async () => {
+    // A proxy on purpose. Only the sync service knows any of this: its
+    // scrapers' answers reach this database as concerts and nothing else, so
+    // reshaping it here could only lose something.
+    answer = () => [200, {
+      bands: [{ band: 'Opeth', sources: { songkick: { ok: true, kept: 12 } } }],
+      alerts: [{ band: 'Opeth', source: 'bandsintown', level: 'hard' }],
+    }];
+
+    const res = await request(app).get('/scraper-health').set(...authHeader(admin)).expect(200);
+
+    expect(res.body.bands[0].sources.songkick.kept).toBe(12);
+    expect(res.body.alerts[0].level).toBe('hard');
+  });
+
+  it('asks with the shared secret', async () => {
+    let sent;
+    answer = (req) => {
+      sent = req.headers.authorization;
+      return [200, {}];
+    };
+    process.env.SCRAPER_TOKEN = 's3cret';
+
+    await request(app).get('/scraper-health').set(...authHeader(admin)).expect(200);
+
+    expect(sent).toBe('Bearer s3cret');
+  });
+
+  it('names the shared secret when the sync service turns the read away', async () => {
+    answer = () => [401, { detail: 'Unauthorized' }];
+
+    const res = await request(app).get('/scraper-health').set(...authHeader(admin)).expect(502);
+
+    expect(res.body.error).toMatch(/SCRAPER_TOKEN/);
+  });
+
+  it('turns a plain user away', async () => {
+    await request(app).get('/scraper-health').set(...authHeader({ role: 'USER' })).expect(403);
+  });
+});
+
 describe('the routing surface', () => {
-  it('registers exactly one route, behind auth, a role check and a limiter', () => {
-    expect(routeManifest(router)).toEqual(['GET /health [4]']);
+  it('registers both reads, behind auth, a role check and a limiter', () => {
+    expect(routeManifest(router)).toEqual(['GET /health [4]', 'GET /scraper-health [4]']);
   });
 });

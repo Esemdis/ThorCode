@@ -21,6 +21,8 @@ const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
 const { rateLimiter } = require("../../utils/rateLimiter");
 const { archiveStatus } = require("../../utils/mediaHealth");
+const { pythonServiceGet, pythonServiceFailure } = require("../../utils/pythonService");
+const { error: sendError } = require("../../utils/apiResponse");
 
 const rateLimit = rateLimiter({
   message: "Too many requests to the health route, please try again later.",
@@ -154,6 +156,39 @@ router.get(
     } catch (error) {
       console.error("Error building health counts:", error);
       res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+/**
+ * GET /data/concerts/scraper-health — how the scrapers themselves are doing.
+ *
+ * A straight proxy of the sync service's own `/sync-history`, which is the
+ * only thing that knows: the scrapers' answers never reach this database
+ * except as concerts, so nothing here can say whether Songkick worked this
+ * morning, how much it listed, or whether what it listed looked wrong.
+ *
+ * Separate from `/health` above rather than folded into it, because this one
+ * depends on another host being up. A sync service that is down or slow must
+ * not take the nightly-job counts down with it — those are local queries that
+ * always work, and they annotate four buttons an admin is looking at right
+ * now.
+ *
+ * Nothing is started by this. It is the one call to the sync service that only
+ * reads, which is why `read: true` below: the usual "the job may still be
+ * running" would be untrue.
+ */
+router.get(
+  "/scraper-health",
+  [auth, roleCheck(["ADMIN"]), rateLimit],
+  async (_req, res) => {
+    try {
+      const { data } = await pythonServiceGet("/sync-history", { timeout: 10000 });
+      res.json(data);
+    } catch (error) {
+      console.error("Error reading scraper health:", error.message);
+      const { status, message } = pythonServiceFailure(error, { read: true });
+      sendError(res, status, message);
     }
   }
 );
