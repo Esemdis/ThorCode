@@ -7,6 +7,7 @@ const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
 const { fail } = require("../../utils/apiResponse");
 const { normaliseLoadoutInput } = require("../../utils/travel/loadoutInput");
+const { serialise } = require("../../utils/serialQueue");
 
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
@@ -206,21 +207,44 @@ router.post("/:id/apply/:tripId", [param("id").isInt(), param("tripId").isInt()]
     if (!loadout) return res.status(404).json({ error: "Loadout not found" });
     if (!trip) return res.status(404).json({ error: "Trip not found" });
 
-    const toAdd = loadout.entries.map((entry) => ({
-      trip_id: tripId,
-      name: entry.gear_item_rel.name,
-      category: entry.gear_item_rel.category || null,
-      gear_item_id: entry.gear_item_id,
-      status: "BOUGHT",
-      worn: entry.worn || false,
-      bag_id: entry.bag_id || null,
-    }));
+    // One apply at a time per trip: the read below decides what to create, so
+    // two overlapping applies — a double click, or a retry of a request that
+    // did land — each read the same list and packed the whole loadout twice.
+    // In-process only, which covers the API; there is no unique index on
+    // (trip_id, gear_item_id) to catch a second process, and there cannot be
+    // one until any duplicates already stored are cleaned up.
+    const { created, skipped } = await serialise(`trip-items:${tripId}`, async () => {
+      // Only the gear this loadout carries, and only rows that came from gear:
+      // a hand-written "toothbrush" has no gear id and must not stand in the
+      // way of packing the brush the loadout names.
+      const packed = await prisma.tripItem.findMany({
+        where: { trip_id: tripId, gear_item_id: { in: loadout.entries.map((entry) => entry.gear_item_id) } },
+        select: { gear_item_id: true },
+      });
+      const alreadyPacked = new Set(packed.map((item) => item.gear_item_id));
 
-    const created = await prisma.$transaction(
-      toAdd.map((item) => prisma.tripItem.create({ data: item }))
-    );
+      const toAdd = loadout.entries
+        .filter((entry) => !alreadyPacked.has(entry.gear_item_id))
+        .map((entry) => ({
+          trip_id: tripId,
+          name: entry.gear_item_rel.name,
+          category: entry.gear_item_rel.category || null,
+          gear_item_id: entry.gear_item_id,
+          status: "BOUGHT",
+          worn: entry.worn || false,
+          bag_id: entry.bag_id || null,
+        }));
 
-    res.json({ data: { added: created.length, items: created } });
+      return {
+        created: await prisma.$transaction(toAdd.map((item) => prisma.tripItem.create({ data: item }))),
+        skipped: loadout.entries.length - toAdd.length,
+      };
+    });
+
+    // `added` and `items` are what the client reads — the count it reports and
+    // the rows it appends to the list it holds — so `items` stays the rows this
+    // call created and nothing else. `skipped` is new.
+    res.json({ data: { added: created.length, skipped, items: created } });
   } catch (err) {
     fail(res, err, { context: `POST apply loadout ${loadoutId} to trip ${tripId}` });
   }
