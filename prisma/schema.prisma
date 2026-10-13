@@ -447,12 +447,12 @@ model Trip {
   end_date             DateTime?         @db.Date
   notes                String?           @db.Text
   weight_budget        Int?
-  money_budget         Decimal?          @db.Decimal(10, 2)
+  money_budget         Decimal?          @db.Decimal(12, 2)
   currency             String            @default("SEK") @db.VarChar(3)
-  budget_flights       Decimal?          @db.Decimal(10, 2)
-  budget_hotel         Decimal?          @db.Decimal(10, 2)
-  budget_entertainment Decimal?          @db.Decimal(10, 2)
-  budget_food          Decimal?          @db.Decimal(10, 2)
+  budget_flights       Decimal?          @db.Decimal(12, 2)
+  budget_hotel         Decimal?          @db.Decimal(12, 2)
+  budget_entertainment Decimal?          @db.Decimal(12, 2)
+  budget_food          Decimal?          @db.Decimal(12, 2)
   weather_data         Json?
   weather_updated_at   DateTime?
   exchange_rates       Json?
@@ -593,7 +593,7 @@ model ExpenseEstimate {
   id         Int       @id @default(autoincrement())
   trip_id    Int
   category   String    @db.VarChar(100)
-  amount     Decimal   @db.Decimal(10, 2)
+  amount     Decimal   @db.Decimal(12, 2)
   currency   String    @default("SEK") @db.VarChar(3)
   date       DateTime? @db.Date
   end_date   DateTime? @db.Date
@@ -656,8 +656,8 @@ model GearItem {
   retired          Boolean        @default(false)
   replaced_by_id   Int?
   photo            String?        @db.Text
-  retail_price     Decimal?       @db.Decimal(10, 2)
-  bought_for       Decimal?       @db.Decimal(10, 2)
+  retail_price     Decimal?       @db.Decimal(12, 2)
+  bought_for       Decimal?       @db.Decimal(12, 2)
   currency         String         @default("SEK") @db.VarChar(3)
   fill_level       Int?
   price_irrelevant Boolean        @default(false)

@@ -13,8 +13,11 @@
 
 const INT32_MAX = 2147483647;
 const INT32_MIN = -2147483648;
-// Decimal(10, 2): eight digits before the point.
-const DECIMAL_MAX = 99999999.99;
+// Decimal(12, 2): ten digits before the point. It was (10, 2), and eight
+// digits refused a two-week budget in dong or rupiah, where 100,000,000 is a
+// few thousand euros. Every travel money column shares this bound, so it must
+// move with all of them or a value passes here and overflows the column.
+const DECIMAL_MAX = 9999999999.99;
 
 const blank = (v) => v === null || v === undefined || v === '';
 

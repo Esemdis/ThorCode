@@ -23,6 +23,19 @@ describe('normaliseEstimateInput', () => {
     expect(normaliseEstimateInput({ category: 'Refund', amount: -200 }).data.amount).toBe(-200);
   });
 
+  it('takes one hotel stay logged in rupiah, which the old Decimal(10, 2) refused', () => {
+    // 120,000,000 IDR is a few thousand euros, and nine digits before the point.
+    expect(normaliseEstimateInput({ category: 'Hotel', amount: 120000000, currency: 'IDR' }).data.amount)
+      .toBe(120000000);
+  });
+
+  it('bounds an amount at what Decimal(12, 2) holds, in both directions', () => {
+    expect(normaliseEstimateInput({ category: 'Hotel', amount: 9999999999.99 }).data.amount).toBe(9999999999.99);
+    expect(normaliseEstimateInput({ category: 'Refund', amount: -9999999999.99 }).data.amount).toBe(-9999999999.99);
+    expect(normaliseEstimateInput({ category: 'Hotel', amount: 10000000000 }).error).toMatch(/amount/);
+    expect(normaliseEstimateInput({ category: 'Refund', amount: -10000000000 }).error).toMatch(/amount/);
+  });
+
   it('touches only what an edit sent', () => {
     // bookedAction's update: the amount and its currency, nothing else.
     expect(normaliseEstimateInput({ amount: 2400, currency: 'SEK' }, { partial: true }))
