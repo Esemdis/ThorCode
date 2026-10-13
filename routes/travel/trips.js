@@ -8,6 +8,7 @@ const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
 const { fail, error: sendError, paginate, sendList } = require("../../utils/apiResponse");
+const { sumCounts } = require("../../utils/bulkCounts");
 const { normaliseTripInput } = require("../../utils/travel/tripInput");
 
 router.use(auth);
@@ -76,22 +77,27 @@ router.patch("/weather/bulk", roleCheck(["SYSTEM"]), async (req, res) => {
     return res.status(400).json({ error: "Every entry needs an integer id" });
   }
 
+  // updateMany, so a trip deleted since weather-pending was read is skipped
+  // rather than failing everything after it: the sync spends minutes on
+  // Open-Meteo between that read and this PATCH, and `update` throws P2025 for
+  // a missing id, which rolled back the whole chunk and stopped the loop.
   const now = new Date();
   let updated = 0;
   try {
     for (let i = 0; i < updates.length; i += BULK_CHUNK) {
       const chunk = updates.slice(i, i + BULK_CHUNK);
-      await prisma.$transaction(
+      const results = await prisma.$transaction(
         chunk.map(({ id, weather_data }) =>
-          prisma.trip.update({
+          prisma.trip.updateMany({
             where: { id },
             data: { weather_data, weather_updated_at: now },
           })
         )
       );
-      updated += chunk.length;
+      updated += sumCounts(results);
     }
-    res.json({ ok: true, updated });
+    // `skipped` is additive; python-crohn only checks the status code.
+    res.json({ ok: true, updated, skipped: updates.length - updated });
   } catch (err) {
     // Say how far it got: the caller is a cron job that can retry the rest.
     console.error(`[${new Date().toISOString()}] PATCH weather/bulk failed after ${updated}/${updates.length}`, err);
