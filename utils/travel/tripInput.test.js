@@ -47,6 +47,23 @@ describe('normaliseTripInput refuses what used to become a 500', () => {
   });
 });
 
+describe('normaliseTripInput on budgets in a currency with a lot of zeros', () => {
+  // The columns were Decimal(10, 2) and refused anything from 100,000,000 up,
+  // which in dong or rupiah is a few thousand euros: an ordinary two-week
+  // budget was answered with "must be an amount from 0 to 99999999.99".
+  it('takes a two-week budget in dong', () => {
+    expect(normaliseTripInput({ name: 'Hanoi', money_budget: 150000000, currency: 'VND' }).data)
+      .toMatchObject({ money_budget: 150000000, currency: 'VND' });
+  });
+
+  it('takes the largest amount Decimal(12, 2) holds and refuses a cent more', () => {
+    expect(normaliseTripInput({ name: 'x', budget_hotel: 9999999999.99 }).data.budget_hotel)
+      .toBe(9999999999.99);
+    expect(normaliseTripInput({ name: 'x', budget_hotel: 10000000000 }).error)
+      .toMatch(/budget_hotel must be an amount from 0 to 9999999999.99/);
+  });
+});
+
 describe('normaliseTripInput on update', () => {
   it('leaves out what was not sent', () => {
     expect(normaliseTripInput({ notes: 'bring an adapter' }, { partial: true })).toEqual({

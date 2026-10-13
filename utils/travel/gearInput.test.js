@@ -61,7 +61,7 @@ describe('normaliseGearInput refusing what used to be a 500', () => {
     ['a name longer than its column', { name: 'x'.repeat(201) }, /name/],
     ['a brand that is not text', { brand: 5 }, /brand/],
     ['a price that is not a number', { retail_price: 'twelve' }, /retail_price/],
-    ['a price too large for Decimal(10, 2)', { bought_for: 1e9 }, /bought_for/],
+    ['a price too large for Decimal(12, 2)', { bought_for: 1e10 }, /bought_for/],
     ['a currency longer than three letters', { currency: 'SEKK' }, /currency/],
     ['a fill level that is not a number', { fill_level: 'full' }, /fill_level/],
     ['tags that are not a list of text', { tags: [1, 2] }, /tags/],
