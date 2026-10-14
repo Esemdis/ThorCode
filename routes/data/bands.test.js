@@ -14,7 +14,7 @@ const prisma = installFakePrisma({
     findMany: vi.fn(), count: vi.fn(), findUnique: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(),
     create: vi.fn(), update: vi.fn(), updateMany: vi.fn(),
   },
-  city: { upsert: vi.fn(), update: vi.fn() },
+  city: { upsert: vi.fn(), update: vi.fn(), findMany: vi.fn(async () => []) },
   wishlist: { findUnique: vi.fn(), findFirst: vi.fn() },
   wishlistBandReference: { findMany: vi.fn(), create: vi.fn(), findUnique: vi.fn(), deleteMany: vi.fn() },
   concertBandReference: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn() },
@@ -241,6 +241,23 @@ describe('POST /bulk', () => {
       expect(res.status).toBe(200);
       expect(prisma.city.update).not.toHaveBeenCalled();
       expect(prisma.city.upsert.mock.calls[0][0].update).toEqual({});
+    });
+
+    it('files a show under the stored city it sits in, by that city\'s name', async () => {
+      // Each spelling used to become its own City, and a watch on Stockholm
+      // never saw a show filed under Johanneshov.
+      prisma.city.findMany.mockResolvedValue([
+        { id: 7, name: 'Stockholm', country: 'SE', latitude: 59.3293, longitude: 18.0686 },
+      ]);
+      prisma.city.upsert.mockResolvedValue({ id: 7, latitude: 59.3293, longitude: 18.0686 });
+
+      const res = await request(app)
+        .post('/bulk').set(...authHeader(system)).send({ concerts: [placed({ city: 'Johanneshov' })] });
+
+      expect(res.status).toBe(200);
+      expect(prisma.city.upsert.mock.calls[0][0].where).toEqual({ name_country: { name: 'Stockholm', country: 'SE' } });
+      expect(prisma.concert.create.mock.calls[0][0].data).toMatchObject({ city: 'Stockholm', city_id: 7 });
+      expect(res.body.details.insertedConcerts[0].city).toBe('Stockholm');
     });
   });
 

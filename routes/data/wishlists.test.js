@@ -1083,6 +1083,7 @@ describe('POST /wishlists/:id/attendance/from-setlist', () => {
     vi.spyOn(setlistFm, 'fetchSetlistById').mockResolvedValue(SETLIST);
     prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1' });
     prisma.band.findUnique.mockResolvedValue({ id: 3, MBID: SETLIST.artist.mbid });
+    prisma.city.findMany.mockResolvedValue([]);
     prisma.city.upsert.mockResolvedValue({ id: 12, latitude: 59.3 });
     prisma.concert.upsert.mockResolvedValue({ id: 500 });
     prisma.concert.updateMany.mockResolvedValue({ count: 0 });
@@ -1117,6 +1118,20 @@ describe('POST /wishlists/:id/attendance/from-setlist', () => {
     expect(prisma.concertBandReference.upsert).toHaveBeenCalledWith(expect.objectContaining({
       create: expect.objectContaining({ setlist: { songs: [{ name: 'Stranded', cover: null, tape: false }] } }),
     }));
+  });
+
+  it('files the show under a stored city it sits in', async () => {
+    setlistFm.fetchSetlistById.mockResolvedValue({
+      ...SETLIST,
+      venue: { ...SETLIST.venue, city: { ...SETLIST.venue.city, name: 'Solna', coords: { lat: 59.36, long: 18.0 } } },
+    });
+    prisma.city.findMany.mockResolvedValue([{ id: 12, name: 'Stockholm', country: 'SE', latitude: 59.33, longitude: 18.07 }]);
+
+    const res = await post({ setlistfm_id: '63de4613', band_id: 3 });
+
+    expect(res.status).toBe(200);
+    expect(prisma.city.upsert.mock.calls[0][0].where).toEqual({ name_country: { name: 'Stockholm', country: 'SE' } });
+    expect(prisma.concert.upsert.mock.calls[0][0].create).toMatchObject({ city: 'Stockholm', city_id: 12 });
   });
 
   it('refuses a show that has not happened yet', async () => {

@@ -15,6 +15,7 @@ const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
 const { logActivity } = require('../../../utils/activityLog');
+const { storedCity } = require('../../../utils/cityMatch');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Two positions further apart than this are two places, not one venue under
@@ -279,6 +280,7 @@ router.post(
 
           // Find or create city record
           let cityId = null;
+          let cityName = concert.city;
           if (concert.city && concert.country) {
             const coord = (v) => {
               const n = parseFloat(v);
@@ -288,10 +290,15 @@ router.post(
             const longitude = coord(concert.longitude);
             const hasCoords = latitude != null && longitude != null;
 
+            // Another spelling of a place already stored nearby ("Wien" by
+            // "Vienna") goes on that row, under its name: see utils/cityMatch.js.
+            const match = await storedCity(tx, { name: concert.city, country: concert.country, latitude, longitude });
+            if (match) cityName = match.name;
+
             const cityRecord = await tx.city.upsert({
-              where: { name_country: { name: concert.city, country: concert.country } },
+              where: { name_country: { name: cityName, country: concert.country } },
               create: {
-                name: concert.city,
+                name: cityName,
                 country: concert.country,
                 latitude: hasCoords ? latitude : null,
                 longitude: hasCoords ? longitude : null,
@@ -324,7 +331,7 @@ router.post(
             data: {
               country: concert.country,
               venue: concert.venue,
-              city: concert.city,
+              city: cityName,
               concert_date: concert.concert_date ? new Date(concert.concert_date) : null,
               on_sale: concert.on_sale ?? false,
               event_id: concert.event_id || null,
