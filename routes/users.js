@@ -4,7 +4,6 @@ const { validationResult, param } = require('express-validator');
 const bcrypt = require('bcrypt');
 const multer = require('multer');
 const crypto = require('node:crypto');
-const { v4: uuidv4 } = require('uuid');
 const upload = multer();
 
 const userValidation = require('../utils/validation/user');
@@ -105,7 +104,7 @@ router.post(
       try {
         user = await prisma.user.create({
           data: {
-            id: uuidv4().replace(/-/g, ''),
+            id: crypto.randomUUID().replace(/-/g, ''),
             email,
             password_hash: passwordHash,
             wishlists: { create: { name: 'My Wishlist' } },
