@@ -30,7 +30,7 @@ Auth is a JWT in `Authorization: Bearer`. Roles are `USER`, `ADMIN` and `SYSTEM`
 
 | Job | When |
 | --- | --- |
-| Notification digest | 08:00 |
+| Notification digest | 09:00 |
 | Spotify artist matching and photo warming | 04:00 |
 | Songkick/Bandsintown source URL backfill | 05:00 |
 | Setlist backfill for attended shows | 06:00 |
