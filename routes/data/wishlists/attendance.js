@@ -16,6 +16,7 @@ const { storesRealInstant } = require("../../../utils/ics");
 const { conflict } = require("../../../utils/apiResponse");
 const { countMediaForAttendances } = require("../../../utils/mediaDetach");
 const { enrichConcertBands } = require("../../../utils/setlistEnrich");
+const { storedCity } = require("../../../utils/cityMatch");
 const { ownWishlist } = require("./shared");
 // Called through the module rather than destructured, so a test can stand in
 // for setlist.fm on the router's own copy of it.
@@ -402,10 +403,12 @@ router.post(
       // Coordinates and a city link, both of which this route used to leave
       // empty: a concert without a position is dropped by the map's grouping and
       // simply never appears, and the city link is what carries reachability.
+      // A spelling of a place already stored nearby goes on that row.
+      const cityName = (await storedCity(prisma, { name: city, country, latitude, longitude }))?.name ?? city;
       const cityRecord = await prisma.city.upsert({
-        where: { name_country: { name: city, country } },
+        where: { name_country: { name: cityName, country } },
         create: {
-          name: city,
+          name: cityName,
           country,
           latitude: hasCoords ? latitude : null,
           longitude: hasCoords ? longitude : null,
@@ -426,7 +429,7 @@ router.post(
         create: {
           event_id: eventId,
           venue,
-          city,
+          city: cityName,
           country,
           concert_date: concertDate,
           on_sale: false,
