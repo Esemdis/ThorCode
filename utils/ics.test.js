@@ -213,6 +213,17 @@ describe('concertToIcs', () => {
     expect(description).toContain('\\n');
   });
 
+  it('escapes a lone CR, so a scraped title cannot start a property of its own', () => {
+    const ics = concertToIcs(concert({ name: 'Show\rURL:https://evil.example' }), NOW);
+    expect(ics.split('\r\n')).toContain('SUMMARY:Show\\nURL:https://evil.example');
+    expect(ics.replace(/\r\n/g, '')).not.toMatch(/[\r\n]/);
+  });
+
+  it('drops control characters from a title', () => {
+    const ics = concertToIcs(concert({ name: 'Sli\u0000pk\u001bnot\u007f' }), NOW);
+    expect(ics.split('\r\n')).toContain('SUMMARY:Slipknot');
+  });
+
   it('keeps every line inside the 75-octet limit', () => {
     const ics = concertToIcs(concert({
       metadata: JSON.stringify(Array.from({ length: 30 }, (_, i) => `Band Number ${i}`)),
