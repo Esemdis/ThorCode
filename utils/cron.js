@@ -7,8 +7,8 @@ const { sendWeeklyRecaps } = require("./weeklyRecap");
 const { runTicketAlerts } = require("./ticketAlerts");
 const prisma = require("../prisma/client");
 
-// Default: once a day at 08:00 server time.
-const NOTIFICATION_DIGEST_CRON = process.env.NOTIFICATION_DIGEST_CRON || "0 8 * * *";
+// Default: once a day at 09:00 server time, after the 08:00 sync's inserts land (~08:07).
+const NOTIFICATION_DIGEST_CRON = process.env.NOTIFICATION_DIGEST_CRON || "0 9 * * *";
 
 // Matches new bands to Spotify artists and refreshes every band's photo url.
 // Daily is the required cadence, not a preference: the cached urls expire just
