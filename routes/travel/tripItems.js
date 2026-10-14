@@ -115,9 +115,15 @@ router.patch("/reorder", async (req, res) => {
 });
 
 // PATCH /travel/trips/:tripId/items/:itemId
-router.patch("/:itemId", param("itemId").isInt(), async (req, res) => {
+// The handler calls .trim() on these, so a null name or a numeric field threw
+// before the try and answered 500.
+router.patch("/:itemId", [
+  param("itemId", "Invalid parameters").isInt(),
+  body("name", "name must be non-empty text").optional().isString().trim().notEmpty(),
+  body(["category", "note", "url"]).optional({ nullable: true }).isString().withMessage((_, { path }) => `${path} must be text or null`),
+], async (req, res) => {
   const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid parameters" });
+  if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
   const { name, category, status, note, url, sort_order, gear_item_id, worn } = req.body;
   if (status && !VALID_STATUSES.includes(status)) {

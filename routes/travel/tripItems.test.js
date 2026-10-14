@@ -108,6 +108,54 @@ describe('PATCH /travel/trips/:tripId/items/reorder', () => {
   });
 });
 
+describe('PATCH an item\'s text fields', () => {
+  const patch = (body) => request(app())
+    .patch('/travel/trips/1/items/9')
+    .set(...authHeader({ id: 'user-1' }))
+    .send(body);
+
+  // POST requires a name; PATCH saved "" as one, and .trim() on a null or a
+  // number threw before the try and answered 500.
+  it.each([
+    ['an empty name', { name: '' }, 'name'],
+    ['a blank name', { name: '   ' }, 'name'],
+    ['a null name', { name: null }, 'name'],
+    ['a numeric category', { category: 5 }, 'category'],
+    ['a numeric note', { note: 5 }, 'note'],
+    ['an object url', { url: {} }, 'url'],
+  ])('refuses %s with a 400 that names the field', async (_, body, field) => {
+    const res = await patch(body);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain(field);
+    expect(prisma.tripItem.update).not.toHaveBeenCalled();
+  });
+
+  it('still renames, trimmed', async () => {
+    const res = await patch({ name: '  Rain shell  ' }).expect(200);
+
+    expect(res.body.data.name).toBe('Rain shell');
+  });
+
+  it('still clears a note with null, and a blank category to null', async () => {
+    await patch({ note: null, category: '  ' }).expect(200);
+
+    expect(prisma.tripItem.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: { note: null, category: null },
+    }));
+  });
+
+  it('keeps the old message for an item id that is not a number', async () => {
+    const res = await request(app())
+      .patch('/travel/trips/1/items/abc')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ name: 'Rain shell' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('Invalid parameters');
+  });
+});
+
 describe('a gear id that is not a number', () => {
   it('is a 400, not a Prisma error', async () => {
     const res = await request(app())
