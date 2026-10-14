@@ -43,13 +43,18 @@ function icsInstant(date) {
  * Backslashes go first, or the escapes added below get escaped again. An
  * unescaped comma is the damaging one: it splits a property into two values, so
  * a venue like "Rockefeller, Oslo" silently loses everything after the comma.
+ *
+ * A lone CR counts as a line break too: some clients end the line there, and
+ * the scraped rest of the value would then read as a property of its own.
  */
 function escapeText(value) {
   return String(value)
+    // Other control characters are not legal in a content line.
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
     .replace(/\\/g, '\\\\')
     .replace(/;/g, '\\;')
     .replace(/,/g, '\\,')
-    .replace(/\r?\n/g, '\\n');
+    .replace(/\r\n|\r|\n/g, '\\n');
 }
 
 /** Lowercase, hyphen-separated, safe in a filename. */
