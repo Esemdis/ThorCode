@@ -17,9 +17,14 @@ const API_URL = 'https://api.spotify.com/v1';
 const PROVIDER = 'spotify';
 const LABEL = 'Spotify';
 
-// Creating a private playlist and putting songs in it. Nothing here reads the
-// user's library or listening history, so nothing else is asked for.
-const SCOPES = ['playlist-modify-private'];
+// Creating a private playlist and putting songs in it, and reading the user's
+// top artists so the app can suggest who to follow. A connection made before
+// user-top-read was asked for lacks it; topArtists then fails with a 403 and
+// the route asks for a reconnect.
+const SCOPES = ['playlist-modify-private', 'user-top-read'];
+
+// Spotify caps /me/top/artists at 50 per page; one page is plenty to suggest from.
+const TOP_ARTISTS_LIMIT = 50;
 
 // Dev-mode apps are capped at 10 results per search; asking for more is an error
 // rather than a truncation.
@@ -266,6 +271,19 @@ async function getArtists(ids) {
   return results.filter(Boolean);
 }
 
+/**
+ * The user's most-listened artists over the last six months, most played first.
+ *
+ * @returns {Promise<object[]>} Raw artist objects.
+ */
+async function topArtists(accessToken) {
+  const { data } = await getWithBackoff(`${API_URL}/me/top/artists`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    params: { limit: TOP_ARTISTS_LIMIT, time_range: 'medium_term' },
+  });
+  return data?.items ?? [];
+}
+
 /** Create an empty private playlist on the connected account. */
 async function createPlaylist(accessToken, { name, description }) {
   const { data } = await axios.post(
@@ -304,6 +322,7 @@ module.exports = {
   getAppToken,
   searchArtists,
   getArtists,
+  topArtists,
   findTrack,
   createPlaylist,
   addItems,

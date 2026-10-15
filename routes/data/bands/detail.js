@@ -12,6 +12,8 @@ const { validationResult, body } = require('express-validator');
 const axios = require('axios');
 const { canonicalBandName } = require('../../../utils/lineupNames');
 const { searchArtists, getArtists } = require('../../../utils/spotify');
+// The user-token reads go through the module, so a test can stand in for them.
+const spotify = require('../../../utils/spotify');
 const { getArtistInfo } = require('../../../utils/lastfm');
 const { relevantArtists } = require('../../../utils/artistSearch');
 const { resolveArtistImages } = require('../../../utils/bandImages');
@@ -413,7 +415,54 @@ router.delete(
   },
 );
 
-// Search bands on Ticketmaster to get their IDs (helpful for disambiguation)
+/**
+ * GET /bands/recommended
+ *
+ * Artists to follow, from the caller's own Spotify listening: their top
+ * artists of the last six months, less the ones already on their wishlist.
+ * Shaped like artist-search's rows, so the add dialog shows both the same way.
+ *
+ * 409 with reconnect: true when Spotify is not connected, or was connected
+ * before user-top-read was in the scopes — Spotify answers the missing scope
+ * with a 403, and only a fresh consent screen adds it.
+ */
+router.get('/bands/recommended', auth, artistLookupRateLimit, async (req, res) => {
+  let artists;
+  try {
+    artists = await spotify.topArtists(await spotify.getValidToken(req.user.id));
+  } catch (error) {
+    if (error instanceof spotify.SpotifyAuthError) {
+      return res.status(409).json({ error: error.message, reconnect: true });
+    }
+    if (error.response?.status === 403) {
+      return res.status(409).json({ error: 'Reconnect Spotify so it can share your top artists.', reconnect: true });
+    }
+    console.error('[spotify] Top artists failed:', error.response?.data ?? error.message);
+    return res.status(502).json({ error: 'Could not reach Spotify. Try again in a moment.' });
+  }
+
+  try {
+    const onList = await prisma.wishlistBandReference.findMany({
+      where: { wishlist_rel: { user_id: req.user.id } },
+      select: { band_rel: { select: { name: true, spotify_id: true } } },
+    });
+    const ids = new Set(onList.map((row) => row.band_rel.spotify_id).filter(Boolean));
+    const names = new Set(onList.map((row) => canonicalBandName(row.band_rel.name)));
+    const rows = artists
+      .filter((artist) => !ids.has(artist.id) && !names.has(canonicalBandName(artist.name)))
+      .map((artist) => ({
+        id: artist.id,
+        name: artist.name,
+        image: artist.images?.[0]?.url ?? null,
+        spotifyUrl: artist.external_urls?.spotify ?? null,
+      }));
+    return res.json(rows);
+  } catch (error) {
+    console.error('[bands/recommended] Error:', error.message);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 /**
  * GET /bands/artist-search?q=
  *

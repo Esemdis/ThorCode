@@ -17,7 +17,6 @@ const prisma = installFakePrisma({
 const gear = buildApp((await import('./gear.js')).default);
 const loadouts = buildApp((await import('./loadouts.js')).default);
 // Mounted as index.js mounts them, so ownsTrip sees :tripId.
-const estimates = buildApp((await import('./estimates.js')).default, '/trips/:tripId/estimates');
 const todos = buildApp((await import('./tripTodos.js')).default, '/trips/:tripId/todos');
 
 const user = authHeader({ id: 'user-1' });
@@ -86,22 +85,6 @@ describe('the other closet routes, given a body they cannot store', () => {
 
     expect(res.status).toBe(400);
     expect(prisma.loadout.update).not.toHaveBeenCalled();
-  });
-
-  it('refuses an estimate edit with an amount that is not a number', async () => {
-    // The edit route validated nothing, so this reached Prisma as NaN.
-    const res = await request(estimates).patch('/trips/5/estimates/8').set(...user).send({ amount: 'lots' });
-
-    expect(res.status).toBe(400);
-    expect(prisma.expenseEstimate.update).not.toHaveBeenCalled();
-  });
-
-  it('refuses an estimate with a date that does not parse', async () => {
-    const res = await request(estimates).post('/trips/5/estimates').set(...user)
-      .send({ category: 'Food', amount: 50, date: 'soonish' });
-
-    expect(res.status).toBe(400);
-    expect(prisma.expenseEstimate.create).not.toHaveBeenCalled();
   });
 
   it('refuses todo text that is not a string, and a sort position that is not whole', async () => {

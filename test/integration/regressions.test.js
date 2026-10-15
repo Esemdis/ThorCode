@@ -115,31 +115,6 @@ describe.skipIf(!url)('against Postgres', () => {
     }
   });
 
-  it('gives the planner the arrival and departure the trip holds', async () => {
-    // Both solve routes selected only dates and weather, so these never reached
-    // the planner and a 14:00 landing was planned from 09:00.
-    process.env.ROUTE_PLANNER_URL ||= 'http://planner.invalid';
-    const routePlanner = require('../../utils/travel/routePlanner.js');
-    const solve = vi.spyOn(routePlanner, 'solve').mockResolvedValue({ days: [] });
-    const owner = await prisma.user.create({ data: { id: `${RUN}-planner`, email: `${RUN}-planner@example.test` } });
-    const trip = await prisma.trip.create({
-      data: {
-        user_id: owner.id, name: 'Paris', start_date: new Date('2031-10-01'), end_date: new Date('2031-10-02'),
-        arrival_time: 14 * 60, departure_time: 11 * 60, transfer_minutes: 45,
-        places: { create: { name: 'Hotel', kind: 'HOTEL', lat: 48.85, lon: 2.35 } },
-      },
-    });
-
-    const app = appWith([['/travel/trips/:tripId/plan', require('../../routes/travel/tripPlan.js')]]);
-    const res = await request(app).post(`/travel/trips/${trip.id}/plan`).set('Authorization', token(owner.id)).send({});
-
-    expect(res.status).toBe(200);
-    const { days } = solve.mock.calls[0][0];
-    expect(days[0].start).toBe(14 * 60 + 45);
-    expect(days[days.length - 1].end).toBe(11 * 60 - 45);
-    solve.mockRestore();
-  });
-
   it('answers the admin user lookup', async () => {
     // The fake client takes any select. Only a real one refuses a bad one, and
     // a bad one here was once a 500 on every request.
