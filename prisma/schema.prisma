@@ -66,46 +66,46 @@ model Band {
 }
 
 model Concert {
-  id                Int                    @id @default(autoincrement())
-  country           String
-  venue             String
-  created_at        DateTime
-  on_sale           Boolean
-  city              String
-  concert_date      DateTime?
-  event_id          String?                @unique
-  latitude          String?                @db.VarChar
-  longitude         String?                @db.VarChar
-  metadata          String?
-  name              String?
-  ticket_sale_start DateTime?              @db.Timestamp(6)
-  url               String?
-  festival          Boolean?               @default(false)
-  source            String?
-  weather           Json?
-  price_min         Float?
-  price_max         Float?
-  price_currency    String?
-  sold_out          Boolean?               @default(false)
-  reachable         String?
+  id                 Int                    @id @default(autoincrement())
+  country            String
+  venue              String
+  created_at         DateTime
+  on_sale            Boolean
+  city               String
+  concert_date       DateTime?
+  event_id           String?                @unique
+  latitude           String?                @db.VarChar
+  longitude          String?                @db.VarChar
+  metadata           String?
+  name               String?
+  ticket_sale_start  DateTime?              @db.Timestamp(6)
+  url                String?
+  festival           Boolean?               @default(false)
+  source             String?
+  weather            Json?
+  price_min          Float?
+  price_max          Float?
+  price_currency     String?
+  sold_out           Boolean?               @default(false)
+  reachable          String?
   setlist_checked_at DateTime?
   // Set when a scheduled sync inserts the show or adds an act to it, cleared
   // once /wishlists/notify has posted it. A delivery that failed leaves it set,
   // and the next sync's /bulk hands the show back to be sent again — the
   // scraper only ever announced what it had just inserted, so a failed one was
   // never retried. Which acts are news is on ConcertBandReference.notify_pending.
-  notify_pending    Boolean                @default(false)
+  notify_pending     Boolean                @default(false)
   // When the activity feeds were told about the show. A post that failed keeps
   // notify_pending set and is sent again, and the feeds must not get a second
   // BAND_ADDED entry for it each time. Null on rows from before it existed,
   // which nothing announces again.
-  announced_at      DateTime?
-  city_id           Int?
-  city_rel          City?                  @relation(fields: [city_id], references: [id])
-  bands             ConcertBandReference[] @relation("ConcertBands")
-  attendances       ConcertAttendance[]    @relation("ConcertAttendances")
-  deliveries        ConcertDelivery[]      @relation("ConcertDeliveries")
-  follows           ConcertFollow[]        @relation("ConcertFollows")
+  announced_at       DateTime?
+  city_id            Int?
+  city_rel           City?                  @relation(fields: [city_id], references: [id])
+  bands              ConcertBandReference[] @relation("ConcertBands")
+  attendances        ConcertAttendance[]    @relation("ConcertAttendances")
+  deliveries         ConcertDelivery[]      @relation("ConcertDeliveries")
+  follows            ConcertFollow[]        @relation("ConcertFollows")
 
   @@index([city_id])
   @@index([concert_date, latitude, longitude])
@@ -156,18 +156,18 @@ model ConcertBandReference {
 }
 
 model Wishlist {
-  id                 Int                     @id @default(autoincrement())
-  name               String
-  user_id            String                  @unique
-  discord_webhook    String?
-  last_active_at     DateTime?
-  calendar_token     String?                 @unique
-  calendar_token_at  DateTime?
-  user_rel           User                    @relation("UserWishlists", fields: [user_id], references: [id])
-  bands              WishlistBandReference[] @relation("WishlistBands")
-  activity_logs      ActivityLog[]           @relation("WishlistActivityLogs")
-  attendance         ConcertAttendance[]     @relation("WishlistAttendance")
-  deliveries         ConcertDelivery[]       @relation("WishlistDeliveries")
+  id                Int                     @id @default(autoincrement())
+  name              String
+  user_id           String                  @unique
+  discord_webhook   String?
+  last_active_at    DateTime?
+  calendar_token    String?                 @unique
+  calendar_token_at DateTime?
+  user_rel          User                    @relation("UserWishlists", fields: [user_id], references: [id])
+  bands             WishlistBandReference[] @relation("WishlistBands")
+  activity_logs     ActivityLog[]           @relation("WishlistActivityLogs")
+  attendance        ConcertAttendance[]     @relation("WishlistAttendance")
+  deliveries        ConcertDelivery[]       @relation("WishlistDeliveries")
 }
 
 // A show someone wants to hear about: the morning its tickets go on sale, when
@@ -286,25 +286,25 @@ model AttendanceMissedBand {
 /// three orphan-cleanup paths that delete attendances in bulk — can quietly
 /// destroy the only copy of a photograph. See utils/mediaDetach.js.
 model ConcertMedia {
-  id            Int       @id @default(autoincrement())
-  attendance_id Int
-  band_id       Int?
-  rel_path      String
-  filename      String
-  kind          MediaKind
-  bytes         Int
-  sha256        String
-  width         Int?
-  height        Int?
-  duration_ms   Int?
-  caption       String?
+  id              Int       @id @default(autoincrement())
+  attendance_id   Int
+  band_id         Int?
+  rel_path        String
+  filename        String
+  kind            MediaKind
+  bytes           Int
+  sha256          String
+  width           Int?
+  height          Int?
+  duration_ms     Int?
+  caption         String?
   /// Which song a video is a recording of, as a plain name rather than a
   /// reference: there is no song table to point at, setlists are JSON blobs
   /// scraped from setlist.fm, and the name is what survives both a setlist
   /// refetch and a rebuild of this table from the sidecars. Only ever set on
   /// a VIDEO, and only alongside a band_id — a song title with no artist
   /// names nobody on a festival bill.
-  song          String?
+  song            String?
   /// One of the files that stand for the night in the year recap.
   ///
   /// The recap shows three a night, and the lightbox offers no fourth, but
@@ -317,7 +317,7 @@ model ConcertMedia {
   ///
   /// A night with fewer than three picked is topped up by the recap's own
   /// choice. That is what keeps an unpicked year from being an empty one.
-  picked        Boolean   @default(false)
+  picked          Boolean   @default(false)
   /// The stretch of a video the recap plays, in milliseconds into the clip.
   ///
   /// Not a MediaShareLink, though those carry a range too: a link lasts
@@ -331,8 +331,8 @@ model ConcertMedia {
   /// should not lose the moment someone took the trouble to find.
   moment_start_ms Int?
   moment_end_ms   Int?
-  taken_at      DateTime?
-  created_at    DateTime  @default(now())
+  taken_at        DateTime?
+  created_at      DateTime  @default(now())
 
   attendance_rel ConcertAttendance @relation("AttendanceMedia", fields: [attendance_id], references: [id], onDelete: Restrict)
   band_rel       Band?             @relation("BandMedia", fields: [band_id], references: [id], onDelete: SetNull)
@@ -439,114 +439,26 @@ enum MediaKind {
 // ── TRAVEL BAG ────────────────────────────────────────────────────────────────
 
 model Trip {
-  id                   Int               @id @default(autoincrement())
-  user_id              String
-  name                 String            @db.VarChar(200)
-  destination          String?           @db.VarChar(200)
-  start_date           DateTime?         @db.Date
-  end_date             DateTime?         @db.Date
-  notes                String?           @db.Text
-  weight_budget        Int?
-  money_budget         Decimal?          @db.Decimal(12, 2)
-  currency             String            @default("SEK") @db.VarChar(3)
-  budget_flights       Decimal?          @db.Decimal(12, 2)
-  budget_hotel         Decimal?          @db.Decimal(12, 2)
-  budget_entertainment Decimal?          @db.Decimal(12, 2)
-  budget_food          Decimal?          @db.Decimal(12, 2)
-  weather_data         Json?
-  weather_updated_at   DateTime?
-  exchange_rates       Json?
-  tags                 String[]
-  // When you land and when you fly out, as minutes since midnight on the first
-  // and last day. Without them the planner offers a 09:00 museum on a day you
-  // arrive at 14:00, which is worse than no plan for that day at all.
-  arrival_time         Int?
-  departure_time       Int?
-  // Where those days begin and end. Optional: left null the hotel is used, which
-  // is right for a train you catch from town and wrong for an airport an hour
-  // out. Not a relation — a foreign key back to TripPlace would have to be
-  // cleared by hand every time a place is deleted, and a stale id here is
-  // already handled by the planner refusing to plan against a place it cannot
-  // find.
-  arrival_place_id     Int?
-  departure_place_id   Int?
-  // How long it takes to get between a terminal and the city, by whatever means
-  // people actually use. Nobody walks out of an airport, and routing one the
-  // same way as a museum produced a five-and-a-half hour walk from CDG.
-  transfer_minutes     Int?
-  // The last day plan the solver returned, stored whole. Not normalised into
-  // rows: it is one immutable answer to one question, always read in full and
-  // always replaced in full, and the shape belongs to route-planner rather than
-  // to this schema. Null means "never planned", which the UI shows differently
-  // from an empty plan.
-  plan_data            Json?
-  plan_updated_at      DateTime?
-  created_at           DateTime          @default(now())
-  updated_at           DateTime          @updatedAt
-  user_rel             User              @relation("UserTrips", fields: [user_id], references: [id])
-  items                TripItem[]
-  estimates            ExpenseEstimate[]
-  reviews              ItemReview[]      @relation("TripItemReviews")
-  trip_review          TripReview?
-  todos                TripTodo[]
-  places               TripPlace[]
+  id                 Int          @id @default(autoincrement())
+  user_id            String
+  name               String       @db.VarChar(200)
+  destination        String?      @db.VarChar(200)
+  start_date         DateTime?    @db.Date
+  end_date           DateTime?    @db.Date
+  notes              String?      @db.Text
+  weight_budget      Int?
+  weather_data       Json?
+  weather_updated_at DateTime?
+  tags               String[]
+  created_at         DateTime     @default(now())
+  updated_at         DateTime     @updatedAt
+  user_rel           User         @relation("UserTrips", fields: [user_id], references: [id])
+  items              TripItem[]
+  reviews            ItemReview[] @relation("TripItemReviews")
+  trip_review        TripReview?
+  todos              TripTodo[]
 
   @@index([user_id])
-}
-
-// Somewhere you intend to go on a trip — a museum, a restaurant, the hotel.
-// Distinct from TripItem, which is something you pack.
-//
-// lat/lon are written once when the place is saved and then left alone, because
-// a museum does not move. They are nullable on purpose: a place nothing could
-// geocode is still worth keeping, flagged, and the solver reports it as dropped
-// rather than refusing to plan the trip.
-model TripPlace {
-  id               Int       @id @default(autoincrement())
-  trip_id          Int
-  name             String    @db.VarChar(200)
-  kind             PlaceKind @default(SIGHT)
-  lat              Float?
-  lon              Float?
-  address          String?   @db.VarChar(500)
-  url              String?   @db.VarChar(1000)
-  // Minutes to spend there. Null lets the solver apply its own default rather
-  // than making every place a form to fill in before the trip can be planned.
-  duration         Int?
-  priority         Int       @default(3)
-  outdoor          Boolean   @default(false)
-  // Per weekday, [open, close] minute pairs: { "tue": [[570, 1080]] }. Absent
-  // means always open; an explicit [] means closed that day. A weekday simply
-  // missing from the object means unknown, and unknown is treated as open —
-  // guessing "closed" silently deletes places from a trip.
-  hours            Json?
-  pinned_day       DateTime? @db.Date
-  // A ticket or a reservation, as minutes since midnight. These bound when you
-  // turn up, not when you leave — both set to the same minute is a timed entry.
-  // Usually paired with pinned_day: on their own they apply to whichever day
-  // the place ends up on.
-  arrive_after     Int?
-  arrive_by        Int?
-  // Demotes `hours` to reference. Opening times are about getting inside, and
-  // seeing a building lit up, a night tour or a concert in a venue that shuts
-  // at six have nothing to do with that. The hours stay stored — they are still
-  // worth knowing — they just stop constraining the plan.
-  ignore_hours     Boolean   @default(false)
-  // A paragraph about the place from Wikipedia, with the article it came from.
-  // Cached rather than fetched on view: it does not change, and Wikipedia asks
-  // for politeness. `blurb_checked_at` records that we *looked* — most places
-  // have no article and never will, and without it every load re-asks about the
-  // same neighbourhood restaurant forever.
-  blurb            String?   @db.Text
-  blurb_url        String?   @db.VarChar(500)
-  blurb_checked_at DateTime?
-  note             String?   @db.Text
-  sort_order       Int       @default(0)
-  created_at       DateTime  @default(now())
-  updated_at       DateTime  @updatedAt
-  trip_rel         Trip      @relation(fields: [trip_id], references: [id], onDelete: Cascade)
-
-  @@index([trip_id])
 }
 
 // Things to do before a trip that aren't gear — book the taxi, print the
@@ -586,23 +498,6 @@ model TripItem {
 
   @@index([bag_id])
   @@index([gear_item_id])
-  @@index([trip_id])
-}
-
-model ExpenseEstimate {
-  id         Int       @id @default(autoincrement())
-  trip_id    Int
-  category   String    @db.VarChar(100)
-  amount     Decimal   @db.Decimal(12, 2)
-  currency   String    @default("SEK") @db.VarChar(3)
-  date       DateTime? @db.Date
-  end_date   DateTime? @db.Date
-  note       String?   @db.Text
-  sort_order Int       @default(0)
-  created_at DateTime  @default(now())
-  updated_at DateTime  @updatedAt
-  trip_rel   Trip      @relation(fields: [trip_id], references: [id], onDelete: Cascade)
-
   @@index([trip_id])
 }
 
@@ -779,15 +674,6 @@ enum PackingStatus {
   BOUGHT
   PACKED
   NOT_PACKED
-}
-
-// What a place is *for*, which is the only thing the solver treats differently:
-// a HOTEL anchors the start and end of a day, a FOOD place can fill a meal slot
-// and nothing else, a SIGHT is an ordinary optional stop.
-enum PlaceKind {
-  SIGHT
-  FOOD
-  HOTEL
 }
 
 enum ReviewUsage {

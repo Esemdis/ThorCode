@@ -8,7 +8,6 @@ import { buildApp, authHeader, installFakePrisma } from '../../test/routeApp.js'
 const prisma = installFakePrisma({
   gearItem: { create: vi.fn(), update: vi.fn(), updateMany: vi.fn(), findFirst: vi.fn() },
   loadout: { create: vi.fn(), update: vi.fn() },
-  expenseEstimate: { create: vi.fn(), update: vi.fn() },
   tripTodo: { create: vi.fn(), update: vi.fn() },
   trip: { findFirst: vi.fn() },
   $transaction: vi.fn(async (ops) => Promise.all(ops)),

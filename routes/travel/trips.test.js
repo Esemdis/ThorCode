@@ -10,7 +10,6 @@ const prisma = installFakePrisma({
     findFirst: vi.fn(),
   },
   tripItem: {},
-  tripPlace: { findFirst: vi.fn() },
 });
 
 const { default: router } = await import('./trips.js');
@@ -48,7 +47,7 @@ describe('POST /travel/trips', () => {
   it('answers a malformed body with 400 rather than letting Prisma throw', async () => {
     // A string in tags, or a date that does not parse, reached Prisma and came
     // back as a 500 with nothing to say which field.
-    for (const body of [{ name: 'Lisbon', tags: 'city' }, { name: 'Lisbon', start_date: 'soon' }, { name: 'Lisbon', currency: 12 }]) {
+    for (const body of [{ name: 'Lisbon', tags: 'city' }, { name: 'Lisbon', start_date: 'soon' }]) {
       const res = await request(app).post('/').set(...authHeader()).send(body);
       expect(res.status).toBe(400);
     }
@@ -56,37 +55,11 @@ describe('POST /travel/trips', () => {
   });
 
   it('creates the trip for the caller', async () => {
-    const res = await request(app).post('/').set(...authHeader({ id: 'user-1' })).send({ name: 'Lisbon', currency: 'eur' });
+    const res = await request(app).post('/').set(...authHeader({ id: 'user-1' })).send({ name: 'Lisbon' });
 
     expect(res.status).toBe(201);
     expect(prisma.trip.create).toHaveBeenCalledWith({
-      data: { name: 'Lisbon', currency: 'EUR', tags: [], user_id: 'user-1' },
-    });
-  });
-});
-
-describe('PATCH /travel/trips/:id', () => {
-  it('refuses a terminal that is not one of this trip\'s places', async () => {
-    prisma.tripPlace.findFirst.mockResolvedValue(null);
-
-    const res = await request(app).patch('/5').set(...authHeader({ id: 'user-1' })).send({ arrival_place_id: 77 });
-
-    expect(res.status).toBe(400);
-    expect(prisma.tripPlace.findFirst).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: 77, trip_id: 5, trip_rel: { user_id: 'user-1' } },
-    }));
-    expect(prisma.trip.update).not.toHaveBeenCalled();
-  });
-
-  it('stores a terminal that is', async () => {
-    prisma.tripPlace.findFirst.mockResolvedValue({ id: 77 });
-
-    const res = await request(app).patch('/5').set(...authHeader({ id: 'user-1' })).send({ arrival_place_id: 77, arrival_time: 840 });
-
-    expect(res.status).toBe(200);
-    expect(prisma.trip.update).toHaveBeenCalledWith({
-      where: { id: 5, user_id: 'user-1' },
-      data: { arrival_place_id: 77, arrival_time: 840 },
+      data: { name: 'Lisbon', tags: [], user_id: 'user-1' },
     });
   });
 });

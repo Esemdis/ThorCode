@@ -125,7 +125,6 @@ router.get("/", async (req, res) => {
             include: { gear_item_rel: { select: { id: true, name: true, fill_level: true, dimensions: true, review_status: true } } },
           },
           todos: { orderBy: [{ done: "asc" }, { sort_order: "asc" }, { created_at: "asc" }] },
-          estimates: { select: { amount: true, currency: true, category: true } },
           reviews: { select: { trip_item_id: true } },
           trip_review: {
             select: {
@@ -157,7 +156,7 @@ router.post("/", async (req, res) => {
   }
 });
 
-// GET /travel/trips/:id — get trip with items + estimates
+// GET /travel/trips/:id — get trip with items, todos and reviews
 router.get("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
@@ -173,7 +172,6 @@ router.get("/:id", param("id").isInt(), async (req, res) => {
           },
           orderBy: [{ sort_order: "asc" }, { created_at: "asc" }],
         },
-        estimates: { orderBy: [{ sort_order: "asc" }, { created_at: "asc" }] },
         reviews: { orderBy: { created_at: "asc" } },
         trip_review: true,
         todos: { orderBy: [{ done: "asc" }, { sort_order: "asc" }, { created_at: "asc" }] },
@@ -191,23 +189,11 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
 
-  const { data, error } = normaliseTripInput(req.body, { partial: true, withPlaces: true });
+  const { data, error } = normaliseTripInput(req.body, { partial: true });
   if (error) return res.status(400).json({ error });
   const tripId = parseInt(req.params.id, 10);
 
   try {
-    // A terminal has to be one of this trip's own places. The planner already
-    // ignores an id it cannot find on the trip, but storing another trip's
-    // place — someone else's, even — is a reference nothing should hold.
-    for (const field of ["arrival_place_id", "departure_place_id"]) {
-      if (data[field] == null) continue;
-      const place = await prisma.tripPlace.findFirst({
-        where: { id: data[field], trip_id: tripId, trip_rel: { user_id: req.user.id } },
-        select: { id: true },
-      });
-      if (!place) return res.status(400).json({ error: `${field} must be a place on this trip` });
-    }
-
     // user_id in the where does the authorising: a trip that isn't the caller's
     // simply doesn't match, and Prisma reports that the same way as a trip that
     // doesn't exist.
@@ -221,7 +207,7 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   }
 });
 
-// DELETE /travel/trips/:id — delete trip (cascades items, estimates, todos, reviews)
+// DELETE /travel/trips/:id — delete trip (cascades items, todos, reviews)
 router.delete("/:id", param("id").isInt(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid id" });
