@@ -2,15 +2,26 @@
  * Which Venue row a show was at, when its source spells the building another way.
  *
  * Concert.venue is the text the source sent, so one building arrives as
- * "Rockefeller" and "ROCKEFELLER ". Concert.venue_id points every spelling at
- * one Venue row (THO-346), so a venue page or a venue review has one thing to
- * hang off.
+ * "Rockefeller", "ROCKEFELLER " and, from another source, "Rockefeller Music
+ * Hall". Concert.venue_id points every spelling at one Venue row (THO-346), so
+ * a venue page or a venue review has one thing to hang off.
  *
- * At ingest, and in the migration that made the table, two spellings are one
- * Venue in the same City when they are the same name once case, whitespace and
- * accents are set aside. That is the SQL function venue_key(), defined by the
- * migration, so both fold alike.
+ * Two levels of sameness:
+ * - At ingest, and in the migration that made the table: same City, and the
+ *   same name once case, whitespace and accents are set aside. That is the
+ *   SQL function venue_key(), defined by the migration, so both fold alike.
+ * - In scripts/merge-venues.js, a dry run read before it is applied: same City
+ *   and a name that mostly agrees (concertDedup's venueSimilarity), or two
+ *   rows standing within NEAR_KM of each other.
  */
+const { haversineKm, venueSimilarity } = require('./concertDedup');
+
+// The bar concertDedup holds two listings' venue names to before calling them one room.
+const NAME_SIM = 0.7;
+// Two rows this close are one building with two names, or two rooms in one
+// building (Rockefeller and John Dee). The dry run shows which; veto the second.
+const NEAR_KM = 0.2;
+
 const coord = (v) => {
   const n = parseFloat(v);
   return Number.isFinite(n) ? n : null;
@@ -39,6 +50,47 @@ async function venueId(db, { name, cityId, latitude = null, longitude = null }) 
   return row.id;
 }
 
+/** Why `a` and `b` look like one building, or null. */
+function sameBuilding(a, b) {
+  const name = venueSimilarity(a.name, b.name);
+  const km = a.latitude != null && a.longitude != null && b.latitude != null && b.longitude != null
+    ? haversineKm(a.latitude, a.longitude, b.latitude, b.longitude)
+    : null;
+  if (name < NAME_SIM && !(km != null && km <= NEAR_KM)) return null;
+  return { name, km };
+}
+
+/**
+ * The merges scripts/merge-venues.js proposes.
+ *
+ * Rows are taken busiest first (most concerts, then oldest), and each one either
+ * stays or goes into a row already kept in its City: the one whose name agrees
+ * most, then the nearest. A row that goes is never a target itself, so nothing
+ * chains from one name to the next.
+ *
+ * @param {Array<{id: number, name: string, city_id: number, latitude: number|null,
+ *   longitude: number|null, concerts: number}>} venues
+ * @returns {Array<{loser: object, winner: object, name: number, km: number|null}>}
+ */
+function planVenueMerges(venues) {
+  const kept = new Map();
+  const merges = [];
+  const busiestFirst = [...venues].sort((a, b) => b.concerts - a.concerts || a.id - b.id);
+  for (const venue of busiestFirst) {
+    if (!kept.has(venue.city_id)) kept.set(venue.city_id, []);
+    let best = null;
+    for (const other of kept.get(venue.city_id)) {
+      const why = sameBuilding(venue, other);
+      if (why && (!best || why.name > best.name || (why.name === best.name && (why.km ?? Infinity) < (best.km ?? Infinity)))) {
+        best = { winner: other, ...why };
+      }
+    }
+    if (best) merges.push({ loser: venue, ...best });
+    else kept.get(venue.city_id).push(venue);
+  }
+  return merges;
+}
+
 /**
  * Moves every concert at Venue `loserId` onto `winnerId`, fills the winner's
  * position if it has none, then deletes the loser. Run inside one transaction.
@@ -57,4 +109,4 @@ async function mergeVenue(tx, loserId, winnerId) {
   return { concerts: concerts.count };
 }
 
-module.exports = { venueId, mergeVenue };
+module.exports = { NEAR_KM, venueId, sameBuilding, planVenueMerges, mergeVenue };
