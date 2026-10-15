@@ -1142,7 +1142,11 @@ describe('GET /bands/recommended', () => {
   const tidal = require('../../utils/tidal.js');
   const artist = (id, name) => ({ id, name, images: [{ url: `https://i/${id}` }], external_urls: { spotify: `https://open/${id}` } });
   const connected = (...providers) => prisma.oAuth.findMany.mockResolvedValue(
-    providers.map((provider) => ({ provider, provider_user_id: `${provider}-acct` })),
+    providers.map((provider) => ({ provider, provider_user_id: `${provider}-acct`, scope: null })),
+  );
+  // A row whose stored grant is spelled out, for the scope-decides cases.
+  const connectedWith = (provider, scope) => prisma.oAuth.findMany.mockResolvedValue(
+    [{ provider, provider_user_id: `${provider}-acct`, scope }],
   );
 
   beforeEach(() => {
@@ -1189,6 +1193,75 @@ describe('GET /bands/recommended', () => {
     expect(res.status).toBe(200);
     expect(res.body.artists).toHaveLength(1);
     expect(res.body.reconnect).toEqual(['tidal']);
+  });
+
+  it('adds the artists you follow after your top ones on a grant that includes user-follow-read', async () => {
+    connectedWith('spotify', 'playlist-modify-private user-top-read user-follow-read');
+    vi.spyOn(spotify, 'topArtists').mockResolvedValue([artist('a', 'Opeth')]);
+    vi.spyOn(spotify, 'followedArtists').mockResolvedValue([artist('a', 'Opeth'), artist('d', 'Gojira')]);
+
+    const res = await request(app).get('/bands/recommended').set(...authHeader());
+
+    expect(res.body.artists.map((a) => a.id)).toEqual(['a', 'd']);
+    expect(res.body.reconnect).toEqual([]);
+  });
+
+  it('keeps answering with top artists on a grant from before user-follow-read, without asking for a reconnect', async () => {
+    // Connections made between the two scope changes have top artists but not
+    // follows. Sending them back through consent for the smaller half of the
+    // list would read as broken; they get follows whenever they next connect.
+    connectedWith('spotify', 'playlist-modify-private user-top-read');
+    vi.spyOn(spotify, 'topArtists').mockResolvedValue([artist('a', 'Opeth')]);
+    const followed = vi.spyOn(spotify, 'followedArtists');
+
+    const res = await request(app).get('/bands/recommended').set(...authHeader());
+
+    expect(followed).not.toHaveBeenCalled();
+    expect(res.body).toMatchObject({ artists: [{ id: 'a' }], reconnect: [] });
+  });
+
+  it('asks for a reconnect from the stored grant alone when it lacks the listening scope, spending no request', async () => {
+    connectedWith('spotify', 'playlist-modify-private');
+    const top = vi.spyOn(spotify, 'topArtists');
+
+    const res = await request(app).get('/bands/recommended').set(...authHeader());
+
+    expect(top).not.toHaveBeenCalled();
+    expect(spotify.getValidToken).not.toHaveBeenCalled();
+    expect(res.body).toEqual({ artists: [], reconnect: ['spotify'] });
+  });
+
+  it('asks for a reconnect when the refresh token no longer works, rather than a 500', async () => {
+    connected('spotify');
+    spotify.getValidToken.mockRejectedValue(new spotify.SpotifyAuthError('Spotify connection is no longer valid'));
+
+    const res = await request(app).get('/bands/recommended').set(...authHeader());
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ artists: [], reconnect: ['spotify'] });
+  });
+
+  it('answers 502 when the service is down, rather than an empty list pretending nothing matched', async () => {
+    connected('spotify');
+    vi.spyOn(spotify, 'topArtists').mockRejectedValue({ response: { status: 503, data: 'down' } });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await request(app).get('/bands/recommended').set(...authHeader());
+
+    expect(res.status).toBe(502);
+    expect(res.body.error).toMatch(/Spotify/);
+  });
+
+  it('reads only the caller\'s own connections and wishlist, and never returns a token', async () => {
+    connected('spotify');
+    vi.spyOn(spotify, 'topArtists').mockResolvedValue([artist('a', 'Opeth')]);
+
+    const res = await request(app).get('/bands/recommended').set(...authHeader({ id: 'user-1' }));
+
+    expect(prisma.oAuth.findMany.mock.calls[0][0].where.user).toBe('user-1');
+    expect(prisma.oAuth.findMany.mock.calls[0][0].select).not.toHaveProperty('access_token');
+    expect(prisma.wishlistBandReference.findMany.mock.calls[0][0].where).toEqual({ wishlist_rel: { user_id: 'user-1' } });
+    expect(JSON.stringify(res.body)).not.toContain('tok');
   });
 
   it('asks for a connection when there is none', async () => {

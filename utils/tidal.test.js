@@ -151,3 +151,29 @@ describe('writing the playlist', () => {
     expect(keys.size).toBe(3);
   });
 });
+
+describe('favouriteArtists', () => {
+  it('names each favourite from the included artists and follows the next link', async () => {
+    const request = vi.spyOn(axios, 'request')
+      .mockResolvedValueOnce(ok({
+        data: [{ id: '1', type: 'artists' }, { id: '2', type: 'artists' }],
+        included: [{ id: '1', type: 'artists', attributes: { name: 'Leprous' } }, { id: '2', type: 'artists', attributes: { name: 'Gojira' } }],
+        links: { next: '/userCollections/42/relationships/artists?include=artists&page[cursor]=abc' },
+      }))
+      .mockResolvedValueOnce(ok({
+        // An id with nothing included for it has no name to show, so it is skipped.
+        data: [{ id: '3', type: 'artists' }, { id: '4', type: 'artists' }],
+        included: [{ id: '3', type: 'artists', attributes: { name: 'Opeth' } }],
+        links: {},
+      }));
+
+    const out = await tidal.favouriteArtists('token', '42');
+
+    expect(out).toEqual([{ id: '1', name: 'Leprous' }, { id: '2', name: 'Gojira' }, { id: '3', name: 'Opeth' }]);
+    expect(request.mock.calls[0][0].url).toMatch(/\/userCollections\/42\/relationships\/artists$/);
+    // The next link carries its own query string; sending params again would
+    // duplicate include and could drop the cursor.
+    expect(request.mock.calls[1][0].url).toMatch(/page\[cursor\]=abc$/);
+    expect(request.mock.calls[1][0].params).toBeUndefined();
+  });
+});
