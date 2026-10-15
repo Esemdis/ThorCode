@@ -35,7 +35,8 @@ function invalid(req, res) {
   return true;
 }
 
-const recapFor = (wishlist, source) => weeklyRecap(wishlist.bands, {
+const recapFor = (wishlist, source, { similar = false } = {}) => weeklyRecap(wishlist.bands, {
+  similarFor: similar ? wishlist.user_id : undefined,
   timeZone: source.tz ?? "UTC",
   weeksAgo: source.weeks_ago === undefined ? 0 : Number(source.weeks_ago),
 });
@@ -78,8 +79,8 @@ router.post(
         return res.status(409).json({ error: "This wishlist has no Discord webhook to post to." });
       }
 
-      const recap = await recapFor(wishlist, req.body);
-      if (recap.total === 0) {
+      const recap = await recapFor(wishlist, req.body, { similar: true });
+      if (recap.total === 0 && !recap.similar) {
         return res.status(409).json({ error: "No new concerts that week, so there is nothing to post." });
       }
 

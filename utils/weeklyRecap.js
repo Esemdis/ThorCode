@@ -16,6 +16,9 @@
 const axios = require("axios");
 const prisma = require("../prisma/client");
 const { buildRecapEmbed } = require("./discordEmbeds");
+// Through the module, so a test can stand in for Last.fm.
+const lastfm = require("./lastfm");
+const { canonicalBandName } = require("./lineupNames");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -180,13 +183,78 @@ function summarizeWeek(concerts) {
   };
 }
 
+// An attended show brought in from setlist.fm is a record of a night, not an
+// announcement. Null is said outright: SQL's != never matches it.
+const ANNOUNCED = [{ source: null }, { source: { not: "setlistfm" } }];
+
+// Last.fm is asked for every band on the wishlist, a day's cache behind it.
+// shortcut: one at a time and uncapped; batch or cap if a wishlist outgrows a Monday morning.
+async function relatedNames(bands) {
+  const names = new Set();
+  for (const band of bands) {
+    try {
+      for (const r of (await lastfm.getRelated(band)).related ?? []) names.add(canonicalBandName(r.name));
+    } catch (err) {
+      console.error(`[weeklyRecap] No similar artists for ${band.name}:`, err.message);
+    }
+  }
+  names.delete("");
+  return names;
+}
+
+/**
+ * The week's new shows by bands Last.fm calls similar to the wishlist's, in the
+ * cities the user watches (a city subscription with no band). Same week and
+ * "added" rules as the recap proper; shows already in it, and bands already on
+ * the wishlist, are left out.
+ *
+ * @returns {Promise<{total: number, cities: Array}|null>} null when there is nothing to show
+ */
+async function similarNearYou(bandRefs, userId, bounds) {
+  if (!process.env.LASTFM_API_KEY || bandRefs.length === 0) return null;
+  const watched = await prisma.notificationSubscription.findMany({
+    where: { user_id: userId, band_id: null, city_id: { not: null } },
+    select: { city_id: true },
+  });
+  if (watched.length === 0) return null;
+
+  const bandIds = bandRefs.map((b) => b.band_id);
+  const rows = await prisma.concert.findMany({
+    where: {
+      created_at: { gte: bounds.start, lt: bounds.end },
+      city_id: { in: watched.map((w) => w.city_id) },
+      bands: { some: {}, none: { band: { in: bandIds } } },
+      OR: ANNOUNCED,
+    },
+    select: {
+      id: true, name: true, venue: true, festival: true, url: true, city: true, country: true,
+      concert_date: true, created_at: true,
+      bands: { select: { band_rel: { select: { id: true, name: true } } } },
+    },
+  });
+  if (rows.length === 0) return null;
+
+  const related = await relatedNames(await prisma.band.findMany({
+    where: { id: { in: bandIds } }, select: { id: true, name: true, MBID: true },
+  }));
+  const concerts = rows.filter(addedAhead).flatMap((c) => {
+    const similar = c.bands.map((b) => b.band_rel).filter((b) => related.has(canonicalBandName(b.name)));
+    return similar.length === 0 ? [] : [{ ...c, participating_bands: similar }];
+  });
+  if (concerts.length === 0) return null;
+  const { total, cities } = summarizeWeek(concerts);
+  return { total, cities };
+}
+
 /**
  * The recap of one week for a wishlist.
  *
  * @param {Array<{band_id: number, tier: string}>} bandRefs - the wishlist's bands
- * @param {{now?: Date, timeZone: string, weeksAgo?: number}} options
+ * @param {{now?: Date, timeZone: string, weeksAgo?: number, similarFor?: string}} options
+ *   `similarFor`, the owner's user id, adds `similar`: the Discord post's
+ *   "similar bands near you" section. The tab leaves it out.
  */
-async function weeklyRecap(bandRefs, { now = new Date(), timeZone, weeksAgo = 0 }) {
+async function weeklyRecap(bandRefs, { now = new Date(), timeZone, weeksAgo = 0, similarFor }) {
   const bounds = weekBounds(now, timeZone, weeksAgo);
   const tiers = new Map(bandRefs.map((b) => [b.band_id, b.tier]));
   const bandIds = [...tiers.keys()];
@@ -195,9 +263,7 @@ async function weeklyRecap(bandRefs, { now = new Date(), timeZone, weeksAgo = 0 
     where: {
       created_at: { gte: bounds.start, lt: bounds.end },
       bands: { some: { band: { in: bandIds } } },
-      // An attended show brought in from setlist.fm is a record of a night,
-      // not an announcement. Null is said outright: SQL's != never matches it.
-      OR: [{ source: null }, { source: { not: "setlistfm" } }],
+      OR: ANNOUNCED,
     },
     select: {
       id: true,
@@ -230,7 +296,8 @@ async function weeklyRecap(bandRefs, { now = new Date(), timeZone, weeksAgo = 0 
     })),
   }));
 
-  return { ...bounds, time_zone: timeZone, ...summarizeWeek(concerts) };
+  const similar = similarFor ? await similarNearYou(bandRefs, similarFor, bounds) : null;
+  return { ...bounds, time_zone: timeZone, ...summarizeWeek(concerts), ...(similar && { similar }) };
 }
 
 /** Posts a recap to a Discord webhook. Throws what axios throws. */
@@ -243,7 +310,7 @@ async function postRecap(webhook, recap) {
  * on and has somewhere for it to go.
  *
  * Last week is the latest one that has ended on the owner's clock. A week with
- * nothing in it is not posted. One missed — the server down on a Monday
+ * nothing in it, not even a similar band's show, is not posted. One missed — the server down on a Monday
  * morning — is not caught up the week after: it is a recap, and the tab still
  * has it.
  *
@@ -254,6 +321,7 @@ async function sendWeeklyRecaps(now = new Date()) {
     where: { discord_webhook: { not: null } },
     select: {
       id: true,
+      user_id: true,
       discord_webhook: true,
       user_rel: { select: { settings: true } },
       bands: { select: { band_id: true, tier: true } },
@@ -266,8 +334,8 @@ async function sendWeeklyRecaps(now = new Date()) {
     if (!settings || typeof settings !== "object" || settings.weeklyRecap !== true) continue;
     const timeZone = isTimeZone(settings.timeZone) ? settings.timeZone : "UTC";
 
-    const recap = await weeklyRecap(wishlist.bands, { now, timeZone, weeksAgo: 1 });
-    if (recap.total === 0) {
+    const recap = await weeklyRecap(wishlist.bands, { now, timeZone, weeksAgo: 1, similarFor: wishlist.user_id });
+    if (recap.total === 0 && !recap.similar) {
       result.quiet += 1;
       continue;
     }

@@ -5,12 +5,15 @@ import { installFakePrisma } from '../test/routeApp.js';
 const prisma = installFakePrisma({
   concert: { findMany: vi.fn() },
   wishlist: { findMany: vi.fn() },
+  notificationSubscription: { findMany: vi.fn() },
+  band: { findMany: vi.fn() },
 });
 
 // This file's own copies — it is CommonJS and loads them through Node's
 // require, which an ESM import would not share.
 const require = createRequire(import.meta.url);
 const axios = require('axios');
+const lastfm = require('./lastfm.js');
 const { weekBounds, summarizeWeek, weeklyRecap, sendWeeklyRecaps } = require('./weeklyRecap.js');
 
 const iso = (b) => [b.start.toISOString(), b.end.toISOString()];
@@ -19,6 +22,8 @@ beforeEach(() => {
   vi.restoreAllMocks();
   prisma.concert.findMany.mockReset().mockResolvedValue([]);
   prisma.wishlist.findMany.mockReset().mockResolvedValue([]);
+  prisma.notificationSubscription.findMany.mockReset().mockResolvedValue([]);
+  prisma.band.findMany.mockReset().mockResolvedValue([]);
 });
 
 describe('weekBounds', () => {
@@ -246,5 +251,73 @@ describe('sendWeeklyRecaps', () => {
     const result = await sendWeeklyRecaps(MONDAY);
 
     expect(result).toEqual({ sent: 1, failed: 1, quiet: 0 });
+  });
+});
+
+describe('similar bands near you', () => {
+  const NOW = new Date('2026-10-04T12:00:00Z');
+  const refs = [{ band_id: 1, tier: 'LOVE' }];
+  const show = (id, name, created = '2026-10-01T10:00:00Z', date = '2027-03-12') => ({
+    id, city: 'Stockholm', country: 'SE', concert_date: new Date(date), created_at: new Date(created),
+    bands: [{ band_rel: { id: id + 10, name } }],
+  });
+  const run = () => weeklyRecap(refs, { now: NOW, timeZone: 'UTC', similarFor: 'user-1' });
+
+  beforeEach(() => {
+    process.env.LASTFM_API_KEY = 'k';
+    prisma.notificationSubscription.findMany.mockResolvedValue([{ city_id: 7 }]);
+    prisma.band.findMany.mockResolvedValue([{ id: 1, name: 'Ghost', MBID: null }]);
+    vi.spyOn(lastfm, 'getRelated').mockResolvedValue({ related: [{ name: 'Mercyful Fate' }] });
+  });
+
+  it('lists related bands playing a watched city, leaving out the unrelated and the already-past', async () => {
+    prisma.concert.findMany
+      .mockResolvedValueOnce([]) // the wishlist's own bands
+      .mockResolvedValueOnce([
+        show(1, 'Mercyful Fate'), show(2, 'Some Other Band'), show(3, 'Mercyful Fate', '2026-10-01T10:00:00Z', '2019-01-01'),
+      ]);
+
+    const recap = await run();
+
+    expect(recap.total).toBe(0);
+    expect(recap.similar.total).toBe(1);
+    expect(recap.similar.cities[0]).toMatchObject({ city: 'Stockholm', count: 1 });
+    const { where } = prisma.concert.findMany.mock.calls[1][0];
+    expect(where.city_id).toEqual({ in: [7] });
+    expect(where.bands.none).toEqual({ band: { in: [1] } });
+    expect(prisma.notificationSubscription.findMany.mock.calls[0][0].where)
+      .toEqual({ user_id: 'user-1', band_id: null, city_id: { not: null } });
+  });
+
+  it('has no section without watched cities, and the tab never asks', async () => {
+    prisma.notificationSubscription.findMany.mockResolvedValue([]);
+    expect((await run()).similar).toBeUndefined();
+
+    await weeklyRecap(refs, { now: NOW, timeZone: 'UTC' });
+    expect(prisma.notificationSubscription.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('carries on when Last.fm fails for a band', async () => {
+    prisma.concert.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([show(1, 'Mercyful Fate')]);
+    lastfm.getRelated.mockRejectedValue(new Error('timeout'));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    expect((await run()).similar).toBeUndefined();
+  });
+
+  it('posts a week that holds only a similar band, and still skips an empty one', async () => {
+    prisma.wishlist.findMany.mockResolvedValue([{
+      id: 1, user_id: 'user-1', discord_webhook: 'https://discord.example/1',
+      user_rel: { settings: { weeklyRecap: true } }, bands: refs,
+    }]);
+    prisma.concert.findMany.mockImplementation(async ({ where }) =>
+      where.city_id ? [show(1, 'Mercyful Fate')] : []);
+    const post = vi.spyOn(axios, 'post').mockResolvedValue({ status: 204 });
+
+    expect(await sendWeeklyRecaps(new Date('2026-10-05T09:00:00Z'))).toEqual({ sent: 1, failed: 0, quiet: 0 });
+    expect(post.mock.calls[0][1].embeds[0].title).toBe('Week 40: similar bands near you');
+
+    prisma.concert.findMany.mockResolvedValue([]);
+    expect(await sendWeeklyRecaps(new Date('2026-10-05T09:00:00Z'))).toEqual({ sent: 0, failed: 0, quiet: 1 });
   });
 });

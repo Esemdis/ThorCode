@@ -148,6 +148,20 @@ describe('buildRecapEmbed', () => {
     ]);
   });
 
+  it('adds the similar-bands section after the cities, and stands alone in a week with none of yours', () => {
+    const similar = { total: 1, cities: [{ city: 'Oslo', country: 'NO', count: 1, concerts: [show('2027-04-01', 'Mercyful Fate')] }] };
+
+    const both = buildRecapEmbed(recap({ similar }));
+    expect(both.fields.slice(-2)).toEqual([
+      { name: 'Similar bands near you · 1 concert', value: expect.any(String), inline: false },
+      { name: '↳ 🇳🇴 Oslo · 1', value: '**1 Apr 2027** — Mercyful Fate', inline: false },
+    ]);
+
+    const alone = buildRecapEmbed(recap({ total: 0, bands: [], cities: [], country_count: 0, similar }));
+    expect(alone.title).toBe('Week 40: similar bands near you');
+    expect(alone.description).toBe('28 Sep – 4 Oct 2026');
+  });
+
   it('reads a show\'s day in UTC, as the app does', () => {
     // 23:30 in Stockholm on the 12th is the 12th; read in a zone ahead of
     // UTC it could print as the 13th.
