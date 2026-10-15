@@ -12,8 +12,9 @@ const { validationResult, body } = require('express-validator');
 const axios = require('axios');
 const { canonicalBandName } = require('../../../utils/lineupNames');
 const { searchArtists, getArtists } = require('../../../utils/spotify');
-// The user-token reads go through the module, so a test can stand in for them.
+// The user-token reads go through the modules, so a test can stand in for them.
 const spotify = require('../../../utils/spotify');
+const tidal = require('../../../utils/tidal');
 const { getArtistInfo } = require('../../../utils/lastfm');
 const { relevantArtists } = require('../../../utils/artistSearch');
 const { resolveArtistImages } = require('../../../utils/bandImages');
@@ -415,48 +416,74 @@ router.delete(
   },
 );
 
+// How each connected service says who you listen to: Spotify's top artists of
+// the last six months, Tidal's favourites. Rows are shaped like artist-search's
+// so the add dialog shows both the same way; Tidal gives no image.
+const LISTENING = {
+  spotify: async (userId) => (await spotify.topArtists(await spotify.getValidToken(userId)))
+    .map((a) => ({ id: a.id, name: a.name, image: a.images?.[0]?.url ?? null, spotifyUrl: a.external_urls?.spotify ?? null })),
+  tidal: async (userId, accountId) => (await tidal.favouriteArtists(await tidal.getValidToken(userId), accountId))
+    .map((a) => ({ id: `tidal:${a.id}`, name: a.name, image: null, spotifyUrl: null })),
+};
+
 /**
  * GET /bands/recommended
  *
- * Artists to follow, from the caller's own Spotify listening: their top
- * artists of the last six months, less the ones already on their wishlist.
- * Shaped like artist-search's rows, so the add dialog shows both the same way.
+ * Artists to follow, from the caller's own listening on every service they
+ * have connected, less the ones already on their wishlist. Spotify's rows come
+ * first; an artist on both services is listed once.
  *
- * 409 with reconnect: true when Spotify is not connected, or was connected
- * before user-top-read was in the scopes — Spotify answers the missing scope
- * with a 403, and only a fresh consent screen adds it.
+ * `reconnect` names a connected service that would not answer: its connection
+ * has lapsed, or predates the listening scope — both answer the missing scope
+ * with a 403, and only a fresh consent screen adds it. 409 only when nothing
+ * is connected at all, with the services this server can connect.
  */
 router.get('/bands/recommended', auth, artistLookupRateLimit, async (req, res) => {
-  let artists;
   try {
-    artists = await spotify.topArtists(await spotify.getValidToken(req.user.id));
-  } catch (error) {
-    if (error instanceof spotify.SpotifyAuthError) {
-      return res.status(409).json({ error: error.message, reconnect: true });
+    const connections = await prisma.oAuth.findMany({
+      where: { user: req.user.id, provider: { in: Object.keys(LISTENING) } },
+      select: { provider: true, provider_user_id: true },
+    });
+    if (connections.length === 0) {
+      return res.status(409).json({
+        error: 'Connect Spotify or Tidal to see the artists you listen to.',
+        reconnect: true,
+        services: [spotify, tidal].filter((s) => s.isConfigured()).map((s) => s.PROVIDER),
+      });
     }
-    if (error.response?.status === 403) {
-      return res.status(409).json({ error: 'Reconnect Spotify so it can share your top artists.', reconnect: true });
-    }
-    console.error('[spotify] Top artists failed:', error.response?.data ?? error.message);
-    return res.status(502).json({ error: 'Could not reach Spotify. Try again in a moment.' });
-  }
 
-  try {
     const onList = await prisma.wishlistBandReference.findMany({
       where: { wishlist_rel: { user_id: req.user.id } },
       select: { band_rel: { select: { name: true, spotify_id: true } } },
     });
     const ids = new Set(onList.map((row) => row.band_rel.spotify_id).filter(Boolean));
+    // Grows as rows are kept, so the same artist from a second service is dropped too.
     const names = new Set(onList.map((row) => canonicalBandName(row.band_rel.name)));
-    const rows = artists
-      .filter((artist) => !ids.has(artist.id) && !names.has(canonicalBandName(artist.name)))
-      .map((artist) => ({
-        id: artist.id,
-        name: artist.name,
-        image: artist.images?.[0]?.url ?? null,
-        spotifyUrl: artist.external_urls?.spotify ?? null,
-      }));
-    return res.json(rows);
+
+    const artists = [];
+    const reconnect = [];
+    // Spotify first whatever order the rows came in.
+    const byService = Object.keys(LISTENING).map((key) => connections.find((c) => c.provider === key)).filter(Boolean);
+    for (const { provider, provider_user_id: accountId } of byService) {
+      let rows;
+      try {
+        rows = await LISTENING[provider](req.user.id, accountId);
+      } catch (error) {
+        if (error instanceof spotify.SpotifyAuthError || error instanceof tidal.TidalAuthError || error.response?.status === 403) {
+          reconnect.push(provider);
+          continue;
+        }
+        console.error(`[${provider}] Listening read failed:`, error.response?.data ?? error.message);
+        return res.status(502).json({ error: `Could not reach ${provider === 'tidal' ? tidal.LABEL : spotify.LABEL}. Try again in a moment.` });
+      }
+      for (const row of rows) {
+        const key = canonicalBandName(row.name);
+        if (ids.has(row.id) || names.has(key)) continue;
+        names.add(key);
+        artists.push({ ...row, service: provider });
+      }
+    }
+    return res.json({ artists, reconnect });
   } catch (error) {
     console.error('[bands/recommended] Error:', error.message);
     return res.status(500).json({ error: 'Internal server error' });

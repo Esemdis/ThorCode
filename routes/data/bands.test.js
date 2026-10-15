@@ -16,6 +16,7 @@ const prisma = installFakePrisma({
   },
   city: { upsert: vi.fn(), update: vi.fn(), findMany: vi.fn(async () => []) },
   wishlist: { findUnique: vi.fn(), findFirst: vi.fn() },
+  oAuth: { findMany: vi.fn(async () => []) },
   wishlistBandReference: { findMany: vi.fn(), create: vi.fn(), findUnique: vi.fn(), deleteMany: vi.fn() },
   concertBandReference: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn() },
   concertAttendance: { findMany: vi.fn(), deleteMany: vi.fn() },
@@ -1138,10 +1139,20 @@ describe('a sync the Python service turns away', () => {
 describe('GET /bands/recommended', () => {
   const require = createRequire(import.meta.url);
   const spotify = require('../../utils/spotify.js');
+  const tidal = require('../../utils/tidal.js');
   const artist = (id, name) => ({ id, name, images: [{ url: `https://i/${id}` }], external_urls: { spotify: `https://open/${id}` } });
+  const connected = (...providers) => prisma.oAuth.findMany.mockResolvedValue(
+    providers.map((provider) => ({ provider, provider_user_id: `${provider}-acct` })),
+  );
+
+  beforeEach(() => {
+    prisma.wishlistBandReference.findMany.mockResolvedValue([]);
+    vi.spyOn(spotify, 'getValidToken').mockResolvedValue('tok');
+    vi.spyOn(tidal, 'getValidToken').mockResolvedValue('tok');
+  });
 
   it('drops the artists already on your wishlist, by Spotify id or by name', async () => {
-    vi.spyOn(spotify, 'getValidToken').mockResolvedValue('tok');
+    connected('spotify');
     vi.spyOn(spotify, 'topArtists').mockResolvedValue([artist('a', 'Opeth'), artist('b', 'Spiritbox'), artist('c', 'The Ocean')]);
     prisma.wishlistBandReference.findMany.mockResolvedValue([
       { band_rel: { name: 'Opeth', spotify_id: null } },
@@ -1151,25 +1162,42 @@ describe('GET /bands/recommended', () => {
     const res = await request(app).get('/bands/recommended').set(...authHeader());
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual([{ id: 'b', name: 'Spiritbox', image: 'https://i/b', spotifyUrl: 'https://open/b' }]);
+    expect(res.body).toEqual({
+      artists: [{ id: 'b', name: 'Spiritbox', image: 'https://i/b', spotifyUrl: 'https://open/b', service: 'spotify' }],
+      reconnect: [],
+    });
   });
 
-  it('asks for a reconnect when the connection predates the top-artists scope', async () => {
-    vi.spyOn(spotify, 'getValidToken').mockResolvedValue('tok');
-    vi.spyOn(spotify, 'topArtists').mockRejectedValue({ response: { status: 403 } });
+  it('adds Tidal favourites after Spotify, once each, with the account id from the connection', async () => {
+    connected('tidal', 'spotify');
+    vi.spyOn(spotify, 'topArtists').mockResolvedValue([artist('a', 'Opeth')]);
+    vi.spyOn(tidal, 'favouriteArtists').mockResolvedValue([{ id: '9', name: 'OPETH' }, { id: '8', name: 'Leprous' }]);
+
+    const res = await request(app).get('/bands/recommended').set(...authHeader());
+
+    expect(tidal.favouriteArtists).toHaveBeenCalledWith('tok', 'tidal-acct');
+    expect(res.body.artists.map((a) => [a.id, a.service])).toEqual([['a', 'spotify'], ['tidal:8', 'tidal']]);
+  });
+
+  it('names the service to reconnect when its connection predates the listening scope, and still answers the other', async () => {
+    connected('spotify', 'tidal');
+    vi.spyOn(spotify, 'topArtists').mockResolvedValue([artist('a', 'Opeth')]);
+    vi.spyOn(tidal, 'favouriteArtists').mockRejectedValue({ response: { status: 403 } });
+
+    const res = await request(app).get('/bands/recommended').set(...authHeader());
+
+    expect(res.status).toBe(200);
+    expect(res.body.artists).toHaveLength(1);
+    expect(res.body.reconnect).toEqual(['tidal']);
+  });
+
+  it('asks for a connection when there is none', async () => {
+    connected();
 
     const res = await request(app).get('/bands/recommended').set(...authHeader());
 
     expect(res.status).toBe(409);
     expect(res.body.reconnect).toBe(true);
-  });
-
-  it('asks for a connection when there is none', async () => {
-    vi.spyOn(spotify, 'getValidToken').mockRejectedValue(new spotify.SpotifyAuthError('Spotify is not connected'));
-
-    const res = await request(app).get('/bands/recommended').set(...authHeader());
-
-    expect(res.status).toBe(409);
-    expect(res.body).toEqual({ error: 'Spotify is not connected', reconnect: true });
+    expect(spotify.getValidToken).not.toHaveBeenCalled();
   });
 });

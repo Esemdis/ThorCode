@@ -41,7 +41,7 @@ describe('connecting', () => {
     expect(url.searchParams.get('code_challenge_method')).toBe('S256');
     expect(url.searchParams.get('code_challenge')).toBe(pkceChallenge(sent.get('code_verifier')));
     expect(sent.get('code_verifier')).toBe(pkceVerifier(state));
-    expect(url.searchParams.get('scope')).toBe('playlists.write search.read');
+    expect(url.searchParams.get('scope')).toBe('playlists.write search.read collection.read');
   });
 
   it('keeps the refresh token it has when a refresh does not issue a new one', async () => {

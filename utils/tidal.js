@@ -31,9 +31,14 @@ const PROVIDER = 'tidal';
 const LABEL = 'Tidal';
 const JSON_API = 'application/vnd.api+json';
 
-// Creating a playlist, and searching as the user so results are the ones
-// their country can play. Nothing reads their library or history.
-const SCOPES = ['playlists.write', 'search.read'];
+// Creating a playlist, searching as the user so results are the ones their
+// country can play, and reading their favourite artists to suggest who to
+// follow. A connection made before collection.read was asked for lacks it;
+// favouriteArtists then fails with a 403 and the route asks for a reconnect.
+const SCOPES = ['playlists.write', 'search.read', 'collection.read'];
+
+// Favourites come 20 a page, newest first. Five pages is plenty to suggest from.
+const FAVOURITE_PAGES = 5;
 
 // The API takes at most 50 items per add call.
 const ADD_CHUNK = 50;
@@ -203,6 +208,33 @@ async function findTrack(accessToken, track) {
 }
 
 /**
+ * The artists the user has favourited, newest first.
+ *
+ * Tidal keeps no listening history an app can read, so the collection is the
+ * nearest thing to "who you listen to". The account id is the OAuth row's
+ * provider_user_id — the token response named it at connect time.
+ *
+ * @returns {Promise<{ id: string, name: string }[]>}
+ */
+async function favouriteArtists(accessToken, tidalUserId) {
+  const out = [];
+  let url = `${API_URL}/userCollections/${encodeURIComponent(tidalUserId)}/relationships/artists`;
+  let params = { include: 'artists' };
+  for (let page = 0; page < FAVOURITE_PAGES && url; page++) {
+    const { data } = await request({ method: 'get', url, params, headers: headersFor(accessToken) });
+    const byId = new Map((data?.included ?? []).filter((r) => r?.type === 'artists').map((r) => [r.id, r]));
+    for (const { id } of (Array.isArray(data?.data) ? data.data : [])) {
+      const name = byId.get(id)?.attributes?.name;
+      if (name) out.push({ id, name });
+    }
+    // The next link carries its own query string, include and cursor both.
+    url = data?.links?.next ? `${API_URL}${data.links.next}` : null;
+    params = undefined;
+  }
+  return out;
+}
+
+/**
  * Create an empty unlisted playlist on the connected account.
  *
  * Sent with an idempotency key, so a retry after a 429 replays the first
@@ -251,6 +283,7 @@ module.exports = {
   exchangeCode,
   expiryFrom,
   getValidToken,
+  favouriteArtists,
   findTrack,
   createPlaylist,
   addItems,
