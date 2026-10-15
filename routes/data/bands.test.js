@@ -209,6 +209,8 @@ describe('POST /bulk', () => {
     prisma.band.findUnique.mockImplementation(async ({ where }) => ({ id: where.id, name: `Band ${where.id}` }));
     prisma.concert.findMany.mockResolvedValue([]);
     prisma.city.upsert.mockResolvedValue({ id: 7 });
+    // utils/venueMatch.js's INSERT ... RETURNING id.
+    prisma.$queryRaw.mockResolvedValue([{ id: 31 }]);
     let nextId = 100;
     prisma.concert.create.mockImplementation(async ({ data }) => ({ id: nextId++, ...data }));
     prisma.concertBandReference.createMany.mockResolvedValue({ count: 1 });
@@ -257,8 +259,10 @@ describe('POST /bulk', () => {
 
       expect(res.status).toBe(200);
       expect(prisma.city.upsert.mock.calls[0][0].where).toEqual({ name_country: { name: 'Stockholm', country: 'SE' } });
-      expect(prisma.concert.create.mock.calls[0][0].data).toMatchObject({ city: 'Stockholm', city_id: 7 });
+      expect(prisma.concert.create.mock.calls[0][0].data).toMatchObject({ city: 'Stockholm', city_id: 7, venue_id: 31 });
       expect(res.body.details.insertedConcerts[0].city).toBe('Stockholm');
+      // The Venue is filed under the City the show went to, at the show's position.
+      expect(prisma.$queryRaw.mock.calls[0].slice(1)).toEqual(['Annexet', 'Annexet', 7, 59.2937, 18.081]);
     });
   });
 
@@ -305,7 +309,7 @@ describe('POST /bulk', () => {
     // venue here: only prices, sale state and sold-out were ever updated, and
     // reconcile matches it by event id and looks no further.
     const stored = (over = {}) => ({
-      id: 55, event_id: 'bit_1', name: 'Gojira', venue: 'Annexet', city: 'Stockholm', country: 'SE',
+      id: 55, event_id: 'bit_1', name: 'Gojira', venue: 'Annexet', city: 'Stockholm', country: 'SE', city_id: 7,
       concert_date: new Date('2030-05-01T19:00:00Z'), latitude: '59.2936', longitude: '18.0836',
       sold_out: false, _count: { bands: 1 }, ...over,
     });
@@ -353,7 +357,8 @@ describe('POST /bulk', () => {
 
       await ingest(again({ venue: 'Cirkus', latitude: '59.3247', longitude: '18.0991' }));
 
-      expect(written()[0]).toMatchObject({ venue: 'Cirkus', latitude: '59.3247', longitude: '18.0991' });
+      expect(written()[0]).toMatchObject({ venue: 'Cirkus', latitude: '59.3247', longitude: '18.0991', venue_id: 31 });
+      expect(prisma.$queryRaw.mock.calls[0].slice(1)).toEqual(['Cirkus', 'Cirkus', 7, 59.3247, 18.0991]);
     });
 
     it('keeps a wishlist\'s feed to its fifteen entries when a show sells out', async () => {

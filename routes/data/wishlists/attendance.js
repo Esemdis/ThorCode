@@ -17,6 +17,7 @@ const { conflict } = require("../../../utils/apiResponse");
 const { countMediaForAttendances } = require("../../../utils/mediaDetach");
 const { enrichConcertBands } = require("../../../utils/setlistEnrich");
 const { storedCity } = require("../../../utils/cityMatch");
+const { venueId } = require("../../../utils/venueMatch");
 const { ownWishlist } = require("./shared");
 // Called through the module rather than destructured, so a test can stand in
 // for setlist.fm on the router's own copy of it.
@@ -439,6 +440,8 @@ router.post(
           latitude: hasCoords ? String(latitude) : null,
           longitude: hasCoords ? String(longitude) : null,
           city_id: cityId,
+          // No position: setlist.fm's is the city's (see below).
+          venue_id: await venueId(prisma, { name: venue, cityId }),
         },
         update: {},
         select: { id: true },

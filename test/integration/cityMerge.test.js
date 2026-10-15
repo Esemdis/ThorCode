@@ -29,6 +29,7 @@ describe.skipIf(!url)('one place, one City', () => {
   afterAll(async () => {
     await prisma.notificationSubscription.deleteMany({ where: { user_id: { startsWith: RUN } } });
     await prisma.concert.deleteMany({ where: { country: COUNTRY } });
+    await prisma.venue.deleteMany({ where: { city_rel: { country: COUNTRY } } });
     await prisma.city.deleteMany({ where: { country: COUNTRY } });
     await prisma.user.deleteMany({ where: { id: { startsWith: RUN } } });
     await prisma.band.deleteMany({ where: { name: { startsWith: RUN } } });
@@ -80,7 +81,9 @@ describe.skipIf(!url)('one place, one City', () => {
 
     const moved = await prisma.$transaction((tx) => mergeCity(tx, loser.id, winner.id));
 
-    expect(moved).toEqual({ concerts: 1, watches: 1, droppedWatches: 1, homes: 2, filled: ['reachable', 'airport_iata'] });
+    expect(moved).toEqual({
+      concerts: 1, watches: 1, droppedWatches: 1, venues: 0, mergedVenues: 0, homes: 2, filled: ['reachable', 'airport_iata'],
+    });
     expect(await prisma.city.findUnique({ where: { id: loser.id } })).toBeNull();
     expect(await prisma.city.findUnique({ where: { id: winner.id } })).toMatchObject({ airport_iata: 'LHR', reachable: 'flight' });
     expect(await prisma.concert.findUnique({ where: { id: concert.id } })).toMatchObject({ city: winner.name, city_id: winner.id });

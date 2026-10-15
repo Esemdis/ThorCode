@@ -1086,6 +1086,8 @@ describe('POST /wishlists/:id/attendance/from-setlist', () => {
     prisma.city.findMany.mockResolvedValue([]);
     prisma.city.upsert.mockResolvedValue({ id: 12, latitude: 59.3 });
     prisma.concert.upsert.mockResolvedValue({ id: 500 });
+    // utils/venueMatch.js's INSERT ... RETURNING id.
+    prisma.$queryRaw.mockResolvedValue([{ id: 31 }]);
     prisma.concert.updateMany.mockResolvedValue({ count: 0 });
     prisma.concertBandReference.upsert.mockResolvedValue({});
     prisma.concertAttendance.upsert.mockResolvedValue({ id: 900 });
@@ -1113,8 +1115,11 @@ describe('POST /wishlists/:id/attendance/from-setlist', () => {
         venue: 'Fållan', city: 'Stockholm', country: 'SE',
         concert_date: new Date('2026-06-24T12:00:00Z'),
         url: SETLIST.url,
+        venue_id: 31,
       }),
     }));
+    // Filed under its City with no position: setlist.fm's is the city's.
+    expect(prisma.$queryRaw.mock.calls[0].slice(1)).toEqual(['Fållan', 'Fållan', 12, null, null]);
     expect(prisma.concertBandReference.upsert).toHaveBeenCalledWith(expect.objectContaining({
       create: expect.objectContaining({ setlist: { songs: [{ name: 'Stranded', cover: null, tape: false }] } }),
     }));
