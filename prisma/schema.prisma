@@ -102,12 +102,16 @@ model Concert {
   announced_at       DateTime?
   city_id            Int?
   city_rel           City?                  @relation(fields: [city_id], references: [id])
+  // The building, folded across spellings. `venue` stays the source's text.
+  venue_id           Int?
+  venue_rel          Venue?                 @relation(fields: [venue_id], references: [id])
   bands              ConcertBandReference[] @relation("ConcertBands")
   attendances        ConcertAttendance[]    @relation("ConcertAttendances")
   deliveries         ConcertDelivery[]      @relation("ConcertDeliveries")
   follows            ConcertFollow[]        @relation("ConcertFollows")
 
   @@index([city_id])
+  @@index([venue_id])
   @@index([concert_date, latitude, longitude])
   @@index([concert_date])
 }
@@ -125,8 +129,25 @@ model City {
   created_at                 DateTime                   @default(now())
   concerts                   Concert[]
   notification_subscriptions NotificationSubscription[] @relation("CityNotificationSubscriptions")
+  venues                     Venue[]
 
   @@unique([name, country])
+}
+
+// One building in one city, however the sources spell it: see utils/venueMatch.js.
+// name_key is venue_key(name), the SQL function the THO-346 migration defines.
+model Venue {
+  id         Int       @id @default(autoincrement())
+  name       String
+  name_key   String
+  city_id    Int
+  city_rel   City      @relation(fields: [city_id], references: [id])
+  latitude   Float?
+  longitude  Float?
+  created_at DateTime  @default(now())
+  concerts   Concert[]
+
+  @@unique([city_id, name_key])
 }
 
 model Country {

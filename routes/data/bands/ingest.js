@@ -16,6 +16,7 @@ const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
 const { logActivity } = require('../../../utils/activityLog');
 const { storedCity } = require('../../../utils/cityMatch');
+const { venueId } = require('../../../utils/venueMatch');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Two positions further apart than this are two places, not one venue under
@@ -175,6 +176,14 @@ router.post(
                 ...mergedFields(existingByEventId, concert),
                 ...moved,
               };
+
+              // A moved show, or one stored with no venue name, is at another Venue now.
+              if (concertFieldUpdate.venue) {
+                concertFieldUpdate.venue_id = await venueId(tx, {
+                  name: concertFieldUpdate.venue, cityId: existingByEventId.city_id,
+                  latitude: concert.latitude, longitude: concert.longitude,
+                });
+              }
 
               const betterName = concertFieldUpdate.name ?? null;
               const becameSoldOut = concertFieldUpdate.sold_out === true;
@@ -350,6 +359,7 @@ router.post(
               reachable: concert.reachable ?? null,
               notify_pending: notify,
               city_id: cityId,
+              venue_id: await venueId(tx, { name: concert.venue, cityId, latitude: concert.latitude, longitude: concert.longitude }),
               created_at: new Date(),
             },
           });

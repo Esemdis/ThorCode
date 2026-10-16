@@ -110,6 +110,7 @@ describe.skipIf(!url)('against Postgres', () => {
       await prisma.$executeRawUnsafe(`DROP FUNCTION IF EXISTS ${RUN}_explode()`);
       await prisma.concertBandReference.deleteMany({ where: { band: band.id } });
       await prisma.concert.deleteMany({ where: { city: `${RUN} city` } });
+      await prisma.venue.deleteMany({ where: { city_rel: { name: `${RUN} city` } } });
       await prisma.city.deleteMany({ where: { name: `${RUN} city` } });
       await prisma.band.delete({ where: { id: band.id } });
     }

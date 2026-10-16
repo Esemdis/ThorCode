@@ -17,6 +17,7 @@
  * country and taking the nearest keeps that rare.
  */
 const { haversineKm } = require('./concertDedup');
+const { mergeVenue } = require('./venueMatch');
 
 const CITY_KM = 15;
 // CITY_KM in degrees of latitude, rounded up: a cheap box for the query to
@@ -105,7 +106,9 @@ const GAP_FIELDS = ['reachable', 'airport_iata', 'weather_monthly', 'weather_upd
  * Watches move first, because deleting a City cascades to its watches. A watch
  * the user already holds on the winner is dropped instead, as the route refuses
  * a second one. Concerts take the winner's name too, so the string and the link
- * agree. A home city lives in User.settings, which no foreign key covers.
+ * agree. Venues move too, and one the winner already has under the same
+ * folded name is merged into it. A home city lives in User.settings, which no
+ * foreign key covers.
  */
 async function mergeCity(tx, loserId, winnerId) {
   const [loser, winner] = await Promise.all([
@@ -128,6 +131,12 @@ async function mergeCity(tx, loserId, winnerId) {
   const concerts = await tx.concert.updateMany({
     where: { city_id: loserId }, data: { city_id: winnerId, city: winner.name },
   });
+  const theirs = await tx.venue.findMany({ where: { city_id: loserId }, select: { id: true, name_key: true } });
+  const ours = new Map((await tx.venue.findMany({
+    where: { city_id: winnerId, name_key: { in: theirs.map((v) => v.name_key) } }, select: { id: true, name_key: true },
+  })).map((v) => [v.name_key, v.id]));
+  for (const v of theirs.filter((t) => ours.has(t.name_key))) await mergeVenue(tx, v.id, ours.get(v.name_key));
+  const venues = await tx.venue.updateMany({ where: { city_id: loserId }, data: { city_id: winnerId } });
   const homes = await tx.$executeRaw`
     UPDATE "User" SET settings = jsonb_set(settings, '{homeCityId}', to_jsonb(${winnerId}::int))
     WHERE settings->>'homeCityId' = ${String(loserId)}`;
@@ -138,7 +147,10 @@ async function mergeCity(tx, loserId, winnerId) {
   await tx.city.delete({ where: { id: loserId } });
   if (Object.keys(gaps).length) await tx.city.update({ where: { id: winnerId }, data: gaps });
 
-  return { concerts: concerts.count, watches: watches.count, droppedWatches: twins.length, homes, filled: Object.keys(gaps) };
+  return {
+    concerts: concerts.count, watches: watches.count, droppedWatches: twins.length,
+    venues: venues.count, mergedVenues: theirs.length - venues.count, homes, filled: Object.keys(gaps),
+  };
 }
 
 module.exports = { CITY_KM, nearestCity, matchCity, storedCity, planCityMerges, mergeCity };
