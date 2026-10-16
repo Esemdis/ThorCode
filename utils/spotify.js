@@ -18,13 +18,21 @@ const PROVIDER = 'spotify';
 const LABEL = 'Spotify';
 
 // Creating a private playlist and putting songs in it, and reading the user's
-// top artists so the app can suggest who to follow. A connection made before
-// user-top-read was asked for lacks it; topArtists then fails with a 403 and
-// the route asks for a reconnect.
-const SCOPES = ['playlist-modify-private', 'user-top-read'];
+// top and followed artists so the app can suggest who to follow. A connection
+// made before user-top-read was asked for lacks it; topArtists then fails with
+// a 403 and the route asks for a reconnect. user-follow-read came later still,
+// so the route reads followed artists only when the stored grant names it —
+// a connection with top artists alone keeps working rather than being sent
+// back through the consent screen a second time.
+const SCOPES = ['playlist-modify-private', 'user-top-read', 'user-follow-read'];
 
 // Spotify caps /me/top/artists at 50 per page; one page is plenty to suggest from.
 const TOP_ARTISTS_LIMIT = 50;
+
+// /me/following pages are 50 at most too, cursor-paged. Four pages is 200
+// followed artists, which is past what a suggestion list is read to the end of.
+const FOLLOWED_PAGE_SIZE = 50;
+const FOLLOWED_PAGES = 4;
 
 // Dev-mode apps are capped at 10 results per search; asking for more is an error
 // rather than a truncation.
@@ -284,6 +292,30 @@ async function topArtists(accessToken) {
   return data?.items ?? [];
 }
 
+/**
+ * The artists the user follows on Spotify, in the order Spotify pages them.
+ *
+ * Cursor-paged rather than offset-paged: each page's `cursors.after` is the
+ * last artist id, and a page with no `next` is the last.
+ *
+ * @returns {Promise<object[]>} Raw artist objects.
+ */
+async function followedArtists(accessToken) {
+  const out = [];
+  let after;
+  for (let page = 0; page < FOLLOWED_PAGES; page++) {
+    const { data } = await getWithBackoff(`${API_URL}/me/following`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      params: { type: 'artist', limit: FOLLOWED_PAGE_SIZE, ...(after ? { after } : {}) },
+    });
+    const items = data?.artists?.items ?? [];
+    out.push(...items);
+    after = data?.artists?.cursors?.after;
+    if (!data?.artists?.next || !after || items.length === 0) break;
+  }
+  return out;
+}
+
 /** Create an empty private playlist on the connected account. */
 async function createPlaylist(accessToken, { name, description }) {
   const { data } = await axios.post(
@@ -323,6 +355,7 @@ module.exports = {
   searchArtists,
   getArtists,
   topArtists,
+  followedArtists,
   findTrack,
   createPlaylist,
   addItems,
