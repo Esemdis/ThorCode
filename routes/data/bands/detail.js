@@ -15,7 +15,7 @@ const { searchArtists, getArtists } = require('../../../utils/spotify');
 // The user-token reads go through the modules, so a test can stand in for them.
 const spotify = require('../../../utils/spotify');
 const tidal = require('../../../utils/tidal');
-const { getArtistInfo } = require('../../../utils/lastfm');
+const { getArtistInfo, getRelated } = require('../../../utils/lastfm');
 const { relevantArtists } = require('../../../utils/artistSearch');
 const { resolveArtistImages } = require('../../../utils/bandImages');
 const { matchBandToSpotify } = require('../../../utils/bandSpotifyMatch');
@@ -153,46 +153,14 @@ router.get('/bands/:bandId/related', auth, async (req, res) => {
   if (!apiKey) return res.status(503).json({ error: 'Last.fm API key not configured' });
 
   try {
-    const cacheKey = `lfm:related:${bandId}`;
-    const cached = await getCache(cacheKey);
-    if (cached) return res.json(cached);
-
     const band = await prisma.band.findUnique({
       where: { id: bandId },
       select: { id: true, name: true, MBID: true },
     });
     if (!band) return res.status(404).json({ error: 'Band not found' });
 
-    const params = {
-      method: 'artist.getSimilar',
-      api_key: apiKey,
-      format: 'json',
-      limit: 12,
-      autocorrect: 1,
-    };
-    if (band.MBID) params.mbid = band.MBID;
-    else params.artist = band.name;
-
-    const lfmRes = await axios.get('https://ws.audioscrobbler.com/2.0/', {
-      params,
-      timeout: 8000,
-    });
-
-    // Last.fm returns { error, message } on failure
-    if (lfmRes.data?.error) {
-      return res.status(404).json({ error: lfmRes.data.message || 'Artist not found on Last.fm' });
-    }
-
-    const raw = lfmRes.data?.similarartists?.artist ?? [];
-    const related = raw.map((a) => ({
-      name: a.name,
-      match: Math.round(parseFloat(a.match) * 100), // 0–100
-      mbid: a.mbid || null,
-      url: a.url || null,
-    }));
-
-    const payload = { band: { id: band.id, name: band.name }, related };
-    await setCache(cacheKey, payload, 86400); // 24h — similar artists are stable
+    const payload = await getRelated(band);
+    if (payload.error) return res.status(404).json({ error: payload.error });
     return res.json(payload);
   } catch (e) {
     console.error('[related-artists]', e.message);

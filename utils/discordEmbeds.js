@@ -151,6 +151,34 @@ function cityLabel({ city, country }) {
 }
 
 /**
+ * A field per city, biggest first, until the embed is full; the rest are summed
+ * in one last field. Returns the characters used.
+ */
+function cityFields(cities, fields, used, prefix = "") {
+  for (const [i, city] of cities.entries()) {
+    const name = `${prefix}${cityLabel(city)} · ${city.count}`;
+    const value = listWithin(city.concerts.map(showLine), CITY_LIST_LIMIT, {
+      sep: "\n", more: (n) => `\n+${plural(n, "more show", "more shows")}`,
+    }) || "—";
+    const last = i === cities.length - 1;
+    const full = fields.length === MAX_FIELDS - 1 && !last;
+    if (full || used + name.length + value.length + (last ? 0 : OVERFLOW_RESERVE) > EMBED_CHAR_LIMIT) {
+      const rest = cities.slice(i);
+      const field = {
+        name: `+${plural(rest.length, "more city", "more cities")}`,
+        value: plural(rest.reduce((sum, c) => sum + c.count, 0), "concert", "concerts"),
+        inline: false,
+      };
+      fields.push(field);
+      return used + field.name.length + field.value.length;
+    }
+    fields.push({ name, value, inline: false });
+    used += name.length + value.length;
+  }
+  return used;
+}
+
+/**
  * One embed for a week's recap (see utils/weeklyRecap.js): the total, every
  * band with its count, and a field per city with its shows, one to a line.
  *
@@ -158,35 +186,28 @@ function cityLabel({ city, country }) {
  * summed in one last field, so a busy week is cut short rather than refused.
  */
 function buildRecapEmbed(recap) {
-  const title = `Week ${recap.week}: ${plural(recap.total, "new concert", "new concerts")}`;
+  const title = `Week ${recap.week}: ${recap.total > 0 ? plural(recap.total, "new concert", "new concerts") : "similar bands near you"}`;
   const counted = (b) => `**${escapeMarkdown(b.name)}**${b.count > 1 ? ` (${b.count})` : ""}`;
 
   const where = plural(recap.cities.length, "city", "cities")
     + (recap.country_count > 0 ? ` in ${plural(recap.country_count, "country", "countries")}` : "");
-  const heading = `${dayRange(recap.first_day, recap.last_day)} · ${where}`;
+  const days = dayRange(recap.first_day, recap.last_day);
+  const heading = recap.total > 0 ? `${days} · ${where}` : days;
   const bands = listWithin(recap.bands.map(counted), BAND_LIST_LIMIT);
   const description = bands ? `${heading}\n\n${bands}` : heading;
 
   const fields = [];
-  let used = title.length + description.length;
-  for (const [i, city] of recap.cities.entries()) {
-    const name = `${cityLabel(city)} · ${city.count}`;
-    const value = listWithin(city.concerts.map(showLine), CITY_LIST_LIMIT, {
-      sep: "\n", more: (n) => `\n+${plural(n, "more show", "more shows")}`,
-    }) || "—";
-    const last = i === recap.cities.length - 1;
-    const full = fields.length === MAX_FIELDS - 1 && !last;
-    if (full || used + name.length + value.length + (last ? 0 : OVERFLOW_RESERVE) > EMBED_CHAR_LIMIT) {
-      const rest = recap.cities.slice(i);
-      fields.push({
-        name: `+${plural(rest.length, "more city", "more cities")}`,
-        value: plural(rest.reduce((sum, c) => sum + c.count, 0), "concert", "concerts"),
-        inline: false,
-      });
-      break;
-    }
-    fields.push({ name, value, inline: false });
-    used += name.length + value.length;
+  const used = cityFields(recap.cities, fields, title.length + description.length);
+  // After the cities, which come first: it gets what room they leave, or none.
+  const similar = recap.similar;
+  if (similar && fields.length < MAX_FIELDS - 1 && used + 200 < EMBED_CHAR_LIMIT) {
+    const head = {
+      name: `Similar bands near you · ${plural(similar.total, "concert", "concerts")}`,
+      value: "In the cities you watch, by artists like the ones on your wishlist.",
+      inline: false,
+    };
+    fields.push(head);
+    cityFields(similar.cities, fields, used + head.name.length + head.value.length, "↳ ");
   }
 
   return { title, description, color: 0x5865f2, fields };
