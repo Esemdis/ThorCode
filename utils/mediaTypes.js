@@ -51,6 +51,13 @@ const MIME_KINDS = new Map([
   ['video/mp4', 'VIDEO'],
 ]);
 
+const MIME_EXTENSIONS = new Map([
+  ['image/jpeg', '.jpg'],
+  ['image/png', '.png'],
+  ['image/webp', '.webp'],
+  ['video/mp4', '.mp4'],
+]);
+
 // Deliberately absent: image/heic and image/heif. No browser decodes them.
 
 // No codec list lives here. An mp4 is a container, not a codec: a Pixel writes
@@ -60,9 +67,16 @@ const MIME_KINDS = new Map([
 // upload dialog answers that question directly by decoding a frame before it
 // sends anything.
 
+function normaliseMime(mime) {
+  return String(mime ?? '').split(';')[0].trim().toLowerCase();
+}
+
 function kindForMime(mime) {
-  const normalised = String(mime ?? '').split(';')[0].trim().toLowerCase();
-  return MIME_KINDS.get(normalised) ?? null;
+  return MIME_KINDS.get(normaliseMime(mime)) ?? null;
+}
+
+function extensionForMime(mime) {
+  return MIME_EXTENSIONS.get(normaliseMime(mime)) ?? '';
 }
 
 /**
@@ -89,5 +103,5 @@ function posterProblem({ mimetype, size } = {}) {
 }
 
 module.exports = {
-  MAX_FILE_BYTES, MAX_POSTER_BYTES, MAX_FILES_PER_REQUEST, kindForMime, posterProblem,
+  MAX_FILE_BYTES, MAX_POSTER_BYTES, MAX_FILES_PER_REQUEST, kindForMime, extensionForMime, posterProblem,
 };

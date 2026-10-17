@@ -28,14 +28,14 @@ const {
   fail, badRequest, notFound, forbidden, success,
 } = require('../../../utils/apiResponse');
 const {
-  uniqueFilename, resolveArchivePath, slugSegment, safeExtension,
+  uniqueFilename, resolveArchivePath, slugSegment,
 } = require('../../../utils/mediaPaths');
 const { showDirForAttendance, lockFolderChoice } = require('../../../utils/mediaShowDir');
 const { capturedAtFor } = require('../../../utils/mediaCapture');
 const { exifCapturedAtOfFile } = require('../../../utils/exifCapturedAt');
 const { emptySidecar, upsertFile, readSidecar, updateSidecar } = require('../../../utils/mediaSidecar');
 const {
-  kindForMime, posterProblem, MAX_FILE_BYTES, MAX_FILES_PER_REQUEST,
+  kindForMime, extensionForMime, posterProblem, MAX_FILE_BYTES, MAX_FILES_PER_REQUEST,
 } = require('../../../utils/mediaTypes');
 const { uploadErrors } = require('../../../utils/uploadErrors');
 const { storePoster, ensureThumb } = require('../../../utils/mediaThumbs');
@@ -57,9 +57,9 @@ const upload = multer({
       try { await mkdir(dir, { recursive: true }); cb(null, dir); }
       catch (err) { cb(err); }
     },
-    // The temp file sits on the same SMB share, so its extension gets the same
-    // cleaning as the stored one — raw, a `:` in it failed the upload.
-    filename: (req, file, cb) => cb(null, `${crypto.randomUUID()}${safeExtension(file.originalname)}`),
+    // The temporary file gets the same canonical type extension as the archive
+    // copy, never an executable extension supplied in the multipart filename.
+    filename: (req, file, cb) => cb(null, `${crypto.randomUUID()}${extensionForMime(file.mimetype)}`),
   }),
   limits: { fileSize: MAX_FILE_BYTES },
 });
@@ -91,12 +91,12 @@ const asInt = (v) => {
 // several characters ext4 would allow, which is why every other path segment
 // in this archive already goes through slugSegment. A browser-supplied
 // filename is exactly as untrusted as a venue name and gets the same
-// treatment before it becomes one. The extension is cleaned on its own and
-// kept out of the slug so MAX_SEGMENT truncating a long stem can never eat
-// into it.
-function slugFilename(originalName) {
+// treatment before it becomes one. Its extension comes from the accepted MIME
+// type and stays out of the slug so MAX_SEGMENT truncating a long stem can never
+// eat into it.
+function slugFilename(originalName, mimeType) {
   const stem = originalName.slice(0, originalName.length - path.extname(originalName).length);
-  return `${slugSegment(stem)}${safeExtension(originalName)}`;
+  return `${slugSegment(stem)}${extensionForMime(mimeType)}`;
 }
 
 // Admin-only. Everyone signed in can look at the archive; only an admin adds
@@ -354,7 +354,7 @@ router.post(
           // reaches here as two parts of one upload.
           knownHashes.add(sha256);
 
-          const filename = uniqueFilename([...taken], slugFilename(file.originalname));
+          const filename = uniqueFilename([...taken], slugFilename(file.originalname, file.mimetype));
           taken.add(filename);
           const absPath = path.join(absDir, filename);
           await rename(file.path, absPath);

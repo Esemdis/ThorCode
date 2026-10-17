@@ -194,6 +194,23 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const tripId = parseInt(req.params.id, 10);
 
   try {
+    // A partial date update has to be checked against the other half already
+    // on the trip. Keep the lookup scoped to the caller, just like the write,
+    // so an absent trip and somebody else's trip both answer 404.
+    if (('start_date' in data) !== ('end_date' in data)) {
+      const existing = await prisma.trip.findFirst({
+        where: { id: tripId, user_id: req.user.id },
+        select: { start_date: true, end_date: true },
+      });
+      if (!existing) return res.status(404).json({ error: "Trip not found" });
+
+      const startDate = 'start_date' in data ? data.start_date : existing.start_date;
+      const endDate = 'end_date' in data ? data.end_date : existing.end_date;
+      if (startDate && endDate && endDate < startDate) {
+        return res.status(400).json({ error: "The trip ends before it starts" });
+      }
+    }
+
     // user_id in the where does the authorising: a trip that isn't the caller's
     // simply doesn't match, and Prisma reports that the same way as a trip that
     // doesn't exist.

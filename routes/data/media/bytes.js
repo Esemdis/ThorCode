@@ -15,6 +15,7 @@
  * the resulting surface.
  */
 const express = require('express');
+const path = require('node:path');
 
 const prisma = require('../../../prisma/client');
 const { fail } = require('../../../utils/apiResponse');
@@ -28,6 +29,7 @@ const { clipFiles, isClip, prepareClip } = require('../../../utils/mediaClips');
 const { withOwner } = require('./shared');
 
 const router = express.Router();
+const INLINE_MEDIA_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.mp4']);
 
 // The owner-token routes: one row's file, poster, viewing copy or original.
 async function serveMedia(req, res, which) {
@@ -159,6 +161,16 @@ function sendFileSafely(res, absPath, context) {
   // point, so send's dotfile heuristic guards nothing here and only breaks
   // deploys whose mount happens to sit under a hidden directory.
   const sendOpts = { dotfiles: 'allow' };
+  res.set('X-Content-Type-Options', 'nosniff');
+
+  // Old uploads may already have a filename such as .svg or .html even
+  // though the route only accepts media. Never let an extension turn those
+  // bytes into an active same-origin document when someone opens a share URL.
+  const extension = path.extname(absPath).toLowerCase();
+  if (!INLINE_MEDIA_EXTENSIONS.has(extension)) {
+    res.attachment(path.basename(absPath));
+    res.type('application/octet-stream');
+  }
 
   // mime-types 3 answers application/mp4 for .mp4, and send takes its word. A
   // <video> plays that regardless, but a share link opened straight in a
