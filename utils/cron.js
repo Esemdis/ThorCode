@@ -83,7 +83,7 @@ function startCronJobs() {
     } catch (err) {
       console.error("[cron] Ticket alerts failed:", err);
     }
-  });
+  }, { noOverlap: true });
 
   // Cleanup expired email verifications - runs every hour
   cron.schedule("0 * * * *", cleanupExpiredEmailVerifications);
