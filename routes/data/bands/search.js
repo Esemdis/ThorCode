@@ -13,13 +13,14 @@ const { getArtists } = require('../../../utils/spotify');
 const { resolveArtistImages } = require('../../../utils/bandImages');
 const prisma = require('../../../prisma/client');
 const { setCache, getCache } = require('../../../utils/cache');
+const auth = require('../../../auth/verifyJWT');
 
 // Bound to the module's cache and Spotify client once, so no route has to
 // remember which three functions resolveArtistImages needs.
 const bandImageDeps = { getCache, setCache, getArtists };
 
 // Search bands by name for autocomplete
-router.get('/bands/search', async (req, res) => {
+router.get('/bands/search', auth, async (req, res) => {
   try {
     const { q } = req.query;
 
@@ -74,7 +75,7 @@ router.get('/bands/search', async (req, res) => {
 });
 
 // List all bands with concert counts (number of ConcertBandReferences)
-router.get('/upcoming/bands', async (req, res) => {
+router.get('/upcoming/bands', auth, async (req, res) => {
   try {
     const now = new Date();
 
@@ -147,7 +148,7 @@ router.get('/upcoming/bands', async (req, res) => {
   }
 });
 
-router.get('/bands', async (req, res) => {
+router.get('/bands', auth, async (req, res) => {
   try {
     const bands = await prisma.band.findMany({
       // No ticketmaster_id: the scraper polls Ticketmaster only for bands it
