@@ -18,6 +18,7 @@ const { countMediaForAttendances } = require("../../../utils/mediaDetach");
 const { enrichConcertBands } = require("../../../utils/setlistEnrich");
 const { storedCity } = require("../../../utils/cityMatch");
 const { venueId } = require("../../../utils/venueMatch");
+const { canonicalBandName } = require("../../../utils/lineupNames");
 const { ownWishlist } = require("./shared");
 // Called through the module rather than destructured, so a test can stand in
 // for setlist.fm on the router's own copy of it.
@@ -357,7 +358,7 @@ router.post(
 
       if (!(await ownWishlist(req, res, { select: { id: true } }))) return;
 
-      const band = await prisma.band.findUnique({ where: { id: bandId }, select: { id: true, MBID: true } });
+      const band = await prisma.band.findUnique({ where: { id: bandId }, select: { id: true, name: true, MBID: true } });
       if (!band) return res.status(404).json({ error: "Band not found" });
 
       if (!process.env.SETLIST_API_KEY) {
@@ -373,11 +374,35 @@ router.post(
         return res.status(502).json({ error: "Could not reach setlist.fm — try again shortly" });
       }
 
-      // The setlist has to be this band's. Without an MBID on the band there is
-      // nothing to compare, but the show itself is still setlist.fm's own.
+      // The setlist has to be this band's. Quick-added bands often have no
+      // MBID, so compare canonical names until setlist.fm can fill that gap.
       const artistMbid = setlist?.artist?.mbid ?? null;
-      if (band.MBID && artistMbid && band.MBID.toLowerCase() !== String(artistMbid).toLowerCase()) {
-        return res.status(400).json({ error: "That setlist is by a different artist" });
+      if (band.MBID && artistMbid) {
+        if (band.MBID.toLowerCase() !== String(artistMbid).toLowerCase()) {
+          return res.status(400).json({ error: "That setlist is by a different artist" });
+        }
+      } else {
+        const bandName = canonicalBandName(band.name);
+        const artistName = canonicalBandName(setlist?.artist?.name);
+        if (!bandName || !artistName || bandName !== artistName) {
+          return res.status(400).json({ error: "That setlist is by a different artist" });
+        }
+
+        // Remember setlist.fm's MBID after the name check, so later requests
+        // can use the stronger identity check. Avoid claiming an MBID already
+        // assigned to a different band.
+        if (!band.MBID && artistMbid) {
+          const mbidOwner = await prisma.band.findUnique({
+            where: { MBID: String(artistMbid) },
+            select: { id: true },
+          });
+          if (!mbidOwner || mbidOwner.id === band.id) {
+            await prisma.band.updateMany({
+              where: { id: band.id, MBID: null },
+              data: { MBID: String(artistMbid) },
+            });
+          }
+        }
       }
 
       const show = setlistFm.setlistSummary(setlist);
