@@ -101,7 +101,9 @@ router.post(
         // linked "Architects" but not "Architects (UK)", so which path a bill
         // arrived by decided whether the band ended up on it. /bulk creates no
         // bands, so one snapshot holds for the whole request.
-        const allBands = await tx.band.findMany({ select: { id: true, name: true } });
+        // Oldest first: where production holds two rows for one canonical name,
+        // the first-seen one below must always be the same one.
+        const allBands = await tx.band.findMany({ select: { id: true, name: true }, orderBy: { id: 'asc' } });
         const bandsByCanonical = new Map();
         for (const band of allBands) {
           const key = canonicalBandName(band.name);

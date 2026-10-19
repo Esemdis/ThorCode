@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createRequire } from 'node:module';
 import { installFakePrisma } from '../test/routeApp.js';
 
-const prisma = installFakePrisma({ band: { findUnique: vi.fn(), create: vi.fn() } });
+const prisma = installFakePrisma({ band: { findUnique: vi.fn(), findMany: vi.fn(), create: vi.fn() } });
 
 // This file's own copies — it is CommonJS and loads them through Node's
 // require, which an ESM import would not share.
@@ -23,7 +23,7 @@ describe('createBand', () => {
   });
 
   it('creates the band with what the lookup found and starts its sync', async () => {
-    prisma.band.findUnique.mockResolvedValue(null);
+    prisma.band.findMany.mockResolvedValue([]);
     prisma.band.create.mockImplementation(async ({ data }) => ({ id: 9, ...data }));
 
     const out = await createBand('Gojira');
@@ -35,10 +35,21 @@ describe('createBand', () => {
   });
 
   it('refuses a name already stored, before asking MusicBrainz', async () => {
-    prisma.band.findUnique.mockResolvedValue({ id: 3, name: 'Gojira' });
+    prisma.band.findMany.mockResolvedValue([{ id: 3, name: 'Gojira' }]);
 
     await expect(createBand('Gojira')).rejects.toBeInstanceOf(BandExistsError);
     expect(bandSourceUrls.findSourceUrls).not.toHaveBeenCalled();
+  });
+
+  it('refuses a name stored under other capitalisation, and answers with the stored row', async () => {
+    // Band.name is unique byte for byte, so this used to create a second row.
+    prisma.band.findMany.mockResolvedValue([{ id: 3, name: 'Gojira' }]);
+
+    const err = await createBand('GOJIRA').catch((e) => e);
+
+    expect(err).toBeInstanceOf(BandExistsError);
+    expect(err.band).toMatchObject({ id: 3, name: 'Gojira' });
+    expect(prisma.band.create).not.toHaveBeenCalled();
   });
 
   it('answers with the stored band when MusicBrainz says it is the same artist', async () => {
@@ -46,6 +57,7 @@ describe('createBand', () => {
     // is unique, so the create failed, the re-read by name found nothing, and
     // the request was a 500.
     const stored = { id: 4, name: 'Architects', MBID };
+    prisma.band.findMany.mockResolvedValue([]);
     prisma.band.findUnique.mockImplementation(async ({ where }) => (where.MBID === MBID ? stored : null));
     prisma.band.create.mockRejectedValue(uniqueViolation());
 
@@ -57,6 +69,7 @@ describe('createBand', () => {
   });
 
   it('still fails on a unique violation it cannot explain', async () => {
+    prisma.band.findMany.mockResolvedValue([]);
     prisma.band.findUnique.mockResolvedValue(null);
     prisma.band.create.mockRejectedValue(uniqueViolation());
 
@@ -65,7 +78,7 @@ describe('createBand', () => {
 
   it('creates the band anyway when MusicBrainz is down, and says so', async () => {
     bandSourceUrls.findSourceUrls.mockRejectedValue(new Error('ETIMEDOUT'));
-    prisma.band.findUnique.mockResolvedValue(null);
+    prisma.band.findMany.mockResolvedValue([]);
     prisma.band.create.mockImplementation(async ({ data }) => ({ id: 9, ...data }));
 
     const out = await createBand('Gojira');
