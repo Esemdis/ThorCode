@@ -37,7 +37,8 @@ names its concert, its owner, and for each file the band, the caption, the
 checksum and the dimensions — and, once you have chosen them, whether the file
 is one of the night's picks for the year recap and which moment of a video it
 plays (`picked`, `moment_start_ms`, `moment_end_ms`; absent means not picked
-and no moment). `scripts/rebuild-media-index.js` reconstructs the
+and no moment) and the named clips an admin marked on a video (`clips`, a list
+of `name`, `start_ms`, `end_ms`; absent means none). `scripts/rebuild-media-index.js` reconstructs the
 database from those files alone. That is what lets you treat the share as the
 thing being protected and the application as replaceable.
 

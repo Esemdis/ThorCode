@@ -13,6 +13,7 @@ router.use(require('./media/upload'));
 router.use(require('./media/reads'));
 router.use(require('./media/lineup'));
 router.use(require('./media/tagging'));
+router.use(require('./media/clips'));
 router.use(require('./media/deletes'));
 router.use(require('./media/share'));
 router.use(require('./media/bytes'));
