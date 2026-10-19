@@ -3366,15 +3366,9 @@ describe('the byte routes under conditions the archive really meets', () => {
 
 describe('an upload that collides with the archive\'s own bookkeeping', () => {
   it('will not let a file named concert-media.json land on the sidecar', async () => {
-    // A multipart part carries both its filename and its content type, and the
-    // client picks both, so declaring image/jpeg over a part named
-    // concert-media.json got past the MIME gate and wrote its bytes onto the
-    // record of truth. `taken` is built from database rows and sidecar
-    // entries, and the sidecar is not one of its own entries, so nothing
-    // covered its name. In the ordering that actually runs, the sidecar write
-    // at the end of the batch put valid JSON back over the photo, so it was
-    // the user's file that vanished while a row and an entry both went on
-    // pointing at it; a different ordering loses the sidecar instead.
+    // The client picks both the filename and MIME type, so the image extension
+    // must come from the accepted MIME type. Otherwise a JPEG part named
+    // concert-media.json could overwrite the sidecar that records the archive.
     const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
     await request(app()).post('/data/concerts/attendances/1/media')
       .set(...authHeader(admin))
@@ -3388,13 +3382,13 @@ describe('an upload that collides with the archive\'s own bookkeeping', () => {
       .expect(201);
 
     const stored = prisma.concertMedia.create.mock.calls.at(-1)[0].data;
-    expect(stored.filename).toBe('concert-media (2).json');
+    expect(stored.filename).toBe('concert-media.jpg');
     // The sidecar is still the sidecar, and still knows about both files.
     const sidecar = JSON.parse(await readFile(join(dir, 'concert-media.json'), 'utf8'));
     expect(sidecar.files.map((f) => f.name).sort())
-      .toEqual(['IMG_1.jpg', 'concert-media (2).json']);
+      .toEqual(['IMG_1.jpg', 'concert-media.jpg']);
     // And the uploaded bytes are still a JPEG, at the name the row claims.
-    const bytes = await readFile(join(dir, 'concert-media (2).json'));
+    const bytes = await readFile(join(dir, 'concert-media.jpg'));
     expect(bytes.slice(0, 3)).toEqual(Buffer.from([0xff, 0xd8, 0xff]));
   });
 });
