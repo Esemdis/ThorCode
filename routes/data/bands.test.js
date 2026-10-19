@@ -78,7 +78,7 @@ describe('POST /bands', () => {
     // The name is the unique key, so this is the ordinary "already added" case
     // rather than an error — and it must not spend a MusicBrainz call on a band
     // whose urls were resolved when it was first added.
-    prisma.band.findUnique.mockResolvedValue({ id: 5, name: 'Architects' });
+    prisma.band.findMany.mockResolvedValue([{ id: 5, name: 'Architects' }]);
 
     const res = await request(app).post('/bands').set(...authHeader()).send({ name: 'Architects' });
 
@@ -99,11 +99,12 @@ describe('POST /bands', () => {
   });
 
   it('trims the name before deciding whether the band already exists', async () => {
-    prisma.band.findUnique.mockResolvedValue({ id: 5, name: 'Architects' });
+    prisma.band.findMany.mockResolvedValue([{ id: 5, name: 'Architects' }]);
 
-    await request(app).post('/bands').set(...authHeader()).send({ name: '  Architects  ' });
+    const res = await request(app).post('/bands').set(...authHeader()).send({ name: '  Architects  ' });
 
-    expect(prisma.band.findUnique).toHaveBeenCalledWith({ where: { name: 'Architects' } });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('Band already exists.');
   });
 
   it('refuses a name that is only whitespace', async () => {
@@ -122,6 +123,7 @@ describe('POST /bands/quick-add', () => {
 
   beforeEach(() => {
     prisma.band.findFirst = vi.fn(async () => null);
+    prisma.band.findMany = vi.fn(async () => []);
     prisma.band.create = vi.fn(async ({ data }) => ({ id: 50, name: data.name }));
     prisma.concert.findMany.mockResolvedValue([]);
   });
@@ -129,7 +131,7 @@ describe('POST /bands/quick-add', () => {
   it('uses the band already stored under that name when its MBID is not on file', async () => {
     // Looked up by MBID alone, this missed, and creating the band again hit
     // the unique name as a 500.
-    prisma.band.findFirst = vi.fn(async ({ where }) => (where.name === 'Gojira' ? { id: 92, name: 'Gojira' } : null));
+    prisma.band.findMany = vi.fn(async () => [{ id: 92, name: 'Gojira' }]);
 
     const res = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'Gojira', mbid: MBID });
 
@@ -140,13 +142,23 @@ describe('POST /bands/quick-add', () => {
 
   it('takes the band someone else created a moment ago', async () => {
     let created = false;
-    prisma.band.findFirst = vi.fn(async ({ where }) => (created && where.name === 'Gojira' ? { id: 93, name: 'Gojira' } : null));
+    prisma.band.findMany = vi.fn(async () => (created ? [{ id: 93, name: 'Gojira' }] : []));
     prisma.band.create = vi.fn(async () => { created = true; throw Object.assign(new Error('unique'), { code: 'P2002' }); });
 
     const res = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'Gojira' });
 
     expect(res.status).toBe(201);
     expect(res.body.band.id).toBe(93);
+  });
+
+  it('uses the band stored under other capitalisation instead of creating a second', async () => {
+    prisma.band.findMany = vi.fn(async () => [{ id: 92, name: 'Gojira' }]);
+
+    const res = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'gojira' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.band).toEqual({ id: 92, name: 'Gojira' });
+    expect(prisma.band.create).not.toHaveBeenCalled();
   });
 
   it('refuses an MBID that is not one', async () => {

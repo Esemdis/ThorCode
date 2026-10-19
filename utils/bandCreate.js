@@ -12,6 +12,7 @@
  */
 
 const prisma = require('../prisma/client');
+const { findBandByCanonicalName } = require('./bandLookup');
 // Through the module objects, so a test can stand in for MusicBrainz, the
 // backlink and the Python service.
 const bandSourceUrls = require('./bandSourceUrls');
@@ -38,7 +39,9 @@ const UNIQUE_VIOLATION = 'P2002';
  * @throws {BandExistsError} when a band by that name is already there
  */
 async function createBand(name) {
-  const existing = await prisma.band.findUnique({ where: { name } });
+  // Canonical, not exact: "gojira" under "Gojira" is the same band, and Band
+  // .name only refuses the byte-identical one.
+  const existing = await findBandByCanonicalName(prisma, name, { MBID: true });
   if (existing) throw new BandExistsError(existing);
 
   // No Ticketmaster lookup. It used to resolve the name here and 404 with
@@ -85,7 +88,7 @@ async function createBand(name) {
     // MusicBrainz matched this name to an artist already stored under another
     // one ("Architects (UK)" for "Architects") — MBID is unique too, and that
     // used to answer 500. Both are the band already existing; theirs stands.
-    const winner = await prisma.band.findUnique({ where: { name } })
+    const winner = await findBandByCanonicalName(prisma, name, { MBID: true })
       || (mbid && await prisma.band.findUnique({ where: { MBID: mbid } }));
     if (winner) throw new BandExistsError(winner);
     throw error;
