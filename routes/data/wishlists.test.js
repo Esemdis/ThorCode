@@ -62,7 +62,7 @@ const EXPECTED_ROUTES = [
   'POST /wishlists/:id/calendar-token [4]',
   'DELETE /wishlists/:id/calendar-token [4]',
   'GET /wishlists/:id/attendance [4]',
-  'POST /wishlists/:id/attendance [5]',
+  'POST /wishlists/:id/attendance [6]',
   'DELETE /wishlists/:id/attendance/:concertId [5]',
   'PUT /wishlists/:id/attendance/missed [8]',
   // One more than it was: the setlist.fm budget it shares with the band routes.
@@ -1061,6 +1061,64 @@ describe('DELETE /wishlists/:id/attendance/:concertId', () => {
 
     expect(res.status).toBe(200);
     expect(prisma.concertAttendance.delete).toHaveBeenCalledWith({ where: { id: 42 } });
+  });
+});
+
+describe('POST /wishlists/:id/attendance', () => {
+  // enrichConcertBands reaches setlist.fm through axios, so a spy on the same
+  // CommonJS copy counts the calls that spend the shared key.
+  const axios = createRequire(import.meta.url)('axios');
+  let tho425Searches;
+  let tho425Caller;
+  const tho425Concert = (concert_date) => ({ id: 5, concert_date, venue: 'Ullevi', city: 'Gothenburg', bands: [] });
+  const tho425Mark = (user = 'user-1') => request(app)
+    .post('/wishlists/7/attendance').set(...authHeader({ id: user })).send({ concert_id: 5 });
+  // Enrichment runs after the response, so give it a tick to reach axios.
+  const tho425Settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  beforeEach(() => {
+    process.env.SETLIST_API_KEY = 'test-key';
+    tho425Caller = 'user-1';
+    tho425Searches = vi.spyOn(axios, 'get').mockResolvedValue({ data: { setlist: [] } });
+    prisma.wishlist.findUnique.mockImplementation(async () => ({ id: 7, user_id: tho425Caller }));
+    prisma.concertBandReference.findMany.mockResolvedValue([]);
+    prisma.concertAttendance.findUnique.mockResolvedValue(null);
+    prisma.concertAttendance.upsert.mockResolvedValue({ id: 900 });
+  });
+
+  it('searches setlist.fm once for a past show it marks for the first time', async () => {
+    prisma.concert.findUnique.mockResolvedValue(tho425Concert(new Date('2026-06-24T12:00:00Z')));
+    expect((await tho425Mark()).status).toBe(200);
+    await tho425Settle();
+    expect(tho425Searches).toHaveBeenCalledTimes(1);
+    expect(tho425Searches.mock.calls[0][1].params).toMatchObject({ date: '24-06-2026', venueName: 'Ullevi' });
+  });
+
+  it('does not search for a show still to come', async () => {
+    prisma.concert.findUnique.mockResolvedValue(tho425Concert(new Date('2027-06-01T00:00:00Z')));
+    expect((await tho425Mark()).status).toBe(200);
+    await tho425Settle();
+    expect(tho425Searches).not.toHaveBeenCalled();
+  });
+
+  it('does not search again when the show was already marked', async () => {
+    prisma.concert.findUnique.mockResolvedValue(tho425Concert(new Date('2026-06-24T12:00:00Z')));
+    prisma.concertAttendance.findUnique.mockResolvedValue({ id: 900 });
+    expect((await tho425Mark()).status).toBe(200);
+    await tho425Settle();
+    expect(tho425Searches).not.toHaveBeenCalled();
+  });
+
+  it('stops one account at the shared setlist.fm budget', async () => {
+    prisma.concert.findUnique.mockResolvedValue(tho425Concert(new Date('2027-06-01T00:00:00Z')));
+    tho425Caller = 'tho-425-greedy';
+    for (let i = 0; i < 100; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      expect((await tho425Mark('tho-425-greedy')).status).toBe(200);
+    }
+    expect((await tho425Mark('tho-425-greedy')).status).toBe(429);
+    tho425Caller = 'tho-425-other';
+    expect((await tho425Mark('tho-425-other')).status).toBe(200);
   });
 });
 
