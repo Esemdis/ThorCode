@@ -70,6 +70,8 @@ router.get(
               event_id: true,
               name: true,
               venue: true,
+              // The Venue row, so the client can address a review at it.
+              venue_id: true,
               city: true,
               country: true,
               concert_date: true,

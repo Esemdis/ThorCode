@@ -10,5 +10,6 @@ const router = express.Router();
 router.use(require("./bands"));
 router.use(require("./wishlists"));
 router.use(require("./calendar"));
+router.use(require("./venueReviews"));
 
 module.exports = router;

@@ -26,6 +26,7 @@ model User {
   notification_subscriptions NotificationSubscription[] @relation("UserNotificationSubscriptions")
   email_verifications        EmailVerification[]        @relation("UserEmailVerifications")
   concert_follows            ConcertFollow[]            @relation("UserConcertFollows")
+  venue_reviews              VenueReview[]              @relation("UserVenueReviews")
 }
 
 model OAuth {
@@ -137,17 +138,48 @@ model City {
 // One building in one city, however the sources spell it: see utils/venueMatch.js.
 // name_key is venue_key(name), the SQL function the THO-346 migration defines.
 model Venue {
-  id         Int       @id @default(autoincrement())
+  id         Int           @id @default(autoincrement())
   name       String
   name_key   String
   city_id    Int
-  city_rel   City      @relation(fields: [city_id], references: [id])
+  city_rel   City          @relation(fields: [city_id], references: [id])
   latitude   Float?
   longitude  Float?
-  created_at DateTime  @default(now())
+  created_at DateTime      @default(now())
   concerts   Concert[]
+  reviews    VenueReview[]
 
   @@unique([city_id, name_key])
+}
+
+enum VenueAccess {
+  YES
+  PARTIAL
+  NO
+}
+
+/// One person's private notes on a building they have been to (THO-192). Nobody
+/// but the author reads it; there is no aggregate. Every aspect is optional.
+///
+/// The venue relation is Restrict on purpose: a venue merge has to carry the
+/// reviews across (utils/venueMatch.js), not silently drop them.
+model VenueReview {
+  id         Int          @id @default(autoincrement())
+  user_id    String
+  venue_id   Int
+  sound      Int?
+  view       Int?
+  stage      Int?
+  vibe       Int?
+  wheelchair VenueAccess?
+  comment    String?      @db.VarChar(1000)
+  created_at DateTime     @default(now())
+  updated_at DateTime     @updatedAt
+  user_rel   User         @relation("UserVenueReviews", fields: [user_id], references: [id], onDelete: Cascade)
+  venue_rel  Venue        @relation(fields: [venue_id], references: [id])
+
+  @@unique([user_id, venue_id])
+  @@index([venue_id])
 }
 
 model Country {
