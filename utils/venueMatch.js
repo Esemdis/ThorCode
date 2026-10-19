@@ -92,7 +92,8 @@ function planVenueMerges(venues) {
 }
 
 /**
- * Moves every concert at Venue `loserId` onto `winnerId`, fills the winner's
+ * Moves every concert and review at Venue `loserId` onto `winnerId` (a user's
+ * older review loses to the newer when both venues have one), fills the winner's
  * position if it has none, then deletes the loser. Run inside one transaction.
  * The concerts keep their own venue text.
  */
@@ -102,6 +103,16 @@ async function mergeVenue(tx, loserId, winnerId) {
     tx.venue.findUniqueOrThrow({ where: { id: winnerId } }),
   ]);
   const concerts = await tx.concert.updateMany({ where: { venue_id: loserId }, data: { venue_id: winnerId } });
+  // One review per user and venue: where a user reviewed both, the newer stays.
+  const reviews = await tx.venueReview.findMany({
+    where: { venue_id: { in: [loserId, winnerId] } },
+    orderBy: { updated_at: 'desc' },
+    select: { id: true, user_id: true },
+  });
+  const seen = new Set();
+  const older = reviews.filter((r) => seen.has(r.user_id) || !seen.add(r.user_id)).map((r) => r.id);
+  await tx.venueReview.deleteMany({ where: { id: { in: older } } });
+  await tx.venueReview.updateMany({ where: { venue_id: loserId }, data: { venue_id: winnerId } });
   await tx.venue.delete({ where: { id: loserId } });
   if (winner.latitude == null && loser.latitude != null) {
     await tx.venue.update({ where: { id: winnerId }, data: { latitude: loser.latitude, longitude: loser.longitude } });
