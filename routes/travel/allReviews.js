@@ -11,7 +11,7 @@ router.use(roleCheck(["USER", "ADMIN"]));
 
 // GET /travel/reviews — every review the user has written, newest first
 router.get("/", async (req, res) => {
-  const { take, skip } = paginate(req, { defaultLimit: 150, maxLimit: 500 });
+  const { take, skip } = paginate(req, { defaultLimit: 500, maxLimit: 500 });
   try {
     const where = { user_id: req.user.id };
     const [reviews, total] = await Promise.all([
@@ -28,7 +28,7 @@ router.get("/", async (req, res) => {
             },
           },
         },
-        orderBy: [{ trip_rel: { start_date: "desc" } }, { created_at: "desc" }],
+        orderBy: [{ trip_rel: { start_date: "desc" } }, { created_at: "desc" }, { id: "asc" }],
         take,
         skip,
       }),
