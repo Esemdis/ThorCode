@@ -38,7 +38,10 @@ const prisma = installFakePrisma({
 const { default: router } = await import('./bands.js');
 const app = buildApp(router);
 
-beforeEach(() => { vi.clearAllMocks(); });
+// The upcoming-bands memo is module state in the route; without clearing it the
+// first test to hit /upcoming/bands would answer for every later one.
+const { upcomingBandsMemo: tho381UpcomingBandsMemo } = createRequire(import.meta.url)('./bands/search.js');
+beforeEach(() => { vi.clearAllMocks(); tho381UpcomingBandsMemo.clear(); });
 
 describe('GET /bands/search', () => {
   it('answers a one-character query with an empty list, without touching the database', async () => {
@@ -822,6 +825,30 @@ describe('the handlers actually run', () => {
   it('serves the band list', async () => {
     const res = await request(app).get('/bands').set(...authHeader());
     expect(res.status).toBe(200);
+  });
+
+  // THO-381: five aggregate queries over every band per request, open to a loop.
+  it('answers a second upcoming-bands request within a minute without querying again', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date('2026-10-19T12:00:00Z'));
+      await request(app).get('/upcoming/bands').set(...authHeader()).expect(200);
+      expect(prisma.band.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(4);
+      vi.clearAllMocks();
+
+      vi.setSystemTime(new Date('2026-10-19T12:00:59Z'));
+      const res = await request(app).get('/upcoming/bands').set(...authHeader({ id: 'user-2' })).expect(200);
+      expect(res.body).toHaveLength(1);
+      expect(prisma.band.findMany).not.toHaveBeenCalled();
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
+
+      vi.setSystemTime(new Date('2026-10-19T12:01:01Z'));
+      await request(app).get('/upcoming/bands').set(...authHeader()).expect(200);
+      expect(prisma.band.findMany).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('serves one band\'s upcoming shows to a signed-in caller', async () => {
