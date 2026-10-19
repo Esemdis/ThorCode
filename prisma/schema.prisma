@@ -358,10 +358,33 @@ model ConcertMedia {
   attendance_rel ConcertAttendance @relation("AttendanceMedia", fields: [attendance_id], references: [id], onDelete: Restrict)
   band_rel       Band?             @relation("BandMedia", fields: [band_id], references: [id], onDelete: SetNull)
   share_links    MediaShareLink[]  @relation("MediaShareLinks")
+  clips          MediaClip[]       @relation("MediaClips")
 
   @@unique([attendance_id, filename])
   @@index([band_id])
   @@index([attendance_id])
+}
+
+/// A named stretch of a video, played in place by seeking the viewing copy.
+///
+/// Virtual like ConcertMedia.moment_*: no file is cut, so there is nothing to
+/// store but the two ends. Unlike the moment there are several to a video and
+/// no length cap, since a clip is for browsing a night rather than for a slide
+/// that moves on. Only an admin writes them, always as the whole list for a
+/// video at once (PUT /media/:id/clips), and they live in the sidecar entry as
+/// `clips` too, so a rebuild from the archive brings them back.
+///
+/// Cascade, like MediaShareLink: a clip is a note about the file and goes with it.
+model MediaClip {
+  id       Int    @id @default(autoincrement())
+  media_id Int
+  name     String
+  start_ms Int
+  end_ms   Int
+
+  media_rel ConcertMedia @relation("MediaClips", fields: [media_id], references: [id], onDelete: Cascade)
+
+  @@index([media_id])
 }
 
 /// A time-boxed public URL to one photo or video, for someone with no account.

@@ -351,9 +351,11 @@ describe('applyUpserts', () => {
       concertMedia: {
         upsert: vi.fn(async ({ create }) => {
           if (create.filename === 'bad.jpg') throw new Error('kind must not be null');
-          return create;
+          return { id: 1, ...create };
         }),
       },
+      mediaClip: { deleteMany: vi.fn(), createMany: vi.fn() },
+      $transaction: vi.fn(async (ops) => ops),
     };
 
     const result = await applyUpserts(prisma, [row('a.jpg'), row('bad.jpg'), row('c.jpg')]);
