@@ -38,11 +38,14 @@ const prisma = installFakePrisma({
 const { default: router } = await import('./bands.js');
 const app = buildApp(router);
 
-beforeEach(() => { vi.clearAllMocks(); });
+// The upcoming-bands memo is module state in the route; without clearing it the
+// first test to hit /upcoming/bands would answer for every later one.
+const { upcomingBandsMemo: tho381UpcomingBandsMemo } = createRequire(import.meta.url)('./bands/search.js');
+beforeEach(() => { vi.clearAllMocks(); tho381UpcomingBandsMemo.clear(); });
 
 describe('GET /bands/search', () => {
   it('answers a one-character query with an empty list, without touching the database', async () => {
-    const res = await request(app).get('/bands/search').query({ q: 'a' });
+    const res = await request(app).get('/bands/search').set(...authHeader()).query({ q: 'a' });
     expect(res.status).toBe(200);
     expect(res.body).toEqual([]);
     expect(prisma.band.findMany).not.toHaveBeenCalled();
@@ -53,7 +56,7 @@ describe('GET /bands/search', () => {
       { id: 2, name: 'Bring Me The Horizon' },
       { id: 1, name: 'Horizon' },
     ]);
-    const res = await request(app).get('/bands/search').query({ q: 'hori' });
+    const res = await request(app).get('/bands/search').set(...authHeader()).query({ q: 'hori' });
     expect(res.status).toBe(200);
     expect(res.body.map((b) => b.name)).toEqual(['Horizon', 'Bring Me The Horizon']);
   });
@@ -158,7 +161,7 @@ describe('GET /bands/search input', () => {
   it('clamps a limit that is not a number instead of passing NaN to Prisma', async () => {
     prisma.band.findMany.mockResolvedValue([]);
 
-    const res = await request(app).get('/bands/search').query({ q: 'gojira', limit: 'abc' });
+    const res = await request(app).get('/bands/search').set(...authHeader()).query({ q: 'gojira', limit: 'abc' });
 
     expect(res.status).toBe(200);
     expect(prisma.band.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 10 }));
@@ -167,13 +170,13 @@ describe('GET /bands/search input', () => {
   it('caps a large limit', async () => {
     prisma.band.findMany.mockResolvedValue([]);
 
-    await request(app).get('/bands/search').query({ q: 'gojira', limit: '100000' });
+    await request(app).get('/bands/search').set(...authHeader()).query({ q: 'gojira', limit: '100000' });
 
     expect(prisma.band.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 50 }));
   });
 
   it('answers an empty list for a repeated q rather than throwing on it', async () => {
-    const res = await request(app).get('/bands/search?q=ab&q=cd');
+    const res = await request(app).get('/bands/search?q=ab&q=cd').set(...authHeader());
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual([]);
@@ -651,9 +654,9 @@ describe('POST /:concertId/enrich-lineup', () => {
  */
 const EXPECTED_ROUTES = [
   'POST /bulk [4]',
-  'GET /bands/search [1]',
-  'GET /upcoming/bands [1]',
-  'GET /bands [1]',
+  'GET /bands/search [2]',
+  'GET /upcoming/bands [2]',
+  'GET /bands [2]',
   'POST /bands/:bandId/sync-concerts [4]',
   'POST /bands/:bandId/reconcile [3]',
   'POST /bands [6]',
@@ -791,10 +794,12 @@ describe('auth', () => {
     expect(res.status).toBe(403);
   });
 
-  it('lets an ordinary user search without a token at all', async () => {
-    prisma.band.findMany.mockResolvedValue([]);
-    const res = await request(app).get('/bands/search').query({ q: 'opeth' });
-    expect(res.status).toBe(200);
+  it('requires a signed-in caller for the band search and list endpoints', async () => {
+    for (const path of ['/bands/search?q=opeth', '/upcoming/bands', '/bands']) {
+      // eslint-disable-next-line no-await-in-loop
+      const res = await request(app).get(path);
+      expect(res.status).toBe(401);
+    }
   });
 });
 
@@ -813,13 +818,37 @@ describe('the handlers actually run', () => {
   });
 
   it('serves the upcoming-bands list', async () => {
-    const res = await request(app).get('/upcoming/bands');
+    const res = await request(app).get('/upcoming/bands').set(...authHeader());
     expect(res.status).toBe(200);
   });
 
   it('serves the band list', async () => {
-    const res = await request(app).get('/bands');
+    const res = await request(app).get('/bands').set(...authHeader());
     expect(res.status).toBe(200);
+  });
+
+  // THO-381: five aggregate queries over every band per request, open to a loop.
+  it('answers a second upcoming-bands request within a minute without querying again', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date('2026-10-19T12:00:00Z'));
+      await request(app).get('/upcoming/bands').set(...authHeader()).expect(200);
+      expect(prisma.band.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(4);
+      vi.clearAllMocks();
+
+      vi.setSystemTime(new Date('2026-10-19T12:00:59Z'));
+      const res = await request(app).get('/upcoming/bands').set(...authHeader({ id: 'user-2' })).expect(200);
+      expect(res.body).toHaveLength(1);
+      expect(prisma.band.findMany).not.toHaveBeenCalled();
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
+
+      vi.setSystemTime(new Date('2026-10-19T12:01:01Z'));
+      await request(app).get('/upcoming/bands').set(...authHeader()).expect(200);
+      expect(prisma.band.findMany).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('serves one band\'s upcoming shows to a signed-in caller', async () => {
