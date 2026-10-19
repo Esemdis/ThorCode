@@ -36,7 +36,6 @@ async function runNotificationDigest() {
     where: {
       created_at: { gt: since, lte: now },
       concert_rel: {
-        city_id: { not: null },
         OR: [{ concert_date: null }, { concert_date: { gte: startOfToday } }],
       },
     },
