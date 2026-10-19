@@ -76,6 +76,27 @@ describe('runNotificationDigest', () => {
     expect(where.concert_rel.OR).toContainEqual({ concert_date: null });
   });
 
+  it('mails a band watch about a show stored without a city', async () => {
+    // A festival is often filed with a venue and no resolved city; a band watch
+    // names no city, so the show must not be filtered out by one.
+    prisma.concertBandReference.findMany.mockResolvedValue([linked(concert(101, { city: null, country: null, city_id: null }))]);
+    const send = vi.spyOn(mail, 'sendDigestEmail').mockResolvedValue({ data: { id: 'a' } });
+
+    await runNotificationDigest();
+
+    const { where } = prisma.concertBandReference.findMany.mock.calls[0][0];
+    expect(where.concert_rel).not.toHaveProperty('city_id');
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[0][0].items[0]).toMatchObject({ city: null, country: null });
+  });
+
+  it('prints a show with no city without the word null', () => {
+    const html = mail.buildDigestHtml([{ name: null, bandNames: ['Opeth'], venue: 'Refshaleøen', city: null, country: null, date: null, url: null }]);
+
+    expect(html).toContain('Refshaleøen');
+    expect(html).not.toContain('null');
+  });
+
   describe('an act added to a show mailed before', () => {
     // Copenhell, found with Opeth on it weeks ago. Gojira joined it since the
     // last run. Read by when the row was created, it was never news again.
