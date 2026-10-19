@@ -13,6 +13,7 @@ const { pythonServicePost, pythonServiceFailure } = require('../../../utils/pyth
 const { error: sendError } = require('../../../utils/apiResponse');
 const { haversineKm, stringSimilarity, venueSimilarity } = require('../../../utils/concertDedup');
 const { backlinkBandToConcerts } = require('../../../utils/bandBacklink');
+const { findBandByCanonicalName } = require('../../../utils/bandLookup');
 // Called through the module rather than destructured, so a test can stand in
 // for band creation (which reaches MusicBrainz) on the router's own copy.
 const bandCreate = require('../../../utils/bandCreate');
@@ -376,7 +377,7 @@ router.post('/bands/quick-add', auth, async (req, res) => {
     // was not found, and creating it again hit the unique name as a 500.
     const select = { id: true, name: true };
     let band = (mbid && await prisma.band.findFirst({ where: { MBID: mbid }, select }))
-      || await prisma.band.findFirst({ where: { name }, select });
+      || await findBandByCanonicalName(prisma, name);
 
     if (!band) {
       try {
@@ -388,7 +389,7 @@ router.post('/bands/quick-add', auth, async (req, res) => {
         // Added by someone else between the lookup and here. Use theirs.
         if (error.code !== 'P2002') throw error;
         band = (mbid && await prisma.band.findFirst({ where: { MBID: mbid }, select }))
-          || await prisma.band.findFirst({ where: { name }, select });
+          || await findBandByCanonicalName(prisma, name);
         if (!band) throw error;
       }
       // Same reason as the create route above. Only for a band that was just

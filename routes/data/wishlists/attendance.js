@@ -70,6 +70,8 @@ router.get(
               event_id: true,
               name: true,
               venue: true,
+              // The Venue row, so the client can address a review at it.
+              venue_id: true,
               city: true,
               country: true,
               concert_date: true,
@@ -164,6 +166,8 @@ router.post(
     roleCheck(["ADMIN", "USER"]),
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
     body("concert_id").isInt().withMessage("concert_id must be an integer"),
+    // A new mark can search the shared setlist.fm key (below): same budget.
+    setlistFmLimit,
   ],
   async (req, res) => {
     try {
@@ -181,8 +185,10 @@ router.post(
       });
       if (!concert) return res.status(404).json({ error: "Concert not found" });
 
+      const where = { wishlist_id_concert_id: { wishlist_id: wishlistId, concert_id: concertId } };
+      const existed = await prisma.concertAttendance.findUnique({ where, select: { id: true } });
       const attendance = await prisma.concertAttendance.upsert({
-        where: { wishlist_id_concert_id: { wishlist_id: wishlistId, concert_id: concertId } },
+        where,
         create: { wishlist_id: wishlistId, concert_id: concertId },
         update: {},
       });
@@ -198,7 +204,14 @@ router.post(
       // clock wearing a UTC label (see date-handling notes), so its UTC
       // getters are the venue's own date, which is what Setlist.fm's search
       // expects in dd-MM-yyyy form.
-      if (concert.concert_date) {
+      //
+      // Only a new mark of a show that has happened: "Going" and "Attended"
+      // are one row split by date, so nothing changes when the date passes,
+      // and setlist.fm has nothing for a show to come. The 06:00 backfill
+      // (setlistBackfill.js) picks up the rest, so a repeat click costs no
+      // calls on the shared key.
+      const startOfTodayUtc = new Date().setUTCHours(0, 0, 0, 0);
+      if (!existed && concert.concert_date && new Date(concert.concert_date).getTime() < startOfTodayUtc) {
         const d = new Date(concert.concert_date);
         const eventDate = `${String(d.getUTCDate()).padStart(2, "0")}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${d.getUTCFullYear()}`;
         enrichConcertBands(concertId, eventDate, concert.venue, concert.city).catch(() => {});
