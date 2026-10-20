@@ -23,6 +23,9 @@ const { dateOnly, ownAttendance } = require('./shared');
 
 const router = express.Router();
 
+// A video's named clips (routes/data/media/clips.js), in the order they start.
+const clipsInclude = { select: { name: true, start_ms: true, end_ms: true }, orderBy: [{ start_ms: 'asc' }, { id: 'asc' }] };
+
 /**
  * When each of these files stops being shared: the latest expiry among its
  * public links to the whole file that are neither revoked nor expired. A file
@@ -85,6 +88,7 @@ router.get(
       const mint = urlMinter(req.user.id);
       const rows = await prisma.concertMedia.findMany({
         where: { attendance_id: attendanceId },
+        include: { clips: clipsInclude },
         // The night in the order it happened, not the order it was uploaded.
         // Ordered here rather than on the client because everything downstream
         // inherits it: the grid, the shift-click range, and the clips the
@@ -205,6 +209,7 @@ router.get(
       const media = attendances.length
         ? await prisma.concertMedia.findMany({
             where: { band_id: bandId, attendance_id: { in: attendances.map((a) => a.id) } },
+            include: { clips: clipsInclude },
           })
         : [];
       // As on the gig view: when each file's public link stops working, if it

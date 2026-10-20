@@ -149,6 +149,7 @@ describe('POST /attendances/:id/media', () => {
       'GET /bands/:bandId/media [4]',
       'POST /attendances/:attendanceId/lineup [5]',
       'PATCH /media [11]',
+      'PUT /media/:id/clips [5]',
       'DELETE /media/:id [4]',
       'DELETE /media [5]',
       'POST /media/:id/share [6]',

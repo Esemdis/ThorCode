@@ -17,6 +17,7 @@ const path = require('node:path');
 const { readdir } = require('node:fs/promises');
 const { readSidecar, SIDECAR_NAME } = require('./mediaSidecar');
 const { DETACHED_DIR, slugSegment } = require('./mediaPaths');
+const { namedClips } = require('./namedClips');
 
 // user_id and concert_id together, because ConcertAttendance is
 // @@unique([wishlist_id, concert_id]): a concert has one attendance row per
@@ -129,6 +130,13 @@ function entryProblem(f) {
   if ((f.moment_start_ms == null) !== (f.moment_end_ms == null)) {
     return 'moment_start_ms and moment_end_ms are not both set or both empty';
   }
+  // Named clips, if any: an array of whole-millisecond ranges with a name.
+  // Checked with the same rules the route applies, so a hand edit cannot put
+  // a row in the index the API would have refused.
+  if (f.clips != null) {
+    const { error } = namedClips(f.clips, { durationMs: f.duration_ms ?? null });
+    if (error) return `clips: ${error}`;
+  }
   return null;
 }
 
@@ -222,6 +230,9 @@ function planRebuild({ sidecars, filesOnDisk, attendanceIds, bandIds = null }) {
         moment_start_ms: f.moment_start_ms ?? null,
         moment_end_ms: f.moment_end_ms ?? null,
         taken_at: f.taken_at ? new Date(f.taken_at) : null,
+        // Replaces what the index holds for the file, so a file whose sidecar
+        // has none comes out with none. See applyUpserts.
+        clips: namedClips(f.clips ?? [], { durationMs: f.duration_ms ?? null }).clips,
       });
     }
 
@@ -254,11 +265,16 @@ async function applyUpserts(prisma, upserts) {
   const rejected = [];
   for (const row of upserts) {
     try {
-      await prisma.concertMedia.upsert({
+      const { clips = [], ...data } = row;
+      const media = await prisma.concertMedia.upsert({
         where: { attendance_id_filename: { attendance_id: row.attendance_id, filename: row.filename } },
-        create: row,
-        update: row,
+        create: data,
+        update: data,
       });
+      await prisma.$transaction([
+        prisma.mediaClip.deleteMany({ where: { media_id: media.id } }),
+        prisma.mediaClip.createMany({ data: clips.map((c) => ({ ...c, media_id: media.id })) }),
+      ]);
     } catch (err) {
       rejected.push({ rel_path: row.rel_path, reason: err.message });
     }
