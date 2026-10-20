@@ -109,13 +109,15 @@ router.use(roleCheck(["USER", "ADMIN"]));
 
 // GET /travel/trips — list user's trips
 router.get("/", async (req, res) => {
-  const { take, skip } = paginate(req, { defaultLimit: 100, maxLimit: 500 });
+  // travel-bag reads one page and never asks for the next, so the default is the cap.
+  // shortcut: past 500 trips the tail is still cut (newest kept), upgrade by paging the client.
+  const { take, skip } = paginate(req, { defaultLimit: 500, maxLimit: 500 });
   try {
     const where = { user_id: req.user.id };
     const [trips, total] = await Promise.all([
       prisma.trip.findMany({
         where,
-        orderBy: [{ start_date: "asc" }, { created_at: "desc" }],
+        orderBy: [{ start_date: "desc" }, { created_at: "desc" }, { id: "asc" }],
         take,
         skip,
         include: {

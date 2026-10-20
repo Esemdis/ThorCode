@@ -62,7 +62,7 @@ router.get("/usage-stats", async (req, res) => {
 
 // GET /travel/gear — list all gear items with trip count
 router.get("/", async (req, res) => {
-  const { take, skip } = paginate(req, { defaultLimit: 250, maxLimit: 500 });
+  const { take, skip } = paginate(req, { defaultLimit: 500, maxLimit: 500 });
   try {
     const where = { user_id: req.user.id };
     const [gear, total] = await Promise.all([
@@ -73,7 +73,7 @@ router.get("/", async (req, res) => {
           loadout_entries: { select: { loadout_rel: { select: { id: true, name: true } } } },
           replaced_by_rel: { select: { id: true, name: true, brand: true, model: true } },
         },
-        orderBy: [{ category: "asc" }, { brand: "asc" }, { name: "asc" }],
+        orderBy: [{ category: "asc" }, { brand: "asc" }, { name: "asc" }, { id: "asc" }],
         take,
         skip,
       }),

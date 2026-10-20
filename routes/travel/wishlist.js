@@ -13,13 +13,13 @@ router.use(roleCheck(["USER", "ADMIN", "SYSTEM"]));
 
 // GET /travel/wishlist
 router.get("/", async (req, res) => {
-  const { take, skip } = paginate(req, { defaultLimit: 250, maxLimit: 500 });
+  const { take, skip } = paginate(req, { defaultLimit: 500, maxLimit: 500 });
   try {
     const where = { user_id: req.user.id };
     const [items, total] = await Promise.all([
       prisma.travelWishlistItem.findMany({
         where,
-        orderBy: [{ bought: "asc" }, { category: "asc" }, { name: "asc" }],
+        orderBy: [{ bought: "asc" }, { category: "asc" }, { name: "asc" }, { id: "asc" }],
         take,
         skip,
       }),
