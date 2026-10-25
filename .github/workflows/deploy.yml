@@ -78,7 +78,9 @@ jobs:
 
   build:
     needs: [test, database]
-    if: github.event_name != 'pull_request'
+    # A manual run can be started on any branch; only main may publish :latest,
+    # which Watchtower deploys, migrations and all.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read

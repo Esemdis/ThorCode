@@ -86,4 +86,7 @@ EXPOSE 4000
 # becomes a container that will not start. It writes an encrypted copy after
 # each successful fetch and reads it only when the API is unreachable. Map
 # /doppler to a host path on Unraid or the file dies with the container.
-CMD ["doppler", "run", "--fallback", "/doppler/fallback.json", "--", "sh", "-c", "npx prisma migrate deploy && node index.js"]
+#
+# `exec` replaces the shell with node, so the SIGTERM from `docker stop` reaches
+# it (utils/shutdown.js) instead of stopping at `sh`, which does not forward it.
+CMD ["doppler", "run", "--fallback", "/doppler/fallback.json", "--", "sh", "-c", "npx prisma migrate deploy && exec node index.js"]
