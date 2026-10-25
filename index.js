@@ -3,6 +3,7 @@ const cors = require('cors');
 const dotenv = require("dotenv").config();
 const { startCronJobs } = require("./utils/cron");
 const { archiveStatus, archiveWarning } = require("./utils/mediaHealth");
+const { closeOnSigterm } = require("./utils/shutdown");
 const app = express();
 const port = process.env.PORT || 4000;
 
@@ -74,3 +75,5 @@ const server = app.listen(port, async () => {
 // rather than crawls is still cut off by the reverse proxy, whose timeouts run
 // between reads (see the runbook's proxy section), not across the whole body.
 server.requestTimeout = 2 * 60 * 60 * 1000;
+
+closeOnSigterm(server);
