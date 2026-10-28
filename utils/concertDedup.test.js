@@ -478,6 +478,43 @@ describe('checkDuplicateConcert and a second night at the same venue', () => {
     });
     expect(isDuplicate).toBe(true);
   });
+
+  // THO-649: across sources the name rule reached NAMED_DAYS, so a Sunday only
+  // the other source listed was folded into the stored Friday.
+  it('keeps a night two days on when only the other source has the first', async () => {
+    const { isDuplicate } = await checkDuplicateConcert({
+      concert: incoming({ source: 'songkick', concert_date: '2026-11-29T19:00:00Z' }),
+      bandIds: [93],
+      tx: txWith([existing()]),
+    });
+    expect(isDuplicate).toBe(false);
+  });
+
+  // THO-649: the response fold matched "Band @ Venue" across a week and hid a
+  // second night ingest had stored on purpose.
+  const tho649Night = (id, date, source = 'bandsintown') => ({
+    id, name: 'THROWN @ Fållan', venue: 'Fållan', city: 'Johanneshov',
+    latitude: '59.2964153', longitude: '18.0755919', concert_date: date, source, festival: false,
+    participating_bands: [{ id: 93, name: 'THROWN' }],
+  });
+
+  it('shows both stored nights of a two-night run', () => {
+    expect(deduplicateConcerts([
+      tho649Night(1, '2026-11-27T19:00:00Z'), tho649Night(2, '2026-11-28T19:00:00Z'),
+    ])).toHaveLength(2);
+  });
+
+  it('shows both nights of a run with a night off, across sources', () => {
+    expect(deduplicateConcerts([
+      tho649Night(1, '2026-11-27T19:00:00Z', 'songkick'), tho649Night(2, '2026-11-29T19:00:00Z'),
+    ])).toHaveLength(2);
+  });
+
+  it('still folds two sources dating one show a day apart', () => {
+    expect(deduplicateConcerts([
+      tho649Night(1, '2026-11-27T19:00:00Z', 'songkick'), tho649Night(2, '2026-11-28T19:00:00Z'),
+    ])).toHaveLength(1);
+  });
 });
 
 describe('checkDuplicateConcert and what the tickets are doing', () => {
