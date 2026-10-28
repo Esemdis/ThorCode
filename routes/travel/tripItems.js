@@ -7,7 +7,7 @@ const roleCheck = require("../../middlewares/roleCheck");
 const ownsTrip = require("../../middlewares/ownsTrip");
 const prisma = require("../../prisma/client");
 const { fail } = require("../../utils/apiResponse");
-const { parseReorder } = require("../../utils/travel/reorder");
+const { parseReorder, MAX_ENTRIES } = require("../../utils/travel/reorder");
 
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
@@ -111,6 +111,28 @@ router.patch("/reorder", async (req, res) => {
     res.json({ message: "Reordered" });
   } catch (err) {
     fail(res, err, { context: `PATCH reorder (trip ${req.tripId})` });
+  }
+});
+
+// PATCH /travel/trips/:tripId/items/bulk — { ids, status }: one status for many
+// items, e.g. a bag and everything in it packed in one answer. All or nothing:
+// an id not on this trip refuses the whole request.
+router.patch("/bulk", async (req, res) => {
+  const { ids, status } = req.body ?? {};
+  if (!VALID_STATUSES.includes(status)) return res.status(400).json({ error: "Invalid status" });
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_ENTRIES || !ids.every(isId)) {
+    return res.status(400).json({ error: `ids must be 1 to ${MAX_ENTRIES} item ids` });
+  }
+  const wanted = [...new Set(ids.map(Number))];
+
+  try {
+    const count = await prisma.tripItem.count({ where: { id: { in: wanted }, trip_id: req.tripId } });
+    if (count !== wanted.length) return res.status(404).json({ error: "Item not found" });
+
+    await prisma.tripItem.updateMany({ where: { id: { in: wanted }, trip_id: req.tripId }, data: { status } });
+    res.json({ data: { ids: wanted, status } });
+  } catch (err) {
+    fail(res, err, { context: `PATCH bulk (trip ${req.tripId})` });
   }
 });
 
