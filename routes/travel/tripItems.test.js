@@ -177,3 +177,54 @@ describe('a gear id that is not a number', () => {
     expect(prisma.gearItem.findFirst).not.toHaveBeenCalled();
   });
 });
+
+describe('PATCH /travel/trips/:tripId/items/bulk (THO-654)', () => {
+  const bulkPatchTho654 = (body) => request(app())
+    .patch('/travel/trips/1/items/bulk')
+    .set(...authHeader({ id: 'user-1' }))
+    .send(body);
+
+  it('sets one status on every listed item of this trip in one update', async () => {
+    prisma.tripItem.count = vi.fn(async () => 3);
+    prisma.tripItem.updateMany = vi.fn(async () => ({ count: 3 }));
+
+    const res = await bulkPatchTho654({ ids: [4, '5', 6, 4], status: 'PACKED' }).expect(200);
+
+    expect(res.body.data).toEqual({ ids: [4, 5, 6], status: 'PACKED' });
+    expect(prisma.tripItem.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: [4, 5, 6] }, trip_id: 1 },
+      data: { status: 'PACKED' },
+    });
+  });
+
+  it('refuses the whole request when an id is not on this trip', async () => {
+    prisma.tripItem.count = vi.fn(async () => 1);
+    prisma.tripItem.updateMany = vi.fn(async () => ({ count: 1 }));
+
+    const res = await bulkPatchTho654({ ids: [4, 999], status: 'PACKED' });
+
+    expect(res.status).toBe(404);
+    expect(prisma.tripItem.count).toHaveBeenCalledWith({ where: { id: { in: [4, 999] }, trip_id: 1 } });
+    expect(prisma.tripItem.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('answers 404 for somebody else\'s trip before touching items', async () => {
+    prisma.trip.findFirst = vi.fn(async () => null);
+    prisma.tripItem.updateMany = vi.fn();
+
+    expect((await bulkPatchTho654({ ids: [4], status: 'PACKED' })).status).toBe(404);
+    expect(prisma.tripItem.updateMany).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ ids: [4], status: 'LOST' }],
+    [{ ids: [], status: 'PACKED' }],
+    [{ ids: 4, status: 'PACKED' }],
+    [{ ids: [4, 'x'], status: 'PACKED' }],
+    [{ ids: [0], status: 'PACKED' }],
+  ])('answers 400 for %j', async (body) => {
+    prisma.tripItem.updateMany = vi.fn();
+    expect((await bulkPatchTho654(body)).status).toBe(400);
+    expect(prisma.tripItem.updateMany).not.toHaveBeenCalled();
+  });
+});
