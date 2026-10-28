@@ -426,6 +426,11 @@ function findStoredMatch(concert, bandIds, candidates, upgraded = new Set()) {
       // the identical fallback name and score 1.0 on the raw one.
       const oneEvent = norm >= NAME_SIM && raw < NAME_SIM;
       if (separateNight(row, oneEvent)) return false;
+      // Two "Band @ Venue" fallbacks say only "same band, same room", which a
+      // two-night run shares too, so they get the one-show slip and no more.
+      if (!oneEvent && isFallbackName(concert.name) && isFallbackName(row.name) && !eitherIsBill(row)) {
+        return gap(row) <= SLIP_DAYS;
+      }
       return gap(row) <= (oneEvent ? WINDOW_DAYS : NAMED_DAYS);
     },
 
@@ -637,7 +642,13 @@ function billNames(json) {
 /** Two rows that are one event: one name, one room, one place, inside a week. */
 function sameEvent(a, b) {
   if (!a.name || !b.name || !a.venue || !b.venue) return false;
-  if (!(dayGap(a.concert_date, b.concert_date) <= WINDOW_DAYS)) return false;
+  const gap = dayGap(a.concert_date, b.concert_date);
+  if (!(gap <= WINDOW_DAYS)) return false;
+  // Two "Band @ Venue" fallbacks match on any night of a run in that room. Held
+  // to the rules ingest stored them by: one source's two days are two nights,
+  // two sources' reports a day apart are one show slipped over midnight.
+  if (isFallbackName(a.name) && isFallbackName(b.name) && !a.festival && !b.festival
+    && (gap > SLIP_DAYS || (gap > 0 && !!a.source && a.source === b.source))) return false;
   return venueSimilarity(a.venue, b.venue) >= VENUE_SIM
     && stringSimilarity(a.name, b.name) >= NAME_SIM
     && nearby(a, b);
