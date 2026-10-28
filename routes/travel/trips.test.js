@@ -80,3 +80,15 @@ describe('POST /travel/trips/:id/duplicate', () => {
     expect(data.items.create).toEqual([expect.objectContaining({ gear_item_id: 3, bag_id: 4 })]);
   });
 });
+
+describe('GET /travel/trips/:id bag photo (THO-656)', () => {
+  it("asks for each item's bag photo, so a bag card shows it even when the bag is not on the trip", async () => {
+    prisma.trip.findFirst.mockResolvedValue({ id: 5, items: [] });
+
+    const res = await request(app).get('/5').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    const { include } = prisma.trip.findFirst.mock.calls[0][0];
+    expect(include.items.include.bag_rel).toEqual({ select: { id: true, name: true, brand: true, photo: true } });
+  });
+});

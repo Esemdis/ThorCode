@@ -170,7 +170,7 @@ router.get("/:id", param("id").isInt(), async (req, res) => {
         items: {
           include: {
             gear_item_rel: true,
-            bag_rel: { select: { id: true, name: true, brand: true } },
+            bag_rel: { select: { id: true, name: true, brand: true, photo: true } },
           },
           orderBy: [{ sort_order: "asc" }, { created_at: "asc" }],
         },
