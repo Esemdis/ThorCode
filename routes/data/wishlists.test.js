@@ -1136,8 +1136,17 @@ describe('POST /wishlists/:id/attendance/from-setlist', () => {
     sets: { set: [{ song: [{ name: 'Stranded' }] }] },
   };
 
+  const axios = createRequire(import.meta.url)('axios');
+
   beforeEach(() => {
     process.env.SETLIST_API_KEY = 'test-key';
+    // THO-673: a 200 from this route starts enrichConcertBands after the
+    // response, and it searches setlist.fm through axios. Unstubbed, that
+    // reached the real network in CI, took an unpredictable time to fail, and
+    // then called concertBandReference.findMany in whichever test happened to be
+    // running: GET /wishlists/:id/new read it as its own first call and failed
+    // on main, one run in a few. Answered here, it ends within the test.
+    vi.spyOn(axios, 'get').mockResolvedValue({ data: { setlist: [] } });
     vi.spyOn(setlistFm, 'fetchSetlistById').mockResolvedValue(SETLIST);
     prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1' });
     prisma.band.findUnique.mockResolvedValue({ id: 3, MBID: SETLIST.artist.mbid });
