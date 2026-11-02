@@ -77,9 +77,12 @@ over anything here.
 8. **Merge it, only if every one of these holds:**
    - the verify command passes, every other pre-merge check in step 4 has
      actually run, and the new tests are real;
-   - CI on the PR is green where it exists. Where the repo runs none on PRs
-     (concert-map, route-planner, python-crohn), your local verify is the only
-     gate, so its output must be clean and quoted in the PR;
+   - CI on the PR is green. wander, route-planner, ThorCode and concert-map
+     all run their tests on a PR; check the workflow's `pull_request` trigger in
+     any other repo, and where there is none, your local verify is the only
+     gate, so its output must be clean and quoted in the PR. A job that failed
+     within a second or two with no logs never ran a test: re-run it once, and
+     count it as neither green nor red;
    - the final review verdict has no unresolved blocking finding;
    - **the default branch is not already red** (a known failing test there blocks
      the deploy, so your change would not go live). Check the latest default-branch
@@ -99,7 +102,7 @@ over anything here.
 9. **Check it landed.** Confirm the default branch contains the change (grep the
    file, not just "merged: true") and that no commit of this work was left behind
    on the branch. A merge to the default branch deploys itself in these repos, and
-   some run no tests on a PR at all, so **watch the default-branch run**: if it
+   a PR's run skips the image step, so **watch the default-branch run**: if it
    is red or its image step is skipped, say so and hand back.
 10. **Report.** One short message: what was wrong, what changed, what was tested
     and what was not, what the review found, the PR number, and what the owner
