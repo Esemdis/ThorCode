@@ -743,6 +743,7 @@ function deduplicateConcerts(concerts) {
 module.exports = {
   // Shared by other modules for fuzzy matching
   haversineKm,
+  hasTimeOfDay,
   stringSimilarity,
   venueContains,
   venueSimilarity,

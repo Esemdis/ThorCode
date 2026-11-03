@@ -16,7 +16,7 @@ The API runs as one Node process against Postgres through Prisma. Two other serv
 | --- | --- | --- |
 | Accounts | `/users` | `routes/users.js`. Covers register, login, settings and email change. Email verification goes through Resend. |
 | Bands and concerts | `/data/concerts` | `routes/data/bands/`. Covers ingest from the scraper, search, band pages, setlists and admin. |
-| Wishlists and attendance | `/data/concerts` | `routes/data/wishlists/`. Covers wishlists, the shows you went to and the ones you missed, and the ICS calendar feed. |
+| Wishlists and attendance | `/data/concerts` | `routes/data/wishlists/`. Covers wishlists, the shows you went to and the ones you missed, and the ICS calendar feed. `GET /data/concerts/nearby` (`routes/data/concertsNearby.js`) lists the caller's wishlist shows within a radius of a point on some dates, for wander's trip page (THO-667). |
 | Notifications | `/data/concerts` | `routes/data/notifications.js` handles subscriptions to a band, a city or a festival. New shows go to the wishlist's Discord webhook as the scraper reports them, and a daily email digest goes out by cron. |
 | Photo and video archive | `/data/concerts` | `routes/data/media/`. Covers upload, tagging, 12-hour share links and byte serving. See [docs/concert-media-runbook.md](docs/concert-media-runbook.md). |
 | Setlist playlists | `/data/concerts`, `/oauth/spotify`, `/oauth/tidal` | `routes/data/playlists.js` builds a Spotify or Tidal playlist from a night's setlists, on whichever the user chose in Settings. |
