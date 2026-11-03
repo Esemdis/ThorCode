@@ -35,8 +35,6 @@ need no database.
   chain. `npm ci --ignore-scripts` is acceptable, but the PR must say you used
   it. Without a generated client `utils/prismaAccessors.test.js` cannot load,
   so expect that file to fail there.
-- On `main` today `routes/data/media.test.js` fails (the sidecar test, THO-423).
-  Say so in the PR rather than assuming you broke it.
 
 ### Migrations
 
