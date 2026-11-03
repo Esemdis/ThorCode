@@ -34,6 +34,18 @@ describe('createBand', () => {
     expect(pythonService.pythonServicePost).toHaveBeenCalledWith('/sync/9', expect.any(Object));
   });
 
+  it('marks the sync it starts as the first one, so the scraper does not announce a new band\'s whole calendar (THO-680)', async () => {
+    prisma.band.findMany.mockResolvedValue([]);
+    prisma.band.create.mockImplementation(async ({ data }) => ({ id: 9, ...data }));
+
+    await createBand('Gojira');
+
+    expect(pythonService.pythonServicePost).toHaveBeenCalledWith('/sync/9', expect.objectContaining({
+      band_name: 'Gojira',
+      initial: true,
+    }));
+  });
+
   it('refuses a name already stored, before asking MusicBrainz', async () => {
     prisma.band.findMany.mockResolvedValue([{ id: 3, name: 'Gojira' }]);
 
