@@ -14,7 +14,7 @@ const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
 const { fail } = require("../../utils/apiResponse");
-const { nearbyConcerts, nearbyConcertOut } = require("../../utils/concertsNearby");
+const { inWindow, nearbyConcerts, nearbyConcertOut } = require("../../utils/concertsNearby");
 
 const DEFAULT_RADIUS_KM = 30;
 const MAX_RADIUS_KM = 300;
@@ -23,10 +23,18 @@ const MAX_RADIUS_KM = 300;
 const MAX_SPAN_DAYS = 120;
 // The prefilter is by date and wishlist only (the coordinate columns are
 // strings, so the radius is applied in code), so the read is bounded here.
+// Not narrowed by city before the cap: the city column is free text ("København"
+// / "Copenhagen"), and a prefilter on it would drop real shows.
 const READ_CEILING = 500;
 const DAY_MS = 86_400_000;
 
-const isoDay = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`));
+// A real calendar day: Date.parse rolls 2026-02-30 over into March, so the
+// round trip is what proves it.
+const isoDay = (v) => {
+  const s = String(v ?? "");
+  const d = new Date(`${s}T00:00:00Z`);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(d.getTime()) && d.toISOString().startsWith(s);
+};
 
 const checks = [
   query("from").custom(isoDay).withMessage("from must be a date, YYYY-MM-DD"),
@@ -35,6 +43,8 @@ const checks = [
   query("lng").optional().isFloat({ min: -180, max: 180 }).withMessage("lng must be a longitude"),
   query("radius_km").optional().isFloat({ min: 1, max: MAX_RADIUS_KM }).withMessage(`radius_km must be 1 to ${MAX_RADIUS_KM}`),
   query("city").optional().isString().isLength({ max: 120 }),
+  // Disambiguates the name fallback only (Birmingham, Cambridge).
+  query("country").optional().isString().isLength({ max: 60 }),
 ];
 
 router.get("/nearby", [auth, roleCheck(["ADMIN", "USER"]), ...checks], async (req, res) => {
@@ -44,6 +54,7 @@ router.get("/nearby", [auth, roleCheck(["ADMIN", "USER"]), ...checks], async (re
   const lat = req.query.lat === undefined ? null : Number(req.query.lat);
   const lng = req.query.lng === undefined ? null : Number(req.query.lng);
   const city = req.query.city?.trim() || null;
+  const country = req.query.country?.trim() || null;
   if ((lat === null) !== (lng === null)) return res.status(400).json({ error: "Give lat and lng together" });
   if (lat === null && !city) return res.status(400).json({ error: "Give a point (lat and lng) or a city" });
   const start = Date.parse(`${from}T00:00:00Z`);
@@ -69,21 +80,30 @@ router.get("/nearby", [auth, roleCheck(["ADMIN", "USER"]), ...checks], async (re
       where: {
         concert_date: { gte: new Date(start - DAY_MS), lt: new Date(end + 2 * DAY_MS) },
         bands: { some: { band: { in: [...tiers.keys()] } } },
+        // Not the past-attendance imports from setlist.fm (source "setlistfm",
+        // sfm_ ids), which are shows someone went to. `not` skips null in SQL,
+        // hence the OR (as utils/weeklyRecap.js's ANNOUNCED).
+        OR: [{ source: null }, { source: { not: "setlistfm" } }],
       },
       orderBy: [{ concert_date: "asc" }, { id: "asc" }],
-      take: READ_CEILING,
+      // One past the ceiling: exactly READ_CEILING rows is a complete answer.
+      take: READ_CEILING + 1,
       select: {
         id: true, name: true, festival: true, venue: true, city: true, country: true, concert_date: true,
         source: true, latitude: true, longitude: true, url: true, on_sale: true, sold_out: true, ticket_sale_start: true,
         price_min: true, price_max: true, price_currency: true,
-        city_rel: { select: { name: true } },
+        city_rel: { select: { name: true, country: true } },
         bands: { where: { band: { in: [...tiers.keys()] } }, select: { band_rel: { select: { id: true, name: true } } } },
       },
     });
     const now = new Date();
-    const concerts = nearbyConcerts(rows, { lat, lng, radiusKm, city }).map((c) => nearbyConcertOut(c, tiers, now));
+    const truncated = rows.length > READ_CEILING;
+    const read = truncated ? rows.slice(0, READ_CEILING) : rows;
+    const concerts = nearbyConcerts(read.filter((c) => inWindow(c, from, to)), {
+      lat, lng, radiusKm, city, country,
+    }).map((c) => nearbyConcertOut(c, tiers, now));
     // Said, not hidden: a cut-off read means some shows may be missing.
-    return res.json({ data: { concerts, truncated: rows.length >= READ_CEILING } });
+    return res.json({ data: { concerts, truncated } });
   } catch (err) {
     return fail(res, err, { context: "GET concerts nearby" });
   }

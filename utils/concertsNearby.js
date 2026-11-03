@@ -4,6 +4,7 @@
 const { haversineKm, hasTimeOfDay } = require('./concertDedup');
 const { storesRealInstant } = require('./ics');
 const { ticketState } = require('./ticketState');
+const { countryName } = require('./countries');
 
 /**
  * What the stored `concert_date` means, so a reader that has to place the show
@@ -20,6 +21,11 @@ const { ticketState } = require('./ticketState');
  * This is the same stopgap rule the calendar feed uses (`storesRealInstant`),
  * kept here as one named answer rather than copied into a second consumer.
  *
+ * Known edge, deliberately not changed: midnight UTC means "no time", so a
+ * Songkick instant at exactly 00:00Z is classified `date_only` too (the same
+ * stopgap as ics.js). A US evening show whose UTC time falls on the next day at
+ * 00:00Z is read as a show with no start, on the UTC date.
+ *
  * @param {{concert_date?: Date|string|null, source?: string|null}} concert
  * @returns {'instant'|'wall_clock'|'date_only'}
  */
@@ -30,13 +36,23 @@ function concertTimeKind(concert) {
 
 /**
  * A stored coordinate as a number, or null. The columns are strings and hold
- * whatever a scraper wrote, so "" , "null" and out-of-range values all count
- * as no coordinate rather than as a point in the Gulf of Guinea.
+ * whatever a scraper wrote, so "" , "null", hex ("0x10"), exponent ("1e1") and
+ * out-of-range values all count as no coordinate rather than as a point in the
+ * Gulf of Guinea. Plain decimals only.
  */
+const DECIMAL = /^-?\d+(\.\d+)?$/;
 function coordinate(value, limit) {
   if (value == null || value === '') return null;
-  const n = typeof value === 'number' ? value : Number(String(value).trim());
+  if (typeof value === 'string' && !DECIMAL.test(value.trim())) return null;
+  const n = typeof value === 'number' ? value : Number(value.trim());
   return Number.isFinite(n) && Math.abs(n) <= limit ? n : null;
+}
+
+/** A pair of coordinates, or null for either missing or exactly 0/0, which is a scraper's blank, not a venue. */
+function point(latitude, longitude) {
+  const lat = coordinate(latitude, 90);
+  const lng = coordinate(longitude, 180);
+  return lat == null || lng == null || (lat === 0 && lng === 0) ? null : { lat, lng };
 }
 
 /** Lowercase, accent-free and single-spaced, so "Köln " and "koln" compare equal. */
@@ -61,30 +77,56 @@ function cityKey(name) {
  * why a name is only ever the fallback.
  *
  * @param {object[]} concerts rows with latitude, longitude, city and optionally city_rel.name
- * @param {{lat?: number|null, lng?: number|null, radiusKm: number, city?: string|null}} where
+ * @param {{lat?: number|null, lng?: number|null, radiusKm: number, city?: string|null, country?: string|null}} where
  * @returns {Array<object>} the concerts with `latitude`/`longitude` as numbers
  *   or null, `distance_km` (one decimal, null when not measured) and `match`
  */
-function nearbyConcerts(concerts, { lat = null, lng = null, radiusKm, city = null }) {
+function nearbyConcerts(concerts, {
+  lat = null, lng = null, radiusKm, city = null, country = null,
+}) {
   const hasPoint = Number.isFinite(lat) && Number.isFinite(lng);
   const wanted = cityKey(city);
-  const sameCity = (c) => Boolean(wanted) && [c.city, c.city_rel?.name].some((n) => n && cityKey(n) === wanted);
+  const wantedCountry = country ? cityKey(countryName(country)) : '';
+  // Same name, and the same country when both sides have one: Birmingham AL is
+  // not Birmingham, and Cambridge MA is not Cambridge.
+  const sameCity = (c) => {
+    if (!wanted || ![c.city, c.city_rel?.name].some((n) => n && cityKey(n) === wanted)) return false;
+    const theirs = c.country || c.city_rel?.country;
+    return !wantedCountry || !theirs || cityKey(countryName(theirs)) === wantedCountry;
+  };
   const out = [];
   for (const concert of concerts) {
-    const latitude = coordinate(concert.latitude, 90);
-    const longitude = coordinate(concert.longitude, 180);
-    const located = latitude != null && longitude != null;
-    if (located && hasPoint) {
+    const where = point(concert.latitude, concert.longitude);
+    const latitude = where?.lat ?? null;
+    const longitude = where?.lng ?? null;
+    if (where && hasPoint) {
       const distance = haversineKm(lat, lng, latitude, longitude);
       if (distance > radiusKm) continue;
       out.push({ ...concert, latitude, longitude, distance_km: Math.round(distance * 10) / 10, match: 'distance' });
-    } else if ((!located || !hasPoint) && sameCity(concert)) {
+    } else if ((!where || !hasPoint) && sameCity(concert)) {
       // Not measurable: the show has no usable coordinates, or the caller sent
       // no point. Either way it is the name that matched, and it says so.
       out.push({ ...concert, latitude, longitude, distance_km: null, match: 'city_name' });
     }
   }
   return out;
+}
+
+/**
+ * Whether a show's day is inside the asked window. A `wall_clock` or `date_only`
+ * row stores the venue's own date, so it is cut exactly to [from, to]. An
+ * `instant` row's UTC date can be a day either side of the venue's, so it is
+ * kept (the query is already a day wider each side) and the caller, who has the
+ * zone, makes the exact cut.
+ *
+ * @param {object} concert
+ * @param {string} from YYYY-MM-DD
+ * @param {string} to YYYY-MM-DD
+ */
+function inWindow(concert, from, to) {
+  if (concertTimeKind(concert) === 'instant') return true;
+  const day = new Date(concert.concert_date).toISOString().slice(0, 10);
+  return day >= from && day <= to;
 }
 
 /**
@@ -121,4 +163,4 @@ function nearbyConcertOut(concert, tiers, now = new Date()) {
   };
 }
 
-module.exports = { concertTimeKind, nearbyConcerts, nearbyConcertOut };
+module.exports = { concertTimeKind, inWindow, nearbyConcerts, nearbyConcertOut };

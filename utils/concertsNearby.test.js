@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { concertTimeKind, nearbyConcerts, nearbyConcertOut } from './concertsNearby.js';
+import {
+  concertTimeKind, inWindow, nearbyConcerts, nearbyConcertOut,
+} from './concertsNearby.js';
 
 const CPH = { lat: 55.6761, lng: 12.5683 };
 
@@ -41,7 +43,7 @@ describe('nearbyConcerts', () => {
   });
 
   it('drops a venue outside the radius even when the city name is the same', () => {
-    // Malmö is about 28 km from Copenhagen; Roskilde-side Helsingør is further.
+    // Helsingør is about 40 km from Copenhagen, and still called Copenhagen here.
     const far = nearbyShowAt({ latitude: '56.0361', longitude: '12.6136', city: 'Copenhagen' });
     expect(nearbyConcerts([far], { ...CPH, radiusKm: 30, city: 'Copenhagen' })).toEqual([]);
   });
@@ -51,9 +53,20 @@ describe('nearbyConcerts', () => {
     expect(nearbyConcerts([numeric], { ...CPH, radiusKm: 30 })).toHaveLength(1);
   });
 
-  it.each([[''], ['null'], ['abc'], [null], ['999']])('treats the stored coordinate %j as missing, not as a point', (bad) => {
+  it.each([[''], ['null'], ['abc'], [null], ['999'], ['0x10'], ['1e1'], ['5.'], ['+5']])('treats the stored coordinate %j as missing, not as a point', (bad) => {
     const [kept] = nearbyConcerts([nearbyShowAt({ latitude: bad, longitude: bad })], { ...CPH, radiusKm: 30, city: 'Copenhagen' });
     expect(kept).toMatchObject({ match: 'city_name', distance_km: null, latitude: null, longitude: null });
+  });
+
+  it('treats exactly 0/0 as a scraper\'s blank, not a venue in the Gulf of Guinea', () => {
+    const [kept] = nearbyConcerts([nearbyShowAt({ latitude: '0', longitude: '0' })], { ...CPH, radiusKm: 30, city: 'Copenhagen' });
+    expect(kept).toMatchObject({ match: 'city_name', latitude: null });
+    expect(nearbyConcerts([nearbyShowAt({ latitude: 0, longitude: 0 })], { ...CPH, radiusKm: 30 })).toEqual([]);
+  });
+
+  it('still measures a venue on the equator or the meridian when only one coordinate is zero', () => {
+    const equator = nearbyShowAt({ latitude: '0', longitude: '12.5683' });
+    expect(nearbyConcerts([equator], { lat: 0, lng: 12.5683, radiusKm: 30 })).toHaveLength(1);
   });
 
   it('falls back to the city name only for a show with no coordinates, and marks it', () => {
@@ -76,10 +89,54 @@ describe('nearbyConcerts', () => {
     expect(nearbyConcerts([folded], { radiusKm: 30, city: 'Copenhagen' })).toHaveLength(1);
   });
 
+  it('does not match a same-named city in another country when both sides say which', () => {
+    // Birmingham, UK is not Birmingham, Alabama; Cambridge, MA is not Cambridge.
+    const alabama = nearbyShowAt({ latitude: null, longitude: null, city: 'Birmingham', country: 'US' });
+    expect(nearbyConcerts([alabama], { radiusKm: 30, city: 'Birmingham', country: 'GB' })).toEqual([]);
+    expect(nearbyConcerts([alabama], { radiusKm: 30, city: 'Birmingham', country: 'US' })).toHaveLength(1);
+  });
+
+  it('reads a country as a code on one side and a name on the other', () => {
+    const named = nearbyShowAt({ latitude: null, longitude: null, city: 'Birmingham', country: 'United Kingdom' });
+    expect(nearbyConcerts([named], { radiusKm: 30, city: 'Birmingham', country: 'GB' })).toHaveLength(1);
+  });
+
+  it('matches by name when either side has no country to compare', () => {
+    const none = nearbyShowAt({ latitude: null, longitude: null, city: 'Birmingham', country: null });
+    expect(nearbyConcerts([none], { radiusKm: 30, city: 'Birmingham', country: 'GB' })).toHaveLength(1);
+    expect(nearbyConcerts([none], { radiusKm: 30, city: 'Birmingham' })).toHaveLength(1);
+  });
+
   it('asked by name alone, keeps a located show and leaves it unmeasured', () => {
     const [kept] = nearbyConcerts([nearbyShowAt()], { radiusKm: 30, city: 'Copenhagen' });
     expect(kept).toMatchObject({ match: 'city_name', distance_km: null });
     expect(kept.latitude).toBeCloseTo(55.6677);
+  });
+});
+
+describe('inWindow', () => {
+  const edge = (concert_date, source) => ({ concert_date, source });
+
+  it('cuts a wall-clock row exactly to the asked days, at both edges', () => {
+    // Bandsintown stores the venue's own date, so a 23:30 show on the day
+    // before the window is the day before, not "close enough".
+    expect(inWindow(edge('2026-11-11T23:30:00.000Z', 'bandsintown'), '2026-11-12', '2026-11-16')).toBe(false);
+    expect(inWindow(edge('2026-11-12T00:30:00.000Z', 'bandsintown'), '2026-11-12', '2026-11-16')).toBe(true);
+    expect(inWindow(edge('2026-11-16T23:30:00.000Z', 'bandsintown'), '2026-11-12', '2026-11-16')).toBe(true);
+    expect(inWindow(edge('2026-11-17T00:30:00.000Z', 'bandsintown'), '2026-11-12', '2026-11-16')).toBe(false);
+  });
+
+  it('cuts a date-only row exactly too', () => {
+    expect(inWindow(edge('2026-11-11T00:00:00.000Z', 'songkick'), '2026-11-12', '2026-11-16')).toBe(false);
+    expect(inWindow(edge('2026-11-12T00:00:00.000Z', 'songkick'), '2026-11-12', '2026-11-16')).toBe(true);
+    expect(inWindow(edge('2026-11-16T00:00:00.000Z', 'songkick'), '2026-11-12', '2026-11-16')).toBe(true);
+    expect(inWindow(edge('2026-11-17T00:00:00.000Z', 'songkick'), '2026-11-12', '2026-11-16')).toBe(false);
+  });
+
+  it('keeps the slack for an instant row, whose venue day can be a day either side of its UTC date', () => {
+    // 23:30Z on the 11th is already the 12th in Copenhagen; the caller has the zone.
+    expect(inWindow(edge('2026-11-11T23:30:00.000Z', 'songkick'), '2026-11-12', '2026-11-16')).toBe(true);
+    expect(inWindow(edge('2026-11-17T01:30:00.000Z', 'songkick'), '2026-11-12', '2026-11-16')).toBe(true);
   });
 });
 

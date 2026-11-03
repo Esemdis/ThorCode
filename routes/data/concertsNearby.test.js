@@ -28,7 +28,7 @@ beforeEach(() => {
 
 describe('GET /nearby', () => {
   it('requires a signed-in user, with the role check in front', () => {
-    expect(routeManifest(router)).toEqual(['GET /nearby [9]']);
+    expect(routeManifest(router)).toEqual(['GET /nearby [10]']);
   });
 
   it('turns away a caller with no token', async () => {
@@ -72,8 +72,38 @@ describe('GET /nearby', () => {
   });
 
   it('says when the read hit its ceiling, so a missing show is not silently missing', async () => {
+    prisma.concert.findMany.mockResolvedValue(Array.from({ length: 501 }, (_, i) => concertRowAt({ id: i + 1 })));
+    const res = await ask(`${WINDOW}&${POINT}`);
+    expect(res.body.data.truncated).toBe(true);
+    // The 501st row is only the proof that there was more.
+    expect(res.body.data.concerts).toHaveLength(500);
+  });
+
+  it('does not call exactly 500 rows truncated, which is a complete answer', async () => {
     prisma.concert.findMany.mockResolvedValue(Array.from({ length: 500 }, (_, i) => concertRowAt({ id: i + 1 })));
-    expect((await ask(`${WINDOW}&${POINT}`)).body.data.truncated).toBe(true);
+    expect((await ask(`${WINDOW}&${POINT}`)).body.data.truncated).toBe(false);
+    expect(prisma.concert.findMany.mock.calls[0][0].take).toBe(501);
+  });
+
+  it('leaves out past-attendance imports from setlist.fm, but not rows with no source', async () => {
+    await ask(`${WINDOW}&${POINT}`);
+    expect(prisma.concert.findMany.mock.calls[0][0].where.OR).toEqual([{ source: null }, { source: { not: 'setlistfm' } }]);
+  });
+
+  it('cuts wall-clock rows to the asked days but keeps the instant rows\' slack for the caller', async () => {
+    prisma.concert.findMany.mockResolvedValue([
+      concertRowAt({ id: 1, concert_date: new Date('2026-11-11T20:00:00Z'), source: 'bandsintown' }),
+      concertRowAt({ id: 2, concert_date: new Date('2026-11-11T23:30:00Z'), source: 'songkick' }),
+      concertRowAt({ id: 3, concert_date: new Date('2026-11-12T19:00:00Z'), source: 'bandsintown' }),
+    ]);
+    const ids = (await ask(`${WINDOW}&${POINT}`)).body.data.concerts.map((c) => c.id);
+    expect(ids).toEqual([2, 3]);
+  });
+
+  it('passes the country on for the name fallback', async () => {
+    prisma.concert.findMany.mockResolvedValue([concertRowAt({ latitude: null, longitude: null, city: 'Birmingham', country: 'US' })]);
+    expect((await ask(`${WINDOW}&city=Birmingham&country=GB`)).body.data.concerts).toEqual([]);
+    expect((await ask(`${WINDOW}&city=Birmingham&country=US`)).body.data.concerts).toHaveLength(1);
   });
 
   it('accepts a city with no point and marks a name match', async () => {
@@ -85,6 +115,7 @@ describe('GET /nearby', () => {
   it.each([
     ['no dates', POINT],
     ['a bad date', `from=2026-13-40&to=2026-11-16&${POINT}`],
+    ['a date that does not exist, which Date would roll over', `from=2026-02-30&to=2026-03-02&${POINT}`],
     ['a window the wrong way round', `from=2026-11-16&to=2026-11-12&${POINT}`],
     ['a window over 120 days', `from=2026-01-01&to=2026-12-31&${POINT}`],
     ['neither a point nor a city', WINDOW],
