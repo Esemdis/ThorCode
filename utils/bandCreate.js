@@ -112,8 +112,14 @@ async function createBand(name) {
   // The scrape itself stays in the background: it is long-running, and unlike
   // the lookup above there is a retry path for it — the band now has its urls
   // stored, so an admin re-sync or the cron picks it up.
+  //
+  // `initial: true` is sent from here and nowhere else (THO-680). The sync
+  // service flags the shows a single-band sync inserts so the next full sync
+  // announces them to wishlists, and a brand-new band's whole back catalogue
+  // of dates is not news, so this first sync stays quiet. The admin re-sync
+  // (routes/data/bands/writes.js) must not send it.
   pythonService.pythonServicePost(`/sync/${band.id}`,
-    { songkick_url: songkickUrl || null, bandsintown_url: bandsintownUrl || null, band_name: band.name },
+    { songkick_url: songkickUrl || null, bandsintown_url: bandsintownUrl || null, band_name: band.name, initial: true },
   ).then(
     () => console.log(`[bands] Sync queued for ${band.name}`),
     (e) => console.error(`[bands] Background sync failed for ${band.name}:`, e.message),

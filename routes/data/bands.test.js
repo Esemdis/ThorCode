@@ -1182,6 +1182,49 @@ describe('a sync the Python service turns away', () => {
   });
 });
 
+describe('POST /bands/:bandId/sync-concerts body (THO-680)', () => {
+  // The scraper treats `initial: true` as "this band was only just added, keep
+  // its first sync quiet". The admin button re-syncs a band that already
+  // exists, so sending it there would silence the alerts the flag exists to
+  // protect. Captured off a real socket for the same reason as the block above.
+  let tho680Server;
+  let tho680Bodies;
+
+  beforeAll(async () => {
+    const { createServer } = await import('node:http');
+    tho680Server = createServer((req, res) => {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        tho680Bodies.push({ url: req.url, body: JSON.parse(raw || '{}') });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'queued' }));
+      });
+    });
+    await new Promise((resolve) => tho680Server.listen(0, '127.0.0.1', resolve));
+    process.env.PYTHON_SERVICE_URL = `http://127.0.0.1:${tho680Server.address().port}`;
+    delete process.env.PYTHON_SERVICE_FALLBACK_URL;
+  });
+
+  afterAll(() => new Promise((resolve) => tho680Server.close(resolve)));
+
+  beforeEach(() => { tho680Bodies = []; });
+
+  it('does not send initial when an admin re-syncs an existing band', async () => {
+    prisma.band.findUnique.mockResolvedValue({
+      id: 1, name: 'Opeth', songkick_url: 'sk', bandsintown_url: null,
+    });
+
+    const res = await request(app).post('/bands/1/sync-concerts').set(...authHeader({ role: 'ADMIN' }));
+
+    expect(res.status).toBe(200);
+    expect(tho680Bodies).toHaveLength(1);
+    expect(tho680Bodies[0].url).toBe('/sync/1');
+    expect(tho680Bodies[0].body).toEqual({ songkick_url: 'sk', bandsintown_url: null, band_name: 'Opeth' });
+    expect(tho680Bodies[0].body).not.toHaveProperty('initial');
+  });
+});
+
 describe('GET /bands/recommended', () => {
   const require = createRequire(import.meta.url);
   const spotify = require('../../utils/spotify.js');
