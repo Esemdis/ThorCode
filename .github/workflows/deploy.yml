@@ -102,3 +102,7 @@ jobs:
           context: .
           push: true
           tags: ghcr.io/esemdis/thorcode:latest
+          # The commit this image was built from, so munin-dashboard can say
+          # which merge is live (THO-711).
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
