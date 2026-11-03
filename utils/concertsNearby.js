@@ -55,6 +55,37 @@ function point(latitude, longitude) {
   return lat == null || lng == null || (lat === 0 && lng === 0) ? null : { lat, lng };
 }
 
+// Country names Intl knows, lowercase, so a name can be told from a guess.
+let knownNames = null;
+function regionNames() {
+  if (!knownNames) {
+    knownNames = new Set();
+    for (const a of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') {
+      for (const b of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') {
+        const name = countryName(a + b);
+        if (name && name !== a + b) knownNames.add(name.toLowerCase());
+      }
+    }
+  }
+  return knownNames;
+}
+
+/**
+ * A country as one comparable name, or null when it is not one we can read.
+ * Scrapers write 'DK', 'dk', 'Denmark', and also 'USA' or 'Deutschland'; the
+ * last two are not an ISO code or an English name, so they are "unknown", never
+ * a mismatch: comparing them would drop a real show from the name fallback.
+ */
+function countryKey(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  if (/^[A-Za-z]{2}$/.test(text)) {
+    const name = countryName(text.toUpperCase());
+    return name && name !== text.toUpperCase() ? name.toLowerCase() : null;
+  }
+  return regionNames().has(text.toLowerCase()) ? text.toLowerCase() : null;
+}
+
 /** Lowercase, accent-free and single-spaced, so "Köln " and "koln" compare equal. */
 function cityKey(name) {
   return String(name ?? '')
@@ -86,13 +117,14 @@ function nearbyConcerts(concerts, {
 }) {
   const hasPoint = Number.isFinite(lat) && Number.isFinite(lng);
   const wanted = cityKey(city);
-  const wantedCountry = country ? cityKey(countryName(country)) : '';
+  const wantedCountry = countryKey(country);
   // Same name, and the same country when both sides have one: Birmingham AL is
   // not Birmingham, and Cambridge MA is not Cambridge.
   const sameCity = (c) => {
     if (!wanted || ![c.city, c.city_rel?.name].some((n) => n && cityKey(n) === wanted)) return false;
     const theirs = c.country || c.city_rel?.country;
-    return !wantedCountry || !theirs || cityKey(countryName(theirs)) === wantedCountry;
+    const theirKey = countryKey(theirs);
+    return !wantedCountry || !theirKey || theirKey === wantedCountry;
   };
   const out = [];
   for (const concert of concerts) {

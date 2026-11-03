@@ -36,7 +36,14 @@ const isoDay = (v) => {
   return /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(d.getTime()) && d.toISOString().startsWith(s);
 };
 
+// A param given twice (`?radius_km=1&radius_km=2`) arrives as an array, which
+// the per-value validators below accept element by element and `Number([..])`
+// then turns into NaN, so the radius filter was skipped and shows at any
+// distance came back. Every param is one string or absent.
 const checks = [
+  query(["from", "to", "lat", "lng", "radius_km", "city", "country"])
+    .custom((v) => v === undefined || typeof v === "string")
+    .withMessage("Each parameter may be given once"),
   query("from").custom(isoDay).withMessage("from must be a date, YYYY-MM-DD"),
   query("to").custom(isoDay).withMessage("to must be a date, YYYY-MM-DD"),
   query("lat").optional().isFloat({ min: -90, max: 90 }).withMessage("lat must be a latitude"),

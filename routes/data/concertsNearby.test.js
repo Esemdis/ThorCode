@@ -28,7 +28,7 @@ beforeEach(() => {
 
 describe('GET /nearby', () => {
   it('requires a signed-in user, with the role check in front', () => {
-    expect(routeManifest(router)).toEqual(['GET /nearby [10]']);
+    expect(routeManifest(router)).toEqual(['GET /nearby [11]']);
   });
 
   it('turns away a caller with no token', async () => {
@@ -121,6 +121,10 @@ describe('GET /nearby', () => {
     ['neither a point nor a city', WINDOW],
     ['a latitude without a longitude', `${WINDOW}&lat=55`],
     ['a latitude out of range', `${WINDOW}&lat=95&lng=12`],
+    ['a radius given twice, which Number() would turn into NaN and skip the filter', `${WINDOW}&${POINT}&radius_km=1&radius_km=2`],
+    ['a latitude given twice', `${WINDOW}&lat=55&lat=56&lng=12`],
+    ['a date given twice', `from=2026-11-12&from=2026-11-13&to=2026-11-16&${POINT}`],
+    ['a city given twice', `${WINDOW}&city=Oslo&city=Bergen`],
     ['a radius over the cap', `${WINDOW}&${POINT}&radius_km=5000`],
   ])('refuses %s with a 400', async (_name, qs) => {
     const res = await ask(qs);

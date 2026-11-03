@@ -101,6 +101,18 @@ describe('nearbyConcerts', () => {
     expect(nearbyConcerts([named], { radiusKm: 30, city: 'Birmingham', country: 'GB' })).toHaveLength(1);
   });
 
+  it.each([['USA'], ['Deutschland'], ['xx'], ['  '], ['U.S.']])('does not drop a name match over a country it cannot read: %j', (odd) => {
+    // Not an ISO code or an English name: unknown, never a mismatch.
+    const shown = nearbyShowAt({ latitude: null, longitude: null, city: 'Berlin', country: odd });
+    expect(nearbyConcerts([shown], { radiusKm: 30, city: 'Berlin', country: 'DE' })).toHaveLength(1);
+  });
+
+  it('reads a lowercase code', () => {
+    const lower = nearbyShowAt({ latitude: null, longitude: null, city: 'Birmingham', country: 'us' });
+    expect(nearbyConcerts([lower], { radiusKm: 30, city: 'Birmingham', country: 'GB' })).toEqual([]);
+    expect(nearbyConcerts([lower], { radiusKm: 30, city: 'Birmingham', country: 'US' })).toHaveLength(1);
+  });
+
   it('matches by name when either side has no country to compare', () => {
     const none = nearbyShowAt({ latitude: null, longitude: null, city: 'Birmingham', country: null });
     expect(nearbyConcerts([none], { radiusKm: 30, city: 'Birmingham', country: 'GB' })).toHaveLength(1);
