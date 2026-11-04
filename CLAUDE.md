@@ -61,13 +61,20 @@ The CI drift check must pass: a schema change without a migration fails there.
   clash with another open PR that edits the same test file.
 - Vitest runs with `mockReset: true` (`vitest.config.js`): set mock
   implementations inside each test.
-- **Tickets you file.** Every Linear ticket an agent creates gets an estimated
-  severity and a project, set when it is created. Severity is Linear's priority
-  field: Urgent (live data loss, a security hole, or the default branch red),
-  High (a wrong result a user will see soon), Medium (wrong but with a
-  workaround), Low (cosmetic, internal or cleanup). An estimate is enough, and
-  the owner changes it; "No priority" is not an answer. The project is the one
-  that owns the repo where the problem lives: Wander and route planner (wander,
-  route-planner), Concert Finder (concert-map, ThorCode, python-crohn) or Travel
-  Bag (travel-bag). If it spans two projects, use the one whose users see the
-  effect and add the `cross-project` label. Keep the repo prefix in the title.
+
+### Linear tickets
+
+- **Tickets you file.** Set Linear's Priority (that is the severity) and the
+  project when you create a ticket. "No priority" is not an answer: an estimate
+  is enough, and the owner changes it. For a bug, Urgent is live data loss, a
+  security hole, the service down or the default branch really red (not a CI
+  job that died in a second or two with no logs); High is a wrong result a user
+  will see soon; Medium is wrong but has a workaround; Low is cosmetic,
+  internal or cleanup. For a feature or an improvement, rate how much it is
+  wanted on the same scale. The project is the one that owns the repo being
+  changed: Wander and route planner (wander, route-planner), Concert Finder
+  (concert-map, ThorCode, python-crohn) or Travel Bag (travel-bag). A change in
+  one project's repo that another project's ticket needs goes in the project
+  that owns that repo, gets the `cross-project` label and links the ticket that
+  needs it. Title it `<repo>: …`, or `<repo> + <repo>: …` when it spans two.
+  Work outside these repos (the Munin dashboards) has no project.
