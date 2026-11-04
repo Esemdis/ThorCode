@@ -61,3 +61,13 @@ The CI drift check must pass: a schema change without a migration fails there.
   clash with another open PR that edits the same test file.
 - Vitest runs with `mockReset: true` (`vitest.config.js`): set mock
   implementations inside each test.
+- **Tickets you file.** Every Linear ticket an agent creates gets an estimated
+  severity and a project, set when it is created. Severity is Linear's priority
+  field: Urgent (live data loss, a security hole, or the default branch red),
+  High (a wrong result a user will see soon), Medium (wrong but with a
+  workaround), Low (cosmetic, internal or cleanup). An estimate is enough, and
+  the owner changes it; "No priority" is not an answer. The project is the one
+  that owns the repo where the problem lives: Wander and route planner (wander,
+  route-planner), Concert Finder (concert-map, ThorCode, python-crohn) or Travel
+  Bag (travel-bag). If it spans two projects, use the one whose users see the
+  effect and add the `cross-project` label. Keep the repo prefix in the title.
