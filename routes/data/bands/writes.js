@@ -17,6 +17,8 @@ const { findBandByCanonicalName } = require('../../../utils/bandLookup');
 // Called through the module rather than destructured, so a test can stand in
 // for band creation (which reaches MusicBrainz) on the router's own copy.
 const bandCreate = require('../../../utils/bandCreate');
+// Same reason: a test stubs verifyClaimedMbid, which asks MusicBrainz.
+const bandSourceUrls = require('../../../utils/bandSourceUrls');
 const { isMbid } = require('../../../utils/setlistFm');
 const { detachAttendances, withDetach, sweepableConcertIds } = require('../../../utils/mediaDetach');
 const auth = require('../../../auth/verifyJWT');
@@ -29,6 +31,24 @@ const rateLimit = rateLimiter({
   message:
     'Too many requests to the Ticketmaster data route, please try again later.',
 });
+
+// quick-add had no limit: every new band writes a row every account reads,
+// may ask MusicBrainz, and back-links by scanning every future concert. Per
+// account rather than the per-IP counter above, which POST /bands shares — a
+// household shares one address, and adding bands here should not lock anyone
+// out of the full create route. 30 per quarter hour, like artist search:
+// normal use is a handful of bands from one modal.
+const quickAddRateLimit = rateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: 'Too many bands added at once. Please wait a few minutes and try again.',
+  keyGenerator: (req) => req.user?.id ?? req.ip,
+});
+
+// Band.name has no length limit in the schema, the body limit is 10 MB, and
+// /bulk loads every band name to match lineups against. The longest real band
+// names run to a few dozen characters.
+const QUICK_ADD_NAME_MAX = 200;
 
 // A wishlist id arriving in a request body is a claim, not a fact. Wishlist
 // .user_id is unique — one wishlist per account — and ids are sequential
@@ -345,18 +365,23 @@ router.post(
 );
 
 // POST /bands/quick-add
-// Minimal band creation from known name + MBID (e.g. from Setlist.fm).
-// Does not do Ticketmaster lookup — adds straight to DB and optionally to a wishlist.
-router.post('/bands/quick-add', auth, async (req, res) => {
+// Adds a band by name, with an optional MBID the client got from setlist.fm or
+// Last.fm, and optionally puts it on the caller's wishlist. No Ticketmaster or
+// source-url lookup; the MBID is kept only if MusicBrainz confirms it.
+router.post('/bands/quick-add', auth, roleCheck(['ADMIN', 'USER']), quickAddRateLimit, async (req, res) => {
   try {
     const { wishlistId, tier } = req.body;
     const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
     if (!name) {
       return res.status(400).json({ error: 'name is required' });
     }
-    // The MBID arrives from the client and becomes the band's identity for
-    // every account — setlist.fm lookups go by it — so it has to at least be
-    // one. An absent one is fine.
+    if (name.length > QUICK_ADD_NAME_MAX) {
+      return res.status(400).json({ error: `name must be at most ${QUICK_ADD_NAME_MAX} characters` });
+    }
+    // The MBID arrives from the client and would become the band's identity
+    // for every account — setlist.fm lookups go by it — so it must at least be
+    // shaped like one here, and is checked against MusicBrainz before a new
+    // band stores it (below). An absent one is fine.
     const mbid = req.body.mbid == null || req.body.mbid === '' ? null : req.body.mbid;
     if (mbid !== null && !isMbid(mbid)) {
       return res.status(400).json({ error: 'mbid must be a MusicBrainz id' });
@@ -380,15 +405,20 @@ router.post('/bands/quick-add', auth, async (req, res) => {
       || await findBandByCanonicalName(prisma, name);
 
     if (!band) {
+      // Only a new band is checked: MBID is unique, so storing a client's
+      // pairing unverified let one account claim a real band's MBID under any
+      // name and block that band for everyone (THO-758). Unconfirmed — a
+      // mismatch, a 404, or MusicBrainz down — the band goes in without one.
+      const storedMbid = mbid ? await bandSourceUrls.verifyClaimedMbid(name, mbid) : null;
       try {
         band = await prisma.band.create({
-          data: { name, MBID: mbid, created_at: new Date() },
+          data: { name, MBID: storedMbid, created_at: new Date() },
           select,
         });
       } catch (error) {
         // Added by someone else between the lookup and here. Use theirs.
         if (error.code !== 'P2002') throw error;
-        band = (mbid && await prisma.band.findFirst({ where: { MBID: mbid }, select }))
+        band = (storedMbid && await prisma.band.findFirst({ where: { MBID: storedMbid }, select }))
           || await findBandByCanonicalName(prisma, name);
         if (!band) throw error;
       }

@@ -167,6 +167,120 @@ describe('POST /bands/quick-add', () => {
     expect(res.status).toBe(400);
     expect(prisma.band.create).not.toHaveBeenCalled();
   });
+
+  // Band.MBID is unique and shared by every account. quick-add stored the
+  // client's MBID as sent, so one account could pin Gojira's MBID to a name of
+  // its choosing and the real Gojira was refused or resolved to that row for
+  // everyone (THO-758). Stubbed on the router's own copy of the module: an
+  // unstubbed create-with-mbid would ask the real MusicBrainz.
+  const tho758Verifier = () => vi.spyOn(
+    createRequire(import.meta.url)('../../utils/bandSourceUrls.js'),
+    'verifyClaimedMbid',
+  );
+
+  it("refuses to store a real band's MBID under an unrelated name", async () => {
+    const verify = tho758Verifier().mockResolvedValue(null);
+
+    const res = await request(app).post('/bands/quick-add').set(...authHeader())
+      .send({ name: 'Not Gojira At All', mbid: MBID });
+
+    expect(res.status).toBe(201);
+    expect(verify).toHaveBeenCalledWith('Not Gojira At All', MBID);
+    expect(prisma.band.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ name: 'Not Gojira At All', MBID: null }),
+    }));
+  });
+
+  it('stores the MBID when MusicBrainz names the same artist', async () => {
+    tho758Verifier().mockResolvedValue(MBID);
+
+    const res = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'Gojira', mbid: MBID });
+
+    expect(res.status).toBe(201);
+    expect(res.body.band).toEqual({ id: 50, name: 'Gojira' });
+    expect(prisma.band.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ name: 'Gojira', MBID }),
+    }));
+  });
+
+  it('still adds the band, without an MBID, when MusicBrainz cannot be reached', async () => {
+    // verifyClaimedMbid answers null for an outage rather than throwing; the
+    // band goes in without an MBID and from-setlist can fill it in later.
+    tho758Verifier().mockResolvedValue(null);
+    prisma.wishlist.findFirst = vi.fn(async () => ({ id: 3 }));
+    prisma.wishlistBandReference.upsert = vi.fn(async () => ({}));
+
+    const res = await request(app).post('/bands/quick-add').set(...authHeader())
+      .send({ name: 'Gojira', mbid: MBID, wishlistId: 3 });
+
+    expect(res.status).toBe(201);
+    expect(prisma.band.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ MBID: null }),
+    }));
+    expect(prisma.wishlistBandReference.upsert).toHaveBeenCalled();
+  });
+
+  it('does not ask MusicBrainz about a band that is already stored', async () => {
+    const verify = tho758Verifier().mockResolvedValue(MBID);
+    prisma.band.findFirst = vi.fn(async () => ({ id: 92, name: 'Gojira' }));
+
+    const byMbid = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'Gojira', mbid: MBID });
+    prisma.band.findFirst = vi.fn(async () => null);
+    prisma.band.findMany = vi.fn(async () => [{ id: 92, name: 'Gojira' }]);
+    const byName = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'Gojira', mbid: MBID });
+
+    expect(byMbid.body.band.id).toBe(92);
+    expect(byName.body.band.id).toBe(92);
+    expect(verify).not.toHaveBeenCalled();
+    expect(prisma.band.create).not.toHaveBeenCalled();
+  });
+
+  it('does not ask MusicBrainz when no MBID was sent', async () => {
+    const verify = tho758Verifier().mockResolvedValue(MBID);
+
+    const res = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'Gojira' });
+
+    expect(res.status).toBe(201);
+    expect(verify).not.toHaveBeenCalled();
+    expect(prisma.band.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ MBID: null }),
+    }));
+  });
+
+  it('refuses a band name of 100k characters', async () => {
+    // Band.name is unbounded and /bulk loads every name, so a 10 MB body
+    // limit was the only ceiling on what one request could store.
+    const res = await request(app).post('/bands/quick-add').set(...authHeader()).send({ name: 'a'.repeat(100000) });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('name must be at most 200 characters');
+    expect(prisma.band.findMany).not.toHaveBeenCalled();
+    expect(prisma.band.create).not.toHaveBeenCalled();
+  });
+
+  it('turns away a SYSTEM token', async () => {
+    // Same roles as POST /bands: the sync service has no business adding bands.
+    const res = await request(app).post('/bands/quick-add').set(...authHeader({ role: 'SYSTEM' })).send({ name: 'Gojira' });
+
+    expect(res.status).toBe(403);
+    expect(prisma.band.create).not.toHaveBeenCalled();
+  });
+
+  it('rate-limits a burst of quick-adds from one account without stopping anyone else', async () => {
+    // Every new band also scans every future concert to back-link it, so an
+    // unmetered loop cost the database as well as filling the shared table.
+    // Its own account id: the limiter's count is module state for this file.
+    const tho758QuickAddMax = 30;
+    const add = (user) => request(app).post('/bands/quick-add').set(...authHeader({ id: user })).send({ name: 'Gojira' });
+
+    for (let i = 0; i < tho758QuickAddMax; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      expect((await add('tho758-burst')).status).toBe(201);
+    }
+
+    expect((await add('tho758-burst')).status).toBe(429);
+    expect((await add('tho758-someone-else')).status).toBe(201);
+  });
 });
 
 describe('GET /bands/search input', () => {
@@ -672,7 +786,7 @@ const EXPECTED_ROUTES = [
   'POST /bands/:bandId/sync-concerts [4]',
   'POST /bands/:bandId/reconcile [3]',
   'POST /bands [6]',
-  'POST /bands/quick-add [2]',
+  'POST /bands/quick-add [4]',
   // auth + artistLookupRateLimit + handler. This route used to be reachable
   // with no token at all, and it calls matchBandToSpotify — a write plus a
   // Spotify quota burn — so it was an unauthenticated, unmetered proxy.

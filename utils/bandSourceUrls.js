@@ -11,6 +11,7 @@
 
 const axios = require('axios');
 const { stringSimilarity } = require('./concertDedup');
+const { canonicalBandName } = require('./lineupNames');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -164,8 +165,49 @@ async function findSourceUrls(bandName, mbid = null, client = axios) {
   return [songkickUrl, bandsintownUrl, resolvedMbid];
 }
 
+/**
+ * The MBID a client sent, if MusicBrainz agrees it belongs to `name`; else null.
+ *
+ * Band.MBID is unique and shared by every account, so an MBID taken from the
+ * request on trust became the band's identity for everyone. quick-add stored
+ * whatever pairing it was sent: one account could create "Not Gojira At All"
+ * with Gojira's MBID, and the real Gojira was then refused as a duplicate (a
+ * 409 naming the squatter) or resolved to the squatter (THO-758).
+ *
+ * Asks for that one artist by id, never a search, and accepts it only when
+ * the id comes back unchanged — a merged id redirects to another artist, which
+ * is not what the client claimed — and the canonical names are equal. Strict
+ * equality rather than isConfidentNameMatch's 0.5 similarity: legitimate
+ * callers send MusicBrainz-derived names, and "close enough" is exactly the
+ * room a squatter needs.
+ *
+ * Fails closed on identity and open on availability: any error, a 404, or
+ * MusicBrainz still busy after the retries gives null, and the caller stores
+ * the band without an MBID rather than refusing it.
+ *
+ * @returns {Promise<string|null>}
+ */
+async function verifyClaimedMbid(name, mbid, client = axios) {
+  try {
+    const res = await getWithRetry(client, `https://musicbrainz.org/ws/2/artist/${encodeURIComponent(mbid)}`, {
+      params: { fmt: 'json' },
+      headers: MB_HEADERS,
+      timeout: 10000,
+    });
+    const artist = res?.data;
+    if (!artist || String(artist.id).toLowerCase() !== String(mbid).toLowerCase()) return null;
+    const claimed = canonicalBandName(name);
+    if (!claimed || canonicalBandName(artist.name) !== claimed) return null;
+    return mbid;
+  } catch (error) {
+    console.error(`[verifyClaimedMbid] Could not verify ${mbid} for ${name}:`, error.message);
+    return null;
+  }
+}
+
 module.exports = {
   findSourceUrls,
+  verifyClaimedMbid,
   lucenePhrase,
   isConfidentNameMatch,
   NAME_MATCH_THRESHOLD,
