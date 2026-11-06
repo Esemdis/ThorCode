@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
-import { isConfidentNameMatch, findSourceUrls, MB_RETRY_ATTEMPTS } from './bandSourceUrls.js';
+import { isConfidentNameMatch, findSourceUrls, verifyClaimedMbid, MB_RETRY_ATTEMPTS } from './bandSourceUrls.js';
 
 describe('isConfidentNameMatch', () => {
   it('accepts an exact name', () => {
@@ -180,5 +180,97 @@ describe('lucenePhrase', () => {
     // A quote ended the phrase early, and a backslash escaped what followed.
     expect(lucenePhrase('The "Band"')).toBe('"The \\"Band\\""');
     expect(lucenePhrase('A\\B')).toBe('"A\\\\B"');
+  });
+});
+
+describe('verifyClaimedMbid', () => {
+  // quick-add stores a client's MBID only when this says MusicBrainz agrees.
+  // MBID is unique across every account, so a wrong pairing used to block the
+  // real band for everyone (THO-758).
+  const tho758Mbid = '65f4f0c5-ef9e-490c-aee3-909e7ae6b2ab';
+  const tho758Artist = (name, id = tho758Mbid) => ({ data: { id, name } });
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  it('returns the MBID when MusicBrainz names the same artist', async () => {
+    const get = vi.fn().mockResolvedValue(tho758Artist('Gojira'));
+
+    expect(await verifyClaimedMbid('Gojira', tho758Mbid, { get })).toBe(tho758Mbid);
+  });
+
+  it('still matches through a country suffix and accents', async () => {
+    const get = vi.fn()
+      .mockResolvedValueOnce(tho758Artist('Architects'))
+      .mockResolvedValueOnce(tho758Artist('Sigur Rós'));
+
+    expect(await verifyClaimedMbid('Architects (UK)', tho758Mbid, { get })).toBe(tho758Mbid);
+    expect(await verifyClaimedMbid('Sigur Ros', tho758Mbid, { get })).toBe(tho758Mbid);
+  });
+
+  it('refuses an MBID that belongs to an unrelated name', async () => {
+    const get = vi.fn().mockResolvedValue(tho758Artist('Gojira'));
+
+    expect(await verifyClaimedMbid('Not Gojira At All', tho758Mbid, { get })).toBeNull();
+  });
+
+  it('refuses a name with nothing left to compare', async () => {
+    // canonicalBandName('!!!') is '' — two empty keys must not count as equal.
+    const get = vi.fn().mockResolvedValue(tho758Artist('???'));
+
+    expect(await verifyClaimedMbid('!!!', tho758Mbid, { get })).toBeNull();
+  });
+
+  it('refuses an MBID MusicBrainz does not know', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const get = vi.fn().mockRejectedValue(
+      Object.assign(new Error('Request failed with status code 404'), { response: { status: 404 } }),
+    );
+
+    expect(await verifyClaimedMbid('Gojira', tho758Mbid, { get })).toBeNull();
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers null rather than throwing when MusicBrainz cannot be reached', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const get = vi.fn().mockRejectedValue(Object.assign(new Error('timeout of 10000ms exceeded'), { code: 'ECONNABORTED' }));
+
+    await expect(verifyClaimedMbid('Gojira', tho758Mbid, { get })).resolves.toBeNull();
+  });
+
+  it('retries a busy MusicBrainz and verifies what it eventually answers', async () => {
+    vi.useFakeTimers();
+    const get = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error('Request failed with status code 503'), { response: { status: 503 } }))
+      .mockResolvedValueOnce(tho758Artist('Gojira'));
+
+    const promise = verifyClaimedMbid('Gojira', tho758Mbid, { get });
+    await vi.runAllTimersAsync();
+
+    expect(await promise).toBe(tho758Mbid);
+    expect(get).toHaveBeenCalledTimes(2);
+  });
+
+  it('refuses an id that MusicBrainz answers for with a different one', async () => {
+    // A merged MBID redirects to the artist it was merged into. That is not
+    // the id the client claimed, so it is not stored as if it were.
+    const get = vi.fn().mockResolvedValue(tho758Artist('Gojira', 'a6f2c1e2-0000-4000-8000-000000000001'));
+
+    expect(await verifyClaimedMbid('Gojira', tho758Mbid, { get })).toBeNull();
+  });
+
+  it('compares the id without regard to case', async () => {
+    const get = vi.fn().mockResolvedValue(tho758Artist('Gojira'));
+    const upper = tho758Mbid.toUpperCase();
+
+    expect(await verifyClaimedMbid('Gojira', upper, { get })).toBe(upper);
+  });
+
+  it('looks the artist up by id and never searches', async () => {
+    const get = vi.fn().mockResolvedValue(tho758Artist('Gojira'));
+
+    await verifyClaimedMbid('Gojira', tho758Mbid, { get });
+
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(get.mock.calls[0][0]).toBe(`https://musicbrainz.org/ws/2/artist/${tho758Mbid}`);
+    expect(get.mock.calls[0][1].params).toEqual({ fmt: 'json' });
   });
 });
