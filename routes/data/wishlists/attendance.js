@@ -475,6 +475,7 @@ router.post(
           created_at: new Date(),
           url: url ?? null,
           source: "setlistfm",
+          sources: ["setlistfm"],
           latitude: hasCoords ? String(latitude) : null,
           longitude: hasCoords ? String(longitude) : null,
           city_id: cityId,

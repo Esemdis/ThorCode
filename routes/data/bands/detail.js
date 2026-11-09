@@ -103,6 +103,9 @@ router.get('/bands/:bandId/upcoming', auth, bandPageRateLimit, async (req, res) 
         longitude: true,
         event_id: true,
         metadata: true,
+        // Which sites listed the show, for the band view's pills (THO-775).
+        source: true,
+        sources: true,
         bands: {
           select: {
             band_rel: { select: { id: true, name: true } },

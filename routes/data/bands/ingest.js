@@ -9,7 +9,7 @@
 const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
-const { checkDuplicateConcert, deduplicateByCoords, mergedFields, haversineKm } = require('../../../utils/concertDedup');
+const { checkDuplicateConcert, deduplicateByCoords, mergedFields, haversineKm, sourcesOf } = require('../../../utils/concertDedup');
 const { cleanLineupJson, canonicalBandName } = require('../../../utils/lineupNames');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
@@ -354,6 +354,8 @@ router.post(
               url: concert.url || null,
               festival: concert.festival || false,
               source: concert.source ?? null,
+              // Every source folded into this entry by deduplicateByCoords.
+              sources: sourcesOf(concert),
               price_min: concert.price_min ?? null,
               price_max: concert.price_max ?? null,
               price_currency: concert.price_currency ?? null,

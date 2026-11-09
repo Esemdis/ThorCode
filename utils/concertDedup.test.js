@@ -845,6 +845,8 @@ describe('mergedFields', () => {
       concert_date: new Date('2027-06-17T19:00:00Z'),
       source: 'bandsintown',
       url: 'https://bandsintown.test/e/1',
+      // Both sites still listed it: `source` moved, `sources` only grew.
+      sources: ['songkick', 'bandsintown'],
     });
   });
 
@@ -859,9 +861,11 @@ describe('mergedFields', () => {
   it('lets any source fill a price in, and only the row\'s own change one', () => {
     // Both sources scrape the same show twice a day, and a price each of them
     // quotes differently would otherwise be rewritten back and forth for good.
-    expect(mergedFields(stored(), scrape({ source: 'bandsintown', price_min: 280, price_currency: 'EUR' })))
+    // Both sources already listed, so the answer is only about the price.
+    const both = { sources: ['songkick', 'bandsintown'] };
+    expect(mergedFields(stored(both), scrape({ source: 'bandsintown', price_min: 280, price_currency: 'EUR' })))
       .toEqual({ price_min: 280, price_currency: 'EUR' });
-    expect(mergedFields(stored({ price_min: 280 }), scrape({ source: 'bandsintown', price_min: 410 })))
+    expect(mergedFields(stored({ ...both, price_min: 280 }), scrape({ source: 'bandsintown', price_min: 410 })))
       .toEqual({});
     expect(mergedFields(stored({ price_min: 280 }), scrape({ price_min: 410 })))
       .toEqual({ price_min: 410 });
@@ -917,5 +921,70 @@ describe('deduplicateConcerts folding rather than dropping', () => {
 
     expect(merged).toHaveLength(1);
     expect(JSON.parse(merged[0].metadata)).toEqual(['Opeth']);
+  });
+});
+
+describe('which sources listed a show (THO-775)', () => {
+  const tho775SkRow = (over = {}) => ({
+    id: 77, name: 'Opeth @ Zenith', venue: 'Zenith', city: 'Munich', country: 'DE',
+    concert_date: new Date('2027-03-04T00:00:00Z'), latitude: '48.17', longitude: '11.56',
+    festival: false, source: 'songkick', sources: ['songkick'], url: null, metadata: null,
+    on_sale: false, sold_out: false, ticket_sale_start: null,
+    price_min: null, price_max: null, price_currency: null, notify_pending: false,
+    bands: [{ band: 1, band_rel: { name: 'Opeth' } }], ...over,
+  });
+  const tho775BitPayload = (over = {}) => ({
+    name: 'Opeth @ Zenith', venue: 'Zenith', city: 'Munich', country: 'DE',
+    concert_date: '2027-03-04T00:00:00Z', latitude: '48.17', longitude: '11.56',
+    source: 'bandsintown', bands: ['Opeth'], ...over,
+  });
+
+  it('adds a second source to a stored row without touching which source dates it', () => {
+    const data = mergedFields(tho775SkRow(), tho775BitPayload());
+    expect(data.sources).toEqual(['songkick', 'bandsintown']);
+    // Midnight against midnight adopts no time, so the date is still read as
+    // Songkick's.
+    expect(data).not.toHaveProperty('source');
+  });
+
+  it('writes no sources when the incoming source is already listed', () => {
+    // The !== in mergedFields calls every array changed; written through it,
+    // each sync would rewrite every row it touched.
+    expect(mergedFields(tho775SkRow({ sources: ['songkick', 'bandsintown'] }), tho775BitPayload()))
+      .not.toHaveProperty('sources');
+    expect(mergedFields(tho775SkRow(), tho775BitPayload({ source: null }))).not.toHaveProperty('sources');
+  });
+
+  it('fills in sources for a row stored before the column, from its source', () => {
+    // The backfill gave such rows [source], but one written by an old image
+    // between migration and deploy has [] beside a source.
+    expect(mergedFields(tho775SkRow({ sources: [] }), tho775BitPayload()).sources)
+      .toEqual(['songkick', 'bandsintown']);
+    expect(mergedFields(tho775SkRow({ sources: [] }), tho775BitPayload({ source: 'songkick' })))
+      .not.toHaveProperty('sources');
+  });
+
+  it("gives a folded payload entry both sources and keeps the survivor's source", () => {
+    const [survivor] = deduplicateByCoords([
+      tho775BitPayload({ source: 'songkick', bands: ['Opeth', 'Gojira'] }),
+      tho775BitPayload(),
+    ]);
+    expect(survivor.source).toBe('songkick');
+    expect(survivor.sources).toEqual(['songkick', 'bandsintown']);
+  });
+
+  it('checkDuplicateConcert writes the merged sources to the stored row', async () => {
+    const tx = {
+      concert: { findMany: vi.fn(async () => [tho775SkRow()]), update: vi.fn(async () => ({})) },
+      concertBandReference: { findMany: vi.fn(async () => [{ band: 1 }]), createMany: vi.fn(async () => ({})) },
+    };
+
+    const { isDuplicate, merged } = await checkDuplicateConcert({ concert: tho775BitPayload(), bandIds: [1], tx });
+
+    expect(isDuplicate).toBe(true);
+    expect(merged.sources).toEqual(['songkick', 'bandsintown']);
+    expect(tx.concert.update).toHaveBeenCalledWith({
+      where: { id: 77 }, data: expect.objectContaining({ sources: ['songkick', 'bandsintown'] }),
+    });
   });
 });

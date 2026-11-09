@@ -667,6 +667,52 @@ describe('POST /bulk', () => {
     });
   });
 
+  describe('the sources that listed a show (THO-775)', () => {
+    const tho775Ingest = async (concerts) => request(app).post('/bulk').set(...authHeader(system)).send({ concerts });
+
+    it('stores a new show with the one source that listed it', async () => {
+      await tho775Ingest([{ ...concert('Annexet'), source: 'songkick' }]);
+
+      expect(prisma.concert.create.mock.calls[0][0].data).toMatchObject({ source: 'songkick', sources: ['songkick'] });
+    });
+
+    it('stores an empty list for a show with no source, never a null', async () => {
+      await tho775Ingest([concert('Annexet')]);
+
+      expect(prisma.concert.create.mock.calls[0][0].data.sources).toEqual([]);
+    });
+
+    it('stores both sources when Songkick and Bandsintown listed it in one payload', async () => {
+      const placed = { latitude: '59.2937', longitude: '18.0810' };
+      await tho775Ingest([
+        { ...concert('Annexet'), ...placed, source: 'songkick', event_id: 'sk_775' },
+        { ...concert('Annexet'), ...placed, source: 'bandsintown', event_id: 'bit_775' },
+      ]);
+
+      expect(prisma.concert.create).toHaveBeenCalledTimes(1);
+      expect(prisma.concert.create.mock.calls[0][0].data).toMatchObject({
+        source: 'songkick', sources: ['songkick', 'bandsintown'],
+      });
+    });
+
+    it('adds the other source to a show it already has by event id', async () => {
+      prisma.concert.findUnique.mockResolvedValue({
+        id: 55, event_id: 'sk_775', name: 'Gojira', venue: 'Annexet', city: 'Stockholm', country: 'SE', city_id: 7,
+        concert_date: new Date('2027-05-01T19:00:00Z'), source: 'songkick', sources: ['songkick'],
+        sold_out: false, _count: { bands: 1 },
+      });
+      prisma.concertBandReference.findMany.mockResolvedValue([{ band: 1 }]);
+      prisma.concert.update.mockResolvedValue({});
+
+      await tho775Ingest([{ ...concert('Annexet'), event_id: 'sk_775', source: 'bandsintown' }]);
+
+      const data = prisma.concert.update.mock.calls.map(([call]) => call.data);
+      expect(data.some((d) => JSON.stringify(d.sources) === '["songkick","bandsintown"]')).toBe(true);
+      // The stored time is Songkick's and stays read as Songkick's.
+      expect(data.every((d) => !('source' in d))).toBe(true);
+    });
+  });
+
   describe('a scrape of a show it already has by event id', () => {
     // This branch wrote the scrape's ticket fields and bill straight onto the
     // row, so it had neither of the safeguards the duplicate path grew: a
@@ -975,6 +1021,21 @@ describe('the handlers actually run', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('sends every source that listed each upcoming show (THO-775)', async () => {
+    prisma.band.findUnique.mockResolvedValue({ id: 1, name: 'Opeth', spotify_id: 'x', image_url: null });
+    prisma.concert.findMany.mockResolvedValue([{
+      id: 9, name: 'Opeth @ Zenith', venue: 'Zenith', city: 'Munich', country: 'DE',
+      concert_date: new Date('2099-03-04T19:00:00Z'), metadata: null,
+      source: 'songkick', sources: ['songkick', 'bandsintown'], bands: [],
+    }]);
+
+    const res = await request(app).get('/bands/1/upcoming').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body.upcoming[0]).toMatchObject({ source: 'songkick', sources: ['songkick', 'bandsintown'] });
+    expect(prisma.concert.findMany.mock.calls[0][0].select).toMatchObject({ source: true, sources: true });
   });
 
   it('serves one band\'s upcoming shows to a signed-in caller', async () => {
