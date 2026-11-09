@@ -273,7 +273,8 @@ function detectFestivalCluster(concert, bandIds, candidates, bandNames = []) {
  * Deliberately not merged: concert_date and source. A date means a true UTC
  * instant from one source and the venue's wall clock from another, and which
  * it is is read back off `source`, so taking the other row's time would
- * relabel it. event_id likewise stays the survivor's — it is that source's
+ * relabel it. `sources` is merged, because it only says who listed the show,
+ * not how its date reads (THO-775). event_id likewise stays the survivor's — it is that source's
  * handle on the show, and the dropped row's own sync finds the stored row
  * again through the duplicate check.
  *
@@ -320,8 +321,28 @@ function foldSourceInto(keep, drop) {
   merged.name = bestEventName(keep.name, drop.name);
   if (!keep.url && drop.url) merged.url = drop.url;
   if (!keep.venue && drop.venue) merged.venue = drop.venue;
+  merged.sources = unionSources(sourcesOf(keep), sourcesOf(drop));
 
   return merged;
+}
+
+/**
+ * Every source a row or payload entry says listed the show (THO-775).
+ *
+ * A row stored before the `sources` column has `[]` there and its one source in
+ * `source`, so an empty list falls back to that rather than reading as "nobody
+ * listed this". Strings only: a payload is the scraper's word, not ours.
+ */
+function sourcesOf(row) {
+  if (Array.isArray(row?.sources) && row.sources.length > 0) {
+    return unionSources(row.sources, []);
+  }
+  return typeof row?.source === 'string' && row.source ? [row.source] : [];
+}
+
+/** `a` then whatever `b` adds, in first-seen order, each source once. */
+function unionSources(a, b) {
+  return [...new Set([...a, ...b].filter((s) => typeof s === 'string' && s))];
 }
 
 /**
@@ -371,6 +392,7 @@ const CANDIDATE_FIELDS = {
   latitude: true, longitude: true, concert_date: true, festival: true, source: true,
   metadata: true, url: true, on_sale: true, sold_out: true, ticket_sale_start: true,
   price_min: true, price_max: true, price_currency: true, notify_pending: true,
+  sources: true,
   // Band names ride along for eventLabel, which has to know whether a row is
   // named after one of its own acts.
   bands: { select: { band: true, band_rel: { select: { name: true } } } },
@@ -513,8 +535,14 @@ function mergedFields(stored, incoming, now = new Date()) {
     if (value instanceof Date) return !(was && new Date(was).getTime() === value.getTime());
     return (was ?? null) !== value;
   };
+  // Outside `wanted`: `changed` compares with !==, which calls every array new,
+  // and would rewrite every merged row on every sync. Written only when the scrape
+  // brings a source the row did not list yet.
+  const listed = sourcesOf(stored);
+  const sources = unionSources(listed, sourcesOf(incoming));
   return {
     ...Object.fromEntries(Object.entries(wanted).filter(changed)),
+    ...(sources.length > listed.length && { sources }),
     // Already narrowed to what is new, and to what a source is entitled to say
     // — a listing marked in stock by default must not clear a sale day.
     ...mergeTicketFields(stored, incoming, now),
@@ -752,6 +780,7 @@ module.exports = {
   deduplicateByCoords,
   checkDuplicateConcert,
   mergedFields,
+  sourcesOf,
   // Response-time
   deduplicateConcerts,
 };

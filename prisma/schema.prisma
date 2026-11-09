@@ -83,6 +83,9 @@ model Concert {
   url                String?
   festival           Boolean?               @default(false)
   source             String?
+  // Every source that has listed this show (THO-775). `source` stays the one
+  // whose concert_date the row holds, since that decides how the date is read.
+  sources            String[]               @default([])
   weather            Json?
   price_min          Float?
   price_max          Float?

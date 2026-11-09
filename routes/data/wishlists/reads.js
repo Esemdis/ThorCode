@@ -362,6 +362,8 @@ router.get(
           // whose listing it is, and the sale state and price the popup shows.
           metadata: true,
           source: true,
+          // Every site that listed it, for the Updates tab's pills (THO-775).
+          sources: true,
           city: true,
           country: true,
           venue: true,

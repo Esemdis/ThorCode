@@ -1183,6 +1183,9 @@ describe('POST /wishlists/:id/attendance/from-setlist', () => {
         concert_date: new Date('2026-06-24T12:00:00Z'),
         url: SETLIST.url,
         venue_id: 31,
+        // Listed by setlist.fm alone, for the source pills (THO-775).
+        source: 'setlistfm',
+        sources: ['setlistfm'],
       }),
     }));
     // Filed under its City with no position: setlist.fm's is the city's.
@@ -1594,6 +1597,23 @@ describe('GET /wishlists/:id/recent-concerts', () => {
       metadata: true, source: true, on_sale: true, ticket_sale_start: true,
       price_min: true, price_max: true, price_currency: true,
     });
+  });
+
+  it('sends every source that listed each show (THO-775)', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [{ band_id: 1, tier: 1 }] });
+    prisma.concert.findMany.mockResolvedValue([{
+      id: 11, name: null, city: 'Oslo', country: 'NO', venue: 'Spektrum',
+      concert_date: new Date('2027-03-12'), url: null, festival: false, sold_out: false,
+      created_at: new Date('2026-09-01'), latitude: null, longitude: null,
+      source: 'songkick', sources: ['songkick', 'bandsintown'],
+      bands: [{ band_rel: { id: 1, name: 'Ghost' } }],
+    }]);
+
+    const res = await request(app).get('/wishlists/7/recent-concerts').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(prisma.concert.findMany.mock.calls[0][0].select).toMatchObject({ source: true, sources: true });
+    expect(res.body.groups[0].concerts[0]).toMatchObject({ source: 'songkick', sources: ['songkick', 'bandsintown'] });
   });
 });
 
