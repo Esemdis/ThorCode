@@ -47,6 +47,8 @@ const EXPECTED_ROUTES = [
   'GET /wishlists/raw [3]',
   'GET /wishlists/bands [3]',
   'GET /wishlists/:id/new [4]',
+  // THO-802: acknowledging what a peeking GET /new showed.
+  'POST /wishlists/:id/new/seen [5]',
   'GET /wishlists/:id/recent-concerts [4]',
   'GET /wishlists/:id/activity [4]',
   'GET /wishlists/:id [4]',
@@ -1561,6 +1563,125 @@ describe('GET /wishlists/:id/new', () => {
     const { select } = prisma.concertBandReference.findMany.mock.calls[0][0].include.concert_rel;
     expect(select).toMatchObject({ metadata: true, source: true });
     expect(res.body.concerts[0]).toMatchObject({ metadata: show.metadata, source: 'songkick' });
+  });
+});
+
+describe('peeking at /new and acknowledging it (THO-802)', () => {
+  const peekShowTho802 = {
+    id: 14001, created_at: new Date('2026-11-08T10:00:00Z'), name: 'Ghost', city: 'Oslo', country: 'NO',
+    venue: 'Spektrum', concert_date: new Date('2027-03-12T19:00:00Z'), source: 'ticketmaster', metadata: null,
+    bands: [{ band_rel: { id: 1, name: 'Ghost' } }],
+  };
+
+  it('leaves the cursor and the activity feed alone on a peek, and says when it looked', async () => {
+    // Moving the cursor on load lost every update the user saw on the badge
+    // but closed the tab without opening.
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', last_active_at: null, bands: [{ band_id: 1 }] });
+    prisma.concertBandReference.findMany.mockResolvedValue([{ band_rel: { name: 'Ghost' }, concert_rel: peekShowTho802 }]);
+
+    const res = await request(app).get('/wishlists/7/new?peek=1').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body.concerts).toHaveLength(1);
+    expect(Date.parse(res.body.as_of)).not.toBeNaN();
+    expect(prisma.wishlist.update).not.toHaveBeenCalled();
+    expect(prisma.wishlist.updateMany).not.toHaveBeenCalled();
+    expect(prisma.activityLog.create).not.toHaveBeenCalled();
+  });
+
+  it('still moves the cursor without peek, for a client from before the split', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', last_active_at: null, bands: [{ band_id: 1 }] });
+    prisma.concertBandReference.findMany.mockResolvedValue([]);
+    prisma.wishlist.update.mockResolvedValue({});
+
+    const res = await request(app).get('/wishlists/7/new').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(prisma.wishlist.update).toHaveBeenCalledWith({
+      where: { id: 7 }, data: { last_active_at: new Date(res.body.as_of) },
+    });
+  });
+
+  it('moves the cursor to the peek it acknowledges, not to now, and logs what was seen', async () => {
+    // A concert that arrived between the peek and the look was never shown;
+    // moving to now would swallow it.
+    const since = new Date('2026-11-01T00:00:00Z');
+    const asOf = '2026-11-09T12:00:00.000Z';
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', last_active_at: since, bands: [{ band_id: 1 }] });
+    prisma.wishlist.updateMany.mockResolvedValue({ count: 1 });
+    prisma.concertBandReference.findMany.mockResolvedValue([{ band_rel: { name: 'Ghost' }, concert_rel: peekShowTho802 }]);
+    prisma.activityLog.create.mockResolvedValue({});
+    prisma.activityLog.findMany.mockResolvedValue([]);
+
+    const res = await request(app).post('/wishlists/7/new/seen').send({ as_of: asOf }).set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ moved: true });
+    expect(prisma.wishlist.updateMany).toHaveBeenCalledWith({
+      where: { id: 7, OR: [{ last_active_at: null }, { last_active_at: { lt: new Date(asOf) } }] },
+      data: { last_active_at: new Date(asOf) },
+    });
+    const { created_at } = prisma.concertBandReference.findMany.mock.calls[0][0].where.concert_rel;
+    expect(created_at).toEqual({ gt: since, lte: new Date(asOf) });
+    expect(prisma.activityLog.create).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(prisma.activityLog.create.mock.calls[0][0].data.data)).toMatchObject({ total: 1 });
+  });
+
+  it('never moves the cursor backwards, so a stale tab cannot bring back cleared news', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue({
+      id: 7, user_id: 'user-1', last_active_at: new Date('2026-11-09T12:00:00Z'), bands: [{ band_id: 1 }],
+    });
+
+    const res = await request(app).post('/wishlists/7/new/seen')
+      .send({ as_of: '2026-11-05T00:00:00.000Z' }).set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ moved: false });
+    expect(prisma.wishlist.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('logs nothing when another device moved the cursor first', async () => {
+    // Two devices acknowledging at once: the conditional update lets one
+    // through, and only that one logs, so the feed does not say it twice.
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', last_active_at: null, bands: [{ band_id: 1 }] });
+    prisma.wishlist.updateMany.mockResolvedValue({ count: 0 });
+
+    const res = await request(app).post('/wishlists/7/new/seen')
+      .send({ as_of: '2026-11-09T12:00:00.000Z' }).set(...authHeader({ id: 'user-1' }));
+
+    expect(res.body).toEqual({ moved: false });
+    expect(prisma.activityLog.create).not.toHaveBeenCalled();
+  });
+
+  it('never moves the cursor past now, whatever the client sends', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', last_active_at: null, bands: [{ band_id: 1 }] });
+    prisma.wishlist.updateMany.mockResolvedValue({ count: 1 });
+    prisma.concertBandReference.findMany.mockResolvedValue([]);
+
+    const before = Date.now();
+    await request(app).post('/wishlists/7/new/seen')
+      .send({ as_of: '2999-01-01T00:00:00.000Z' }).set(...authHeader({ id: 'user-1' }));
+
+    const written = prisma.wishlist.updateMany.mock.calls[0][0].data.last_active_at;
+    expect(written.getTime()).toBeGreaterThanOrEqual(before);
+    expect(written.getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
+  it('refuses an acknowledgement without a time to acknowledge', async () => {
+    const res = await request(app).post('/wishlists/7/new/seen').send({}).set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(400);
+    expect(prisma.wishlist.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('acknowledges only on your own wishlist', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'someone-else', last_active_at: null, bands: [] });
+
+    const res = await request(app).post('/wishlists/7/new/seen')
+      .send({ as_of: '2026-11-09T12:00:00.000Z' }).set(...authHeader({ id: 'user-1' }));
+
+    expect([403, 404]).toContain(res.status);
+    expect(prisma.wishlist.updateMany).not.toHaveBeenCalled();
   });
 });
 
