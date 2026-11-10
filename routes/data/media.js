@@ -16,6 +16,7 @@ router.use(require('./media/tagging'));
 router.use(require('./media/clips'));
 router.use(require('./media/deletes'));
 router.use(require('./media/share'));
+router.use(require('./media/album'));
 router.use(require('./media/bytes'));
 
 module.exports = router;

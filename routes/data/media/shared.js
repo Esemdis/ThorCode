@@ -6,6 +6,7 @@
 const prisma = require('../../../prisma/client');
 const { notFound, forbidden } = require('../../../utils/apiResponse');
 const { acquire } = require('../../../utils/serialQueue');
+const { isActiveShareLink } = require('../../../utils/mediaShareToken');
 
 // Date-only, sliced rather than parsed. concert_date already carries a UTC
 // instant, and toISOString always renders in UTC regardless of the server's
@@ -103,6 +104,16 @@ function billCandidates(userId, bandId) {
 const withOwner = { attendance_rel: { include: { wishlist_rel: { select: { user_id: true } } } } };
 
 /**
+ * The album link behind a token, or null when there is none that still works:
+ * unknown, revoked and expired are one answer, so the routes that take a token
+ * from a stranger cannot tell them apart either.
+ */
+async function liveAlbumLink(token) {
+  const link = await prisma.mediaAlbumShareLink.findUnique({ where: { token: String(token) } });
+  return isActiveShareLink(link) ? link : null;
+}
+
+/**
  * The refusals every write over a list of files shares, answered here.
  * Returns the response it sent, or null when every id was found and every file
  * is the caller's.
@@ -168,5 +179,5 @@ async function lockShows(rows, read, showsFor) {
 
 module.exports = {
   dateOnly, headlinerOf, INT32_MAX, sidecarSeed,
-  ownAttendance, billCandidates, withOwner, refuseRows, lockShows,
+  ownAttendance, billCandidates, withOwner, refuseRows, lockShows, liveAlbumLink,
 };

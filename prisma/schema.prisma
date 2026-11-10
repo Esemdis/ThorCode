@@ -27,6 +27,7 @@ model User {
   email_verifications        EmailVerification[]        @relation("UserEmailVerifications")
   concert_follows            ConcertFollow[]            @relation("UserConcertFollows")
   venue_reviews              VenueReview[]              @relation("UserVenueReviews")
+  media_album_share_links    MediaAlbumShareLink[]      @relation("UserMediaAlbumShareLinks")
 }
 
 model OAuth {
@@ -452,6 +453,38 @@ model MediaShareLink {
   media_rel ConcertMedia @relation("MediaShareLinks", fields: [media_id], references: [id], onDelete: Cascade)
 
   @@index([media_id])
+  @@index([expires_at])
+}
+
+/// A time-boxed public URL to a whole night: every photo and video filed under
+/// a set of the owner's attendances, for someone with no account (THO-892).
+///
+/// Its own table rather than a nullable media_id on MediaShareLink: that row
+/// is a link to one file and every query on it filters by media_id, so a row
+/// with none would have to be excluded from each of them by hand.
+///
+/// attendance_ids is a list, not one attendance, because a night is not one:
+/// a festival day is a record per stage, folded into one row on the client
+/// (see ConcertMedia.picked). The link names the attendances and not the
+/// files, so it is live — a file added to the night afterwards is in the
+/// album, a deleted one is gone from it. A plain Int[] with no foreign key:
+/// the route re-checks on every read that each id is still an attendance of
+/// user_id, so an id that has gone or changed hands shows nothing.
+///
+/// Cascade from the user, as MediaShareLink does from its file: a link is
+/// disposable metadata and goes with whoever made it.
+model MediaAlbumShareLink {
+  id             Int       @id @default(autoincrement())
+  user_id        String
+  attendance_ids Int[]
+  token          String    @unique
+  created_at     DateTime  @default(now())
+  expires_at     DateTime
+  revoked_at     DateTime?
+
+  user_rel User @relation("UserMediaAlbumShareLinks", fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
   @@index([expires_at])
 }
 
