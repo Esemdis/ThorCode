@@ -55,11 +55,16 @@ function normaliseAttendanceIds(raw) {
 
 const sameIds = (a, b) => a.length === b.length && a.every((id, i) => id === b[i]);
 
+// The two lists as one, in the form normaliseAttendanceIds gives.
+const unionIds = (a, b) => [...new Set([...a, ...b])].sort((x, y) => x - y);
+
 /**
- * The URLs a recipient's page loads one file's bytes from. Built from the
- * configured public base URL, never from the request — see mediaUrls().
+ * The configured public base URL, checked once per listing: absolute, and
+ * over http(s). The reasons are beside mediaUrls() in mediaTokens.js. Once
+ * and not per file, because a festival night is hundreds of files and the
+ * check parses the same string each time.
  */
-function albumMediaUrls(baseUrl, token, mediaId) {
+function albumBase(baseUrl) {
   if (!baseUrl) throw new Error('No public base URL configured (CALLBACK_URL)');
   const base = String(baseUrl).replace(/\/+$/, '');
   let parsed;
@@ -71,6 +76,16 @@ function albumMediaUrls(baseUrl, token, mediaId) {
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error(`Public base URL (CALLBACK_URL) is not http or https: ${base}`);
   }
+  return base;
+}
+
+/**
+ * The URLs a recipient's page loads one file's bytes from. Built from the
+ * configured public base URL, never from the request — see mediaUrls().
+ *
+ * @param {string} base - As albumBase() returns it.
+ */
+function albumMediaUrls(base, token, mediaId) {
   const root = `${base}${ALBUM_PATH}/${encodeURIComponent(token)}/media/${encodeURIComponent(mediaId)}`;
   return {
     thumb: `${root}/thumb`,
@@ -97,9 +112,12 @@ function albumMediaUrls(baseUrl, token, mediaId) {
  * @param {object[]} args.attendances - The owner's, each with `concert_rel`
  *   (date, venue, city, country, and `bands` with `band_rel` and `setlist`).
  * @param {object[]} args.media - ConcertMedia rows, already in night order.
+ * @param {{id: number, name: string}[]} [args.otherBands] - Acts a file is
+ *   filed under that are on none of these bills.
  * @param {string} args.baseUrl
  */
-function albumPayload({ link, attendances, media, baseUrl }) {
+function albumPayload({ link, attendances, media, otherBands = [], baseUrl }) {
+  const base = albumBase(baseUrl);
   const concerts = attendances.map((a) => a.concert_rel);
   const dated = concerts.find((c) => c.concert_date);
   const first = concerts[0];
@@ -114,6 +132,12 @@ function albumPayload({ link, attendances, media, baseUrl }) {
       if (!known) bands.set(b.band_rel.id, { id: b.band_rel.id, name: b.band_rel.name, setlist: b.setlist ?? null });
       else if (!known.setlist && b.setlist) known.setlist = b.setlist;
     }
+  }
+  // After the bill, with no setlist: a file can be filed under an act from
+  // another stage of the day, and without its name here the recipient's page
+  // has nothing to head those files with.
+  for (const b of otherBands) {
+    if (!bands.has(b.id)) bands.set(b.id, { id: b.id, name: b.name, setlist: null });
   }
 
   return {
@@ -137,12 +161,12 @@ function albumPayload({ link, attendances, media, baseUrl }) {
       song: m.song ?? null,
       band_id: m.band_id ?? null,
       taken_at: m.taken_at ?? null,
-      ...albumMediaUrls(baseUrl, link.token, m.id),
+      ...albumMediaUrls(base, link.token, m.id),
     })),
   };
 }
 
 module.exports = {
-  ALBUM_TTL_MS, MAX_ALBUM_ATTENDANCES, albumExpiry, normaliseAttendanceIds, sameIds,
-  albumMediaUrls, albumPayload,
+  ALBUM_TTL_MS, MAX_ALBUM_ATTENDANCES, albumExpiry, normaliseAttendanceIds, sameIds, unionIds,
+  albumBase, albumMediaUrls, albumPayload,
 };

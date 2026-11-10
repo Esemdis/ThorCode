@@ -66,6 +66,7 @@ beforeEach(async () => {
       .filter((id) => attendanceOwnersTho892[id] === where.wishlist_rel.user_id)
       .map((id) => ({ id, concert_rel: concertTho892 }))),
   };
+  prisma.band = { findMany: vi.fn(async ({ where }) => where.id.in.map((id) => ({ id, name: `Band ${id}` }))) };
   prisma.concertMedia = {
     findMany: vi.fn(async ({ where }) => mediaRows.filter((m) => where.attendance_id.in.includes(m.attendance_id))),
     findUnique: vi.fn(async ({ where }) => mediaRows.find((m) => m.id === where.id) ?? null),
@@ -142,6 +143,16 @@ describe('POST /album-shares', () => {
     expect(albumLinks[0].attendance_ids).toEqual([1, 2]);
   });
 
+  it('never narrows a link already sent, when the night is asked for as fewer attendances', async () => {
+    // One stage's row opened on its own and "Show link" pressed. Replacing the
+    // list took the other stage's files out of a URL someone already held.
+    const first = await shareNight([1, 2]).expect(200);
+    const narrower = await shareNight([1]).expect(200);
+    expect(narrower.body.data.token).toBe(first.body.data.token);
+    expect(albumLinks[0].attendance_ids).toEqual([1, 2]);
+    expect(prisma.mediaAlbumShareLink.update).not.toHaveBeenCalled();
+  });
+
   it('mints a fresh link once the last one was stopped or ran out', async () => {
     const first = await shareNight([1]).expect(200);
     await stopNight([1]).expect(204);
@@ -189,6 +200,22 @@ describe('GET /album-shares/:token', () => {
       .toBe(`https://api.example.com/data/concerts/album-shares/${token}/media/1/file`);
     // Where the archive keeps it names the owner's account.
     expect(JSON.stringify(res.body)).not.toContain('rel_path');
+  });
+
+  it('names the act of a file filed under one that is on none of the night\'s bills', async () => {
+    const row = await fileInAlbumTho892({ id: 1 });
+    row.band_id = 7;
+    const { body } = await shareNight([1]).expect(200);
+    const res = await openAlbum(body.data.token).expect(200);
+    expect(res.body.data.bands.map((b) => b.id)).toEqual([92, 7]);
+    expect(prisma.band.findMany.mock.calls[0][0].where).toEqual({ id: { in: [7] } });
+  });
+
+  it('does not ask for acts when every file is filed under one on the bill', async () => {
+    await fileInAlbumTho892({ id: 1 });
+    const { body } = await shareNight([1]).expect(200);
+    await openAlbum(body.data.token).expect(200);
+    expect(prisma.band.findMany).not.toHaveBeenCalled();
   });
 
   it('is live: a file added to the night after sharing is in the album', async () => {
@@ -248,6 +275,12 @@ describe('GET /album-shares/:token/media/:id/:which', () => {
     const { body } = await shareNight([1]).expect(200);
     await bytesAt(body.data.token, 1, 'play').expect(404);
     await bytesAt(body.data.token, '1abc', 'file').expect(404);
+    // Past a 32-bit Int, which the database client throws on: 404, not a 500
+    // a stranger with a token can produce at will.
+    prisma.concertMedia.findUnique.mockClear();
+    await bytesAt(body.data.token, '99999999999', 'file').expect(404);
+    await bytesAt(body.data.token, '2147483648', 'file').expect(404);
+    expect(prisma.concertMedia.findUnique).not.toHaveBeenCalled();
   });
 
   it('stops serving the moment the link is stopped', async () => {

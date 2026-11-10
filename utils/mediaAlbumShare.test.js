@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  ALBUM_TTL_MS, albumExpiry, normaliseAttendanceIds, sameIds, albumMediaUrls, albumPayload,
+  ALBUM_TTL_MS, albumExpiry, normaliseAttendanceIds, sameIds, unionIds, albumBase, albumMediaUrls, albumPayload,
 } from './mediaAlbumShare.js';
 
 describe('albumExpiry', () => {
@@ -46,19 +46,31 @@ describe('sameIds', () => {
   });
 });
 
+describe('unionIds', () => {
+  it('is both lists as one, each id once, ascending', () => {
+    expect(unionIds([1, 5], [3, 1])).toEqual([1, 3, 5]);
+  });
+});
+
+describe('albumBase', () => {
+  it('drops a trailing slash from the configured base', () => {
+    expect(albumBase('https://api.example.com/')).toBe('https://api.example.com');
+  });
+
+  it('throws on a base that would produce a relative URL', () => {
+    expect(() => albumBase('')).toThrow(/CALLBACK_URL/);
+    expect(() => albumBase('api.example.com')).toThrow(/not absolute/);
+    expect(() => albumBase('ftp://api.example.com')).toThrow(/not http/);
+  });
+});
+
 describe('albumMediaUrls', () => {
-  it('builds each copy under the album token, from the configured base', () => {
-    expect(albumMediaUrls('https://api.example.com/', 'tok', 9)).toEqual({
+  it('builds each copy under the album token', () => {
+    expect(albumMediaUrls('https://api.example.com', 'tok', 9)).toEqual({
       thumb: 'https://api.example.com/data/concerts/album-shares/tok/media/9/thumb',
       view: 'https://api.example.com/data/concerts/album-shares/tok/media/9/view',
       file: 'https://api.example.com/data/concerts/album-shares/tok/media/9/file',
     });
-  });
-
-  it('throws on a base that would produce a relative URL', () => {
-    expect(() => albumMediaUrls('', 'tok', 9)).toThrow(/CALLBACK_URL/);
-    expect(() => albumMediaUrls('api.example.com', 'tok', 9)).toThrow(/not absolute/);
-    expect(() => albumMediaUrls('ftp://api.example.com', 'tok', 9)).toThrow(/not http/);
   });
 });
 
@@ -124,5 +136,25 @@ describe('albumPayload', () => {
       { id: 92, name: 'Gojira', setlist: { songs: [{ name: 'Stranded' }] } },
       { id: 7, name: 'Alcest', setlist: null },
     ]);
+  });
+
+  it('names an act a file is filed under though it is on none of the bills, after the bill', () => {
+    // Tagged with an act from another stage of the day. Without the name the
+    // recipient's page has nothing to head those files with.
+    const out = albumPayload({
+      link: albumLinkTho892, attendances: [{ id: 1, concert_rel: albumConcertTho892() }],
+      media: [albumRowTho892({ band_id: 7 })], otherBands: [{ id: 7, name: 'Alcest' }, { id: 92, name: 'Gojira' }],
+      baseUrl: 'https://api.example.com',
+    });
+    expect(out.bands.map((b) => [b.id, b.name, b.setlist === null])).toEqual([
+      [92, 'Gojira', false],
+      [7, 'Alcest', true],
+    ]);
+  });
+
+  it('refuses to build a listing from a base that is not absolute', () => {
+    expect(() => albumPayload({
+      link: albumLinkTho892, attendances: [{ id: 1, concert_rel: albumConcertTho892() }], media: [], baseUrl: 'api.example.com',
+    })).toThrow(/not absolute/);
   });
 });

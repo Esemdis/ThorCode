@@ -26,7 +26,7 @@ const { verifyMediaToken } = require('../../../utils/mediaTokens');
 const { isActiveShareLink } = require('../../../utils/mediaShareToken');
 const { rateLimiter } = require('../../../utils/rateLimiter');
 const { clipFiles, isClip, prepareClip } = require('../../../utils/mediaClips');
-const { withOwner, liveAlbumLink } = require('./shared');
+const { withOwner, liveAlbumLink, INT32_MAX } = require('./shared');
 
 const router = express.Router();
 const INLINE_MEDIA_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.mp4']);
@@ -322,15 +322,16 @@ const ALBUM_COPIES = new Set(['thumb', 'view', 'file']);
 async function servePublicAlbumMedia(req, res) {
   try {
     const { which } = req.params;
-    if (!ALBUM_COPIES.has(which) || !/^[1-9]\d*$/.test(req.params.id)) return res.status(404).end();
+    // At most ten digits and inside a 32-bit Int: a longer id reaching Prisma
+    // is a thrown validation error and a 500, from a route a stranger can call.
+    if (!ALBUM_COPIES.has(which) || !/^[1-9]\d{0,9}$/.test(req.params.id)) return res.status(404).end();
+    const mediaId = Number(req.params.id);
+    if (mediaId > INT32_MAX) return res.status(404).end();
 
     const link = await liveAlbumLink(req.params.token);
     if (!link) return res.status(404).end();
 
-    const row = await prisma.concertMedia.findUnique({
-      where: { id: parseInt(req.params.id, 10) },
-      include: withOwner,
-    });
+    const row = await prisma.concertMedia.findUnique({ where: { id: mediaId }, include: withOwner });
     if (!row
         || !link.attendance_ids.includes(row.attendance_id)
         || row.attendance_rel.wishlist_rel.user_id !== link.user_id) {

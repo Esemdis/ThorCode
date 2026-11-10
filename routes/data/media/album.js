@@ -18,7 +18,7 @@ const { serialise } = require('../../../utils/serialQueue');
 const { rateLimiter } = require('../../../utils/rateLimiter');
 const { generateShareToken } = require('../../../utils/mediaShareToken');
 const {
-  albumExpiry, normaliseAttendanceIds, sameIds, albumPayload,
+  albumExpiry, normaliseAttendanceIds, sameIds, unionIds, albumPayload,
 } = require('../../../utils/mediaAlbumShare');
 const { liveAlbumLink } = require('./shared');
 
@@ -40,9 +40,17 @@ const liveFor = (userId, ids, now = new Date()) => ({
  * an earlier visit.
  *
  * A night can grow — a second stage of a festival day gets attended after the
- * first was shared. Asking then widens the live link to the attendances named
- * now and keeps its token, rather than minting a second: the person holding
- * the first URL sees the whole night, and there is still one link to stop.
+ * first was shared. Asking then widens the live link to take in the
+ * attendances named now and keeps its token, rather than minting a second:
+ * the person holding the first URL sees the whole night.
+ *
+ * Widens, never narrows. The same night can be asked for as fewer attendances
+ * than it was shared as — one stage's row opened on its own — and replacing
+ * the list then took the other stages' files out of a URL already sent.
+ *
+ * Two stages shared separately before they folded are two live links, and the
+ * newest is the one widened; the other goes on showing its own stage until it
+ * runs out. Stop sharing ends both.
  *
  * Answers the token, not a URL. The page a recipient opens is the frontend's,
  * and only the frontend knows its own origin.
@@ -79,8 +87,9 @@ router.post(
             },
           });
         }
-        if (sameIds(live.attendance_ids, ids)) return live;
-        return prisma.mediaAlbumShareLink.update({ where: { id: live.id }, data: { attendance_ids: ids } });
+        const widened = unionIds(live.attendance_ids, ids);
+        if (sameIds(live.attendance_ids, widened)) return live;
+        return prisma.mediaAlbumShareLink.update({ where: { id: live.id }, data: { attendance_ids: widened } });
       });
 
       return success(res, 200, { token: link.token, expires_at: link.expires_at });
@@ -157,9 +166,18 @@ router.get('/album-shares/:token', albumLimiter, async (req, res) => {
       orderBy: [{ taken_at: { sort: 'asc', nulls: 'last' } }, { id: 'asc' }],
     });
 
+    // The acts files are filed under that none of these bills has: a file
+    // tagged with an act from another stage of the day. Named, so the page
+    // can head them; asked for only when there are some.
+    const onBill = new Set(attendances.flatMap((a) => a.concert_rel.bands.map((b) => b.band_rel.id)));
+    const strays = [...new Set(media.map((m) => m.band_id).filter((id) => id != null && !onBill.has(id)))];
+    const otherBands = strays.length
+      ? await prisma.band.findMany({ where: { id: { in: strays } }, select: { id: true, name: true } })
+      : [];
+
     res.set('Cache-Control', 'private, no-store');
     return success(res, 200, albumPayload({
-      link, attendances, media, baseUrl: process.env.CALLBACK_URL,
+      link, attendances, media, otherBands, baseUrl: process.env.CALLBACK_URL,
     }));
   } catch (err) {
     return fail(res, err, { context: 'GET /album-shares/:token' });
