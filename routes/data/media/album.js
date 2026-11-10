@@ -48,6 +48,11 @@ const liveFor = (userId, ids, now = new Date()) => ({
  * than it was shared as — one stage's row opened on its own — and replacing
  * the list then took the other stages' files out of a URL already sent.
  *
+ * Widening keeps the link's expiry. A stage added on the link's last day is
+ * shared for that day, not a fresh week: pushing the date out would also keep
+ * every file already sent open longer, without the owner having asked for
+ * that. The app shows the real date, and Stop then Share mints a new week.
+ *
  * Two stages shared separately before they folded are two live links, and the
  * newest is the one widened; the other goes on showing its own stage until it
  * runs out. Stop sharing ends both.

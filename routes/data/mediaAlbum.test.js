@@ -141,6 +141,9 @@ describe('POST /album-shares', () => {
     expect(grown.body.data.token).toBe(first.body.data.token);
     expect(albumLinks).toHaveLength(1);
     expect(albumLinks[0].attendance_ids).toEqual([1, 2]);
+    // And keeps its expiry: a fresh week would keep the files already sent
+    // open longer than the owner chose (see the route's comment).
+    expect(grown.body.data.expires_at).toBe(first.body.data.expires_at);
   });
 
   it('never narrows a link already sent, when the night is asked for as fewer attendances', async () => {
