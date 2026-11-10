@@ -1707,7 +1707,7 @@ describe('peeking at /new and acknowledging it (THO-802)', () => {
     expect(written.getTime()).toBeLessThanOrEqual(Date.now());
   });
 
-  it.each(['2026-W45-1', '2026-313', '2026-02-30', 'yesterday'])('refuses as_of %s with a 400, not a 500', async (asOf) => {
+  it.each(['2026-W45-1', '2026-313', '2026-02-30', 'yesterday', '2026-11-09T12:00:00'])('refuses as_of %s with a 400, not a 500', async (asOf) => {
     // isISO8601 alone passed week and ordinal dates that new Date() reads as
     // Invalid Date, which reached Prisma and answered 500.
     prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', last_active_at: null, bands: [] });

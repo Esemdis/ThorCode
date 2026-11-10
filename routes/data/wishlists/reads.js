@@ -375,7 +375,11 @@ router.post(
     // Strict, and checked again below: isISO8601 alone passes week and ordinal
     // dates ("2026-W45-1") that new Date() cannot read, which reached Prisma as
     // an Invalid Date and answered 500.
-    body("as_of").isISO8601({ strict: true, strictSeparator: true }).withMessage("as_of must be a date and time"),
+    // With a zone, too: without one new Date() reads it in the server's zone.
+    body("as_of")
+      .isISO8601({ strict: true, strictSeparator: true })
+      .matches(/(Z|[+-]\d{2}:\d{2})$/)
+      .withMessage("as_of must be a date and time"),
   ],
   async (req, res) => {
     try {
