@@ -16,6 +16,15 @@ this says how to change it without breaking a deploy.
 - The container boots with `npx prisma migrate deploy && node index.js`
   (`Dockerfile`), so a merged migration is applied to production the moment the
   image starts. A failed migration stops the API from starting.
+- **A GitHub Actions billing block is not a failure.** It will keep
+  happening, so it is not news. A job that never started because of the
+  account's Actions billing (the run's annotation is about payments or a
+  spending limit; it usually ends within a second or two with no logs) ran
+  nothing. Don't investigate it, re-run it, file a ticket or comment about it,
+  and don't count the default branch as red because of it. It is not a pass
+  either: your local verify command is the gate, so quote its output in the PR
+  and say CI was blocked by billing. A blocked run also built no image, so
+  never report a merged change as deployed; say the deploy waits on CI.
 
 ### Verify
 
