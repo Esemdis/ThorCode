@@ -8,7 +8,7 @@
  */
 const express = require("express");
 const router = express.Router();
-const { validationResult, param } = require("express-validator");
+const { validationResult, param, body } = require("express-validator");
 const { deduplicateConcerts } = require("../../../utils/concertDedup");
 const { groupConcertsByBand } = require("../../../utils/concertUpdateGroups");
 const auth = require("../../../auth/verifyJWT");
@@ -212,7 +212,107 @@ router.get(
   }
 );
 
+/**
+ * The concerts on a wishlist's bands that arrived after `since` (and no later
+ * than `until`, when given), as GET /new sends them, plus the band refs they
+ * came from for the activity log.
+ */
+async function newConcertsSince(bandIds, since, until) {
+  // Still to come, compared by calendar day as the calendar feed does, or
+  // not dated yet. created_at alone is not "announced": a show imported
+  // from setlist.fm history is a row created today with a date years back,
+  // and it came back here as news to everyone following the band.
+  const startOfToday = new Date();
+  startOfToday.setUTCHours(0, 0, 0, 0);
+
+  const refs = await prisma.concertBandReference.findMany({
+    where: {
+      band: { in: bandIds },
+      concert_rel: {
+        created_at: until ? { gt: since, lte: until } : { gt: since },
+        OR: [{ concert_date: null }, { concert_date: { gte: startOfToday } }],
+      },
+    },
+    include: {
+      band_rel: { select: { name: true } },
+      concert_rel: {
+        select: {
+          id: true,
+          // When it was inserted, which is what "new since your last
+          // visit" is measured against — so the client can say how long
+          // ago each announcement landed rather than only that it did.
+          created_at: true,
+          name: true,
+          // The rest of the bill. "Show on map" pins this copy of the show
+          // when its date is outside the map's range, and the popup reads
+          // the acts you don't follow from here. Without it, Palaye Royale
+          // at COS Torwar showed only Badflower, the one band linked to it.
+          metadata: true,
+          source: true,
+          city: true,
+          country: true,
+          venue: true,
+          latitude: true,
+          longitude: true,
+          concert_date: true,
+          on_sale: true,
+          ticket_sale_start: true,
+          price_min: true,
+          price_max: true,
+          price_currency: true,
+          sold_out: true,
+          url: true,
+          festival: true,
+          bands: {
+            include: { band_rel: { select: { name: true, id: true } } },
+          },
+        },
+      },
+    },
+  });
+
+  const concertMap = new Map();
+  for (const ref of refs) {
+    const c = ref.concert_rel;
+    if (!concertMap.has(c.id)) {
+      concertMap.set(c.id, {
+        ...c,
+        participating_bands: c.bands.map((b) => b.band_rel),
+      });
+    }
+  }
+  const concerts = Array.from(concertMap.values()).sort(
+    (a, b) => new Date(a.concert_date || 0) - new Date(b.concert_date || 0),
+  );
+  return { refs, concerts };
+}
+
+// Writes the NEW_CONCERTS activity entry for what a visit took in, when there
+// is anything to report.
+async function logNewConcerts(wishlistId, refs, total) {
+  if (total === 0) return;
+  const bandConcertMap = new Map();
+  for (const ref of refs) {
+    const name = ref.band_rel?.name || "Unknown";
+    if (!bandConcertMap.has(name)) bandConcertMap.set(name, { ids: new Set(), countries: new Set() });
+    bandConcertMap.get(name).ids.add(ref.concert_rel.id);
+    if (ref.concert_rel.country) bandConcertMap.get(name).countries.add(ref.concert_rel.country);
+  }
+  const byBand = [...bandConcertMap.entries()]
+    .map(([name, { ids, countries }]) => ({ name, count: ids.size, countries: [...countries] }))
+    .sort((a, b) => b.count - a.count);
+
+  await logActivity(wishlistId, "NEW_CONCERTS", { total, by_band: byBand });
+}
+
 // GET /wishlists/:id/new — concerts added since the user's last visit (cross-device)
+//
+// `?peek=1` reads without moving the cursor (THO-802). Moving it on every read
+// treated "the app loaded" as "the user looked": open the app, see 3 on the
+// bell, close the tab, and those three were gone for good. A peeking client
+// says when they were actually looked at with POST /new/seen, passing back the
+// `as_of` this answers with. Without `peek` it moves the cursor as it always
+// has, so a client from before the split keeps working.
 router.get(
   "/wishlists/:id/new",
   [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
@@ -222,6 +322,7 @@ router.get(
       const wishlist = await ownWishlist(req, res, { include: { bands: true } });
       if (!wishlist) return;
       const wishlistId = wishlist.id;
+      const peek = req.query.peek === "1" || req.query.peek === "true";
 
       const sinceDate = wishlist.last_active_at ?? new Date(0);
       // Taken now, written last: the cursor moves to when this read began, and
@@ -231,100 +332,101 @@ router.get(
       const visitedAt = new Date();
 
       const bandIds = wishlist.bands.map((b) => b.band_id);
+      // Bounded at visitedAt, which is where the cursor goes (or where the
+      // acknowledgement of a peek will put it): a concert inserted while this
+      // runs is left for next time rather than shown now and again then.
+      const { refs, concerts } = await newConcertsSince(bandIds, sinceDate, visitedAt);
 
-      // Still to come, compared by calendar day as the calendar feed does, or
-      // not dated yet. created_at alone is not "announced": a show imported
-      // from setlist.fm history is a row created today with a date years back,
-      // and it came back here as news to everyone following the band.
-      const startOfToday = new Date();
-      startOfToday.setUTCHours(0, 0, 0, 0);
-
-      const refs = await prisma.concertBandReference.findMany({
-        where: {
-          band: { in: bandIds },
-          concert_rel: {
-            created_at: { gt: sinceDate },
-            OR: [{ concert_date: null }, { concert_date: { gte: startOfToday } }],
-          },
-        },
-        include: {
-          band_rel: { select: { name: true } },
-          concert_rel: {
-            select: {
-              id: true,
-              // When it was inserted, which is what "new since your last
-              // visit" is measured against — so the client can say how long
-              // ago each announcement landed rather than only that it did.
-              created_at: true,
-              name: true,
-              // The rest of the bill. "Show on map" pins this copy of the show
-              // when its date is outside the map's range, and the popup reads
-              // the acts you don't follow from here. Without it, Palaye Royale
-              // at COS Torwar showed only Badflower, the one band linked to it.
-              metadata: true,
-              source: true,
-              city: true,
-              country: true,
-              venue: true,
-              latitude: true,
-              longitude: true,
-              concert_date: true,
-              on_sale: true,
-              ticket_sale_start: true,
-              price_min: true,
-              price_max: true,
-              price_currency: true,
-              sold_out: true,
-              url: true,
-              festival: true,
-              bands: {
-                include: { band_rel: { select: { name: true, id: true } } },
-              },
-            },
-          },
-        },
-      });
-
-      const concertMap = new Map();
-      for (const ref of refs) {
-        const c = ref.concert_rel;
-        if (!concertMap.has(c.id)) {
-          concertMap.set(c.id, {
-            ...c,
-            participating_bands: c.bands.map((b) => b.band_rel),
-          });
-        }
+      // A peek logs nothing either: it would log the same concerts on every
+      // load until they were seen. POST /new/seen logs them once.
+      if (!peek) {
+        await logNewConcerts(wishlistId, refs, concerts.length);
+        // Any device hitting this endpoint moves the cursor — forward only, so
+        // a slow read from an old client cannot undo a newer acknowledgement.
+        await prisma.wishlist.updateMany({
+          where: { id: wishlistId, OR: [{ last_active_at: null }, { last_active_at: { lt: visitedAt } }] },
+          data: { last_active_at: visitedAt },
+        });
       }
 
-      // Write NEW_CONCERTS activity log entry when there's something to report
-      if (concertMap.size > 0) {
-        const bandConcertMap = new Map();
-        for (const ref of refs) {
-          const name = ref.band_rel?.name || "Unknown";
-          if (!bandConcertMap.has(name)) bandConcertMap.set(name, { ids: new Set(), countries: new Set() });
-          bandConcertMap.get(name).ids.add(ref.concert_rel.id);
-          if (ref.concert_rel.country) bandConcertMap.get(name).countries.add(ref.concert_rel.country);
-        }
-        const byBand = [...bandConcertMap.entries()]
-          .map(([name, { ids, countries }]) => ({ name, count: ids.size, countries: [...countries] }))
-          .sort((a, b) => b.count - a.count);
-
-        await logActivity(wishlistId, "NEW_CONCERTS", { total: concertMap.size, by_band: byBand });
-      }
-
-      const concerts = Array.from(concertMap.values()).sort(
-        (a, b) => new Date(a.concert_date || 0) - new Date(b.concert_date || 0),
-      );
-
-      // Any device hitting this endpoint moves the cursor.
-      await prisma.wishlist.update({
-        where: { id: wishlistId },
-        data: { last_active_at: visitedAt },
-      });
-
-      res.json({ concerts });
+      res.json({ concerts, as_of: visitedAt.toISOString() });
     } catch (error) {
       console.error("Error fetching new concerts:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// POST /wishlists/:id/new/seen — { as_of }: the user has looked at what a
+// peeking GET /new answered at `as_of`. The cursor moves there, on every
+// device, and no further.
+//
+// Moved to `as_of` rather than to now: a concert that arrived between the peek
+// and the look was never shown, and moving to now would swallow it. Never moved
+// backwards, so a stale tab acknowledging an old peek cannot bring back news
+// another device has already cleared, and never past now, whatever the client
+// sends.
+router.post(
+  "/wishlists/:id/new/seen",
+  [
+    auth,
+    roleCheck(["ADMIN", "USER"]),
+    param("id").isInt().withMessage("Wishlist ID must be an integer"),
+    // Strict, and checked again below: isISO8601 alone passes week and ordinal
+    // dates ("2026-W45-1") that new Date() cannot read, which reached Prisma as
+    // an Invalid Date and answered 500.
+    // With a zone, too: without one new Date() reads it in the server's zone.
+    body("as_of")
+      .isISO8601({ strict: true, strictSeparator: true })
+      .matches(/(Z|[+-]\d{2}:\d{2})$/)
+      .withMessage("as_of must be a date and time"),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+      const wishlist = await ownWishlist(req, res, { include: { bands: true } });
+      if (!wishlist) return;
+
+      const now = new Date();
+      const asOf = new Date(req.body.as_of);
+      if (Number.isNaN(asOf.getTime())) return res.status(400).json({ error: "as_of must be a date and time" });
+      const until = asOf > now ? now : asOf;
+
+      // A compare-and-swap on the cursor as it was read, so what gets logged is
+      // exactly the stretch this request moved it over. A plain "if earlier"
+      // update let a phone acknowledging at T1 and a laptop at T2 both start
+      // from the same cursor and log the concerts up to T1 twice. Lost to
+      // another device, it reads the cursor again and tries from there.
+      let since = wishlist.last_active_at;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (since && until <= since) return res.json({ moved: false });
+        const { count } = await prisma.wishlist.updateMany({
+          where: { id: wishlist.id, last_active_at: since },
+          data: { last_active_at: until },
+        });
+        if (count === 1) break;
+        if (attempt === 2) return res.json({ moved: false });
+        const fresh = await prisma.wishlist.findUnique({ where: { id: wishlist.id }, select: { last_active_at: true } });
+        if (!fresh) return res.json({ moved: false });
+        since = fresh.last_active_at;
+      }
+
+      // After the move, and not fatal: the feed is a record of what was taken
+      // in, and failing here must not leave the badge claiming news the user
+      // has just read. The bands are as they are now, not as they were at the
+      // peek: a band added in between has its shows on the map already.
+      try {
+        const bandIds = wishlist.bands.map((b) => b.band_id);
+        const { refs, concerts } = await newConcertsSince(bandIds, since ?? new Date(0), until);
+        await logNewConcerts(wishlist.id, refs, concerts.length);
+      } catch (error) {
+        console.error("Error logging seen concerts:", error);
+      }
+
+      res.json({ moved: true });
+    } catch (error) {
+      console.error("Error acknowledging new concerts:", error);
       return res.status(500).json({ error: "Internal server error" });
     }
   }
