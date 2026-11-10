@@ -16,6 +16,15 @@ this says how to change it without breaking a deploy.
 - The container boots with `npx prisma migrate deploy && node index.js`
   (`Dockerfile`), so a merged migration is applied to production the moment the
   image starts. A failed migration stops the API from starting.
+- **A GitHub Actions billing block is not a failure.** It will keep
+  happening, so it is not news. A job that never started because of the
+  account's Actions billing (the run's annotation is about payments or a
+  spending limit; it usually ends within a second or two with no logs) ran
+  nothing. Don't investigate it, re-run it, file a ticket or comment about it,
+  and don't count the default branch as red because of it. It is not a pass
+  either: your local verify command is the gate, so quote its output in the PR
+  and say CI was blocked by billing. A blocked run also built no image, so
+  never report a merged change as deployed; say the deploy waits on CI.
 
 ### Verify
 
@@ -64,6 +73,11 @@ The CI drift check must pass: a schema change without a migration fails there.
 
 ### Linear tickets
 
+- **Reviews comment on the PR; they don't file tickets.** When you review a
+  PR, yours or another agent's, every finding goes on that PR as a comment
+  (inline when it points at a line), including follow-ups and problems you
+  found outside the diff. Don't create a Linear ticket from a review; the
+  owner decides what becomes one.
 - **Tickets you file.** Set Linear's Priority (that is the severity) and the
   project when you create a ticket. "No priority" is not an answer: an estimate
   is enough, and the owner changes it. For a bug, Urgent is live data loss, a

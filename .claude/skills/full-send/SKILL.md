@@ -66,7 +66,9 @@ over anything here.
    decision being reversed. Verify each finding yourself, fix the real ones, run
    step 4 again, then **run the reviewer again on the final diff**: a fix is new
    code. Put its verdict and your answers to its findings in the PR. A finding
-   you reject gets one line saying why.
+   you reject gets one line saying why. A finding you leave for later
+   (a follow-up, a problem outside the diff) goes on the PR as a comment once
+   it is open, never in a new Linear ticket.
 6. **Bring in the default branch.** `git fetch origin`; if it moved, merge it into
    the branch and re-run step 4. If the repo says to check open PRs that touch
    the same files (it names them), do that and keep your change small.
@@ -80,13 +82,15 @@ over anything here.
    - CI on the PR is green. wander, route-planner, ThorCode and concert-map
      all run their tests on a PR; check the workflow's `pull_request` trigger in
      any other repo, and where there is none, your local verify is the only
-     gate, so its output must be clean and quoted in the PR. A job that failed
-     within a second or two with no logs never ran a test: re-run it once, and
-     count it as neither green nor red;
+     gate, so its output must be clean and quoted in the PR. A job blocked by
+     GitHub Actions billing (see the repo's CLAUDE.md) is not a failure: don't
+     re-run it; your local verify is the gate, so its output must be clean and
+     quoted in the PR;
    - the final review verdict has no unresolved blocking finding;
    - **the default branch is not already red** (a known failing test there blocks
      the deploy, so your change would not go live). Check the latest default-branch
-     workflow run (the GitHub tools' workflow-run listing). If the repo's CLAUDE.md
+     workflow run (the GitHub tools' workflow-run listing); a run blocked by
+     Actions billing does not make it red. If the repo's CLAUDE.md
      records a known red test (ThorCode's `media.test.js`, THO-423), hand back and
      say so; do not merge;
    - no database migration: nothing under a migrations folder and no schema
