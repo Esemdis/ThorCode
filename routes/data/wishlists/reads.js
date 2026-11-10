@@ -332,15 +332,19 @@ router.get(
       const visitedAt = new Date();
 
       const bandIds = wishlist.bands.map((b) => b.band_id);
-      const { refs, concerts } = await newConcertsSince(bandIds, sinceDate);
+      // Bounded at visitedAt, which is where the cursor goes (or where the
+      // acknowledgement of a peek will put it): a concert inserted while this
+      // runs is left for next time rather than shown now and again then.
+      const { refs, concerts } = await newConcertsSince(bandIds, sinceDate, visitedAt);
 
       // A peek logs nothing either: it would log the same concerts on every
       // load until they were seen. POST /new/seen logs them once.
       if (!peek) {
         await logNewConcerts(wishlistId, refs, concerts.length);
-        // Any device hitting this endpoint moves the cursor.
-        await prisma.wishlist.update({
-          where: { id: wishlistId },
+        // Any device hitting this endpoint moves the cursor — forward only, so
+        // a slow read from an old client cannot undo a newer acknowledgement.
+        await prisma.wishlist.updateMany({
+          where: { id: wishlistId, OR: [{ last_active_at: null }, { last_active_at: { lt: visitedAt } }] },
           data: { last_active_at: visitedAt },
         });
       }
@@ -368,7 +372,10 @@ router.post(
     auth,
     roleCheck(["ADMIN", "USER"]),
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
-    body("as_of").isISO8601().withMessage("as_of must be a date and time"),
+    // Strict, and checked again below: isISO8601 alone passes week and ordinal
+    // dates ("2026-W45-1") that new Date() cannot read, which reached Prisma as
+    // an Invalid Date and answered 500.
+    body("as_of").isISO8601({ strict: true, strictSeparator: true }).withMessage("as_of must be a date and time"),
   ],
   async (req, res) => {
     try {
@@ -379,23 +386,35 @@ router.post(
 
       const now = new Date();
       const asOf = new Date(req.body.as_of);
+      if (Number.isNaN(asOf.getTime())) return res.status(400).json({ error: "as_of must be a date and time" });
       const until = asOf > now ? now : asOf;
-      const since = wishlist.last_active_at ?? new Date(0);
-      if (until <= since) return res.json({ moved: false });
 
-      // Conditional, so two devices acknowledging at once move it (and log)
-      // once between them, and the later point wins.
-      const { count } = await prisma.wishlist.updateMany({
-        where: { id: wishlist.id, OR: [{ last_active_at: null }, { last_active_at: { lt: until } }] },
-        data: { last_active_at: until },
-      });
-      if (count === 0) return res.json({ moved: false });
+      // A compare-and-swap on the cursor as it was read, so what gets logged is
+      // exactly the stretch this request moved it over. A plain "if earlier"
+      // update let a phone acknowledging at T1 and a laptop at T2 both start
+      // from the same cursor and log the concerts up to T1 twice. Lost to
+      // another device, it reads the cursor again and tries from there.
+      let since = wishlist.last_active_at;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (since && until <= since) return res.json({ moved: false });
+        const { count } = await prisma.wishlist.updateMany({
+          where: { id: wishlist.id, last_active_at: since },
+          data: { last_active_at: until },
+        });
+        if (count === 1) break;
+        if (attempt === 2) return res.json({ moved: false });
+        const fresh = await prisma.wishlist.findUnique({ where: { id: wishlist.id }, select: { last_active_at: true } });
+        if (!fresh) return res.json({ moved: false });
+        since = fresh.last_active_at;
+      }
 
       // After the move, and not fatal: the feed is a record of what was taken
       // in, and failing here must not leave the badge claiming news the user
-      // has just read.
+      // has just read. The bands are as they are now, not as they were at the
+      // peek: a band added in between has its shows on the map already.
       try {
-        const { refs, concerts } = await newConcertsSince(wishlist.bands.map((b) => b.band_id), since, until);
+        const bandIds = wishlist.bands.map((b) => b.band_id);
+        const { refs, concerts } = await newConcertsSince(bandIds, since ?? new Date(0), until);
         await logNewConcerts(wishlist.id, refs, concerts.length);
       } catch (error) {
         console.error("Error logging seen concerts:", error);
