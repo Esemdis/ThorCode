@@ -73,6 +73,11 @@ The CI drift check must pass: a schema change without a migration fails there.
 
 ### Linear tickets
 
+- **Reviews comment on the PR; they don't file tickets.** When you review a
+  PR, yours or another agent's, every finding goes on that PR as a comment
+  (inline when it points at a line), including follow-ups and problems you
+  found outside the diff. Don't create a Linear ticket from a review; the
+  owner decides what becomes one.
 - **Tickets you file.** Set Linear's Priority (that is the severity) and the
   project when you create a ticket. "No priority" is not an answer: an estimate
   is enough, and the owner changes it. For a bug, Urgent is live data loss, a

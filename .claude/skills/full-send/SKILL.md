@@ -66,7 +66,9 @@ over anything here.
    decision being reversed. Verify each finding yourself, fix the real ones, run
    step 4 again, then **run the reviewer again on the final diff**: a fix is new
    code. Put its verdict and your answers to its findings in the PR. A finding
-   you reject gets one line saying why.
+   you reject gets one line saying why. A finding you leave for later
+   (a follow-up, a problem outside the diff) goes on the PR as a comment once
+   it is open, never in a new Linear ticket.
 6. **Bring in the default branch.** `git fetch origin`; if it moved, merge it into
    the branch and re-run step 4. If the repo says to check open PRs that touch
    the same files (it names them), do that and keep your change small.
