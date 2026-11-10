@@ -65,6 +65,7 @@ const prisma = installFakePrisma({
     create: vi.fn(async ({ data }) => ({ id: 1, ...data })),
   },
   mediaShareLink: { findMany: vi.fn(async () => []) },
+  mediaAlbumShareLink: { findFirst: vi.fn(async () => null) },
   attendanceMissedBand: { findMany: vi.fn(async () => []) },
 });
 const router = (await import('./media.js')).default ?? (await import('./media.js'));
@@ -88,6 +89,8 @@ beforeEach(async () => {
   // Every listing asks which of its files are shared. None are unless a test
   // says so; the sharing tests at the end replace the whole table.
   prisma.mediaShareLink = { findMany: vi.fn(async () => []) };
+  // Nor is the night shared as an album; mediaAlbum.test.js covers that.
+  prisma.mediaAlbumShareLink = { findFirst: vi.fn(async () => null) };
   // Every act on the bill was seen unless a test says otherwise.
   prisma.attendanceMissedBand = { findMany: vi.fn(async () => []) };
 });
@@ -143,6 +146,7 @@ describe('POST /attendances/:id/media', () => {
     // lightbox's <img> point at, and an element sends no Authorization
     // header. GET /media/share/:token is public by design — the token in its
     // path is the credential — so its 2 is the rate limiter and the handler.
+    // The same goes for the two GETs under /album-shares/:token (THO-892).
     expect(routeManifest(router)).toEqual([
       'POST /attendances/:attendanceId/media [7]',
       'GET /attendances/:attendanceId/media [4]',
@@ -154,11 +158,15 @@ describe('POST /attendances/:id/media', () => {
       'DELETE /media [5]',
       'POST /media/:id/share [6]',
       'DELETE /media/:id/share [4]',
+      'POST /album-shares [3]',
+      'DELETE /album-shares [3]',
+      'GET /album-shares/:token [2]',
       'GET /media/:id/file [1]',
       'GET /media/:id/play [1]',
       'GET /media/:id/thumb [1]',
       'GET /media/:id/view [1]',
       'GET /media/share/:token [2]',
+      'GET /album-shares/:token/media/:id/:which [2]',
     ]);
   });
 
@@ -1440,6 +1448,22 @@ describe('GET /attendances/:id/media', () => {
       .expect(200);
 
     expect(res.body.data.concert.date).toBeNull();
+  });
+
+  it('says until when the night is shared as an album, asking only for the caller\'s live links (THO-892)', async () => {
+    const until = new Date(Date.now() + 6 * 24 * 3600e3);
+    const unshared = await request(app())
+      .get('/data/concerts/attendances/1/media').set(...authHeader({ id: 'user-1' })).expect(200);
+    expect(unshared.body.data.album_shared_until).toBeNull();
+
+    prisma.mediaAlbumShareLink.findFirst = vi.fn(async () => ({ expires_at: until }));
+    const shared = await request(app())
+      .get('/data/concerts/attendances/1/media').set(...authHeader({ id: 'user-1' })).expect(200);
+    expect(shared.body.data.album_shared_until).toBe(until.toISOString());
+    // Scoped to the caller, to links that still work, and to this show.
+    expect(prisma.mediaAlbumShareLink.findFirst.mock.calls[0][0].where).toMatchObject({
+      user_id: 'user-1', revoked_at: null, expires_at: { gt: expect.any(Date) }, attendance_ids: { has: 1 },
+    });
   });
 
   it('says until when each file is shared: its latest live link, or null', async () => {

@@ -26,7 +26,7 @@ const { verifyMediaToken } = require('../../../utils/mediaTokens');
 const { isActiveShareLink } = require('../../../utils/mediaShareToken');
 const { rateLimiter } = require('../../../utils/rateLimiter');
 const { clipFiles, isClip, prepareClip } = require('../../../utils/mediaClips');
-const { withOwner } = require('./shared');
+const { withOwner, liveAlbumLink, INT32_MAX } = require('./shared');
 
 const router = express.Router();
 const INLINE_MEDIA_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.mp4']);
@@ -292,5 +292,67 @@ async function servePublicShare(req, res) {
 }
 
 router.get('/media/share/:token', shareLimiter, servePublicShare);
+
+/**
+ * One file of a shared night, opened by someone with no account (THO-892).
+ *
+ * The album's token is the credential, and it unlocks only the files filed
+ * under the attendances the link names — checked against the row here, with
+ * the owner, so a media id from somewhere else in the archive answers exactly
+ * as a file that does not exist does. 404 throughout, as for the single-file
+ * link, and for the same reason.
+ *
+ * /file is the archive master, always as a download: that is the full-quality
+ * copy the album is for, and a 4K HEVC original navigated to is a blank tab in
+ * most browsers. /view and /thumb are what the page shows.
+ *
+ * A budget far above the single link's 300 an hour. That one is a single
+ * request per opening; this is a grid of thumbnails, and a video being
+ * scrubbed is a Range request per seek.
+ */
+const albumBytesLimiter = rateLimiter({
+  message: 'Too many requests for this album, please try again later.',
+  windowMs: 60 * 60 * 1000,
+  max: 5000,
+});
+
+const ALBUM_BYTES_CONTEXT = 'GET /album-shares/:token/media/:id/:which';
+const ALBUM_COPIES = new Set(['thumb', 'view', 'file']);
+
+async function servePublicAlbumMedia(req, res) {
+  try {
+    const { which } = req.params;
+    // At most ten digits and inside a 32-bit Int: a longer id reaching Prisma
+    // is a thrown validation error and a 500, from a route a stranger can call.
+    if (!ALBUM_COPIES.has(which) || !/^[1-9]\d{0,9}$/.test(req.params.id)) return res.status(404).end();
+    const mediaId = Number(req.params.id);
+    if (mediaId > INT32_MAX) return res.status(404).end();
+
+    const link = await liveAlbumLink(req.params.token);
+    if (!link) return res.status(404).end();
+
+    const row = await prisma.concertMedia.findUnique({ where: { id: mediaId }, include: withOwner });
+    if (!row
+        || !link.attendance_ids.includes(row.attendance_id)
+        || row.attendance_rel.wishlist_rel.user_id !== link.user_id) {
+      return res.status(404).end();
+    }
+
+    if (which === 'file') res.attachment(row.filename);
+
+    // no-store for the same reason as the single link: it is meant to stop
+    // working. A thumbnail may be kept for an hour — a grid of hundreds
+    // re-fetched over a home connection on every visit is a real cost, and a
+    // thumbnail outliving a revoke by an hour gives away nothing the
+    // recipient has not already seen.
+    return await sendMediaBytes(res, row, which, ALBUM_BYTES_CONTEXT, {
+      cacheControl: which === 'thumb' ? 'private, max-age=3600' : 'private, no-store',
+    });
+  } catch (err) {
+    return fail(res, err, { context: ALBUM_BYTES_CONTEXT });
+  }
+}
+
+router.get('/album-shares/:token/media/:id/:which', albumBytesLimiter, servePublicAlbumMedia);
 
 module.exports = router;

@@ -140,8 +140,24 @@ router.get(
       // when nothing of it is shared, so a tile can say so without asking.
       const shared = await sharedUntil(rows.map((m) => m.id));
 
+      // The same for the night as a whole: until when an album link that
+      // takes in this show works, or null (THO-892). On the listing so the
+      // night can say it is shared as it opens; finding out by asking for the
+      // link would mint one.
+      const album = await prisma.mediaAlbumShareLink.findFirst({
+        where: {
+          user_id: req.user.id,
+          revoked_at: null,
+          expires_at: { gt: new Date() },
+          attendance_ids: { has: attendanceId },
+        },
+        orderBy: { expires_at: 'desc' },
+        select: { expires_at: true },
+      });
+
       return success(res, 200, {
         files: rows.map((m) => ({ ...m, ...mint(m.id), shared_until: shared.get(m.id) ?? null })),
+        album_shared_until: album ? new Date(album.expires_at).toISOString() : null,
         untagged,
         bands,
         // Which show this is. A festival day is one show per stage, so this is
