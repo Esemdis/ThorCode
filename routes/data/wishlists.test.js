@@ -69,6 +69,9 @@ const EXPECTED_ROUTES = [
   'PUT /wishlists/:id/attendance/missed [8]',
   // One more than it was: the setlist.fm budget it shares with the band routes.
   'POST /wishlists/:id/attendance/from-setlist [7]',
+  // THO-823: notes and a rating on a show, and moving it to the right one.
+  'PATCH /wishlists/:id/attendance/:concertId [7]',
+  'POST /wishlists/:id/attendance/:concertId/move [9]',
   'GET /wishlists/:id/weekly [6]',
   // One more for its own limiter: a post goes to Discord, which has its own.
   'POST /wishlists/:id/weekly/discord [7]',
@@ -132,6 +135,8 @@ describe('a wishlist that is someone else\'s', () => {
     ['delete', '/wishlists/7/attendance/1', user],
     ['put', '/wishlists/7/attendance/missed', user, { attendance_ids: [1], band_id: 1, missed: true }],
     ['post', '/wishlists/7/attendance/from-setlist', user, { setlistfm_id: '63de4613', band_id: 1 }],
+    ['patch', '/wishlists/7/attendance/1', user, { rating: 4 }],
+    ['post', '/wishlists/7/attendance/1/move', user, { concert_id: 2 }],
     ['patch', '/wishlists/7/bands/1', user, { tier: 'LOVE' }],
     ['put', '/wishlists/7', admin, { name: 'Mine now' }],
     ['post', '/wishlists/7/bands', user, { name: 'Gojira' }],
@@ -856,6 +861,268 @@ describe('GET /wishlists/:id/attendance', () => {
         missed_bands: { none: { band_id: 5 } },
       }),
     }));
+  });
+});
+
+describe('GET /wishlists/:id/attendance diary (THO-823)', () => {
+  it('returns the notes and rating of each show, and null for one with neither', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [] });
+    const tho823Row = (id, extra) => ({
+      id, created_at: new Date('2026-01-01'), missed_bands: [], ...extra,
+      concert_rel: {
+        id: id * 10, event_id: `e${id}`, venue: 'Vega', city: 'Copenhagen', country: 'DK',
+        concert_date: new Date('2026-01-01'), source: 'songkick', bands: [],
+      },
+    });
+    prisma.concertAttendance.findMany.mockResolvedValue([
+      tho823Row(1, { notes: 'Front row.', rating: 5 }),
+      tho823Row(2, { notes: null, rating: null }),
+    ]);
+    prisma.concertMedia.groupBy.mockResolvedValue([]);
+
+    const res = await request(app).get('/wishlists/7/attendance').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body.attendance.map(({ notes, rating }) => ({ notes, rating }))).toEqual([
+      { notes: 'Front row.', rating: 5 },
+      { notes: null, rating: null },
+    ]);
+  });
+});
+
+describe('PATCH /wishlists/:id/attendance/:concertId (THO-823)', () => {
+  const tho823Patch = (body) => request(app)
+    .patch('/wishlists/7/attendance/99')
+    .set(...authHeader({ id: 'user-1' }))
+    .send(body);
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1' });
+    prisma.concertAttendance.findUnique.mockResolvedValue({ id: 42 });
+    prisma.concertAttendance.update.mockImplementation(async ({ data }) => ({
+      id: 42, notes: 'kept', rating: 3, ...data,
+    }));
+  });
+
+  it('saves notes and a rating on the attendance and answers with both', async () => {
+    const res = await tho823Patch({ notes: 'Best pit of the year.', rating: 4 });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ attendance_id: 42, notes: 'Best pit of the year.', rating: 4 });
+    // Found by the URL's concert within this wishlist, written by attendance id.
+    expect(prisma.concertAttendance.findUnique).toHaveBeenCalledWith(expect.objectContaining({
+      where: { wishlist_id_concert_id: { wishlist_id: 7, concert_id: 99 } },
+    }));
+    expect(prisma.concertAttendance.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 42 }, data: { notes: 'Best pit of the year.', rating: 4 },
+    }));
+  });
+
+  it('clears one field with null and leaves the other alone', async () => {
+    const res = await tho823Patch({ rating: null });
+
+    expect(res.status).toBe(200);
+    expect(prisma.concertAttendance.update.mock.calls[0][0].data).toEqual({ rating: null });
+    expect(res.body).toEqual({ attendance_id: 42, notes: 'kept', rating: null });
+  });
+
+  it.each([0, 6, 3.5, '4'])('refuses a rating of %j', async (rating) => {
+    // "4" too: isInt alone would take the string, and a rating is a number.
+    const res = await tho823Patch({ rating });
+
+    expect(res.status).toBe(400);
+    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses notes over 5000 characters', async () => {
+    const res = await tho823Patch({ notes: 'x'.repeat(5001) });
+
+    expect(res.status).toBe(400);
+    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+  });
+
+  it('stores blank notes as none, and trims the rest', async () => {
+    await tho823Patch({ notes: '   \n ' });
+    await tho823Patch({ notes: '  Encore was long.  ' });
+
+    expect(prisma.concertAttendance.update.mock.calls[0][0].data).toEqual({ notes: null });
+    expect(prisma.concertAttendance.update.mock.calls[1][0].data).toEqual({ notes: 'Encore was long.' });
+  });
+
+  it('needs at least one of notes or rating', async () => {
+    const res = await tho823Patch({ mood: 'great' });
+
+    expect(res.status).toBe(400);
+    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+  });
+
+  it('answers 404 for a show not in this list', async () => {
+    prisma.concertAttendance.findUnique.mockResolvedValue(null);
+
+    const res = await tho823Patch({ rating: 4 });
+
+    expect(res.status).toBe(404);
+    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
+  // The router's own CommonJS copies, which vi.mock cannot reach.
+  const tho823Require = createRequire(import.meta.url);
+  const tho823Retarget = tho823Require('../../utils/mediaRetarget.js');
+  const tho823SetlistFm = tho823Require('../../utils/setlistFm.js');
+  const tho823Axios = tho823Require('axios');
+
+  const TARGET = {
+    id: 600, concert_date: new Date('2026-06-24T12:00:00Z'), venue: 'Fållan', city: 'Stockholm', country: 'SE',
+  };
+  const tho823Move = (body) => request(app)
+    .post('/wishlists/7/attendance/99/move')
+    .set(...authHeader({ id: 'user-1' }))
+    .send(body);
+
+  beforeEach(() => {
+    process.env.SETLIST_API_KEY = 'test-key';
+    // The background enrichment after a 200 searches setlist.fm through axios
+    // (see THO-673 under from-setlist): answered here so it ends in the test.
+    vi.spyOn(tho823Axios, 'get').mockResolvedValue({ data: { setlist: [] } });
+    vi.spyOn(tho823Retarget, 'retargetSidecars').mockResolvedValue([]);
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1' });
+    prisma.concertAttendance.findUnique.mockResolvedValue({ id: 42, concert_id: 99 });
+    prisma.concert.findUnique.mockResolvedValue(TARGET);
+    prisma.concertAttendance.update.mockResolvedValue({ id: 42 });
+    prisma.concertMedia.findMany.mockResolvedValue([]);
+    prisma.concertBandReference.findMany.mockResolvedValue([]);
+  });
+
+  it('re-points the attendance at an existing concert and keeps its id', async () => {
+    const res = await tho823Move({ concert_id: 600 });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ attendance_id: 42, concert_id: 600 });
+    // An update of the one row, not a delete and a create: the media, notes,
+    // rating and missed marks all hang off attendance 42 and go with it.
+    expect(prisma.concertAttendance.update).toHaveBeenCalledWith({ where: { id: 42 }, data: { concert_id: 600 } });
+    expect(prisma.concertAttendance.delete).not.toHaveBeenCalled();
+    expect(prisma.concertAttendance.create).not.toHaveBeenCalled();
+  });
+
+  it('answers 409 for a show already in the list and writes nothing else', async () => {
+    prisma.concertAttendance.update.mockRejectedValue(Object.assign(new Error('unique'), { code: 'P2002' }));
+
+    const res = await tho823Move({ concert_id: 600 });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('You already have that show in your list.');
+    expect(prisma.concertAttendance.update).toHaveBeenCalledTimes(1);
+    expect(tho823Retarget.retargetSidecars).not.toHaveBeenCalled();
+  });
+
+  it('upserts the sfm_ concert of a chosen setlist and moves there', async () => {
+    vi.spyOn(tho823SetlistFm, 'fetchSetlistById').mockResolvedValue({
+      id: '63de4613',
+      eventDate: '24-06-2026',
+      artist: { mbid: '65f4f0c5-ef9e-490c-aee3-909e7ae6b2ab', name: 'Gojira' },
+      venue: { name: 'Fållan', city: { name: 'Stockholm', country: { code: 'SE' }, coords: { lat: 59.3, long: 18.0 } } },
+      sets: { set: [] },
+    });
+    prisma.band.findUnique.mockResolvedValue({ id: 3, MBID: '65f4f0c5-ef9e-490c-aee3-909e7ae6b2ab' });
+    prisma.city.findMany.mockResolvedValue([]);
+    prisma.city.upsert.mockResolvedValue({ id: 12, latitude: 59.3 });
+    prisma.$queryRaw.mockResolvedValue([{ id: 31 }]);
+    prisma.concert.upsert.mockResolvedValue({ id: 600 });
+    prisma.concert.updateMany.mockResolvedValue({ count: 0 });
+    prisma.concertBandReference.upsert.mockResolvedValue({});
+
+    const res = await tho823Move({ setlistfm_id: '63de4613', band_id: 3 });
+
+    expect(res.status).toBe(200);
+    expect(prisma.concert.upsert).toHaveBeenCalledWith(expect.objectContaining({ where: { event_id: 'sfm_63de4613' } }));
+    expect(prisma.concertAttendance.update).toHaveBeenCalledWith({ where: { id: 42 }, data: { concert_id: 600 } });
+  });
+
+  it('refuses a setlist for a show that has not happened yet, as from-setlist does', async () => {
+    vi.spyOn(tho823SetlistFm, 'fetchSetlistById').mockResolvedValue({
+      id: '63de4613', eventDate: '01-01-2099', artist: { name: 'Gojira' },
+      venue: { name: 'Fållan', city: { name: 'Stockholm', country: { code: 'SE' } } }, sets: { set: [] },
+    });
+    prisma.band.findUnique.mockResolvedValue({ id: 3, name: 'Gojira', MBID: null });
+
+    const res = await tho823Move({ setlistfm_id: '63de4613', band_id: 3 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('That show has not happened yet');
+    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+  });
+
+  it('rewrites the sidecar of every folder the media is in, once each', async () => {
+    prisma.concertMedia.findMany.mockResolvedValue([
+      { rel_path: 'user-1/2026-06-23 Stockholm - Gojira/IMG_1.jpg' },
+      { rel_path: 'user-1/2026-06-23 Stockholm - Gojira/IMG_2.jpg' },
+      { rel_path: 'user-1/2026-06-23 Stockholm - Gojira (2)/VID_1.mp4' },
+    ]);
+
+    const res = await tho823Move({ concert_id: 600 });
+
+    expect(res.status).toBe(200);
+    expect(prisma.concertMedia.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { attendance_id: 42 } }));
+    expect(tho823Retarget.retargetSidecars).toHaveBeenCalledWith({
+      relDirs: ['user-1/2026-06-23 Stockholm - Gojira', 'user-1/2026-06-23 Stockholm - Gojira (2)'],
+      concertId: 600,
+      concert: TARGET,
+    });
+  });
+
+  it('puts concert_id back when a sidecar cannot be written', async () => {
+    prisma.concertMedia.findMany.mockResolvedValue([{ rel_path: 'user-1/show/IMG_1.jpg' }]);
+    tho823Retarget.retargetSidecars.mockRejectedValue(new Error('EACCES'));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await tho823Move({ concert_id: 600 });
+
+    expect(res.status).toBe(500);
+    expect(prisma.concertAttendance.update.mock.calls.map((c) => c[0].data)).toEqual([
+      { concert_id: 600 }, { concert_id: 99 },
+    ]);
+  });
+
+  it('answers 200 and writes nothing when the target is the show it already is', async () => {
+    prisma.concert.findUnique.mockResolvedValue({ ...TARGET, id: 99 });
+
+    const res = await tho823Move({ concert_id: 99 });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ attendance_id: 42, concert_id: 99 });
+    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+  });
+
+  it('answers 404 for a concert that does not exist and moves nothing', async () => {
+    prisma.concert.findUnique.mockResolvedValue(null);
+
+    const res = await tho823Move({ concert_id: 600 });
+
+    expect(res.status).toBe(404);
+    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+  });
+
+  it('answers 404 for a show not in this list', async () => {
+    prisma.concertAttendance.findUnique.mockResolvedValue(null);
+
+    const res = await tho823Move({ concert_id: 600 });
+
+    expect(res.status).toBe(404);
+    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{}],
+    [{ concert_id: 600, setlistfm_id: '63de4613', band_id: 3 }],
+    [{ setlistfm_id: '63de4613' }],
+  ])('needs exactly one target, and a band with a setlist: %j', async (body) => {
+    const res = await tho823Move(body);
+
+    expect(res.status).toBe(400);
+    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
   });
 });
 

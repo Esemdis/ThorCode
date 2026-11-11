@@ -299,6 +299,11 @@ model ConcertAttendance {
   wishlist_id  Int
   concert_id   Int
   created_at   DateTime               @default(now())
+  /// The owner's diary of the night (THO-823): their notes and a 1 to 5
+  /// rating, checked in the route rather than by a CHECK, like a venue
+  /// review's. Both are the owner's own and never shown to anyone else.
+  notes        String?                @db.Text
+  rating       Int?
   wishlist_rel Wishlist               @relation("WishlistAttendance", fields: [wishlist_id], references: [id])
   concert_rel  Concert                @relation("ConcertAttendances", fields: [concert_id], references: [id])
   media        ConcertMedia[]         @relation("AttendanceMedia")
