@@ -17,7 +17,6 @@ const {
 } = require('../../../utils/apiResponse');
 const { removeMediaFiles } = require('../../../utils/mediaRemove');
 const { isClip, removeClip } = require('../../../utils/mediaClips');
-const { removePublicCopies } = require('../../../utils/mediaPublicCopy');
 const { refuseRows, lockShows, withOwner } = require('./shared');
 
 const router = express.Router();
@@ -64,9 +63,6 @@ router.delete(
 
       await prisma.concertMedia.delete({ where: { id } });
       for (const link of clipLinks) await removeClip(link.id);
-      // The scrubbed copies share links were served (THO-894): as big as the
-      // file, and unreachable now that its row is gone.
-      for (const row of locked.rows) await removePublicCopies(row);
       return success(res, 200, { deleted: true });
     } catch (err) {
       return fail(res, err, { context: 'DELETE /media/:id' });
@@ -128,7 +124,6 @@ router.delete(
       for (const link of clipLinks.filter((l) => removedSet.has(l.media_id) && isClip(l))) {
         await removeClip(link.id);
       }
-      for (const row of locked.rows.filter((r) => removedSet.has(r.id))) await removePublicCopies(row);
       return success(res, 200, { deleted: removed, failed });
     } catch (err) {
       return fail(res, err, { context: 'DELETE /media' });

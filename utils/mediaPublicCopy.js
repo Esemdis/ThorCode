@@ -49,6 +49,30 @@ const inFlight = new Map();
 
 const exists = (p) => fs.stat(p).then(() => true, () => false);
 
+// How many scrubs may run at once. Each reads and plans its file whole, up to
+// 256 MB, three times over (the source, the copy, the patched copy), and the
+// callers are strangers holding a share link: the album limiter's 5000 an hour
+// bounds the rate, not the concurrency, and four large files at once measured
+// +0.7 to 1 GB RSS. Only real scrubs take a slot. A request answered from a
+// stamp or a marker, or one that joins a flight, never waits for one.
+const MAX_CONCURRENT_SCRUBS = 2;
+let scrubsRunning = 0;
+const scrubQueue = [];
+
+async function withScrubSlot(work) {
+  if (scrubsRunning < MAX_CONCURRENT_SCRUBS) scrubsRunning += 1;
+  else await new Promise((resolve) => { scrubQueue.push(resolve); });
+  try {
+    return await work();
+  } finally {
+    // Handed straight to the next in line, so the count never dips and lets a
+    // newcomer in ahead of it.
+    const next = scrubQueue.shift();
+    if (next) next();
+    else scrubsRunning -= 1;
+  }
+}
+
 function tagged(code, message) {
   const err = new Error(message);
   err.code = code;
@@ -92,9 +116,9 @@ async function makeCopy(absPath, key, keyedByContent) {
 
   await fs.mkdir(path.dirname(target), { recursive: true });
   try {
-    return await scrubInto({
+    return await withScrubSlot(() => scrubInto({
       absPath, target, stampFile, marker, refusedFile, stamp, keyedByContent,
-    });
+    }));
   } catch (err) {
     // Remembered, with the same stamp, so the next request is a cheap 404.
     // Not a source that changed under the read: that one may well work next.
@@ -225,5 +249,5 @@ async function removePublicCopies(row) {
 }
 
 module.exports = {
-  ensurePublicCopy, removePublicCopies, masterCopyKey, renditionCopyKey,
+  ensurePublicCopy, removePublicCopies, masterCopyKey, renditionCopyKey, MAX_CONCURRENT_SCRUBS,
 };
