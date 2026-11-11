@@ -111,7 +111,7 @@ describe('PATCH /users/me/password (THO-810)', () => {
       sessionEndChangedAt = data.password_changed_at;
       return 'user.update';
     });
-    const sessionEndOldLogin = authHeader({ id, kind: 'login', iat: Math.floor(Date.now() / 1000) - 60 });
+    const sessionEndOldLogin = authHeader({ id, kind: 'login', pwc: 0 });
 
     const res = await request(app).patch('/users/me/password').set(...sessionEndOldLogin)
       .send({ currentPassword: CURRENT, newPassword: 'NewPass123' });
@@ -119,7 +119,9 @@ describe('PATCH /users/me/password (THO-810)', () => {
     expect(res.status).toBe(200);
     expect(sessionEndChangedAt).toBeInstanceOf(Date);
     const fresh = jwt.verify(res.body.data.token, process.env.JWT_SECRET);
-    expect(fresh).toMatchObject({ id, email: `${id}@example.test`, role: 'USER', kind: 'login' });
+    expect(fresh).toMatchObject({
+      id, email: `${id}@example.test`, role: 'USER', kind: 'login', pwc: sessionEndChangedAt.getTime(),
+    });
 
     // Any signed-in route will do: an empty body gets past auth to a 400.
     const withOld = await request(app).patch('/users/me/password').set(...sessionEndOldLogin).send({});
@@ -127,6 +129,24 @@ describe('PATCH /users/me/password (THO-810)', () => {
     const withFresh = await request(app).patch('/users/me/password')
       .set('Authorization', `Bearer ${res.body.data.token}`).send({});
     expect(withFresh.status).toBe(400);
+  });
+
+  // The review's reproduction: a login that read the row, and checked the old
+  // hash, before a change committed, signing its token after it. A scripted
+  // login every half second always has one in the change's own second. By
+  // iat it is newer than the change; it still carries the old password.
+  it('ends a login that checked the old password and signed after the change', async () => {
+    const id = accountSettingsUserId();
+    const raceChangedAt = new Date();
+    prisma.user.findMany.mockResolvedValue([accountSettingsUser(id, { password_changed_at: null })]);
+    prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id, { password_changed_at: raceChangedAt }));
+
+    const login = await request(app).post('/users/login').send({ email: `${id}@example.test`, password: CURRENT });
+    expect(login.status).toBe(200);
+
+    const used = await request(app).patch('/users/me/password')
+      .set('Authorization', `Bearer ${login.body.token}`).send({});
+    expect(used.status).toBe(401);
   });
 
   // A link mailed before the change would put the old state back if used.
@@ -235,6 +255,23 @@ describe('DELETE /users/me (THO-810)', () => {
       'itemReview.deleteMany', 'tripReview.deleteMany', 'travelWishlistItem.deleteMany',
     ]));
     expect(prisma.user.delete).toHaveBeenCalledWith({ where: { id } });
+  });
+
+  // THO-898, owner decision: a deleted account's sessions end with it. The
+  // deleting request read the row into the per-user cache, so the delete
+  // must clear it or the token would still work for a minute.
+  it('ends the account\'s login sessions, the one it was deleted from included', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id, { password_changed_at: null }));
+    const deletedLogin = authHeader({ id, kind: 'login', pwc: 0 });
+
+    const res = await request(app).delete('/users/me').set(...deletedLogin).send({ currentPassword: CURRENT });
+    expect(res.status).toBe(200);
+
+    prisma.user.findUnique.mockResolvedValue(null);
+    const after = await request(app).patch('/users/me/password').set(...deletedLogin).send({});
+    expect(after.status).toBe(401);
+    expect(after.body).toEqual({ error: 'This account no longer exists.' });
   });
 
   // No archive here (MEDIA_ROOT unset), so every file fails to go: the

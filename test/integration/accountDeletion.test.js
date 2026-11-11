@@ -192,8 +192,12 @@ describe.skipIf(!url)('deleting an account', () => {
     expect(Object.values(kept).every((n) => n >= 1)).toBe(true);
     expect(await readFile(join(root, 'archive', staying.user.id, 'night', 'IMG_1.jpg'), 'utf8')).toBe('photo bytes');
 
-    const again = await request(app).post('/users/register').send({ email: gone.user.email, password: PASSWORD });
-    expect(again.status).toBe(201);
+    // Sign-up is closed (#53), so "frees the address" is read off the table.
+    expect(await prisma.user.count({ where: { email: gone.user.email } })).toBe(0);
+
+    // THO-898: its login tokens end with it, the one it was deleted from too.
+    const afterwards = await request(app).get('/users/me').set('Authorization', bearer(goneUser));
+    expect(afterwards.status).toBe(401);
   });
 
   it('deletes nothing on a wrong password', async () => {
@@ -221,6 +225,11 @@ describe.skipIf(!url)('deleting an account', () => {
     const changed = await request(app).patch('/users/me/password').set('Authorization', auth)
       .send({ currentPassword: PASSWORD, newPassword: 'BrandNew123' });
     expect(changed.status).toBe(200);
+
+    // THO-898, through the real column: the session the change was made from
+    // is ended, and the token it handed back carries on.
+    expect((await request(app).get('/users/me').set('Authorization', auth)).status).toBe(401);
+    expect((await request(app).get('/users/me').set('Authorization', `Bearer ${changed.body.data.token}`)).status).toBe(200);
 
     expect((await request(app).post('/users/login').send({ email, password: 'BrandNew123' })).status).toBe(200);
     expect((await request(app).post('/users/login').send({ email, password: PASSWORD })).status).toBe(401);

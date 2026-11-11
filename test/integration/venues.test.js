@@ -45,7 +45,7 @@ describe.skipIf(!url)('one building, one Venue', () => {
   });
 
   it('links each new show to the Venue its spelling folds to, one per city', async () => {
-    const signJWT = require('../../auth/signJWT.js');
+    const jwt = require('jsonwebtoken');
     const band = await prisma.band.create({ data: { name: `${RUN} band` } });
     const app = express().use(express.json()).use('/data/concerts', require('../../routes/data/bands.js'));
     const show = (city, venue, day, latitude, longitude) => ({
@@ -55,7 +55,9 @@ describe.skipIf(!url)('one building, one Venue', () => {
 
     const res = await request(app)
       .post('/data/concerts/bulk')
-      .set('Authorization', `Bearer ${signJWT({ user: { id: `${RUN}-scraper`, role: 'SYSTEM' } })}`)
+      // A service token, as scripts/generate-service-token.js mints it: no
+      // `kind`, so it needs no account row (THO-898).
+      .set('Authorization', `Bearer ${jwt.sign({ id: `${RUN}-scraper`, role: 'SYSTEM', service: 'integration' }, process.env.JWT_SECRET)}`)
       .send({
         concerts: [
           show('Helsinki', 'Tavastia', '01', '60.1693', '24.9312'),

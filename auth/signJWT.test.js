@@ -24,6 +24,16 @@ describe('signJWT', () => {
     expect(jwt.verify(token, 'test-secret').kind).toBe('login');
   });
 
+  // What a session is checked against later (THO-898): the password state of
+  // the row the login's hash came from, in milliseconds, 0 for never changed.
+  it('carries the password state it was signed against', () => {
+    const changed = new Date('2026-11-11T12:00:10.700Z');
+    const user = { id: 'u1', email: 'a@b.com', role: 'USER' };
+    expect(jwt.verify(signJWT({ user, passwordChangedAt: changed }), 'test-secret').pwc).toBe(changed.getTime());
+    expect(jwt.verify(signJWT({ user, passwordChangedAt: null }), 'test-secret').pwc).toBe(0);
+    expect(jwt.verify(signJWT({ user }), 'test-secret').pwc).toBe(0);
+  });
+
   it('cannot be verified against the wrong secret', () => {
     const token = signJWT({ user: { id: 1, email: 'a@b.com', role: 'USER' } });
     expect(() => jwt.verify(token, 'wrong-secret')).toThrow();

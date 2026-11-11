@@ -1,8 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   isLoginToken,
-  issuedBeforePasswordChange,
+  passwordChangeStamp,
+  loginStateRefusal,
   createPasswordChangeCache,
+  ACCOUNT_GONE,
 } from './loginRevocation.js';
 
 describe('isLoginToken (THO-898)', () => {
@@ -20,31 +22,39 @@ describe('isLoginToken (THO-898)', () => {
   });
 });
 
-describe('issuedBeforePasswordChange (THO-898)', () => {
-  const changedAt = new Date('2026-11-11T12:00:10.700Z');
-  const changedSecond = Math.floor(changedAt.getTime() / 1000);
-
-  it('ends nothing for an account whose password never changed', () => {
-    expect(issuedBeforePasswordChange(0, null)).toBe(false);
+describe('passwordChangeStamp (THO-898)', () => {
+  it('is the change time in milliseconds', () => {
+    expect(passwordChangeStamp(new Date('2026-11-11T12:00:10.700Z'))).toBe(Date.parse('2026-11-11T12:00:10.700Z'));
   });
 
-  it('refuses a token issued in an earlier second', () => {
-    expect(issuedBeforePasswordChange(changedSecond - 1, changedAt)).toBe(true);
+  it('is 0 for an account whose password never changed', () => {
+    expect(passwordChangeStamp(null)).toBe(0);
+    expect(passwordChangeStamp(undefined)).toBe(0);
+  });
+});
+
+describe('loginStateRefusal (THO-898)', () => {
+  const loginStateChangedAt = new Date('2026-11-11T12:00:10.700Z');
+
+  it('lets through a token signed against the current password', () => {
+    expect(loginStateRefusal({ pwc: loginStateChangedAt.getTime() }, loginStateChangedAt)).toBeNull();
+    expect(loginStateRefusal({ pwc: 0 }, null)).toBeNull();
   });
 
-  it('accepts a token issued later', () => {
-    expect(issuedBeforePasswordChange(changedSecond + 1, changedAt)).toBe(false);
+  // Not compared by the clock. A login that read the row before a reset and
+  // signed after it, or one an attacker timed into the reset's own second,
+  // was issued "after" the change by iat and still carried the old password.
+  it('refuses a token signed against an earlier password, whenever it was issued', () => {
+    expect(loginStateRefusal({ pwc: 0, iat: 9_999_999_999 }, loginStateChangedAt)).toMatch(/password was changed/);
+    expect(loginStateRefusal({ pwc: loginStateChangedAt.getTime() - 1 }, loginStateChangedAt)).toMatch(/password was changed/);
   });
 
-  // The token the change hands back is signed a moment after it, in the same
-  // second, and iat holds whole seconds. Compared in milliseconds it read as
-  // issued 700 ms before the change and was refused on its first use.
-  it('accepts a token issued in the same second as the change', () => {
-    expect(issuedBeforePasswordChange(changedSecond, changedAt)).toBe(false);
+  it('refuses a login token that carries no password state', () => {
+    expect(loginStateRefusal({}, null)).toMatch(/password was changed/);
   });
 
-  it('refuses a login token with no iat once the password has changed', () => {
-    expect(issuedBeforePasswordChange(undefined, changedAt)).toBe(true);
+  it('refuses a token for an account that no longer exists', () => {
+    expect(loginStateRefusal({ pwc: 0 }, ACCOUNT_GONE)).toMatch(/no longer exists/);
   });
 });
 
@@ -66,12 +76,11 @@ describe('createPasswordChangeCache (THO-898)', () => {
     expect(read).toHaveBeenCalledTimes(2);
   });
 
-  // A deleted account's sessions are left to expire (owner decision on
-  // THO-810), and the integration tests sign login tokens for ids they never
-  // create, so a missing row must read as "never changed", not as a refusal.
-  it('reads a missing account as one whose password never changed', async () => {
+  // A deleted account's login tokens are refused (owner decision on THO-898),
+  // so a missing row is remembered as gone, not as "never changed".
+  it('reads a missing account as gone', async () => {
     const cache = createPasswordChangeCache({ read: vi.fn(async () => null) });
-    expect(await cache.get('gone')).toBeNull();
+    expect(await cache.get('gone')).toBe(ACCOUNT_GONE);
   });
 
   it('reads again straight after forget', async () => {

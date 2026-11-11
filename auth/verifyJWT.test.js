@@ -95,6 +95,7 @@ describe('verifyJWT middleware', () => {
 describe('verifyJWT after a password change (THO-898)', () => {
   const loginRevocationChangedAt = new Date('2026-11-11T12:00:00.500Z');
   const loginRevocationChangedSecond = Math.floor(loginRevocationChangedAt.getTime() / 1000);
+  const loginRevocationStamp = loginRevocationChangedAt.getTime();
   const loginRevocationRows = new Map();
   let loginRevocationIdCounter = 0;
   // Each test gets its own user, because the per-user cache is module-level.
@@ -129,12 +130,12 @@ describe('verifyJWT after a password change (THO-898)', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
   });
 
-  it('refuses a login token issued before the password changed', async () => {
+  it('refuses a login token signed against the password before the change', async () => {
     const id = loginRevocationUserId();
     loginRevocationRows.set(id, { password_changed_at: loginRevocationChangedAt });
 
     const { res, nextCalled } = await runLoginRevocation(loginRevocationToken({
-      id, role: 'USER', kind: 'login', iat: loginRevocationChangedSecond - 60,
+      id, role: 'USER', kind: 'login', pwc: 0, iat: loginRevocationChangedSecond - 60,
     }));
 
     expect(nextCalled).toBe(false);
@@ -142,12 +143,27 @@ describe('verifyJWT after a password change (THO-898)', () => {
     expect(res.body).toEqual({ error: 'Your password was changed. Sign in again.' });
   });
 
-  it('accepts a login token issued after it', async () => {
+  // The login read the row (and checked the old hash) before the reset
+  // committed, and signed after it, in the same second or later. By iat it
+  // is newer than the change; by the password it carries, it is not.
+  it('refuses a login token issued after the change from a login that read the old password', async () => {
+    const id = loginRevocationUserId();
+    loginRevocationRows.set(id, { password_changed_at: loginRevocationChangedAt });
+
+    const { res, nextCalled } = await runLoginRevocation(loginRevocationToken({
+      id, role: 'USER', kind: 'login', pwc: 0, iat: loginRevocationChangedSecond + 1,
+    }));
+
+    expect(nextCalled).toBe(false);
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('accepts a login token signed against the current password', async () => {
     const id = loginRevocationUserId();
     loginRevocationRows.set(id, { password_changed_at: loginRevocationChangedAt });
 
     const { req, nextCalled } = await runLoginRevocation(loginRevocationToken({
-      id, role: 'USER', kind: 'login', iat: loginRevocationChangedSecond + 60,
+      id, role: 'USER', kind: 'login', pwc: loginRevocationStamp,
     }));
 
     expect(nextCalled).toBe(true);
@@ -158,7 +174,7 @@ describe('verifyJWT after a password change (THO-898)', () => {
     const id = loginRevocationUserId();
     loginRevocationRows.set(id, { password_changed_at: null });
 
-    const { nextCalled } = await runLoginRevocation(loginRevocationToken({ id, role: 'ADMIN', kind: 'login' }));
+    const { nextCalled } = await runLoginRevocation(loginRevocationToken({ id, role: 'ADMIN', kind: 'login', pwc: 0 }));
 
     expect(nextCalled).toBe(true);
   });
@@ -190,15 +206,15 @@ describe('verifyJWT after a password change (THO-898)', () => {
     expect(globalThis.prisma.user.findUnique).not.toHaveBeenCalled();
   });
 
-  // Not this ticket's to end: a deleted account's sessions run out on their
-  // own (owner decision on THO-810), and test/integration signs login tokens
-  // for a scraper and an admin it never creates.
-  it('leaves a login token alone when no account row is found', async () => {
-    const { nextCalled } = await runLoginRevocation(loginRevocationToken({
-      id: loginRevocationUserId(), role: 'SYSTEM', kind: 'login',
+  // Owner decision on THO-898: a deleted account's sessions end with it.
+  it('refuses a login token when no account row is found', async () => {
+    const { res, nextCalled } = await runLoginRevocation(loginRevocationToken({
+      id: loginRevocationUserId(), role: 'USER', kind: 'login', pwc: 0,
     }));
 
-    expect(nextCalled).toBe(true);
+    expect(nextCalled).toBe(false);
+    expect(res.statusCode).toBe(401);
+    expect(res.body).toEqual({ error: 'This account no longer exists.' });
   });
 
   // concert-map signs the user out on any 401; a database blip must not.

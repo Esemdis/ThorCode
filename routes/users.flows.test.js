@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import request from 'supertest';
 import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
 import { buildApp, authHeader, installFakePrisma } from '../test/routeApp.js';
 import { REGISTRATION_CLOSED_MESSAGE } from '../utils/accounts.js';
 
@@ -142,8 +143,17 @@ describe('POST /users/register, now that sign-up is closed', () => {
   });
 });
 
+// THO-898: an email change asks for the current password. Hashed once at a
+// low cost; bcrypt is most of a test's time.
+const EMAIL_CHANGE_PASSWORD = 'EmailChange1';
+const EMAIL_CHANGE_HASH = bcrypt.hashSync(EMAIL_CHANGE_PASSWORD, 4);
+const emailChangeAccount = (id, over = {}) => ({
+  id, email: `${id}@example.test`, role: 'USER', password_hash: EMAIL_CHANGE_HASH, password_changed_at: null, ...over,
+});
+
 describe('the email change codes', () => {
   it('draws again when six digits collide with another account\'s pending code', async () => {
+    prisma.user.findUnique.mockResolvedValue(emailChangeAccount('user-1'));
     prisma.user.findFirst.mockResolvedValue(null);
     prisma.emailVerification.findFirst.mockResolvedValue(null);
     prisma.emailVerification.create
@@ -154,7 +164,7 @@ describe('the email change codes', () => {
     await request(app)
       .post('/users/email/request-change')
       .set(...authHeader({ id: 'user-1' }))
-      .send({ newEmail: 'new@example.test' });
+      .send({ newEmail: 'new@example.test', currentPassword: EMAIL_CHANGE_PASSWORD });
 
     expect(prisma.emailVerification.create).toHaveBeenCalledTimes(2);
     const codes = prisma.emailVerification.create.mock.calls.map(([{ data }]) => data.code);
@@ -165,6 +175,7 @@ describe('the email change codes', () => {
     // The pending check found the caller's own request and refused it, so
     // "Back" and asking again for the same address was a 409 — and so was
     // every address anyone had asked for and abandoned, until the hourly sweep.
+    prisma.user.findUnique.mockResolvedValue(emailChangeAccount('user-1'));
     prisma.user.findFirst.mockResolvedValue(null);
     prisma.emailVerification.findFirst.mockResolvedValue(null);
     prisma.emailVerification.create.mockImplementation(async ({ data }) => ({ id: 1, ...data }));
@@ -172,7 +183,7 @@ describe('the email change codes', () => {
     await request(app)
       .post('/users/email/request-change')
       .set(...authHeader({ id: 'user-1' }))
-      .send({ newEmail: ' New@Example.test' });
+      .send({ newEmail: ' New@Example.test', currentPassword: EMAIL_CHANGE_PASSWORD });
 
     // Stored as it will be compared: lowercased.
     expect(prisma.emailVerification.create.mock.calls[0][0].data.new_email).toBe('new@example.test');
@@ -208,5 +219,92 @@ describe('the email change codes', () => {
       .send({ code: '123456' });
 
     expect(res.status).toBe(409);
+  });
+});
+
+// THO-898. A stolen login token could move the account to the thief's
+// address with no password, and then the reset mail went to the thief, so the
+// reset that should end their session never happened.
+describe('an email change proves the password and ends other sessions (THO-898)', () => {
+  // Each test its own account: both limiters on these routes are per account.
+  let emailChangeSessionCounter = 0;
+  const emailChangeSessionUser = () => `email-session-${++emailChangeSessionCounter}`;
+
+  const askForCode = (id, body) => request(app)
+    .post('/users/email/request-change').set(...authHeader({ id })).send({ newEmail: 'moved@example.test', ...body });
+
+  // A free address and a working code store, so a route that skipped the
+  // password check would send the code (and fail the test) rather than spin
+  // on a create that returns nothing.
+  beforeEach(() => {
+    prisma.user.findFirst.mockResolvedValue(null);
+    prisma.emailVerification.findFirst.mockResolvedValue(null);
+    prisma.emailVerification.create.mockImplementation(async ({ data }) => ({ id: 1, ...data }));
+    process.env.RESEND_API_KEY = '';
+  });
+
+  it('asks for the current password before sending a code', async () => {
+    const res = await askForCode(emailChangeSessionUser(), {});
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('Current password is required');
+    expect(prisma.emailVerification.create).not.toHaveBeenCalled();
+  });
+
+  // 403, not 401: concert-map signs out on any 401. And before the address is
+  // looked up, so a stolen session cannot ask which addresses have accounts.
+  it('refuses a wrong current password with 403, before looking at the address', async () => {
+    const id = emailChangeSessionUser();
+    prisma.user.findUnique.mockResolvedValue(emailChangeAccount(id));
+
+    const res = await askForCode(id, { currentPassword: 'WrongPass1' });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('Your current password is not right');
+    expect(prisma.user.findFirst).not.toHaveBeenCalled();
+    expect(prisma.emailVerification.create).not.toHaveBeenCalled();
+  });
+
+  it('sends the code for the right password', async () => {
+    const id = emailChangeSessionUser();
+    prisma.user.findUnique.mockResolvedValue(emailChangeAccount(id));
+
+    await askForCode(id, { currentPassword: EMAIL_CHANGE_PASSWORD });
+
+    // There is no Resend key here, so the send itself fails afterwards; that
+    // the code was drawn is what says the password let it through.
+    expect(prisma.emailVerification.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('ends the login sessions issued before the change and hands back one that outlives it', async () => {
+    const id = emailChangeSessionUser();
+    let emailChangeChangedAt = null;
+    prisma.user.findUnique.mockImplementation(async () =>
+      emailChangeAccount(id, { password_changed_at: emailChangeChangedAt }));
+    prisma.emailVerification.findFirst.mockResolvedValue({
+      id: 9, user_id: id, new_email: 'moved@example.test', code: '654321', expires_at: new Date(Date.now() + 60_000),
+    });
+    prisma.emailVerification.delete.mockResolvedValue({});
+    prisma.user.update.mockImplementation(async ({ data }) => {
+      emailChangeChangedAt = data.password_changed_at;
+      return { id, email: data.email, role: 'USER' };
+    });
+    const emailChangeOldLogin = authHeader({ id, kind: 'login', pwc: 0 });
+
+    const res = await request(app).post('/users/email/verify-code').set(...emailChangeOldLogin).send({ code: '654321' });
+
+    expect(res.status).toBe(200);
+    expect(emailChangeChangedAt).toBeInstanceOf(Date);
+    expect(res.body.data.user).toEqual({ id, email: 'moved@example.test' });
+    expect(jwt.verify(res.body.data.token, process.env.JWT_SECRET)).toMatchObject({
+      id, email: 'moved@example.test', role: 'USER', kind: 'login', pwc: emailChangeChangedAt.getTime(),
+    });
+
+    // Any signed-in route will do: an empty body gets past auth to a 400.
+    const withOld = await request(app).post('/users/email/verify-code').set(...emailChangeOldLogin).send({});
+    expect(withOld.status).toBe(401);
+    const withFresh = await request(app).post('/users/email/verify-code')
+      .set('Authorization', `Bearer ${res.body.data.token}`).send({});
+    expect(withFresh.status).toBe(400);
   });
 });

@@ -30,6 +30,12 @@ describe.skipIf(!url)('against Postgres', () => {
   const RUN = `it${Date.now()}`;
 
   const token = (id, role = 'USER') => `Bearer ${signJWT({ user: { id, email: `${id}@example.test`, role } })}`;
+  // For a caller with no account row (the scraper, an admin the test never
+  // makes): a login token for a missing account is refused (THO-898), and a
+  // token minted outside the login route, as the service token is, is not.
+  const tokenWithoutAccount = (id, role) => `Bearer ${require('jsonwebtoken').sign(
+    { id, email: `${id}@example.test`, role }, process.env.JWT_SECRET,
+  )}`;
   const appWith = (mounts) => {
     const app = express();
     app.use(express.json());
@@ -97,7 +103,7 @@ describe.skipIf(!url)('against Postgres', () => {
       const app = appWith([['/data/concerts', require('../../routes/data/bands.js')]]);
       const res = await request(app)
         .post('/data/concerts/bulk')
-        .set('Authorization', token(`${RUN}-scraper`, 'SYSTEM'))
+        .set('Authorization', tokenWithoutAccount(`${RUN}-scraper`, 'SYSTEM'))
         .send({ concerts: [concert(`${RUN}-a`, '01'), concert(venue, '04'), concert(`${RUN}-b`, '08')] });
 
       const stored = await prisma.concert.findMany({ where: { city: `${RUN} city` }, select: { venue: true } });
@@ -123,7 +129,7 @@ describe.skipIf(!url)('against Postgres', () => {
     await prisma.user.create({ data: { id, email: `${RUN}-lookup@example.test` } });
 
     const app = appWith([['/users', require('../../routes/users.js')]]);
-    const res = await request(app).get(`/users/${id}`).set('Authorization', token(`${RUN}-admin`, 'ADMIN'));
+    const res = await request(app).get(`/users/${id}`).set('Authorization', tokenWithoutAccount(`${RUN}-admin`, 'ADMIN'));
 
     expect(res.status).toBe(200);
     expect(res.body.user.id).toBe(id);
