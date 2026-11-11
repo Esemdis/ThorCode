@@ -223,6 +223,132 @@ describe('ensurePublicCopy', () => {
     expect(await readdir(publicDirTho894())).toEqual([]);
     spy.mockRestore();
   });
+
+  it('never serves a file nobody planned to a request that joins another for a different source', async () => {
+    // A rendition key is not a checksum: two rows with one sha256 share
+    // web-<sha>.mp4 but each has its own rendition. A request joining one in
+    // flight for the other row's clean file was handed its own source,
+    // unplanned, GPS and all (round-2 review).
+    const a = await sourceTho894('RA.jpg', minimalJpegTho894);
+    const b = await sourceTho894('RB.jpg', jpegWithGpsTho894().jpeg);
+    const [, fromB] = await Promise.all([
+      ensurePublicCopy({ absPath: a, key: 'web-join.jpg' }),
+      ensurePublicCopy({ absPath: b, key: 'web-join.jpg' }),
+    ]);
+    expect((await readFile(fromB)).includes(Buffer.from('SN-1234567890'))).toBe(false);
+  });
+
+  it('does not share a clean verdict between two renditions of one size written in the same millisecond', async () => {
+    // A rendition key's stamp was size and mtime only, so the second file,
+    // GPS and all, was served on the first one's `.clean` marker.
+    const { jpeg } = jpegWithGpsTho894();
+    const cleanBytes = applyPatches(jpeg, await planScrub(jpeg));
+    const same = new Date('2026-06-12T20:00:00.000Z');
+    const a = await sourceTho894('RENDITION_A.jpg', cleanBytes);
+    const b = await sourceTho894('RENDITION_B.jpg', jpeg);
+    await utimes(a, same, same);
+    await utimes(b, same, same);
+
+    expect(await ensurePublicCopy({ absPath: a, key: 'web-shared-ms.mp4' })).toBe(a);
+    const served = await ensurePublicCopy({ absPath: b, key: 'web-shared-ms.mp4' });
+    expect(served).not.toBe(b);
+    expect((await readFile(served)).includes(Buffer.from('SN-1234567890'))).toBe(false);
+  });
+
+  it('plans a joining request\'s own file under a checksum key, rather than trusting the checksum', async () => {
+    // A request that joined another in flight got its own path back on
+    // "clean" without that file being looked at, not even its size; a file
+    // that no longer matched its checksum went out raw.
+    const { jpeg } = jpegWithGpsTho894();
+    const cleanBytes = applyPatches(jpeg, await planScrub(jpeg));
+    const a = await sourceTho894('MASTER_A.jpg', cleanBytes);
+    const b = await sourceTho894('MASTER_B.jpg', jpeg);
+
+    const [, served] = await Promise.all([
+      ensurePublicCopy({ absPath: a, key: 'cafe-join.jpg', keyedByContent: true }),
+      ensurePublicCopy({ absPath: b, key: 'cafe-join.jpg', keyedByContent: true }),
+    ]);
+    expect((await readFile(served)).includes(Buffer.from('SN-1234567890'))).toBe(false);
+  });
+
+  it('takes the copy back out when its file is deleted just as the copy lands', async () => {
+    // The delete unlinks the source before it removes the copies, so a check
+    // after the rename either sees the source gone or ran before the delete's
+    // own removal, which then finds the copy.
+    const { jpeg } = jpegWithGpsTho894();
+    const absPath = await sourceTho894('IMG_R.jpg', jpeg);
+    const realRename = fsPromises.rename;
+    vi.spyOn(fsPromises, 'rename').mockImplementation(async (from, to) => {
+      await realRename(from, to);
+      await fsPromises.unlink(absPath);
+    });
+    await expect(ensurePublicCopy({ absPath, key: 'del.jpg' })).rejects.toMatchObject({ code: 'NO_SOURCE' });
+    expect(await readdir(publicDirTho894())).toEqual([]);
+  });
+});
+
+describe('the cap on scrubs at once (THO-894)', () => {
+  // Share links are unauthenticated, and each first request for a different
+  // file reads and plans it whole, up to 256 MB, three times over. The album
+  // limiter bounds the rate, not how many run at once. Blocked at the copy,
+  // which only a real scrub reaches.
+  async function blockedCopiesScrubCapTho894() {
+    const realCopy = fsPromises.copyFile;
+    const gate = {};
+    gate.open = new Promise((resolve) => { gate.release = resolve; });
+    let running = 0;
+    const state = { started: 0, most: 0 };
+    vi.spyOn(fsPromises, 'copyFile').mockImplementation(async (from, to) => {
+      state.started += 1;
+      running += 1;
+      state.most = Math.max(state.most, running);
+      await gate.open;
+      running -= 1;
+      return realCopy(from, to);
+    });
+    return { gate, state };
+  }
+
+  const settleScrubCapTho894 = () => new Promise((resolve) => { setTimeout(resolve, 50); });
+
+  it('runs at most MAX_CONCURRENT_SCRUBS at once, and the rest in turn', async () => {
+    const { MAX_CONCURRENT_SCRUBS } = require('./mediaPublicCopy.js');
+    const { gate, state } = await blockedCopiesScrubCapTho894();
+    const files = [];
+    for (let i = 0; i < MAX_CONCURRENT_SCRUBS + 3; i++) {
+      files.push(await sourceTho894(`CAP_${i}.jpg`, jpegWithGpsTho894().jpeg));
+    }
+
+    const all = Promise.all(files.map((absPath, i) => ensurePublicCopy({ absPath, key: `cap${i}.jpg` })));
+    await settleScrubCapTho894();
+    expect(state.started).toBe(MAX_CONCURRENT_SCRUBS);
+
+    gate.release();
+    const served = await all;
+    expect(state.started).toBe(files.length);
+    expect(state.most).toBe(MAX_CONCURRENT_SCRUBS);
+    for (const p of served) expect((await readFile(p)).includes(Buffer.from('SN-1234567890'))).toBe(false);
+  });
+
+  // A copy already made is a stamp read and a stat; it must not queue behind
+  // a stranger's cold scrubs.
+  it('does not make a cached copy wait for a slot', async () => {
+    const { MAX_CONCURRENT_SCRUBS } = require('./mediaPublicCopy.js');
+    const warm = await sourceTho894('CAP_WARM.jpg', jpegWithGpsTho894().jpeg);
+    const warmCopy = await ensurePublicCopy({ absPath: warm, key: 'capwarm.jpg' });
+
+    const { gate } = await blockedCopiesScrubCapTho894();
+    const cold = [];
+    for (let i = 0; i < MAX_CONCURRENT_SCRUBS + 1; i++) {
+      const absPath = await sourceTho894(`CAP_COLD_${i}.jpg`, jpegWithGpsTho894().jpeg);
+      cold.push(ensurePublicCopy({ absPath, key: `capcold${i}.jpg` }));
+    }
+    await settleScrubCapTho894();
+
+    expect(await ensurePublicCopy({ absPath: warm, key: 'capwarm.jpg' })).toBe(warmCopy);
+    gate.release();
+    await Promise.all(cold);
+  });
 });
 
 describe('stalePublicTemps', () => {

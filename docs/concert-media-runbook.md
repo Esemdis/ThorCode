@@ -45,17 +45,25 @@ answers 404 at once instead of reading it again. Any of them is ignored, and
 the file looked at again, once the source or the scrubber has changed. A
 master's are stamped with the version and size only: its name is its checksum,
 and two rows with the same bytes would otherwise keep re-making each other's
-copy. It is keyed by checksum and safe to delete at any time;
+copy. That trusts the archive file to still hold the bytes it was uploaded
+with, which every app path keeps true. **Don't edit archive files in place;**
+if you ever must, empty `cache/public/` afterwards, or an edit that keeps the
+size keeps the old verdict. Renditions and moments keep the mtime in their
+stamp because they are made again under the same name, so two rows with the
+same bytes do re-copy each other's rendition when both are opened in turn
+(disk and time, nothing served unchecked). It is keyed by checksum and safe to delete at any time;
 the next request makes the copy again. A file that cannot be read well enough
 to strip (a format it does not know, a damaged header, anything far outside
 what a camera writes) is answered 404 on the share link, with
 `[media] not serving media <id> publicly` in the log — never sent as it is.
 The owner's own downloads are untouched.
 
-When `utils/mediaScrub.js` learns to strip something it used to leave, bump
-`SCRUB_VERSION` at its top. That is what makes every copy and `.clean` verdict
-already in `cache/public/` be made again; without it they keep the old
-verdict until someone empties the directory.
+When `utils/mediaScrub.js` learns to strip something it used to leave, or
+starts refusing more or fewer files than it did (a limit raised or lowered, a
+parse bug fixed, a box it used to refuse now read), bump `SCRUB_VERSION` at
+its top. That is what makes every copy, `.clean` and `.refused` verdict already
+in `cache/public/` be looked at again; without it they keep the old verdict,
+and a refused file its 404, until someone empties the directory.
 
 Copies go when nothing can reach them: deleting a file removes its copies,
 stopping a moment's link removes the moment's, and the rendition service sweeps
@@ -97,11 +105,14 @@ a reader of Samsung's trailer, such as exiftool, still finds it. A JPEG's APP13
 (Photoshop's IPTC: city, sub-location, country, by-line) is filled with spaces,
 as XMP is.
 
-A file far outside what a camera writes (more than 250,000 MP4 boxes or a
-million image chunks or segments, more than 10,000 patches, boxes 32 deep) is
-refused rather than walked. The one slow shape left is a JPEG whose scan is
+A file far outside what a camera writes is refused rather than walked: more
+than 250,000 MP4 boxes and key entries, or a million image chunks, segments
+and EXIF directory entries; an MP4 key name over 1 KB; more than 10,000
+patches; boxes 32 deep. The one slow shape left is a JPEG whose scan is
 hundreds of megabytes of stuffed `FF 00` bytes, under a second to plan; its
-verdict is then cached like any other.
+verdict is then cached like any other. Nothing limits how many files are
+scrubbed at once: four 250 MB images opened together cost up to a gigabyte of
+memory while they are planned.
 
 The thing to understand before touching any of this: **`concert-media.json` is
 the record of truth and Postgres is a disposable index of it.** Every sidecar

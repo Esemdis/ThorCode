@@ -777,3 +777,37 @@ describe('planScrub on what follows a PNG or a WebP (THO-899)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Round 3 of the THO-894 review: the walks that did not pay into the budget.
+
+describe('planScrub after the THO-894 review, round 3', () => {
+  it('refuses an Apple key name longer than any Apple writes, before decoding it', async () => {
+    // A key entry may be the whole keys box: one 240 MiB name was a 240 MiB
+    // JS string and a second of blocked loop. Apple's names are under 64 bytes.
+    const box = mp4BoxTho894Review;
+    const name = Buffer.alloc(2048, 0x61);
+    const entry = Buffer.concat([u32Tho894Review(name.length + 8), Buffer.from('mdta', 'latin1'), name]);
+    const meta = box('meta', box('hdlr', u32Tho894Review(0), u32Tho894Review(0), 'mdta', Buffer.alloc(12)),
+      box('keys', u32Tho894Review(0), u32Tho894Review(1), entry), box('ilst'));
+    const mp4 = Buffer.concat([box('ftyp', 'isom', u32Tho894Review(0x200), 'isommp42'), box('moov', box('mvhd', Buffer.alloc(100)), meta)]);
+    await expect(planScrub(mp4)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
+  it('counts EXIF directory entries against the budget, across every block', async () => {
+    // Bounded per block (32 × 512) but not across blocks: 4,261 APP1 segments
+    // of 5,120 entries each were 21.8M entries and 0.75 s for nothing.
+    const entries = Array.from({ length: 512 }, () => ({ tag: 0x0001, type: 3, value: shortTho894Review(1) }));
+    const ifds = Array.from({ length: 10 }, () => entries.map((e) => ({ ...e })));
+    const next = Object.fromEntries(ifds.slice(1).map((_, i) => [i, i + 1]));
+    const { tiff } = tiffFromIfdsTho894Review(ifds, { next });
+    const payload = Buffer.concat([Buffer.from('Exif\0\0', 'latin1'), tiff]);
+    const head = Buffer.alloc(4);
+    head.writeUInt16BE(0xffe1, 0);
+    head.writeUInt16BE(payload.length + 2, 2);
+    const segment = Buffer.concat([head, payload]);
+    const many = Buffer.concat(Array.from({ length: 200 }, () => segment));
+    const jpeg = Buffer.concat([minimalJpegTho894.subarray(0, 2), many, minimalJpegTho894.subarray(2)]);
+    await expect(planScrub(jpeg)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+});

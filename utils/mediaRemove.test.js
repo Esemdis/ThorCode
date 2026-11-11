@@ -161,4 +161,34 @@ describe('removeMediaFiles', () => {
     expect(result.removed).toEqual([1]);
     expect(result.failed.map((f) => f.id)).toEqual([9]);
   });
+
+  // THO-894 with THO-810: the scrubbed copies share links were served sit in
+  // cache/public under the row's checksum. Removed here, every path that
+  // removes files takes them: both DELETE /media routes and account deletion,
+  // which only removed them from the routes before.
+  it('takes the row\'s public share copies out of cache/public, and only for rows it removed', async () => {
+    await seed(['IMG_P.jpg', 'VID_P.mp4']);
+    await seed(['IMG_Q.jpg'], alcest);
+    const publicDirRemoveTho894 = join(root, 'cache', 'public');
+    await mkdir(publicDirRemoveTho894, { recursive: true });
+    const publicFilesRemoveTho894 = [
+      'aaa111.jpg', 'aaa111.jpg.stamp', 'bbb222.mp4.clean', 'web-bbb222.mp4', 'web-bbb222.mp4.stamp',
+      'ccc333.jpg', 'ccc333.jpg.stamp',
+    ];
+    for (const name of publicFilesRemoveTho894) await writeFile(join(publicDirRemoveTho894, name), 'copy');
+
+    const failing = async (absDir, fn) => {
+      if (absDir === dirOf(alcest)) throw new Error('disk full');
+      return updateSidecar(absDir, fn);
+    };
+    const result = await removeMediaFiles([
+      { ...row(1, 'IMG_P.jpg'), sha256: 'aaa111' },
+      { ...row(2, 'VID_P.mp4', { kind: 'VIDEO' }), sha256: 'bbb222' },
+      { ...row(3, 'IMG_Q.jpg', { show: alcest }), sha256: 'ccc333' },
+    ], { update: failing });
+
+    expect(result.removed).toEqual([1, 2]);
+    // Row 3 stays, so its copy may still be served and stays too.
+    expect((await readdir(publicDirRemoveTho894)).sort()).toEqual(['ccc333.jpg', 'ccc333.jpg.stamp']);
+  });
 });

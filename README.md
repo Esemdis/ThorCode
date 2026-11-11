@@ -14,7 +14,7 @@ The API runs as one Node process against Postgres through Prisma. Two other serv
 
 | Area | Mounted at | Code |
 | --- | --- | --- |
-| Accounts | `/users` | `routes/users.js`. Covers register, login, settings and email change. Email verification goes through Resend. |
+| Accounts | `/users` | `routes/users.js`. Covers login, settings and email change. Sign-up is closed: `POST /users/register` always answers 403, and accounts are made with `scripts/create-user.js` (below). Email verification goes through Resend. |
 | Bands and concerts | `/data/concerts` | `routes/data/bands/`. Covers ingest from the scraper, search, band pages, setlists and admin. |
 | Wishlists and attendance | `/data/concerts` | `routes/data/wishlists/`. Covers wishlists, the shows you went to and the ones you missed, and the ICS calendar feed. `GET /data/concerts/nearby` (`routes/data/concertsNearby.js`) lists the caller's wishlist shows within a radius of a point on some dates, for wander's trip page (THO-667). |
 | Notifications | `/data/concerts` | `routes/data/notifications.js` handles subscriptions to a band, a city or a festival. New shows go to the wishlist's Discord webhook as the scraper reports them, and a daily email digest goes out by cron. |
@@ -25,6 +25,15 @@ The API runs as one Node process against Postgres through Prisma. Two other serv
 | Travel | `/travel/*` | `routes/travel/`. Covers trips, todos, gear, loadouts, reviews, a wishlist and a Gemini weather verdict. Places, day plans, budgets and expenses are wander's, which reads the packing list from here. |
 
 Auth is a JWT in `Authorization: Bearer`. Roles are `USER`, `ADMIN` and `SYSTEM`. `SYSTEM` is the role of the machine user the sync service signs in as. `scripts/generate-service-token.js` mints its token.
+
+Nobody can sign themselves up. To make an account, including the first one on an empty database:
+
+```bash
+node scripts/create-user.js --email someone@example.com               # a USER; prints a generated password once
+node scripts/create-user.js --email you@example.com --role ADMIN
+```
+
+In the running container the database URL comes from Doppler, so wrap it: `docker exec -it <container> doppler run -- node scripts/create-user.js --email …`. The account gets its wishlist in the same write. `utils/accounts.js` says why sign-up was closed and holds what the script decides.
 
 `utils/cron.js` runs these jobs in-process:
 

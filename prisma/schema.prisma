@@ -28,6 +28,7 @@ model User {
   concert_follows            ConcertFollow[]            @relation("UserConcertFollows")
   venue_reviews              VenueReview[]              @relation("UserVenueReviews")
   media_album_share_links    MediaAlbumShareLink[]      @relation("UserMediaAlbumShareLinks")
+  password_reset             PasswordReset?             @relation("UserPasswordResets")
 }
 
 model OAuth {
@@ -537,6 +538,21 @@ model EmailVerification {
   user_rel   User     @relation("UserEmailVerifications", fields: [user_id], references: [id], onDelete: Cascade)
 
   @@index([user_id])
+}
+
+// A forgotten-password link (THO-808). Only the sha256 of the token is kept:
+// the token is a bearer credential for the account until it is spent, and a
+// leaked database row must not be one. `user_id` is unique so a user has at
+// most one live link; asking again replaces it rather than adding a second.
+model PasswordReset {
+  id         Int      @id @default(autoincrement())
+  user_id    String   @unique
+  token_hash String   @unique
+  expires_at DateTime
+  created_at DateTime @default(now())
+  user_rel   User     @relation("UserPasswordResets", fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([expires_at])
 }
 
 enum Role {

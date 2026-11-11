@@ -23,6 +23,11 @@ const concertTho892 = {
   bands: [{ setlist: null, band_rel: { id: 92, name: 'Gojira' } }],
 };
 
+// THO-895: two more of the owner's attendances, and the concert behind any
+// attendance a test has moved to another night (a scraper's date correction).
+const attendanceOwnersTho895 = { 3: 'user-1', 4: 'user-1' };
+let concertByAttendanceTho895;
+
 let albumLinks;
 let mediaRows;
 let root;
@@ -48,10 +53,14 @@ beforeEach(async () => {
 
   albumLinks = [];
   mediaRows = [];
+  concertByAttendanceTho895 = {};
+  // Newest first, ties by id: two links minted in the same millisecond.
+  const newestAlbumLinks = (where) => albumLinks
+    .filter((l) => matchesAlbumWhere(l, where))
+    .sort((a, b) => b.created_at - a.created_at || b.id - a.id);
   prisma.mediaAlbumShareLink = {
-    findFirst: vi.fn(async ({ where }) => albumLinks
-      .filter((l) => matchesAlbumWhere(l, where))
-      .sort((a, b) => b.created_at - a.created_at)[0] ?? null),
+    findFirst: vi.fn(async ({ where }) => newestAlbumLinks(where)[0] ?? null),
+    findMany: vi.fn(async ({ where }) => newestAlbumLinks(where)),
     findUnique: vi.fn(async ({ where }) => albumLinks.find((l) => l.token === where.token) ?? null),
     create: vi.fn(async ({ data }) => {
       const link = { id: albumLinks.length + 1, created_at: new Date(), revoked_at: null, ...data };
@@ -67,8 +76,8 @@ beforeEach(async () => {
   };
   prisma.concertAttendance = {
     findMany: vi.fn(async ({ where }) => where.id.in
-      .filter((id) => attendanceOwnersTho892[id] === where.wishlist_rel.user_id)
-      .map((id) => ({ id, concert_rel: concertTho892 }))),
+      .filter((id) => (attendanceOwnersTho892[id] ?? attendanceOwnersTho895[id]) === where.wishlist_rel.user_id)
+      .map((id) => ({ id, concert_rel: concertByAttendanceTho895[id] ?? concertTho892 }))),
   };
   prisma.band = { findMany: vi.fn(async ({ where }) => where.id.in.map((id) => ({ id, name: `Band ${id}` }))) };
   prisma.concertMedia = {
@@ -162,6 +171,67 @@ describe('POST /album-shares', () => {
     expect(narrower.body.data.token).toBe(first.body.data.token);
     expect(albumLinks[0].attendance_ids).toEqual([1, 2]);
     expect(prisma.mediaAlbumShareLink.update).not.toHaveBeenCalled();
+  });
+
+  describe('once a show\'s date was corrected after its night was shared (THO-895)', () => {
+    // The day after night A, in the same city: where a scraper's correction
+    // moves the concert behind attendance 2.
+    const nightBConcertTho895 = { ...concertTho892, concert_date: new Date('2026-06-13T19:00:00Z') };
+    const correctDateTho895 = () => {
+      concertByAttendanceTho895[2] = nightBConcertTho895;
+      concertByAttendanceTho895[3] = nightBConcertTho895;
+    };
+
+    it('mints a link to the other night rather than widening this one\'s through the show that moved', async () => {
+      // Night A (1 and 2) sent to a friend; 2's concert moves to the 13th,
+      // where it makes night B with 3. Widening A's link put night B in front
+      // of the friend, and handed the owner A's token and expiry for B.
+      await fileInAlbumTho892({ id: 1, attendanceId: 1 });
+      await fileInAlbumTho892({ id: 2, attendanceId: 2, filename: 'IMG_2.jpg' });
+      await fileInAlbumTho892({ id: 3, attendanceId: 3, filename: 'IMG_3.jpg' });
+      const nightA = await shareNight([1, 2]).expect(200);
+      correctDateTho895();
+
+      const nightB = await shareNight([2, 3]).expect(200);
+
+      expect(nightB.body.data.token).not.toBe(nightA.body.data.token);
+      expect(albumLinks.map((l) => l.attendance_ids)).toEqual([[1, 2], [2, 3]]);
+      // And A's URL keeps every file it was sent with: never narrowed.
+      const sent = await openAlbum(nightA.body.data.token).expect(200);
+      expect(sent.body.data.files.map((f) => f.id)).toEqual([1, 2]);
+    });
+
+    it('does not hand the moved show\'s new night a link that already names it with another night', async () => {
+      // Night B is only attendance 2 now. A's link takes it in without
+      // widening, but it is still night A's link.
+      const nightA = await shareNight([1, 2]).expect(200);
+      concertByAttendanceTho895[2] = nightBConcertTho895;
+
+      const nightB = await shareNight([2]).expect(200);
+
+      expect(nightB.body.data.token).not.toBe(nightA.body.data.token);
+      expect(albumLinks[0].attendance_ids).toEqual([1, 2]);
+    });
+
+    it('reads a night as its city as well as its date', async () => {
+      const first = await shareNight([1]).expect(200);
+      concertByAttendanceTho895[3] = { ...concertTho892, city: 'Bergen' };
+      const elsewhere = await shareNight([1, 3]).expect(200);
+      expect(elsewhere.body.data.token).not.toBe(first.body.data.token);
+      expect(albumLinks[0].attendance_ids).toEqual([1]);
+    });
+
+    it('still widens a link to the same night, and hands back an exact match whatever the dates', async () => {
+      correctDateTho895();
+      const nightB = await shareNight([2]).expect(200);
+      expect((await shareNight([2, 3]).expect(200)).body.data.token).toBe(nightB.body.data.token);
+      expect(albumLinks.map((l) => l.attendance_ids)).toEqual([[2, 3]]);
+      // A list the client sent as one night that the server reads as two is
+      // still the same link when asked for again, not a new one per press.
+      const mixed = await shareNight([1, 4]).expect(200);
+      concertByAttendanceTho895[4] = nightBConcertTho895;
+      expect((await shareNight([4, 1]).expect(200)).body.data.token).toBe(mixed.body.data.token);
+    });
   });
 
   it('mints a fresh link once the last one was stopped or ran out', async () => {
@@ -408,6 +478,11 @@ describe('sharing a night\'s picks', () => {
     prisma.mediaAlbumShareLink.findFirst = vi.fn(async ({ where }) => albumLinks
       .filter((l) => matchesAlbumWhere(l, where) && picksMatchTho849(l, where))
       .sort((a, b) => b.created_at - a.created_at)[0] ?? null);
+    // The POST reads every candidate since THO-895, to pick the one that is
+    // still this night's; the kind must filter that read too.
+    prisma.mediaAlbumShareLink.findMany = vi.fn(async ({ where }) => albumLinks
+      .filter((l) => matchesAlbumWhere(l, where) && picksMatchTho849(l, where))
+      .sort((a, b) => b.created_at - a.created_at || b.id - a.id));
     prisma.mediaAlbumShareLink.updateMany = vi.fn(async ({ where, data }) => {
       const hit = albumLinks.filter((l) => matchesAlbumWhere(l, where) && picksMatchTho849(l, where));
       hit.forEach((l) => Object.assign(l, data));
@@ -437,6 +512,25 @@ describe('sharing a night\'s picks', () => {
     expect((await sharePicksTho849([1]).expect(200)).body.data.token).toBe(picks.body.data.token);
     expect((await shareNight([1]).expect(200)).body.data.token).toBe(night.body.data.token);
     expect(albumLinks.map((l) => l.picks_only)).toEqual([false, true]);
+  });
+
+  it('never hands back or widens a picks link for a whole-night request of the same night, nor the reverse', async () => {
+    // Since THO-895 the POST picks among every live candidate for the night.
+    // If the kind dropped out of that read, sharing the whole night would
+    // widen the picks link (or a picks request the whole night's), and a URL
+    // already sent would change what it shows.
+    const picks = await sharePicksTho849([1]).expect(200);
+    const night = await shareNight([1, 2]).expect(200);
+    expect(night.body.data.token).not.toBe(picks.body.data.token);
+    expect(night.body.data.picks_only).toBe(false);
+    expect(prisma.mediaAlbumShareLink.findMany.mock.calls.at(-1)[0].where.picks_only).toBe(false);
+
+    const morePicks = await sharePicksTho849([1, 2, 3]).expect(200);
+    expect(morePicks.body.data.token).toBe(picks.body.data.token);
+    expect(prisma.mediaAlbumShareLink.findMany.mock.calls.at(-1)[0].where.picks_only).toBe(true);
+
+    // Each link widened only by its own kind.
+    expect(albumLinks.map((l) => [l.picks_only, l.attendance_ids])).toEqual([[true, [1, 2, 3]], [false, [1, 2]]]);
   });
 
   it('refuses a picks_only it cannot read rather than sharing the whole night', async () => {

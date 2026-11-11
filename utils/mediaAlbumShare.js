@@ -59,6 +59,57 @@ const sameIds = (a, b) => a.length === b.length && a.every((id, i) => id === b[i
 const unionIds = (a, b) => [...new Set([...a, ...b])].sort((x, y) => x - y);
 
 /**
+ * Which night a show is, as the app groups them: its calendar day and its
+ * city (THO-895). The client folds a festival's stages into one night by day
+ * and city (attendedNights, groupByCity), so a request names attendances that
+ * all give the same key. Null for a show with no date yet, which the app puts
+ * in no night at all.
+ */
+function albumNightKey(concert) {
+  if (!concert?.concert_date) return null;
+  return `${dateOnly(concert.concert_date)}|${concert.city ?? ''}`;
+}
+
+/**
+ * Of the live links that take in any of the attendances asked for, the one
+ * that is this night's — handed back, or widened to the ones asked for — or
+ * null when none is and a new link is minted.
+ *
+ * A link shares an attendance with the request is not enough (THO-895). A
+ * scraper can correct a concert's date after its night was shared, and the
+ * attendance then belongs to another night. Taking any overlap as the same
+ * night, sharing that other night widened the first night's link into it:
+ * the friend holding the first URL saw the second night, and the owner was
+ * handed the first night's token and expiry for the second. So the link's
+ * attendances and the request's, together, must still be one night, read
+ * from the concerts as they are now.
+ *
+ * A link whose ids are exactly the request's is handed back whatever the
+ * dates say: it reaches nothing the request does not, and refusing it would
+ * mint a new link on every press for a list the client grouped as one night
+ * and the server reads as two.
+ *
+ * Nothing here narrows a link. One left spanning two nights by a correction
+ * keeps every file it was sent with; it just stops being widened, and sharing
+ * either night from then on mints a link of its own. Telling which of the two
+ * nights that link was made for would need the night stored on it at minting.
+ *
+ * @param {{attendance_ids: number[]}[]} links - Newest first.
+ * @param {number[]} ids - As normaliseAttendanceIds gives them.
+ * @param {Map<number, string|null>} nightById - albumNightKey per attendance
+ *   of the owner's. An id on a link and not here (the attendance has gone)
+ *   is left out of the album when it is read, and so out of this.
+ */
+function albumLinkForNight(links, ids, nightById) {
+  const oneNight = (list) => {
+    const nights = new Set(list.filter((id) => nightById.has(id)).map((id) => nightById.get(id)));
+    return nights.size === 1 && !nights.has(null);
+  };
+  return links.find((link) => sameIds(link.attendance_ids, ids)
+    || oneNight(unionIds(link.attendance_ids, ids))) ?? null;
+}
+
+/**
  * Whether a request asks for the night's picks rather than every file of it
  * (THO-849). A POST's JSON carries a boolean; a DELETE's query carries text.
  *
@@ -214,5 +265,6 @@ function albumPayload({ link, attendances, media, otherBands = [], baseUrl }) {
 
 module.exports = {
   ALBUM_TTL_MS, MAX_ALBUM_ATTENDANCES, albumExpiry, normaliseAttendanceIds, sameIds, unionIds,
-  albumBase, albumMediaUrls, albumPayload, parsePicksOnly, albumMediaWhere, albumServesFile,
+  albumNightKey, albumLinkForNight, albumBase, albumMediaUrls, albumPayload, parsePicksOnly, albumMediaWhere,
+  albumServesFile,
 };
