@@ -26,7 +26,7 @@ const { verifyMediaToken } = require('../../../utils/mediaTokens');
 const { isActiveShareLink } = require('../../../utils/mediaShareToken');
 const { rateLimiter } = require('../../../utils/rateLimiter');
 const { clipFiles, isClip, prepareClip } = require('../../../utils/mediaClips');
-const { ensurePublicCopy } = require('../../../utils/mediaPublicCopy');
+const { ensurePublicCopy, masterCopyKey, renditionCopyKey } = require('../../../utils/mediaPublicCopy');
 const { withOwner, liveAlbumLink, INT32_MAX } = require('./shared');
 
 const router = express.Router();
@@ -110,7 +110,7 @@ async function sendMediaBytes(res, row, which, context, { cacheControl, publicCo
     absPath = chosen.absPath;
     servingOriginalForPlayback = !chosen.rendition && row.kind === 'VIDEO';
     archiveBytes = true;
-    publicKey = chosen.rendition ? renditionKey(row) : masterKey(row, absPath);
+    publicKey = chosen.rendition ? renditionCopyKey(row) : masterCopyKey(row);
   } else if (which === 'thumb') {
     try {
       absPath = await ensureThumb({
@@ -139,7 +139,7 @@ async function sendMediaBytes(res, row, which, context, { cacheControl, publicCo
   } else {
     absPath = archivePath;
     archiveBytes = true;
-    publicKey = masterKey(row, absPath);
+    publicKey = masterCopyKey(row);
   }
 
   if (publicCopy && archiveBytes) {
@@ -160,20 +160,6 @@ async function sendMediaBytes(res, row, which, context, { cacheControl, publicCo
     : 'private, max-age=31536000, immutable'));
   return sendFileSafely(res, absPath, context);
 }
-
-// A master's copy in cache/public is named by its checksum, with the
-// extension kept so it is served as the same type; a rendition's by the
-// master's checksum too, so the two never share a name. Null without a
-// checksum, which publicCopyOr404 refuses rather than guess a name for.
-const hasChecksum = (row) => typeof row.sha256 === 'string' && /^[A-Za-z0-9]{1,128}$/.test(row.sha256);
-
-function masterKey(row, absPath) {
-  if (!hasChecksum(row)) return null;
-  const ext = path.extname(absPath).toLowerCase();
-  return `${row.sha256}${/^\.[a-z0-9]{1,8}$/.test(ext) ? ext : ''}`;
-}
-
-const renditionKey = (row) => (hasChecksum(row) ? `web-${row.sha256}.mp4` : null);
 
 /**
  * The scrubbed copy to hand a stranger, or null once a 404 has been sent.

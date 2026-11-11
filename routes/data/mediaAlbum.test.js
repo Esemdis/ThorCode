@@ -291,7 +291,7 @@ describe('GET /album-shares/:token/media/:id/:which', () => {
     const scan = (b) => b.subarray(b.indexOf(Buffer.from([0xff, 0xda])));
     expect(scan(served).equals(scan(jpeg))).toBe(true);
     // Made once, kept in the cache like a thumbnail.
-    expect(await readdir(join(root, 'cache', 'public'))).toEqual(['sha1.jpg']);
+    expect(await readdir(join(root, 'cache', 'public'))).toEqual(['sha1.jpg', 'sha1.jpg.stamp']);
   });
 
   it('strips the location from a shared night\'s video', async () => {

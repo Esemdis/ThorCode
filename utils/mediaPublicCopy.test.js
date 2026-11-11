@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
+import {
+  mkdtemp, readdir, readFile, stat, utimes, writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
@@ -8,7 +10,8 @@ import { jpegWithGpsTho894, minimalJpegTho894 } from '../test/exifFixture.js';
 // THO-894: the scrubbed copy a public route serves, cached like a thumbnail.
 
 const require = createRequire(import.meta.url);
-const { ensurePublicCopy } = require('./mediaPublicCopy.js');
+const { ensurePublicCopy, removePublicCopies } = require('./mediaPublicCopy.js');
+const { planScrub, applyPatches } = require('./mediaScrub.js');
 const fsPromises = require('node:fs/promises');
 
 let rootTho894;
@@ -36,12 +39,13 @@ describe('ensurePublicCopy', () => {
     expect(copy.length).toBe(jpeg.length);
     expect(copy.includes(Buffer.from('SN-1234567890'))).toBe(false);
 
-    // Served from the cache: the source is not read again, which a source
-    // gone missing proves.
-    await fsPromises.unlink(absPath);
+    // Served from the cache: nothing is copied a second time.
+    const copyFile = vi.spyOn(fsPromises, 'copyFile');
     expect(await ensurePublicCopy({ absPath, key: 'abc123.jpg' })).toBe(first);
+    expect(copyFile).not.toHaveBeenCalled();
+    copyFile.mockRestore();
     // And the original was never touched.
-    expect(jpeg.includes(Buffer.from('SN-1234567890'))).toBe(true);
+    expect((await readFile(absPath)).equals(jpeg)).toBe(true);
   });
 
   it('two first requests at once share one copy', async () => {
@@ -110,5 +114,53 @@ describe('ensurePublicCopy', () => {
     const absPath = await sourceTho894('IMG_5.jpg', minimalJpegTho894);
     await expect(ensurePublicCopy({ absPath, key: '../escape.jpg' })).rejects.toThrow(/unsafe/);
     await expect(ensurePublicCopy({ absPath, key: '.hidden' })).rejects.toThrow(/unsafe/);
+  });
+
+  it('makes the copy again when the file behind it has changed', async () => {
+    // A rendition is made again under the same web-<sha>.mp4 key. The cached
+    // copy of the old one must not go on being served for it (THO-894 review).
+    const first = jpegWithGpsTho894().jpeg;
+    const absPath = await sourceTho894('VID_R.jpg', first);
+    await ensurePublicCopy({ absPath, key: 'web-r1.jpg' });
+
+    const second = jpegWithGpsTho894(minimalJpegTho894, { little: false }).jpeg;
+    await writeFile(absPath, second);
+    const later = new Date(Date.now() + 60_000);
+    await utimes(absPath, later, later);
+
+    const served = await ensurePublicCopy({ absPath, key: 'web-r1.jpg' });
+    expect((await readFile(served)).equals(applyPatches(second, await planScrub(second)))).toBe(true);
+  });
+
+  it('looks again at a file an older scrubber called clean', async () => {
+    // The marker a scrubber without a version wrote: size and mtime only. A
+    // planner that has since learned to strip more must not trust it, or every
+    // file already served keeps the old verdict until cache/public is emptied.
+    const { jpeg } = jpegWithGpsTho894();
+    const absPath = await sourceTho894('IMG_V.jpg', jpeg);
+    const info = await stat(absPath);
+    await fsPromises.mkdir(publicDirTho894(), { recursive: true });
+    await writeFile(join(publicDirTho894(), 'v1.jpg.clean'), `${info.size}:${Math.trunc(info.mtimeMs)}`);
+
+    const served = await ensurePublicCopy({ absPath, key: 'v1.jpg' });
+    expect(served).toBe(join(publicDirTho894(), 'v1.jpg'));
+    expect((await readFile(served)).includes(Buffer.from('SN-1234567890'))).toBe(false);
+  });
+
+  it('refuses a key that would name another key\'s marker', async () => {
+    const absPath = await sourceTho894('IMG_6.jpg', minimalJpegTho894);
+    await expect(ensurePublicCopy({ absPath, key: 'abc.jpg.clean' })).rejects.toThrow(/unsafe/);
+    await expect(ensurePublicCopy({ absPath, key: 'abc.jpg.stamp' })).rejects.toThrow(/unsafe/);
+  });
+
+  it('removes the copies a deleted file left in the cache, and nothing else', async () => {
+    // A scrubbed master is a full second copy of the file; with the row gone
+    // no route can reach it, and nothing else would ever delete it.
+    await fsPromises.mkdir(publicDirTho894(), { recursive: true });
+    for (const name of ['abc123.mp4', 'abc123.mp4.stamp', 'web-abc123.mp4', 'web-abc123.mp4.clean', 'def456.jpg']) {
+      await writeFile(join(publicDirTho894(), name), 'x');
+    }
+    await removePublicCopies({ sha256: 'abc123', rel_path: 'u/show/VID_1.MP4' });
+    expect(await readdir(publicDirTho894())).toEqual(['def456.jpg']);
   });
 });

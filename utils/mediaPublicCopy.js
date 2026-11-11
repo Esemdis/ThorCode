@@ -9,9 +9,12 @@
  * the content it was made from, so the directory can be deleted at any time.
  *
  * A file with nothing to strip is not copied: a `.clean` marker records that,
- * and the original is served. The marker holds the source's size and mtime and
- * is ignored when they no longer match, because a rendition can be made again
- * under the same key and the new one may carry what the old one did not.
+ * and the original is served. A copy that was made has a `.stamp` beside it.
+ * Both hold the scrubber's version and the source's size and mtime, and either
+ * is ignored when they no longer match: a rendition can be made again under
+ * the same key, and the new one may carry what the old one did not; and a
+ * scrubber that has learned to strip more must look again at what an older
+ * one let through (SCRUB_VERSION in mediaScrub.js).
  *
  * Nothing here ever falls back to the original on failure. A scrub that throws
  * propagates, and the route answers 404.
@@ -22,12 +25,15 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
-const { planScrubFile } = require('./mediaScrub');
-const { publicCachePath } = require('./mediaPaths');
+const { planScrubFile, SCRUB_VERSION } = require('./mediaScrub');
+const { publicCachePath, publicCopyFiles } = require('./mediaPaths');
 
 // Keys are made by the routes from a checksum or a link id; anything else
-// reaching here is a bug, and must not become a path.
+// reaching here is a bug, and must not become a path. Nor may a key end the
+// way another key's marker or temp file does, or one could be read as the
+// other.
 const SAFE_KEY = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,200}$/;
+const MARKER_NAME = /\.(clean|stamp|tmp)$/;
 
 // Two first requests for one file — an album grid opened twice, a video's
 // first Range requests — share one copy instead of racing two.
@@ -41,7 +47,9 @@ function tagged(code, message) {
   return err;
 }
 
-const stampOf = (info) => `${info.size}:${Math.trunc(info.mtimeMs)}`;
+const stampOf = (info) => `v${SCRUB_VERSION}:${info.size}:${Math.trunc(info.mtimeMs)}`;
+
+const readStamp = (p) => fs.readFile(p, 'utf8').then((text) => text.trim(), () => null);
 
 async function statSource(absPath) {
   try {
@@ -53,13 +61,14 @@ async function statSource(absPath) {
 }
 
 async function makeCopy(absPath, key) {
-  const target = publicCachePath(key);
-  const marker = `${target}.clean`;
-  if (await exists(target)) return target;
-
+  const [target, stampFile, marker] = publicCopyFiles(key);
+  // The source is looked at on every request, hit or not. A copy can only be
+  // trusted while it is still the copy of this source by this scrubber, and a
+  // source that is gone answers NO_SOURCE (a 404) like everywhere else.
   const before = await statSource(absPath);
-  const recorded = await fs.readFile(marker, 'utf8').catch(() => null);
-  if (recorded !== null && recorded.trim() === stampOf(before)) return absPath;
+  const stamp = stampOf(before);
+  if (await readStamp(stampFile) === stamp && await exists(target)) return target;
+  if (await readStamp(marker) === stamp) return absPath;
 
   const plan = await planScrubFile(absPath);
   await fs.mkdir(path.dirname(target), { recursive: true });
@@ -67,8 +76,11 @@ async function makeCopy(absPath, key) {
     // Checked again after the read: a source replaced while it was being
     // planned would otherwise be served on the strength of the old one's plan.
     const after = await statSource(absPath);
-    if (stampOf(after) !== stampOf(before)) throw tagged('UNSCRUBBABLE', `${absPath} changed while being read`);
-    await fs.writeFile(marker, stampOf(before));
+    if (stampOf(after) !== stamp) throw tagged('UNSCRUBBABLE', `${absPath} changed while being read`);
+    await fs.writeFile(marker, stamp);
+    // A copy of what the source used to be is of no use any more.
+    await fs.unlink(stampFile).catch(() => {});
+    await fs.unlink(target).catch(() => {});
     return absPath;
   }
 
@@ -89,6 +101,10 @@ async function makeCopy(absPath, key) {
     const left = await planScrubFile(temp);
     if (left.length) throw tagged('UNSCRUBBABLE', `${left.length} patches left after scrubbing ${absPath}`);
     await fs.rename(temp, target);
+    // After the rename, so a stamp never vouches for a copy that is not there
+    // yet. The stamp is the source as it was before the copy: had it changed
+    // since, the next request finds a mismatch and makes the copy again.
+    await fs.writeFile(stampFile, stamp);
     return target;
   } catch (err) {
     await fs.unlink(temp).catch(() => {});
@@ -107,7 +123,9 @@ async function makeCopy(absPath, key) {
  *   be scrubbed
  */
 function ensurePublicCopy({ absPath, key }) {
-  if (!SAFE_KEY.test(String(key))) return Promise.reject(new Error(`unsafe public copy key: ${key}`));
+  if (!SAFE_KEY.test(String(key)) || MARKER_NAME.test(String(key))) {
+    return Promise.reject(new Error(`unsafe public copy key: ${key}`));
+  }
   const pending = inFlight.get(key);
   if (pending) return pending;
   const work = makeCopy(absPath, key).finally(() => inFlight.delete(key));
@@ -115,4 +133,35 @@ function ensurePublicCopy({ absPath, key }) {
   return work;
 }
 
-module.exports = { ensurePublicCopy };
+// The names a row's copies go by. A master's is its checksum, with the
+// extension kept so it is served as the same type; a rendition's is the
+// master's checksum too, so the two never share a name. Null without a
+// checksum: the routes refuse that rather than guess a name. A checksum is
+// alphanumeric, so neither can collide with a `clip-<id>.mp4` or reach a path.
+const hasChecksum = (row) => typeof row.sha256 === 'string' && /^[A-Za-z0-9]{1,128}$/.test(row.sha256);
+
+function masterCopyKey(row) {
+  if (!hasChecksum(row)) return null;
+  const ext = path.extname(String(row.rel_path ?? '')).toLowerCase();
+  return `${row.sha256}${/^\.[a-z0-9]{1,8}$/.test(ext) ? ext : ''}`;
+}
+
+const renditionCopyKey = (row) => (hasChecksum(row) ? `web-${row.sha256}.mp4` : null);
+
+/**
+ * Delete a row's copies from cache/public, once the row has gone. Nothing can
+ * reach them after that, and a scrubbed video is as big as the video. Another
+ * row with the same bytes simply has its copy made again on its next request.
+ * Best effort: cache/public is disposable, so a failure here is not the
+ * delete's failure.
+ */
+async function removePublicCopies(row) {
+  for (const key of [masterCopyKey(row), renditionCopyKey(row)]) {
+    if (!key) continue;
+    for (const p of publicCopyFiles(key)) await fs.unlink(p).catch(() => {});
+  }
+}
+
+module.exports = {
+  ensurePublicCopy, removePublicCopies, masterCopyKey, renditionCopyKey,
+};

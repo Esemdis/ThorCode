@@ -2624,6 +2624,23 @@ describe('DELETE /media/:id', () => {
   };
   const del = () => request(app()).delete('/data/concerts/media/1').set(...authHeader({ id: 'user-1' }));
 
+  it('takes the scrubbed copies share links were served out of cache/public too', async () => {
+    // THO-894 review: a scrubbed video is as big as the video, and with its
+    // row gone no route can reach it again.
+    const dir = await seedPhoto(gojira);
+    const publicDir = join(root, 'cache', 'public');
+    await mkdir(publicDir, { recursive: true });
+    for (const name of ['deadbeef01.jpg', 'deadbeef01.jpg.stamp', 'web-deadbeef01.mp4.clean', 'other02.jpg']) {
+      await writeFile(join(publicDir, name), 'x');
+    }
+    prisma.concertMedia.findUnique = vi.fn(async () => ({ ...photoIn(1, gojira), sha256: 'deadbeef01' }));
+    prisma.concertMedia.delete = vi.fn(async () => ({ id: 1 }));
+
+    await del().expect(200);
+    expect(await readdir(dir)).not.toContain('IMG_1.jpg');
+    expect(await readdir(publicDir)).toEqual(['other02.jpg']);
+  });
+
   it('takes a video\'s web rendition and the rendition service\'s failure marker with it', async () => {
     // Both live in the show folder, inside the archive that syncs offsite, and
     // both used to stay there for good after their video was gone.
@@ -3626,7 +3643,7 @@ describe('sharing one file by public link', () => {
       const res = await rawBytesTho894(request(app()).get(`/data/concerts/media/share/${token}`)).expect(200);
       expect(res.body.length).toBe(rendition.length);
       expect(res.body.includes(Buffer.from('+59.9139+010.7522'))).toBe(false);
-      expect(await readdir(join(root, 'cache', 'public'))).toEqual(['web-h1.mp4']);
+      expect(await readdir(join(root, 'cache', 'public'))).toEqual(['web-h1.mp4', 'web-h1.mp4.stamp']);
     });
 
     it('the owner\'s own download keeps the original byte for byte, location included', async () => {
@@ -3790,7 +3807,7 @@ describe('sharing one file by public link', () => {
       expect(res.headers['cache-control']).toBe('private, no-store');
 
       // And the scrubbed copy goes with the cut when the link is stopped.
-      expect(await readdir(join(root, 'cache', 'public'))).toEqual([`clip-${id}.mp4`]);
+      expect(await readdir(join(root, 'cache', 'public'))).toEqual([`clip-${id}.mp4`, `clip-${id}.mp4.stamp`]);
       await revoke().expect(204);
       expect(await readdir(join(root, 'cache', 'public'))).toEqual([]);
     });

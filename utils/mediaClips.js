@@ -22,7 +22,7 @@ const { randomBytes } = require('node:crypto');
 const {
   access, mkdir, readdir, readFile, rename, unlink, writeFile,
 } = require('node:fs/promises');
-const { clipCacheRoot } = require('./mediaPaths');
+const { clipCacheRoot, publicCopyFiles } = require('./mediaPaths');
 const { FAILED_SUFFIX, PART_SUFFIX } = require('./renditionPlan');
 
 // Shorter than this is a still with a soundtrack, and far more likely a
@@ -33,6 +33,13 @@ const REQUEST_NAME = /^(\d+)\.json$/;
 // The API's temp name while it writes a request. Never swept: the service could
 // otherwise delete one between the API's write and its rename.
 const TEMP_NAME = /^\.\d+\.json\.[0-9a-f]+\.tmp$/;
+// A moment's scrubbed copy in cache/public and its markers (THO-894). Its temp
+// file, `<name>.<pid>.<uuid>.tmp`, does not match: one swept mid-write would
+// fail the request that was making it.
+const PUBLIC_CLIP_NAME = /^clip-(\d+)\.mp4(\.stamp|\.clean)?$/;
+
+// cache/public, the sibling of the clip root.
+const publicDirOf = (root) => path.join(path.dirname(root), 'public');
 
 const exists = (p) => access(p).then(() => true, () => false);
 
@@ -130,13 +137,16 @@ function parseClipRequest(name, text) {
  * @param {Map<string, object|null>} requests - each `<id>.json` name, parsed
  *   with parseClipRequest (null when unreadable)
  * @param {Date} now
- * @returns {{jobs: object[], sweep: string[]}}
+ * @param {string[]} [publicNames] - cache/public's entries, when the caller
+ *   listed it: the scrubbed copies of moments a share link served (THO-894)
+ * @returns {{jobs: object[], sweep: string[], sweepPublic: string[]}} -
+ *   `sweepPublic` names entries of cache/public
  *
  * A failed clip is not retried here — the queue is polled every few seconds,
  * so a retry flag would re-run a broken cut just as often. Stopping the share
  * and sharing again mints a new link, and with it a fresh attempt.
  */
-function planClips(names, requests, now = new Date()) {
+function planClips(names, requests, now = new Date(), publicNames = []) {
   const present = new Set(names);
   const jobs = [];
   const sweep = new Set();
@@ -164,7 +174,15 @@ function planClips(names, requests, now = new Date()) {
     if (id && !live.has(id) && !REQUEST_NAME.test(name)) sweep.add(name);
   }
 
-  return { jobs, sweep: [...sweep] };
+  // A public copy outlives nothing it was made for: a link that has expired
+  // or gone (no request, or an unreadable one) takes its copy with it. Revoke
+  // already removes it (removeClip); expiry only ever reached cache/clips.
+  const sweepPublic = publicNames.filter((name) => {
+    const id = PUBLIC_CLIP_NAME.exec(name)?.[1];
+    return id !== undefined && !live.has(id);
+  });
+
+  return { jobs, sweep: [...sweep], sweepPublic };
 }
 
 /**
@@ -202,8 +220,8 @@ async function removeClip(id, root = clipCacheRoot()) {
   const files = clipFiles(id, root);
   // The scrubbed copy a share link served (THO-894) lives in cache/public, the
   // sibling of cache/clips, keyed by the same link id.
-  const scrubbed = path.join(path.dirname(root), 'public', `clip-${id}.mp4`);
-  for (const p of [files.request, files.output, files.failed, scrubbed, `${scrubbed}.clean`]) {
+  const scrubbed = publicCopyFiles(`clip-${id}.mp4`, publicDirOf(root));
+  for (const p of [files.request, files.output, files.failed, ...scrubbed]) {
     await unlink(p).catch(() => {});
   }
 }

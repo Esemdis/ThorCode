@@ -37,12 +37,33 @@ night's album) hand to someone with no account: the original or rendition with
 its GPS position, camera make, model and serials, and XMP patched out in place,
 so the picture and the video stream are byte for byte the original's (THO-894).
 `<sha256>.<ext>` is a master, `web-<sha256>.mp4` a rendition, `clip-<link id>.mp4`
-a shared moment, and a `<name>.clean` marker means that file had nothing to
-strip and the original is served as it is. It is keyed by checksum and safe to
-delete at any time; the next request makes the copy again. A file that cannot
-be read well enough to strip (a format it does not know, a damaged header) is
-answered 404 on the share link, with `[media] not serving media <id> publicly`
-in the log — never sent as it is. The owner's own downloads are untouched.
+a shared moment. Beside each copy, `<name>.stamp` records the scrubber version
+and the size and mtime of the file it was made from; a `<name>.clean` marker
+instead means that file had nothing to strip and the original is served as it
+is. Either is ignored, and the file looked at again, once the source or the
+scrubber has changed. It is keyed by checksum and safe to delete at any time;
+the next request makes the copy again. A file that cannot be read well enough
+to strip (a format it does not know, a damaged header, anything far outside
+what a camera writes) is answered 404 on the share link, with
+`[media] not serving media <id> publicly` in the log — never sent as it is.
+The owner's own downloads are untouched.
+
+When `utils/mediaScrub.js` learns to strip something it used to leave, bump
+`SCRUB_VERSION` at its top. That is what makes every copy and `.clean` verdict
+already in `cache/public/` be made again; without it they keep the old
+verdict until someone empties the directory.
+
+Copies go when nothing can reach them: deleting a file removes its copies,
+stopping a moment's link removes the moment's, and the rendition service sweeps
+the copy of a moment whose link has expired on each archive pass.
+
+What the copy still carries, on purpose or because it is not reached yet:
+the capture time and its offset, Orientation and the colour profile (needed to
+show the picture right); EXIF ImageDescription, UserComment and Software
+(the software version, not the device); a location track recorded inside the
+video stream itself (GoPro GPMF, Apple `mebx`, Android GPS tracks), which lives
+in `mdat` and cannot be reached by a same-length patch; and, until THO-899,
+the video a motion photo appends after its JPEG and IPTC in a JPEG's APP13.
 
 The thing to understand before touching any of this: **`concert-media.json` is
 the record of truth and Postgres is a disposable index of it.** Every sidecar
