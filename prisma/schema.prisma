@@ -13,6 +13,9 @@ model User {
   password_hash              String?
   role                       Role                       @default(USER)
   created_at                 DateTime                   @default(now())
+  // When the password was last reset or changed. A login token issued before
+  // it is refused (THO-898, auth/loginRevocation.js); null ends nothing.
+  password_changed_at        DateTime?
   settings                   Json?
   oauth                      OAuth[]                    @relation("UserOauth")
   wishlists                  Wishlist?                  @relation("UserWishlists")

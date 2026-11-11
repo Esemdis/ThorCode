@@ -17,6 +17,13 @@ describe('signJWT', () => {
     expect(decoded.exp - decoded.iat).toBe(8 * 60 * 60);
   });
 
+  // Only a token so marked is ended by a password reset (THO-898); service
+  // and hand-minted long-lived tokens are not.
+  it('marks the token as a login session', () => {
+    const token = signJWT({ user: { id: 1, email: 'a@b.com', role: 'USER' } });
+    expect(jwt.verify(token, 'test-secret').kind).toBe('login');
+  });
+
   it('cannot be verified against the wrong secret', () => {
     const token = signJWT({ user: { id: 1, email: 'a@b.com', role: 'USER' } });
     expect(() => jwt.verify(token, 'wrong-secret')).toThrow();

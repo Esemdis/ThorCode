@@ -263,6 +263,22 @@ describe('POST /users/password/reset', () => {
     expect(res.body.data.token).toBeUndefined();
   });
 
+  // THO-898: the time it records is what ends the account's login sessions.
+  it('records when the password changed, by the clock that signs tokens', async () => {
+    prisma.passwordReset.findUnique.mockResolvedValue(live());
+    prisma.passwordReset.delete.mockResolvedValue({});
+    prisma.user.update.mockResolvedValue({});
+    const before = Date.now();
+
+    const res = await reset({ token: 'reset-token-records-change', password: NEW_PASSWORD });
+
+    expect(res.status).toBe(200);
+    const { password_changed_at: changedAt } = prisma.user.update.mock.calls[0][0].data;
+    expect(changedAt).toBeInstanceOf(Date);
+    expect(changedAt.getTime()).toBeGreaterThanOrEqual(before);
+    expect(changedAt.getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
   it('gives a password to an account that never had one', async () => {
     // The route never reads the old hash, so a null one is no different.
     prisma.passwordReset.findUnique.mockResolvedValue(live({ user_id: 'u-oauth-only' }));

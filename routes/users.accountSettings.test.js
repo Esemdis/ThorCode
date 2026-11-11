@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createRequire } from 'node:module';
 import request from 'supertest';
 import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
 import { buildApp, installFakePrisma, authHeader } from '../test/routeApp.js';
 
 // Every model the account deletion clears, as a deleteMany that returns its
@@ -87,7 +88,7 @@ describe('PATCH /users/me/password (THO-810)', () => {
     const res = await changePassword(id, { currentPassword: CURRENT, newPassword: 'NewPass123' });
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ success: true, data: {}, message: 'Password changed' });
+    expect(res.body).toEqual({ success: true, data: { token: expect.any(String) }, message: 'Password changed' });
     const { where, data } = prisma.user.update.mock.calls[0][0];
     expect(where).toEqual({ id });
 
@@ -96,6 +97,36 @@ describe('PATCH /users/me/password (THO-810)', () => {
     const login = (password) => request(app).post('/users/login').send({ email: `${id}@example.test`, password });
     expect((await login('NewPass123')).status).toBe(200);
     expect((await login(CURRENT)).status).toBe(401);
+  });
+
+  // THO-898: the change ends every login session the account had, the one it
+  // was made from included, and hands that one a fresh token to carry on with.
+  it('ends the login sessions issued before it and hands back one that outlives it', async () => {
+    const id = accountSettingsUserId();
+    let sessionEndChangedAt = null;
+    // Read both by verifyJWT (password_changed_at) and by the route itself.
+    prisma.user.findUnique.mockImplementation(async () =>
+      accountSettingsUser(id, { password_changed_at: sessionEndChangedAt }));
+    prisma.user.update.mockImplementation(({ data }) => {
+      sessionEndChangedAt = data.password_changed_at;
+      return 'user.update';
+    });
+    const sessionEndOldLogin = authHeader({ id, kind: 'login', iat: Math.floor(Date.now() / 1000) - 60 });
+
+    const res = await request(app).patch('/users/me/password').set(...sessionEndOldLogin)
+      .send({ currentPassword: CURRENT, newPassword: 'NewPass123' });
+
+    expect(res.status).toBe(200);
+    expect(sessionEndChangedAt).toBeInstanceOf(Date);
+    const fresh = jwt.verify(res.body.data.token, process.env.JWT_SECRET);
+    expect(fresh).toMatchObject({ id, email: `${id}@example.test`, role: 'USER', kind: 'login' });
+
+    // Any signed-in route will do: an empty body gets past auth to a 400.
+    const withOld = await request(app).patch('/users/me/password').set(...sessionEndOldLogin).send({});
+    expect(withOld.status).toBe(401);
+    const withFresh = await request(app).patch('/users/me/password')
+      .set('Authorization', `Bearer ${res.body.data.token}`).send({});
+    expect(withFresh.status).toBe(400);
   });
 
   // A link mailed before the change would put the old state back if used.

@@ -14,6 +14,7 @@ const { paginationValidation } = require('../utils/validation/pagination');
 const { rateLimiter } = require('../utils/rateLimiter');
 const prisma = require('../prisma/client');
 const signJWT = require('../auth/signJWT');
+const { forgetPasswordChange } = require('../auth/loginRevocation');
 const { sendEmailVerificationCode } = require('../utils/mail');
 // Reached through the module object, not destructured, so a test can replace
 // one sender with vi.spyOn and the route sees the replacement.
@@ -581,7 +582,8 @@ router.post('/password/forgot', forgotIpLimit, upload.none(), forgotAddressLimit
 /**
  * POST /users/password/reset
  * Sets a new password with the token from a reset email, and spends the token.
- * Signs no one in and ends no session: old tokens run to their own expiry.
+ * Signs no one in, and ends every login session the account had (THO-898).
+ * Service and other long-lived tokens keep working: auth/loginRevocation.js.
  * @body {string} token
  * @body {string} password - register's rules
  * @returns {200} "Password changed"
@@ -619,12 +621,18 @@ router.post('/password/reset', resetLimit, upload.none(), passwordValidation, as
     try {
       await prisma.$transaction([
         prisma.passwordReset.delete({ where: { token_hash: tokenHash } }),
-        prisma.user.update({ where: { id: reset.user_id }, data: { password_hash: passwordHash } }),
+        prisma.user.update({
+          where: { id: reset.user_id },
+          // The app's clock, not the database's: it is compared with `iat`,
+          // which the app's clock wrote.
+          data: { password_hash: passwordHash, password_changed_at: new Date() },
+        }),
       ]);
     } catch (error) {
       if (error.code === RECORD_NOT_FOUND) return response.badRequest(res, RESET_USED);
       throw error;
     }
+    forgetPasswordChange(reset.user_id);
 
     return response.success(res, 200, {}, 'Password changed');
   } catch (error) {
@@ -671,10 +679,12 @@ const readCurrentPassword = (req) => {
 /**
  * PATCH /users/me/password
  * Changes the caller's password, given the current one.
- * Ends no session: old tokens run to their own expiry (owner decision, THO-810).
+ * Ends every login session the account had, this one included, and hands back
+ * a fresh token for the caller to carry on with (THO-898). Service and other
+ * long-lived tokens keep working: auth/loginRevocation.js.
  * @body {string} currentPassword
  * @body {string} newPassword - register's rules
- * @returns {200} "Password changed"
+ * @returns {200} "Password changed", with `data.token`, a new login token
  * @throws {400} A missing current password, a new one the rules refuse, or the same one again
  * @throws {403} The current password is wrong, or the account has none
  * @throws {429} Too many wrong passwords for this account
@@ -695,7 +705,7 @@ router.patch(
 
       const user = await prisma.user.findUnique({
         where: { id: req.user.id },
-        select: { id: true, password_hash: true },
+        select: { id: true, email: true, role: true, password_hash: true },
       });
       if (!user) return response.notFound(res, 'User not found');
 
@@ -711,11 +721,20 @@ router.patch(
       // A reset link mailed before the change would undo it if used later, so
       // it goes with it.
       await prisma.$transaction([
-        prisma.user.update({ where: { id: user.id }, data: { password_hash: passwordHash } }),
+        prisma.user.update({
+          where: { id: user.id },
+          data: { password_hash: passwordHash, password_changed_at: new Date() },
+        }),
         prisma.passwordReset.deleteMany({ where: { user_id: user.id } }),
       ]);
+      forgetPasswordChange(user.id);
 
-      return response.success(res, 200, {}, 'Password changed');
+      // Signed after the change, so it is the one session that outlives it.
+      // Without it the caller's own token, issued before the change, would be
+      // refused on their next request and the settings form would sign out
+      // the person who just used it.
+      const token = signJWT({ user: { id: user.id, email: user.email, role: user.role } });
+      return response.success(res, 200, { token }, 'Password changed');
     } catch (error) {
       console.error('Error changing password:', error);
       return response.serverError(res, 'Internal server error');
