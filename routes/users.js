@@ -7,6 +7,7 @@ const crypto = require('node:crypto');
 const upload = multer();
 
 const userValidation = require('../utils/validation/user');
+const { passwordValidation } = require('../utils/validation/user');
 const auth = require('../auth/verifyJWT');
 const roleCheck = require('../middlewares/roleCheck');
 const { paginationValidation } = require('../utils/validation/pagination');
@@ -14,12 +15,23 @@ const { rateLimiter } = require('../utils/rateLimiter');
 const prisma = require('../prisma/client');
 const signJWT = require('../auth/signJWT');
 const { sendEmailVerificationCode } = require('../utils/mail');
+// Reached through the module object, not destructured, so a test can replace
+// one sender with vi.spyOn and the route sees the replacement.
+const mail = require('../utils/mail');
+const {
+  RESET_TTL_MS,
+  newResetToken,
+  hashResetToken,
+  resetLink,
+  isPlausibleToken,
+} = require('../utils/passwordReset');
 const { validateEmail, normaliseEmail } = require('../utils/validation/email');
 const {
   emailRequestRateLimiter,
   emailVerificationRateLimiter,
 } = require('../utils/emailRateLimiter');
 const response = require('../utils/apiResponse');
+const { REGISTRATION_CLOSED_MESSAGE } = require('../utils/accounts');
 
 // Wrong passwords, per IP: ten per quarter hour. Successful sign-ins do not
 // count. Login and register used to share one limiter at rateLimiter's default
@@ -30,13 +42,6 @@ const loginLimit = rateLimiter({
   windowMs: 15 * 60 * 1000,
   max: 10,
   skipSuccessfulRequests: true,
-});
-
-// New accounts, per IP: a handful an hour is plenty for a household.
-const registerLimit = rateLimiter({
-  message: 'Too many accounts created from here. Please try again later.',
-  windowMs: 60 * 60 * 1000,
-  max: 5,
 });
 
 // The profile both /me and the admin lookup return.
@@ -52,7 +57,15 @@ const UNIQUE_VIOLATION = 'P2002';
 // Any account whose address differs from this one only by case. Addresses are
 // stored lowercased now, but the migration that folded the old ones left alone
 // any two accounts that differ only by case, rather than fail on the unique key.
-const sameAddress = (email) => ({ email: { equals: email, mode: 'insensitive' } });
+//
+// Prisma's insensitive `equals` is an ILIKE on Postgres, and it passes the
+// value through unescaped: a `%` or `_` in an address was a wildcard, so
+// `vic%@…` and `v_ctim@…` found victim@… (checked against Postgres 16). That
+// let the forgot form mail one person's reset link from a fresh per-address
+// bucket per variant, and let /register answer 409 to a prefix. Escaped here,
+// with LIKE's default escape character, so only case is ignored.
+const escapeLike = (value) => value.replace(/[\\%_]/g, (c) => `\\${c}`);
+const sameAddress = (email) => ({ email: { equals: escapeLike(email), mode: 'insensitive' } });
 
 /**
  * The account an address signs in to, however it was capitalised. An exact
@@ -71,59 +84,14 @@ async function findUserByEmail(email) {
 // about which it was.
 const DUMMY_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);
 
-router.post(
-  '/register',
-  registerLimit,
-  upload.none(),
-  userValidation,
-  async (req, res) => {
-    try {
-      const errors = validationResult(req);
-      // Check for validation errors
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
-      const { email, password } = req.body;
-
-      // Already registered, in any case. `email` arrives normalised.
-      const existingUser = await prisma.user.findFirst({
-        where: sameAddress(email),
-        select: { id: true },
-      });
-      if (existingUser) {
-        return res.status(409).json({ error: 'Email already in use' });
-      }
-
-      // Hash the password
-      const passwordHash = await bcrypt.hash(password, 10);
-
-      // The account and its wishlist in one write. Two writes left an account
-      // with no wishlist when the second failed — and every concert route
-      // assumes there is one.
-      let user;
-      try {
-        user = await prisma.user.create({
-          data: {
-            id: crypto.randomUUID().replace(/-/g, ''),
-            email,
-            password_hash: passwordHash,
-            wishlists: { create: { name: 'My Wishlist' } },
-          },
-          select: { id: true, email: true },
-        });
-      } catch (error) {
-        // Registered by a second request since the check above.
-        if (error.code === UNIQUE_VIOLATION) return res.status(409).json({ error: 'Email already in use' });
-        throw error;
-      }
-
-      res.status(201).json({ message: 'User registered successfully', user });
-    } catch (error) {
-      console.error('Error during registration:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  },
-);
+// Closed for good. This made an account for anyone who found a sign-up page;
+// accounts are now made by the owner with scripts/create-user.js (see
+// utils/accounts.js). The route stays, answering every request the same way,
+// so the sign-up pages still out there show a sentence instead of a 404, and
+// so the answer says nothing about which addresses have an account.
+router.post('/register', (req, res) => {
+  res.status(403).json({ error: REGISTRATION_CLOSED_MESSAGE });
+});
 
 router.post(
   '/login',
@@ -448,6 +416,170 @@ router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.non
     return response.success(res, 200, { user }, 'Email updated successfully');
   } catch (error) {
     console.error('Error verifying email code:', error);
+    return response.serverError(res, 'Internal server error');
+  }
+});
+
+// --- Forgotten password (THO-808) -------------------------------------------
+
+const FORGOT_SENT = "If an account uses that address, we've sent a link to reset its password.";
+const RESET_USED = 'This reset link has already been used or is not valid. Ask for a new one.';
+const RESET_EXPIRED = 'This reset link has expired. Ask for a new one.';
+const RECORD_NOT_FOUND = 'P2025';
+
+// A limited "forgot" request is answered exactly like one that sent mail. A
+// 429 only for addresses someone has been asking about, or a RateLimit header
+// counting down, would tell a stranger which requests reached an account.
+const answerForgotSent = (req, res) => response.success(res, 200, {}, FORGOT_SENT);
+
+// Per IP: a person who forgot a password asks once or twice.
+const forgotIpLimit = rateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 3,
+  handler: answerForgotSent,
+  standardHeaders: false,
+});
+
+// What the handler accepts as an address, shared with the limiter below.
+const isForgotAddress = (value) => typeof value === 'string' && validateEmail(normaliseEmail(value));
+
+// Per address, whichever IPs ask: without it, rotating IPs could fill one
+// person's inbox with reset mail. Something that is not an address is left to
+// the handler's 400: a blank or missing one normalised to '', so every such
+// request from every IP shared one bucket, and after three of them everyone
+// got the quiet 200 instead. Skipping turns on the shape of what was typed,
+// never on whether an account uses it, so it says nothing about accounts.
+const forgotAddressLimit = rateLimiter({
+  windowMs: 60 * 60 * 1000,
+  max: 3,
+  keyGenerator: (req) => `addr:${normaliseEmail(req.body?.email)}`,
+  skip: (req) => !isForgotAddress(req.body?.email),
+  handler: answerForgotSent,
+  standardHeaders: false,
+});
+
+// Guesses at a token, per IP. A token is 256 random bits, so this is about
+// load rather than odds, at the email-change guess limit.
+const resetLimit = rateLimiter({
+  message: 'Too many attempts. Please wait a few minutes and try again.',
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+});
+
+/**
+ * Look the address up, store a fresh token's hash and mail the link.
+ *
+ * Runs after the request has been answered. Awaited, the answer for a known
+ * address would wait on the database write and on Resend, and its timing alone
+ * would say which addresses have accounts. Every failure is logged here and
+ * nothing reaches the person asking.
+ *
+ * @param {string} email - already normalised
+ */
+async function issuePasswordReset(email) {
+  const user = await findUserByEmail(email);
+  if (!user) return;
+
+  const token = newResetToken();
+  const link = resetLink(process.env.CONCERT_MAP_URL, token);
+  if (!link) {
+    console.error('[password reset] CONCERT_MAP_URL is not set; no reset link was sent.');
+    return;
+  }
+
+  const tokenHash = hashResetToken(token);
+  const expiresAt = new Date(Date.now() + RESET_TTL_MS);
+  // `user_id` is unique, so asking again replaces the live link rather than
+  // adding another; the link in the earlier email stops working.
+  await prisma.passwordReset.upsert({
+    where: { user_id: user.id },
+    create: { user_id: user.id, token_hash: tokenHash, expires_at: expiresAt },
+    update: { token_hash: tokenHash, expires_at: expiresAt, created_at: new Date() },
+  });
+
+  try {
+    // To the address on the account, which may differ by case from the one typed.
+    await mail.sendPasswordResetEmail({ to: user.email, link });
+  } catch (error) {
+    // A link nobody received is spent. By hash, not by user: a second request
+    // may already have replaced it, and that one did reach the inbox.
+    await prisma.passwordReset.deleteMany({ where: { token_hash: tokenHash } });
+    throw error;
+  }
+}
+
+/**
+ * POST /users/password/forgot
+ * Mails a reset link to the account using `email`, if there is one.
+ * @body {string} email
+ * @returns {200} The same body whether or not the address has an account,
+ *   whether or not the request was limited, and whether or not the mail went.
+ * @throws {400} Not an email address
+ */
+router.post('/password/forgot', forgotIpLimit, upload.none(), forgotAddressLimit, (req, res) => {
+  if (!isForgotAddress(req.body?.email)) {
+    return response.badRequest(res, 'Valid email required');
+  }
+  const email = normaliseEmail(req.body.email);
+
+  response.success(res, 200, {}, FORGOT_SENT);
+
+  issuePasswordReset(email).catch((error) => {
+    console.error('[password reset] Could not issue a reset link:', error);
+  });
+});
+
+/**
+ * POST /users/password/reset
+ * Sets a new password with the token from a reset email, and spends the token.
+ * Signs no one in and ends no session: old tokens run to their own expiry.
+ * @body {string} token
+ * @body {string} password - register's rules
+ * @returns {200} "Password changed"
+ * @throws {400} Used, unknown or expired token, or a password the rules refuse
+ * @throws {429} Too many attempts from this IP
+ */
+router.post('/password/reset', resetLimit, upload.none(), passwordValidation, async (req, res) => {
+  try {
+    const { token, password } = req.body ?? {};
+    if (!isPlausibleToken(token)) return response.badRequest(res, RESET_USED);
+
+    const tokenHash = hashResetToken(token);
+    const reset = await prisma.passwordReset.findUnique({ where: { token_hash: tokenHash } });
+    if (!reset) return response.badRequest(res, RESET_USED);
+
+    // The hourly sweep may not have reached it yet.
+    if (reset.expires_at <= new Date()) {
+      await prisma.passwordReset.deleteMany({ where: { token_hash: tokenHash } });
+      return response.badRequest(res, RESET_EXPIRED);
+    }
+
+    // After the token, so a dead link says so before the rules are argued over.
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // The token goes with the change, in one transaction. Deleted by its hash:
+    // when a second submit of the same link, or a newer link, got there first,
+    // the delete finds nothing, the whole thing rolls back, and the answer is
+    // "used" rather than a second password change. An account that never had
+    // a password (`password_hash` null) gets one here.
+    try {
+      await prisma.$transaction([
+        prisma.passwordReset.delete({ where: { token_hash: tokenHash } }),
+        prisma.user.update({ where: { id: reset.user_id }, data: { password_hash: passwordHash } }),
+      ]);
+    } catch (error) {
+      if (error.code === RECORD_NOT_FOUND) return response.badRequest(res, RESET_USED);
+      throw error;
+    }
+
+    return response.success(res, 200, {}, 'Password changed');
+  } catch (error) {
+    console.error('Error resetting password:', error);
     return response.serverError(res, 'Internal server error');
   }
 });

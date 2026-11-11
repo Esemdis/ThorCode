@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   ALBUM_TTL_MS, albumExpiry, normaliseAttendanceIds, sameIds, unionIds, albumBase, albumMediaUrls, albumPayload,
+  albumNightKey, albumLinkForNight,
 } from './mediaAlbumShare.js';
 
 describe('albumExpiry', () => {
@@ -49,6 +50,62 @@ describe('sameIds', () => {
 describe('unionIds', () => {
   it('is both lists as one, each id once, ascending', () => {
     expect(unionIds([1, 5], [3, 1])).toEqual([1, 3, 5]);
+  });
+});
+
+describe('albumNightKey (THO-895)', () => {
+  it('reads a night as the UTC calendar day and the city, as the app groups them', () => {
+    // 23:30 UTC is still the 12th: the day is sliced from the instant, the
+    // way the client slices concert_date, never read through local time.
+    expect(albumNightKey({ concert_date: new Date('2026-06-12T23:30:00Z'), city: 'Oslo' })).toBe('2026-06-12|Oslo');
+    expect(albumNightKey({ concert_date: '2026-06-12T19:00:00.000Z', city: null })).toBe('2026-06-12|');
+  });
+
+  it('puts a show with no date in no night', () => {
+    expect(albumNightKey({ concert_date: null, city: 'Oslo' })).toBeNull();
+    expect(albumNightKey(undefined)).toBeNull();
+  });
+});
+
+describe('albumLinkForNight (THO-895)', () => {
+  const NIGHT_A_THO895 = '2026-06-12|Oslo';
+  const NIGHT_B_THO895 = '2026-06-13|Oslo';
+  const nightsTho895 = (entries) => new Map(Object.entries(entries).map(([id, night]) => [Number(id), night]));
+
+  it('widens a link whose attendances and the request\'s are still one night', () => {
+    const link = { attendance_ids: [1] };
+    expect(albumLinkForNight([link], [1, 2], nightsTho895({ 1: NIGHT_A_THO895, 2: NIGHT_A_THO895 }))).toBe(link);
+  });
+
+  it('passes over a link that shares an attendance but has become another night', () => {
+    // Night A shared as 1 and 2; 2's date was corrected into night B with 3.
+    const nightA = { attendance_ids: [1, 2] };
+    const nights = nightsTho895({ 1: NIGHT_A_THO895, 2: NIGHT_B_THO895, 3: NIGHT_B_THO895 });
+    expect(albumLinkForNight([nightA], [2, 3], nights)).toBeNull();
+    expect(albumLinkForNight([nightA], [2], nights)).toBeNull();
+  });
+
+  it('takes the newest link that is this night, past one that is not', () => {
+    const stale = { attendance_ids: [1, 2] };
+    const nightB = { attendance_ids: [2, 3] };
+    const nights = nightsTho895({ 1: NIGHT_A_THO895, 2: NIGHT_B_THO895, 3: NIGHT_B_THO895 });
+    expect(albumLinkForNight([stale, nightB], [2, 3], nights)).toBe(nightB);
+  });
+
+  it('hands back an exact match whatever the dates say, so asking again never mints another', () => {
+    const link = { attendance_ids: [1, 4] };
+    expect(albumLinkForNight([link], [1, 4], nightsTho895({ 1: NIGHT_A_THO895, 4: NIGHT_B_THO895 }))).toBe(link);
+  });
+
+  it('never widens into or out of a show with no date', () => {
+    const link = { attendance_ids: [1] };
+    expect(albumLinkForNight([link], [1, 2], nightsTho895({ 1: NIGHT_A_THO895, 2: null }))).toBeNull();
+  });
+
+  it('leaves out an attendance on the link that has gone, as reading the album does', () => {
+    // 7 is on the link but no longer the owner's: not in the map at all.
+    const link = { attendance_ids: [1, 7] };
+    expect(albumLinkForNight([link], [1, 2], nightsTho895({ 1: NIGHT_A_THO895, 2: NIGHT_A_THO895 }))).toBe(link);
   });
 });
 
