@@ -20,7 +20,7 @@ const {
   emailVerificationRateLimiter,
 } = require('../utils/emailRateLimiter');
 const response = require('../utils/apiResponse');
-const { requireOpenRegistration } = require('../utils/registration');
+const { REGISTRATION_CLOSED_MESSAGE } = require('../utils/accounts');
 
 // Wrong passwords, per IP: ten per quarter hour. Successful sign-ins do not
 // count. Login and register used to share one limiter at rateLimiter's default
@@ -31,13 +31,6 @@ const loginLimit = rateLimiter({
   windowMs: 15 * 60 * 1000,
   max: 10,
   skipSuccessfulRequests: true,
-});
-
-// New accounts, per IP: a handful an hour is plenty for a household.
-const registerLimit = rateLimiter({
-  message: 'Too many accounts created from here. Please try again later.',
-  windowMs: 60 * 60 * 1000,
-  max: 5,
 });
 
 // The profile both /me and the admin lookup return.
@@ -72,61 +65,14 @@ async function findUserByEmail(email) {
 // about which it was.
 const DUMMY_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);
 
-router.post(
-  '/register',
-  // Closed unless REGISTRATION_OPEN=true; see utils/registration.js.
-  requireOpenRegistration,
-  registerLimit,
-  upload.none(),
-  userValidation,
-  async (req, res) => {
-    try {
-      const errors = validationResult(req);
-      // Check for validation errors
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
-      const { email, password } = req.body;
-
-      // Already registered, in any case. `email` arrives normalised.
-      const existingUser = await prisma.user.findFirst({
-        where: sameAddress(email),
-        select: { id: true },
-      });
-      if (existingUser) {
-        return res.status(409).json({ error: 'Email already in use' });
-      }
-
-      // Hash the password
-      const passwordHash = await bcrypt.hash(password, 10);
-
-      // The account and its wishlist in one write. Two writes left an account
-      // with no wishlist when the second failed — and every concert route
-      // assumes there is one.
-      let user;
-      try {
-        user = await prisma.user.create({
-          data: {
-            id: crypto.randomUUID().replace(/-/g, ''),
-            email,
-            password_hash: passwordHash,
-            wishlists: { create: { name: 'My Wishlist' } },
-          },
-          select: { id: true, email: true },
-        });
-      } catch (error) {
-        // Registered by a second request since the check above.
-        if (error.code === UNIQUE_VIOLATION) return res.status(409).json({ error: 'Email already in use' });
-        throw error;
-      }
-
-      res.status(201).json({ message: 'User registered successfully', user });
-    } catch (error) {
-      console.error('Error during registration:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  },
-);
+// Closed for good. This made an account for anyone who found a sign-up page;
+// accounts are now made by the owner with scripts/create-user.js (see
+// utils/accounts.js). The route stays, answering every request the same way,
+// so the sign-up pages still out there show a sentence instead of a 404, and
+// so the answer says nothing about which addresses have an account.
+router.post('/register', (req, res) => {
+  res.status(403).json({ error: REGISTRATION_CLOSED_MESSAGE });
+});
 
 router.post(
   '/login',
