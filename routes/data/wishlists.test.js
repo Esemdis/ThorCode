@@ -783,7 +783,7 @@ describe('GET /wishlists/:id/attendance', () => {
       id: id * 10, event_id: `e${id}`, name: null, venue: 'Vega', city: 'Copenhagen',
       country: 'DK', concert_date: new Date('2026-01-01'), url: null, festival: false,
       metadata: null, source: 'songkick', latitude: null, longitude: null,
-      on_sale: false, sold_out: false, price_min: null, price_max: null,
+      on_sale: false, sold_out: false, ticket_sale_start: null, price_min: null, price_max: null,
       price_currency: null, weather: null, bands: [],
     },
   });
@@ -843,6 +843,23 @@ describe('GET /wishlists/:id/attendance', () => {
     const bands = res.body.attendance[0].concert.participating_bands;
     expect(bands.find((b) => b.id === 1).missed).toBe(false);
     expect(bands.find((b) => b.id === 2).missed).toBe(true);
+  });
+
+  it('returns when ticket sales open, so a Going card can say the sale has not started (THO-812)', async () => {
+    // on_sale is true by default at the sources, so a card reading only that
+    // flag would say "On sale" for a sale that opens next week.
+    const saleStartTho812 = new Date('2026-11-14T10:00:00Z');
+    prisma.concertAttendance.findMany.mockResolvedValue([{
+      ...attendanceRow(1),
+      concert_rel: { ...attendanceRow(1).concert_rel, on_sale: true, ticket_sale_start: saleStartTho812 },
+    }]);
+    prisma.concertMedia.groupBy.mockResolvedValue([]);
+
+    const res = await request(app).get('/wishlists/7/attendance').set(...authHeader({ id: 'user-1' }));
+
+    const select = prisma.concertAttendance.findMany.mock.calls[0][0].include.concert_rel.select;
+    expect(select.ticket_sale_start).toBe(true);
+    expect(res.body.attendance[0].concert.ticket_sale_start).toBe('2026-11-14T10:00:00.000Z');
   });
 
   it("leaves a show you missed a band at out of that band's own list", async () => {
