@@ -14,8 +14,10 @@ import { createRequire } from 'node:module';
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import express from 'express';
 import request from 'supertest';
+import { minimalJpegTho894 } from '../exifFixture.js';
 
 const url = process.env.INTEGRATION_DATABASE_URL;
 const require = createRequire(import.meta.url);
@@ -65,15 +67,17 @@ describe.skipIf(!url)('album share links', () => {
     },
   });
 
-  // A media row with its bytes where the archive keeps them.
-  const makeAlbumFile = async ({ attendanceId, userId, filename, bandId = null, bytes = 'master bytes' }) => {
+  // A media row with its bytes where the archive keeps them. A real JPEG and a
+  // hex checksum, as an upload writes them: the album's /file is a scrubbed
+  // copy named by the checksum (THO-894), and text in a .jpg is refused.
+  const makeAlbumFile = async ({ attendanceId, userId, filename, bandId = null, bytes = minimalJpegTho894 }) => {
     const dir = join(root, 'archive', userId, 'night');
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, filename), bytes);
     return prisma.concertMedia.create({
       data: {
         attendance_id: attendanceId, band_id: bandId, rel_path: `${userId}/night/${filename}`, filename,
-        kind: 'PHOTO', bytes: bytes.length, sha256: `${RUN}-${filename}`,
+        kind: 'PHOTO', bytes: bytes.length, sha256: createHash('sha256').update(`${RUN}-${filename}`).digest('hex'),
       },
     });
   };
