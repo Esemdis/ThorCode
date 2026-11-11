@@ -87,6 +87,12 @@ const sourceTag = (absPath) => createHash('sha256').update(String(absPath)).dige
 const stampOf = (info, keyedByContent, absPath) => (keyedByContent
   ? `v${SCRUB_VERSION}:${info.size}`
   : `v${SCRUB_VERSION}:${info.size}:${Math.trunc(info.mtimeMs)}:${sourceTag(absPath)}`);
+// The "clean" and "refused" markers are verdicts on one file, so they always
+// name it. A copy under a checksum key is scrubbed bytes any row may be
+// handed; a "clean" verdict is not: it sends the caller's own file unplanned,
+// and with only the size in it row A's verdict let row B's same-size file
+// out raw, whenever B's bytes no longer matched the checksum.
+const verdictOf = (stamp, keyedByContent, absPath) => (keyedByContent ? `${stamp}:${sourceTag(absPath)}` : stamp);
 
 // What makeCopy answers for a file with nothing to strip. Each caller then
 // serves its own source: two rows with the same bytes can share one request.
@@ -110,25 +116,26 @@ async function makeCopy(absPath, key, keyedByContent) {
   // source that is gone answers NO_SOURCE (a 404) like everywhere else.
   const before = await statSource(absPath);
   const stamp = stampOf(before, keyedByContent, absPath);
+  const verdict = verdictOf(stamp, keyedByContent, absPath);
   if (await readStamp(stampFile) === stamp && await exists(target)) return target;
-  if (await readStamp(marker) === stamp) return CLEAN;
-  if (await readStamp(refusedFile) === stamp) throw tagged('UNSCRUBBABLE', `refused before: ${key}`);
+  if (await readStamp(marker) === verdict) return CLEAN;
+  if (await readStamp(refusedFile) === verdict) throw tagged('UNSCRUBBABLE', `refused before: ${key}`);
 
   await fs.mkdir(path.dirname(target), { recursive: true });
   try {
     return await withScrubSlot(() => scrubInto({
-      absPath, target, stampFile, marker, refusedFile, stamp, keyedByContent,
+      absPath, target, stampFile, marker, refusedFile, stamp, verdict, keyedByContent,
     }));
   } catch (err) {
     // Remembered, with the same stamp, so the next request is a cheap 404.
     // Not a source that changed under the read: that one may well work next.
-    if (err.code === 'UNSCRUBBABLE' && !err.transient) await fs.writeFile(refusedFile, stamp).catch(() => {});
+    if (err.code === 'UNSCRUBBABLE' && !err.transient) await fs.writeFile(refusedFile, verdict).catch(() => {});
     throw err;
   }
 }
 
 async function scrubInto({
-  absPath, target, stampFile, marker, refusedFile, stamp, keyedByContent,
+  absPath, target, stampFile, marker, refusedFile, stamp, verdict, keyedByContent,
 }) {
   const plan = await planScrubFile(absPath);
   if (plan.length === 0) {
@@ -138,7 +145,7 @@ async function scrubInto({
     if (stampOf(after, keyedByContent, absPath) !== stamp) {
       throw Object.assign(tagged('UNSCRUBBABLE', `${absPath} changed while being read`), { transient: true });
     }
-    await fs.writeFile(marker, stamp);
+    await fs.writeFile(marker, verdict);
     // A copy of what the source used to be is of no use any more.
     for (const p of [stampFile, target, refusedFile]) await fs.unlink(p).catch(() => {});
     return CLEAN;

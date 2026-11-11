@@ -1083,7 +1083,7 @@ describe('DELETE /concerts/:concertId', () => {
     // guards against would have made this [55] instead.
     expect(prisma.concertMedia.findMany).toHaveBeenCalledWith({
       where: { attendance_id: { in: [501] } },
-      select: { rel_path: true },
+      select: { rel_path: true, sha256: true },
     });
     // Order matters: deleting the index before every folder move has
     // succeeded is not recoverable. See utils/mediaDetach.js.
@@ -1168,7 +1168,7 @@ describe('DELETE /bands/:bandId', () => {
     // Names the attendance id (901), not the orphaned concert id (700).
     expect(prisma.concertMedia.findMany).toHaveBeenCalledWith({
       where: { attendance_id: { in: [901] } },
-      select: { rel_path: true },
+      select: { rel_path: true, sha256: true },
     });
   });
 
@@ -1304,7 +1304,7 @@ describe('POST /bands/:bandId/reconcile', () => {
     // Names the attendance id (950), not the orphaned concert id (800).
     expect(prisma.concertMedia.findMany).toHaveBeenCalledWith({
       where: { attendance_id: { in: [950] } },
-      select: { rel_path: true },
+      select: { rel_path: true, sha256: true },
     });
   });
 });
