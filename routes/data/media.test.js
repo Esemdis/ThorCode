@@ -7,7 +7,9 @@ import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
 import { signMediaToken } from '../../utils/mediaTokens.js';
-import { buildExif, jpegWithExif } from '../../test/exifFixture.js';
+import {
+  buildExif, jpegWithExif, jpegWithGpsTho894, mp4WithLocationTho894,
+} from '../../test/exifFixture.js';
 import { clipCacheRoot } from '../../utils/mediaPaths.js';
 import { clipFiles, parseClipRequest } from '../../utils/mediaClips.js';
 
@@ -110,6 +112,12 @@ const bytesOf = (req) => req.buffer(true).parse((res, done) => {
   const chunks = [];
   res.on('data', (c) => chunks.push(c));
   res.on('end', () => done(null, Buffer.concat(chunks).toString()));
+});
+// bytesOf, with the bytes kept as bytes: the THO-894 tests compare binary.
+const rawBytesTho894 = (req) => req.buffer(true).parse((res, done) => {
+  const chunks = [];
+  res.on('data', (c) => chunks.push(c));
+  res.on('end', () => done(null, Buffer.concat(chunks)));
 });
 const baseJpeg = Buffer.from(
   '/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a' +
@@ -3572,11 +3580,71 @@ describe('sharing one file by public link', () => {
       }));
       const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
       await mkdir(join(dir, '.web'), { recursive: true });
-      await writeFile(join(dir, '.web', 'VID_1.mp4.mp4'), 'rendition bytes');
+      // A real MP4: a public link serves only what it can scrub (THO-894).
+      const rendition = mp4WithLocationTho894({ location: false });
+      await writeFile(join(dir, '.web', 'VID_1.mp4.mp4'), rendition);
       const token = tokenOf(await share().expect(200));
 
-      const res = await bytesOf(request(app()).get(`/data/concerts/media/share/${token}`)).expect(200);
-      expect(res.body).toBe('rendition bytes');
+      const res = await rawBytesTho894(request(app()).get(`/data/concerts/media/share/${token}`)).expect(200);
+      expect(Buffer.compare(res.body, rendition)).toBe(0);
+    });
+
+    it('the share link\'s photo has no location', async () => {
+      const { jpeg, tiffAt, at } = jpegWithGpsTho894();
+      await request(app())
+        .post('/data/concerts/attendances/1/media')
+        .set(...authHeader(admin))
+        .attach('files', jpeg, 'IMG_1.jpg')
+        .expect(201);
+      const token = tokenOf(await share().expect(200));
+
+      const res = await rawBytesTho894(request(app()).get(`/data/concerts/media/share/${token}`)).expect(200);
+      expect(res.body.length).toBe(jpeg.length);
+      expect(res.body.readUInt16LE(tiffAt + at.gpsIfd)).toBe(0);
+      expect(res.body.includes(Buffer.from('SN-1234567890'))).toBe(false);
+      expect(res.headers['content-type']).toMatch(/image\/jpeg/);
+    });
+
+    it('the share link\'s rendition has no location', async () => {
+      // ffmpeg copies a source's metadata into what it writes unless told not
+      // to, so a rendition can carry the phone's position as well.
+      await request(app())
+        .post('/data/concerts/attendances/1/media')
+        .set(...authHeader(admin))
+        .attach('files', Buffer.from('original bytes'), 'VID_1.mp4')
+        .expect(201);
+      prisma.concertMedia.findUnique = vi.fn(async () => ({
+        ...owned, kind: 'VIDEO', filename: 'VID_1.mp4',
+        rel_path: 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4',
+      }));
+      const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+      await mkdir(join(dir, '.web'), { recursive: true });
+      const rendition = mp4WithLocationTho894();
+      await writeFile(join(dir, '.web', 'VID_1.mp4.mp4'), rendition);
+      const token = tokenOf(await share().expect(200));
+
+      const res = await rawBytesTho894(request(app()).get(`/data/concerts/media/share/${token}`)).expect(200);
+      expect(res.body.length).toBe(rendition.length);
+      expect(res.body.includes(Buffer.from('+59.9139+010.7522'))).toBe(false);
+      expect(await readdir(join(root, 'cache', 'public'))).toEqual(['web-h1.mp4']);
+    });
+
+    it('the owner\'s own download keeps the original byte for byte, location included', async () => {
+      const { jpeg } = jpegWithGpsTho894();
+      await request(app())
+        .post('/data/concerts/attendances/1/media')
+        .set(...authHeader(admin))
+        .attach('files', jpeg, 'IMG_1.jpg')
+        .expect(201);
+      // Shared too, so the public copy exists and cannot be what /file sends.
+      const token = tokenOf(await share().expect(200));
+      await request(app()).get(`/data/concerts/media/share/${token}`).expect(200);
+
+      const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
+      for (const which of ['file', 'play']) {
+        const res = await rawBytesTho894(request(app()).get(`/data/concerts/media/1/${which}?t=${t}`)).expect(200);
+        expect(Buffer.compare(res.body, jpeg)).toBe(0);
+      }
     });
 
     it('tells the browser not to keep a copy, so a revoke is not undone by its cache', async () => {
@@ -3702,12 +3770,39 @@ describe('sharing one file by public link', () => {
 
     it('serves the cut, not the whole video, once it exists', async () => {
       const token = tokenOf(await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200));
-      await writeFile(join(clipsDir(), `${links.at(-1).id}.mp4`), 'just the moment');
+      // A real MP4: a public link serves only what it can scrub (THO-894).
+      const cut = mp4WithLocationTho894({ location: false });
+      await writeFile(join(clipsDir(), `${links.at(-1).id}.mp4`), cut);
 
-      const res = await bytesOf(open(token)).expect(200);
-      expect(res.body).toBe('just the moment');
+      const res = await rawBytesTho894(open(token)).expect(200);
+      expect(Buffer.compare(res.body, cut)).toBe(0);
       expect(res.headers['content-type']).toMatch(/video\/mp4/);
       expect(res.headers['cache-control']).toBe('private, no-store');
+    });
+
+    it('a shared moment has no location', async () => {
+      const token = tokenOf(await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200));
+      const id = links.at(-1).id;
+      await writeFile(join(clipsDir(), `${id}.mp4`), mp4WithLocationTho894());
+
+      const res = await rawBytesTho894(open(token)).expect(200);
+      expect(res.body.includes(Buffer.from('+59.9139+010.7522'))).toBe(false);
+      expect(res.headers['cache-control']).toBe('private, no-store');
+
+      // And the scrubbed copy goes with the cut when the link is stopped.
+      expect(await readdir(join(root, 'cache', 'public'))).toEqual([`clip-${id}.mp4`]);
+      await revoke().expect(204);
+      expect(await readdir(join(root, 'cache', 'public'))).toEqual([]);
+    });
+
+    it('answers 404 for a moment it cannot scrub, never the cut as it is', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const token = tokenOf(await shareMoment({ start_ms: 83_000, end_ms: 101_000 }).expect(200));
+      await writeFile(join(clipsDir(), `${links.at(-1).id}.mp4`), 'not an mp4');
+
+      const res = await open(token).expect(404);
+      expect(res.headers['cache-control']).toBeUndefined();
+      warn.mockRestore();
     });
 
     it('answers 404 for a moment ffmpeg refused, rather than a page promising it', async () => {

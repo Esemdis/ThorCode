@@ -215,4 +215,8 @@ async function exifCapturedAtOfFile(absPath) {
   }
 }
 
-module.exports = { exifCapturedAt, exifCapturedAtOfFile, APP1_PREFIX };
+// TYPE_BYTES and readHeader are shared with mediaScrub.js (THO-894), which
+// walks the same block to blank parts of it.
+module.exports = {
+  exifCapturedAt, exifCapturedAtOfFile, APP1_PREFIX, TYPE_BYTES, readHeader,
+};

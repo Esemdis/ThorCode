@@ -25,11 +25,24 @@ $MEDIA_ROOT/
         thumbs/<sha256>.webp        grid thumbnails of photos, 480px wide
         display/<sha256>.webp       lightbox copies of photos, within 2048px
         clips/<link id>.mp4         shared moments cut from videos
+        public/                     what share links hand out, metadata stripped
     incoming/         multer's scratch space during an upload.
 ```
 
 `archive/` is the only one that gets copied offsite. `cache/` is regenerated on
 demand from the originals, and `incoming/` holds bytes that are mid-flight.
+
+`cache/public/` holds the copies the public share links (one file, or a whole
+night's album) hand to someone with no account: the original or rendition with
+its GPS position, camera make, model and serials, and XMP patched out in place,
+so the picture and the video stream are byte for byte the original's (THO-894).
+`<sha256>.<ext>` is a master, `web-<sha256>.mp4` a rendition, `clip-<link id>.mp4`
+a shared moment, and a `<name>.clean` marker means that file had nothing to
+strip and the original is served as it is. It is keyed by checksum and safe to
+delete at any time; the next request makes the copy again. A file that cannot
+be read well enough to strip (a format it does not know, a damaged header) is
+answered 404 on the share link, with `[media] not serving media <id> publicly`
+in the log — never sent as it is. The owner's own downloads are untouched.
 
 The thing to understand before touching any of this: **`concert-media.json` is
 the record of truth and Postgres is a disposable index of it.** Every sidecar

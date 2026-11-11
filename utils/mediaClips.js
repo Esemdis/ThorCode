@@ -200,7 +200,10 @@ async function prepareClip(link, row, root = clipCacheRoot()) {
  */
 async function removeClip(id, root = clipCacheRoot()) {
   const files = clipFiles(id, root);
-  for (const p of [files.request, files.output, files.failed]) {
+  // The scrubbed copy a share link served (THO-894) lives in cache/public, the
+  // sibling of cache/clips, keyed by the same link id.
+  const scrubbed = path.join(path.dirname(root), 'public', `clip-${id}.mp4`);
+  for (const p of [files.request, files.output, files.failed, scrubbed, `${scrubbed}.clean`]) {
     await unlink(p).catch(() => {});
   }
 }

@@ -1,0 +1,625 @@
+/**
+ * Where a photograph or a video was taken, and what took it, cut out of the
+ * copy a stranger is given (THO-894).
+ *
+ * A share link hands out originals, and a phone original carries the GPS
+ * position it was shot at — a photograph filed under a night may have been
+ * taken at home before leaving. So every file a public route serves goes
+ * through here first.
+ *
+ * Every change is a same-length patch: a value zeroed, a box renamed to `free`.
+ * Nothing is re-encoded and no byte moves. That is the whole design, for three
+ * reasons:
+ *
+ *   - "the original in full quality" stays true. Re-encoding a JPEG loses
+ *     quality, and there is no ffmpeg in this image to re-mux a video (see
+ *     mediaThumbs.js for why).
+ *   - an MP4's sample tables point at absolute file offsets. Removing a box from
+ *     `moov` would shift `mdat` and break every one of them; renaming it to
+ *     `free` and zeroing it moves nothing.
+ *   - the result can be checked: planning the patched copy again must find
+ *     nothing, which is how mediaPublicCopy.js knows it worked.
+ *
+ * Fail closed throughout. Anything that does not parse, or parses to an offset
+ * outside its own block, throws UNSCRUBBABLE rather than returning "nothing to
+ * do" — a planner that gave up quietly would hand out exactly the file this
+ * exists to stop. The route answers that with a 404.
+ *
+ * The format is decided by the file's own first bytes, never by its name.
+ */
+
+const { open } = require('node:fs/promises');
+const { TYPE_BYTES, readHeader } = require('./exifCapturedAt');
+
+function unscrubbable(reason) {
+  const err = new Error(`cannot scrub: ${reason}`);
+  err.code = 'UNSCRUBBABLE';
+  return err;
+}
+
+// A patch is only planned when it changes something, so a scrubbed file plans
+// to nothing — the re-check after patching depends on that.
+function put(ctx, at, bytes) {
+  if (at < 0 || at + bytes.length > ctx.buf.length) throw unscrubbable('patch outside the file');
+  if (ctx.buf.compare(bytes, 0, bytes.length, at, at + bytes.length) === 0) return;
+  ctx.out.push({ offset: ctx.base + at, bytes: Buffer.from(bytes) });
+}
+
+const fill = (ctx, at, length, byte) => put(ctx, at, Buffer.alloc(length, byte));
+
+// ---------------------------------------------------------------------------
+// EXIF (a TIFF block), shared by JPEG, PNG and WebP.
+
+const TAG_EXIF_IFD = 0x8769;
+const TAG_GPS_IFD = 0x8825;
+
+// Blanked wherever they turn up: the camera and the person, not the picture.
+// Orientation, the capture time and its offset, and the colour profile are
+// kept — without them the photograph is shown on its side, out of order, or in
+// the wrong colours.
+const BLANK_TAGS = new Set([
+  0x010f, // Make
+  0x0110, // Model
+  0x013b, // Artist
+  0x927c, // MakerNote — Apple and Samsung keep location and serials in here too
+  0xa420, // ImageUniqueID
+  0xa430, // CameraOwnerName
+  0xa431, // BodySerialNumber
+  0xa433, // LensMake
+  0xa434, // LensModel
+  0xa435, // LensSerialNumber
+]);
+
+// exifCapturedAt's table, plus type 13 (IFD): some writers type the pointers
+// that way. Reading a pointer is the one thing that table never had to do.
+const SCRUB_TYPE_BYTES = { ...TYPE_BYTES, 13: 4 };
+
+// As in exifCapturedAt: a real IFD holds a few dozen entries.
+const MAX_IFD_ENTRIES = 512;
+const ENTRY_BYTES = 12;
+
+/**
+ * Plan the patches for one TIFF block that runs from `start` to `end` in
+ * ctx.buf. Every offset inside it is measured from `start` and must land
+ * before `end`; one that does not throws, because a value that cannot be found
+ * cannot be blanked.
+ *
+ * This is a stricter walk than exifCapturedAt's, deliberately. That reader may
+ * skip an entry it cannot make sense of and still return a time; this one must
+ * not skip anything that could be the location.
+ */
+function planTiff(ctx, start, end) {
+  const { buf } = ctx;
+  if (end > buf.length || end - start < 8) throw unscrubbable('EXIF too short');
+  const header = readHeader(buf.subarray(0, end), start);
+  if (!header) throw unscrubbable('EXIF without a TIFF header');
+  const { little, ifd0 } = header;
+  const r16 = (at) => (little ? buf.readUInt16LE(at) : buf.readUInt16BE(at));
+  const r32 = (at) => (little ? buf.readUInt32LE(at) : buf.readUInt32BE(at));
+  const w16 = (v) => { const b = Buffer.alloc(2); if (little) b.writeUInt16LE(v); else b.writeUInt16BE(v); return b; };
+
+  // Absolute position of `length` bytes at offset `off` in the block.
+  const at = (off, length) => {
+    if (off < 0 || start + off + length > end) throw unscrubbable('EXIF offset outside its block');
+    return start + off;
+  };
+
+  const seen = new Set();
+  function readDir(off) {
+    if (seen.has(off)) throw unscrubbable('EXIF directories loop');
+    seen.add(off);
+    const base = at(off, 2);
+    const count = r16(base);
+    if (count > MAX_IFD_ENTRIES) throw unscrubbable('EXIF directory too large');
+    at(off + 2, count * ENTRY_BYTES);
+    const entries = [];
+    for (let i = 0; i < count; i += 1) {
+      const entry = base + 2 + i * ENTRY_BYTES;
+      const tag = r16(entry);
+      const type = r16(entry + 2);
+      const components = r32(entry + 4);
+      const width = SCRUB_TYPE_BYTES[type];
+      if (!width) {
+        // A type nobody defined has no measurable length, which is fine for a
+        // tag we keep and not for one we have to blank.
+        if (BLANK_TAGS.has(tag) || tag === TAG_GPS_IFD || tag === TAG_EXIF_IFD) {
+          throw unscrubbable(`EXIF tag ${tag} of unknown type ${type}`);
+        }
+        entries.push({ tag, entry, unmeasured: true });
+        continue;
+      }
+      const bytes = width * components;
+      const valueAt = bytes <= 4 ? entry + 8 : at(r32(entry + 8), bytes);
+      entries.push({ tag, type, entry, valueAt, bytes });
+    }
+    // The next-directory pointer is optional in practice: some writers end the
+    // block right after the last entry.
+    const nextAt = start + off + 2 + count * ENTRY_BYTES;
+    const next = nextAt + 4 <= end ? r32(nextAt) : 0;
+    return { base, count, entries, next };
+  }
+
+  const pointer = (e) => (e.type === 3 ? r16(e.valueAt) : r32(e.valueAt));
+
+  function blankIn(dir) {
+    for (const e of dir.entries) {
+      if (BLANK_TAGS.has(e.tag)) fill(ctx, e.valueAt, e.bytes, 0);
+    }
+  }
+
+  // GPS goes entirely: every value it points at zeroed — the coordinates are
+  // RATIONALs, stored out of line, and an entry zeroed in front of them would
+  // leave them sitting in the block for anyone who looks — then the entries,
+  // then the count, so a reader finds an empty directory.
+  function emptyGps(off) {
+    const dir = readDir(off);
+    for (const e of dir.entries) {
+      if (e.unmeasured) throw unscrubbable('GPS entry of unknown type');
+      if (e.bytes > 4) fill(ctx, e.valueAt, e.bytes, 0);
+    }
+    fill(ctx, dir.base + 2, dir.count * ENTRY_BYTES, 0);
+    put(ctx, dir.base, w16(0));
+  }
+
+  let off = ifd0;
+  let first = true;
+  while (off !== 0) {
+    const dir = readDir(off);
+    blankIn(dir);
+    if (first) {
+      for (const e of dir.entries) {
+        if (e.unmeasured) continue;
+        if (e.tag === TAG_EXIF_IFD) {
+          const subOff = pointer(e);
+          if (subOff !== 0) blankIn(readDir(subOff));
+        } else if (e.tag === TAG_GPS_IFD) {
+          const gpsOff = pointer(e);
+          if (gpsOff !== 0) emptyGps(gpsOff);
+        }
+      }
+    }
+    first = false;
+    off = dir.next;
+  }
+}
+
+// EXIF inside a container sometimes keeps the JPEG's `Exif\0\0` prefix (WebP
+// writers disagree) and sometimes not.
+function exifPrefixed(buf, at, end) {
+  return end - at >= 6 && buf.toString('latin1', at, at + 6) === 'Exif\0\0' ? at + 6 : at;
+}
+
+// ---------------------------------------------------------------------------
+// JPEG
+
+const XMP_NAMESPACES = ['http://ns.adobe.com/xap/1.0/\0', 'http://ns.adobe.com/xmp/extension/\0'];
+
+function startsWith(buf, at, end, text) {
+  return end - at >= text.length && buf.toString('latin1', at, at + text.length) === text;
+}
+
+function planApp1(ctx, payload, end) {
+  const { buf } = ctx;
+  if (startsWith(buf, payload, end, 'Exif\0\0')) {
+    planTiff(ctx, payload + 6, end);
+  } else if (XMP_NAMESPACES.some((ns) => startsWith(buf, payload, end, ns))) {
+    // The namespace goes too, so what is left is an APP1 nobody claims, which
+    // every reader skips; an XMP header in front of spaces is a broken packet.
+    fill(ctx, payload, end - payload, 0x20);
+  }
+}
+
+// Past a scan's entropy-coded data to the next marker. Inside it a 0xFF is
+// either stuffed (FF 00), a restart marker (FF D0–D7) or fill before the next
+// real marker.
+function skipEntropy(buf, pos) {
+  for (let i = pos; i < buf.length - 1; i += 1) {
+    if (buf[i] !== 0xff) continue;
+    const next = buf[i + 1];
+    if (next === 0x00 || (next >= 0xd0 && next <= 0xd7) || next === 0xff) continue;
+    return i;
+  }
+  throw unscrubbable('JPEG ends inside a scan');
+}
+
+// One JPEG from its SOI to just past its EOI.
+function planOneJpeg(ctx, start) {
+  const { buf } = ctx;
+  let pos = start + 2;
+  for (;;) {
+    if (pos + 2 > buf.length || buf[pos] !== 0xff) throw unscrubbable('JPEG marker expected');
+    while (pos + 2 < buf.length && buf[pos + 1] === 0xff) pos += 1;
+    const marker = buf[pos + 1];
+    pos += 2;
+    if (marker === 0xd9) return pos;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (marker === 0x00 || marker === 0xd8) throw unscrubbable('JPEG marker out of place');
+    if (pos + 2 > buf.length) throw unscrubbable('JPEG segment truncated');
+    const segEnd = pos + buf.readUInt16BE(pos);
+    if (segEnd < pos + 2 || segEnd > buf.length) throw unscrubbable('JPEG segment overruns the file');
+    if (marker === 0xe1) planApp1(ctx, pos + 2, segEnd);
+    pos = segEnd;
+    if (marker === 0xda) pos = skipEntropy(buf, pos);
+  }
+}
+
+// A second image after the first one's EOI: the MPF secondaries and the HDR
+// gain map a current phone appends. Each carries its own APP1, and an Apple
+// gain map's has been seen with the same EXIF as the primary.
+const NEXT_JPEG = Buffer.from([0xff, 0xd8, 0xff]);
+
+function planJpeg(ctx) {
+  let pos = 0;
+  for (;;) {
+    pos = planOneJpeg(ctx, pos);
+    const next = ctx.buf.indexOf(NEXT_JPEG, pos);
+    if (next < 0) return;
+    pos = next;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PNG
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i += 1) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+// Text chunks that are metadata blocks in disguise: XMP, and the "raw profile"
+// chunks ImageMagick and exiftool write EXIF and XMP into as hex.
+const PNG_METADATA_KEYWORD = /^(XML:com\.adobe\.xmp|Raw profile type (exif|xmp|app1))$/i;
+const PNG_TEXT_CHUNKS = new Set(['tEXt', 'iTXt', 'zTXt']);
+
+// A private, ancillary, safe-to-copy chunk type that no reader interprets: the
+// PNG equivalent of renaming an MP4 box to `free`.
+const PNG_NEUTRAL = Buffer.from('scRb', 'latin1');
+
+function planPng(ctx) {
+  const { buf } = ctx;
+  let pos = 8;
+  for (;;) {
+    if (pos + 12 > buf.length) throw unscrubbable('PNG ends without IEND');
+    const length = buf.readUInt32BE(pos);
+    const type = buf.toString('latin1', pos + 4, pos + 8);
+    const data = pos + 8;
+    const dataEnd = data + length;
+    if (length > 0x7fffffff || dataEnd + 4 > buf.length) throw unscrubbable('PNG chunk overruns the file');
+
+    const chunk = { buf, base: ctx.base, out: [] };
+    if (type === 'eXIf') {
+      planTiff(chunk, exifPrefixed(buf, data, dataEnd), dataEnd);
+    } else if (PNG_TEXT_CHUNKS.has(type)) {
+      const nul = buf.indexOf(0, data);
+      const keyword = nul >= 0 && nul < dataEnd ? buf.toString('latin1', data, nul) : '';
+      if (PNG_METADATA_KEYWORD.test(keyword)) {
+        put(chunk, pos + 4, PNG_NEUTRAL);
+        fill(chunk, data, length, 0);
+      }
+    }
+    // A changed chunk needs its CRC recomputed over type and data, or a strict
+    // decoder refuses the whole image.
+    if (chunk.out.length) {
+      const patched = Buffer.from(buf.subarray(pos + 4, dataEnd));
+      for (const p of chunk.out) p.bytes.copy(patched, p.offset - ctx.base - (pos + 4));
+      const crc = Buffer.alloc(4);
+      crc.writeUInt32BE(crc32(patched));
+      put(chunk, dataEnd, crc);
+      ctx.out.push(...chunk.out);
+    }
+    if (type === 'IEND') return;
+    pos = dataEnd + 4;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WebP
+
+function planWebp(ctx) {
+  const { buf } = ctx;
+  const riffEnd = 8 + buf.readUInt32LE(4);
+  if (riffEnd > buf.length) throw unscrubbable('WebP RIFF overruns the file');
+  let pos = 12;
+  while (pos < riffEnd) {
+    if (pos + 8 > riffEnd) throw unscrubbable('WebP chunk header truncated');
+    const fourcc = buf.toString('latin1', pos, pos + 4);
+    const size = buf.readUInt32LE(pos + 4);
+    const data = pos + 8;
+    const end = data + size;
+    if (end > riffEnd) throw unscrubbable('WebP chunk overruns the file');
+    if (fourcc === 'EXIF') planTiff(ctx, exifPrefixed(buf, data, end), end);
+    else if (fourcc === 'XMP ') fill(ctx, data, size, 0x20);
+    // Chunks are padded to an even length, and the pad is not in the size.
+    pos = end + (size & 1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MP4 / QuickTime
+
+// Renamed to `free` and zeroed wherever they are found under moov: the
+// location (QuickTime's ©xyz, 3GPP's loci), the camera (©mak, ©mod) and the
+// QuickTime XMP box.
+const MP4_NEUTRALISE = new Set(['\xa9xyz', 'loci', '\xa9mak', '\xa9mod', 'XMP_']);
+// The boxes that can hold one of those somewhere below them.
+const MP4_CONTAINERS = new Set(['moov', 'trak', 'mdia', 'udta']);
+// Adobe's XMP box, as a uuid box's user type.
+const XMP_UUID = Buffer.from('be7acfcb97a942e89c71999491e3afac', 'hex');
+const FREE = Buffer.from('free', 'latin1');
+
+// mdta keys that say where or with what: Apple's ISO 6709 position and its
+// accuracy, the body and the phone's model. Matched loosely rather than by
+// Apple's names alone, because ffmpeg with `use_metadata_tags` writes the same
+// position under plain keys (`location`, `location-eng`) — measured on a file
+// re-muxed that way, which kept its coordinates under an exact match.
+const isSensitiveAppleKey = (name) => /location/i.test(name)
+  || /(^|\.)(make|model)$/i.test(name);
+
+// Big enough for a long recording's sample tables, small enough that a
+// corrupt size is a refusal rather than an attempt to read gigabytes into
+// memory.
+const MAX_MOOV_BYTES = 256 * 1024 * 1024;
+
+const printableType = (buf, at) => {
+  for (let i = at; i < at + 4; i += 1) {
+    if (!((buf[i] >= 0x20 && buf[i] <= 0x7e) || buf[i] === 0xa9)) return false;
+  }
+  return true;
+};
+
+// Whether a plausible box header starts at `at`. Used only to tell Apple's
+// plain `meta` from the ISO FullBox one, which has four bytes of version and
+// flags before its first child.
+function looksLikeBox(buf, at, end) {
+  if (at + 8 > end) return false;
+  const size = buf.readUInt32BE(at);
+  return size >= 8 && at + size <= end && printableType(buf, at + 4);
+}
+
+function walkBoxes(ctx, start, end, visit) {
+  const { buf } = ctx;
+  let pos = start;
+  while (pos < end) {
+    const left = end - pos;
+    // QuickTime allows a 32-bit zero to end a udta list.
+    if (left === 4 && buf.readUInt32BE(pos) === 0) return;
+    if (left < 8) throw unscrubbable('MP4 box header truncated');
+    let size = buf.readUInt32BE(pos);
+    let headerLen = 8;
+    if (size === 1) {
+      if (left < 16) throw unscrubbable('MP4 box header truncated');
+      size = Number(buf.readBigUInt64BE(pos + 8));
+      headerLen = 16;
+    }
+    if (size < headerLen || size > left) throw unscrubbable('MP4 box overruns its parent');
+    visit({
+      at: pos, type: buf.toString('latin1', pos + 4, pos + 8), headerLen, end: pos + size,
+    });
+    pos += size;
+  }
+}
+
+function neutralise(ctx, box) {
+  put(ctx, box.at + 4, FREE);
+  fill(ctx, box.at + box.headerLen, box.end - box.at - box.headerLen, 0);
+}
+
+const isXmpUuid = (buf, box) => box.end - (box.at + box.headerLen) >= 16
+  && buf.compare(XMP_UUID, 0, 16, box.at + box.headerLen, box.at + box.headerLen + 16) === 0;
+
+function readAppleKeys(buf, box) {
+  const start = box.at + box.headerLen;
+  if (start + 8 > box.end) throw unscrubbable('MP4 keys box truncated');
+  const count = buf.readUInt32BE(start + 4);
+  const names = [];
+  let pos = start + 8;
+  for (let i = 0; i < count; i += 1) {
+    if (pos + 8 > box.end) throw unscrubbable('MP4 keys entry truncated');
+    const size = buf.readUInt32BE(pos);
+    if (size < 8 || pos + size > box.end) throw unscrubbable('MP4 keys entry overruns its box');
+    names.push(buf.toString('utf8', pos + 8, pos + size));
+    pos += size;
+  }
+  return names;
+}
+
+function planMeta(ctx, box) {
+  const { buf } = ctx;
+  let start = box.at + box.headerLen;
+  if (start === box.end) return;
+  if (!looksLikeBox(buf, start, box.end)) {
+    if (start + 4 === box.end) return;
+    if (!looksLikeBox(buf, start + 4, box.end)) throw unscrubbable('MP4 meta box unreadable');
+    start += 4;
+  }
+
+  const children = [];
+  walkBoxes(ctx, start, box.end, (child) => children.push(child));
+  const hdlr = children.find((c) => c.type === 'hdlr');
+  const handler = hdlr && hdlr.end - hdlr.at >= hdlr.headerLen + 12
+    ? buf.toString('latin1', hdlr.at + hdlr.headerLen + 8, hdlr.at + hdlr.headerLen + 12)
+    : null;
+
+  if (handler === 'mdta') {
+    // Apple's: each ilst item's box type is a 1-based index into `keys`, and
+    // only the key's name says what the item holds.
+    const keysBox = children.find((c) => c.type === 'keys');
+    const names = keysBox ? readAppleKeys(buf, keysBox) : [];
+    for (const child of children) {
+      if (child.type === 'ilst') {
+        walkBoxes(ctx, child.at + child.headerLen, child.end, (item) => {
+          if (item.type === 'free') return;
+          const index = buf.readUInt32BE(item.at + 4);
+          const name = names[index - 1];
+          if (name === undefined) throw unscrubbable('MP4 ilst item without a key');
+          if (isSensitiveAppleKey(name)) neutralise(ctx, item);
+        });
+      } else if (child.type !== 'keys') {
+        planMoovChildren(ctx, child.at, child.end, child);
+      }
+    }
+    return;
+  }
+  for (const child of children) {
+    // An iTunes-style list's items are named boxes, so a ©mak in one is found
+    // by its name like anywhere else.
+    if (child.type === 'ilst') planMoovChildren(ctx, child.at + child.headerLen, child.end);
+    else planMoovChildren(ctx, child.at, child.end, child);
+  }
+}
+
+// One box, or the run of boxes from start to end, below moov.
+function planMoovChildren(ctx, start, end, single = null) {
+  const visit = (box) => {
+    if (box.type === 'cmov') throw unscrubbable('compressed MP4 header');
+    if (MP4_NEUTRALISE.has(box.type)) return neutralise(ctx, box);
+    if (box.type === 'uuid') return isXmpUuid(ctx.buf, box) ? neutralise(ctx, box) : undefined;
+    if (box.type === 'meta') return planMeta(ctx, box);
+    if (MP4_CONTAINERS.has(box.type)) planMoovChildren(ctx, box.at + box.headerLen, box.end);
+    return undefined;
+  };
+  if (single) visit(single);
+  else walkBoxes(ctx, start, end, visit);
+}
+
+/**
+ * The top level is walked off the file, not out of memory: `mdat` is most of
+ * a video and the only part that is never needed. `moov`, and a top-level XMP
+ * uuid box, are read in whole.
+ */
+async function planMp4(source) {
+  const out = [];
+  let pos = 0;
+  let sawMoov = false;
+  while (pos < source.size) {
+    const left = source.size - pos;
+    if (left < 8) throw unscrubbable('MP4 ends inside a box header');
+    const head = await source.read(pos, Math.min(left, 32));
+    let size = head.readUInt32BE(0);
+    let headerLen = 8;
+    if (size === 1) {
+      if (head.length < 16) throw unscrubbable('MP4 box header truncated');
+      size = Number(head.readBigUInt64BE(8));
+      headerLen = 16;
+    } else if (size === 0) {
+      size = left;
+    }
+    if (size < headerLen || size > left) throw unscrubbable('MP4 box overruns the file');
+    const type = head.toString('latin1', 4, 8);
+
+    const readWhole = type === 'moov'
+      || (type === 'uuid' && head.length >= headerLen + 16
+        && head.compare(XMP_UUID, 0, 16, headerLen, headerLen + 16) === 0);
+    if (readWhole) {
+      if (size > MAX_MOOV_BYTES) throw unscrubbable(`MP4 ${type} too large`);
+      const buf = await source.read(pos, size);
+      const ctx = { buf, base: pos, out };
+      const box = { at: 0, type, headerLen, end: size };
+      if (type === 'moov') {
+        sawMoov = true;
+        planMoovChildren(ctx, headerLen, size);
+      } else {
+        neutralise(ctx, box);
+      }
+    }
+    pos += size;
+  }
+  // A file with no movie header is not one this understands — a HEIC, say,
+  // which shares the ftyp start — and "nothing found" would be a guess.
+  if (!sawMoov) throw unscrubbable('MP4 without a moov box');
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+// The first box of an MP4 is ftyp. Older QuickTime files open with one of the
+// others, and an iPhone's .mov uploaded as video/mp4 is one of those.
+const MP4_FIRST_BOXES = new Set(['ftyp', 'wide', 'free', 'skip', 'moov', 'mdat']);
+
+function formatOf(head) {
+  if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return 'jpeg';
+  if (head.length >= 8 && head.compare(PNG_SIGNATURE, 0, 8, 0, 8) === 0) return 'png';
+  if (head.length >= 12 && head.toString('latin1', 0, 4) === 'RIFF'
+    && head.toString('latin1', 8, 12) === 'WEBP') return 'webp';
+  if (head.length >= 8 && MP4_FIRST_BOXES.has(head.toString('latin1', 4, 8))) return 'mp4';
+  return null;
+}
+
+// Photographs are parsed in memory. The cap is far above any phone's output
+// and turns a corrupt or hostile file into a refusal rather than an attempt
+// to hold gigabytes.
+const MAX_IMAGE_BYTES = 256 * 1024 * 1024;
+
+const IMAGE_PLANNERS = { jpeg: planJpeg, png: planPng, webp: planWebp };
+
+async function planSource(source) {
+  const head = await source.read(0, Math.min(source.size, 16));
+  const format = formatOf(head);
+  if (!format) throw unscrubbable('unrecognised format');
+  if (format === 'mp4') return planMp4(source);
+  if (source.size > MAX_IMAGE_BYTES) throw unscrubbable('image too large');
+  const ctx = { buf: await source.read(0, source.size), base: 0, out: [] };
+  IMAGE_PLANNERS[format](ctx);
+  return ctx.out;
+}
+
+/**
+ * The patches that scrub a whole file held in memory.
+ *
+ * @param {Buffer} buf
+ * @returns {Promise<Array<{offset: number, bytes: Buffer}>>} same-length
+ *   patches, empty when there is nothing to strip
+ * @throws {Error} code UNSCRUBBABLE for anything it cannot parse or recognise
+ */
+async function planScrub(buf) {
+  return planSource({
+    size: buf.length,
+    read: async (offset, length) => buf.subarray(offset, offset + length),
+  });
+}
+
+/** The same, read off disk; a video's mdat is never read. */
+async function planScrubFile(absPath) {
+  const fh = await open(absPath, 'r');
+  try {
+    const { size } = await fh.stat();
+    return await planSource({
+      size,
+      read: async (offset, length) => {
+        const buf = Buffer.alloc(length);
+        let got = 0;
+        while (got < length) {
+          const { bytesRead } = await fh.read(buf, got, length - got, offset + got);
+          if (bytesRead === 0) throw unscrubbable('file shorter than it said');
+          got += bytesRead;
+        }
+        return buf;
+      },
+    });
+  } finally {
+    await fh.close();
+  }
+}
+
+/** Patches applied to a copy of `buf`, for tests and for checking a plan. */
+function applyPatches(buf, patches) {
+  const out = Buffer.from(buf);
+  for (const p of patches) p.bytes.copy(out, p.offset);
+  return out;
+}
+
+module.exports = {
+  planScrub, planScrubFile, applyPatches, crc32, XMP_UUID,
+};

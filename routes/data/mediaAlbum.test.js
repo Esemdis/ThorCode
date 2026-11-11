@@ -1,9 +1,12 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildApp, authHeader, installFakePrisma } from '../../test/routeApp.js';
+import {
+  jpegWithGpsTho894, minimalJpegTho894, mp4WithLocationTho894,
+} from '../../test/exifFixture.js';
 
 // Sharing a whole night by public link (THO-892). Its own file rather than
 // more of media.test.js: every behaviour here is about one stateful table, and
@@ -79,14 +82,18 @@ const stopNight = (ids, as = ownerTho892) => request(app())
   .delete(`/data/concerts/album-shares?attendance_ids=${ids.join(',')}`).set(...authHeader(as));
 const openAlbum = (token) => request(app()).get(`/data/concerts/album-shares/${token}`);
 
-// A media row with its bytes on disk, the way the archive holds them.
-async function fileInAlbumTho892({ id = 1, attendanceId = 1, userId = 'user-1', bytes = 'master bytes', filename = 'IMG_1.jpg' } = {}) {
+// A media row with its bytes on disk, the way the archive holds them. A real
+// JPEG by default: a public route serves only what it can scrub (THO-894), and
+// text in a .jpg is refused.
+async function fileInAlbumTho892({
+  id = 1, attendanceId = 1, userId = 'user-1', bytes = minimalJpegTho894, filename = 'IMG_1.jpg', kind = 'PHOTO',
+} = {}) {
   const rel = `${userId}/2026-06-12 Oslo - Gojira/${filename}`;
   const dir = join(root, 'archive', userId, '2026-06-12 Oslo - Gojira');
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, filename), bytes);
   const row = {
-    id, attendance_id: attendanceId, band_id: 92, kind: 'PHOTO', filename, rel_path: rel, sha256: `sha-${id}`,
+    id, attendance_id: attendanceId, band_id: 92, kind, filename, rel_path: rel, sha256: `sha${id}`,
     bytes: bytes.length, taken_at: null,
     attendance_rel: { wishlist_rel: { user_id: userId } },
   };
@@ -245,18 +252,85 @@ describe('GET /album-shares/:token', () => {
   });
 });
 
+// The body as a Buffer whatever its type: superagent leaves a video's undefined.
+const rawBytesTho894 = (req) => req.buffer(true).parse((res, done) => {
+  const chunks = [];
+  res.on('data', (c) => chunks.push(c));
+  res.on('end', () => done(null, Buffer.concat(chunks)));
+});
+
 describe('GET /album-shares/:token/media/:id/:which', () => {
   const bytesAt = (token, id, which) => request(app())
     .get(`/data/concerts/album-shares/${token}/media/${id}/${which}`);
 
   it('sends the archive master as a download under its own name', async () => {
-    await fileInAlbumTho892({ id: 1, filename: 'IMG_1.jpg', bytes: 'master bytes' });
+    await fileInAlbumTho892({ id: 1, filename: 'IMG_1.jpg' });
     const { body } = await shareNight([1]).expect(200);
 
     const res = await bytesAt(body.data.token, 1, 'file').expect(200);
     expect(res.headers['content-disposition']).toMatch(/attachment; filename="IMG_1\.jpg"/);
     expect(res.headers['cache-control']).toBe('private, no-store');
-    expect(res.body.toString()).toBe('master bytes');
+    // A master with nothing to strip goes out exactly as it is.
+    expect(Buffer.compare(res.body, minimalJpegTho894)).toBe(0);
+  });
+
+  it('hands a shared night\'s original out without the place it was taken', async () => {
+    // The original keeps it — the owner may want a map of where photographs
+    // were taken — but a stranger holding the link, or anyone it was
+    // forwarded to, could read the owner's home out of it.
+    const { jpeg, tiffAt, at } = jpegWithGpsTho894();
+    await fileInAlbumTho892({ id: 1, bytes: jpeg });
+    const { body } = await shareNight([1]).expect(200);
+
+    const res = await bytesAt(body.data.token, 1, 'file').expect(200);
+    const served = res.body;
+    expect(served.length).toBe(jpeg.length);
+    expect(served.readUInt16LE(tiffAt + at.gpsIfd)).toBe(0);
+    expect(served.subarray(tiffAt + at.serial, tiffAt + at.serial + 14).equals(Buffer.alloc(14))).toBe(true);
+    // The picture itself, from the first scan on, byte for byte.
+    const scan = (b) => b.subarray(b.indexOf(Buffer.from([0xff, 0xda])));
+    expect(scan(served).equals(scan(jpeg))).toBe(true);
+    // Made once, kept in the cache like a thumbnail.
+    expect(await readdir(join(root, 'cache', 'public'))).toEqual(['sha1.jpg']);
+  });
+
+  it('strips the location from a shared night\'s video', async () => {
+    const mp4 = mp4WithLocationTho894();
+    await fileInAlbumTho892({ id: 1, bytes: mp4, filename: 'VID_1.mp4', kind: 'VIDEO' });
+    const { body } = await shareNight([1]).expect(200);
+
+    for (const which of ['file', 'view']) {
+      const res = await rawBytesTho894(bytesAt(body.data.token, 1, which)).expect(200);
+      expect(res.body.length).toBe(mp4.length);
+      expect(res.body.includes(Buffer.from('+59.9139+010.7522'))).toBe(false);
+      expect(res.body.includes(Buffer.from('iPhone 15 Pro'))).toBe(false);
+    }
+  });
+
+  it('answers 404, not the original, for a file it cannot strip', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await fileInAlbumTho892({ id: 1, bytes: 'not a photograph at all' });
+    const { body } = await shareNight([1]).expect(200);
+
+    const res = await bytesAt(body.data.token, 1, 'file').expect(404);
+    expect(res.headers['cache-control']).toBeUndefined();
+    expect(res.headers['content-disposition']).toBeUndefined();
+    expect(warn.mock.calls.flat().join(' ')).toMatch(/media 1/);
+    warn.mockRestore();
+  });
+
+  it('a shared night\'s thumbnail and viewing copy carry no EXIF at all', async () => {
+    const sharp = (await import('sharp')).default;
+    const base = await sharp({ create: { width: 64, height: 48, channels: 3, background: '#334155' } }).jpeg().toBuffer();
+    const { jpeg } = jpegWithGpsTho894(base);
+    expect((await sharp(jpeg).metadata()).exif).toBeDefined();
+    await fileInAlbumTho892({ id: 1, bytes: jpeg });
+    const { body } = await shareNight([1]).expect(200);
+
+    for (const which of ['thumb', 'view']) {
+      const res = await rawBytesTho894(bytesAt(body.data.token, 1, which)).expect(200);
+      expect((await sharp(res.body).metadata()).exif).toBeUndefined();
+    }
   });
 
   it('refuses a file that is not part of the night, exactly as one that does not exist', async () => {
