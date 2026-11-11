@@ -25,7 +25,7 @@ const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const prisma = require('../../../prisma/client');
 const {
-  fail, badRequest, notFound, forbidden, success,
+  fail, badRequest, notFound, forbidden, success, error,
 } = require('../../../utils/apiResponse');
 const {
   uniqueFilename, resolveArchivePath, slugSegment,
@@ -252,6 +252,20 @@ router.post(
       // handler runs, so what is serialised is hashing and bookkeeping, not
       // the upload itself.
       releaseShow = await acquire(`attendance:${attendanceId}`);
+
+      // The show was read before the lock, and a move (POST .../move, which
+      // takes this lock) can land in between. Its files would then go into a
+      // folder named, and a sidecar seeded, for a concert this user no longer
+      // has, and a rebuild would attach them to nobody. Read again under the
+      // lock, and ask for a retry rather than file them by the old show.
+      const settled = await prisma.concertAttendance.findUnique({
+        where: { id: attendanceId },
+        select: { concert_id: true },
+      });
+      if (settled?.concert_id !== row.concert_rel.id) {
+        await cleanup();
+        return error(res, 409, 'This show was just changed. Try the upload again.');
+      }
 
       const existing = await prisma.concertMedia.findMany({
         where: { attendance_id: attendanceId },
