@@ -2,7 +2,7 @@ const { Resend } = require("resend");
 const { canonicalBandName } = require("./lineupNames");
 // What the two notification emails look like, shared so they look like one
 // another and like the app. See utils/emailTemplate.js for the dialect.
-const { emailShell, showCard, nameSummary } = require("./emailTemplate");
+const { emailShell, showCard, actionCard, nameSummary } = require("./emailTemplate");
 
 let resend;
 function getResend() {
@@ -190,4 +190,54 @@ async function sendEmailVerificationCode({ to, code }) {
   }
 }
 
-module.exports = { sendDigestEmail, sendEmailVerificationCode, buildDigestHtml, sendTicketAlertEmail, buildTicketAlertHtml };
+const PASSWORD_RESET_SUBJECT = "Reset your Concert Map password";
+
+/**
+ * The forgotten-password email (THO-808): one card with the link as a button
+ * and as text. Says how long it lasts and what to do if it was not you,
+ * because anyone can type someone else's address into the form.
+ */
+function buildPasswordResetHtml({ link }) {
+  const card = actionCard({
+    lines: [
+      "Someone asked to reset the password for the Concert Map account that uses this address.",
+      "The link works once, for 30 minutes.",
+    ],
+    label: "Choose a new password",
+    href: link,
+  });
+  return emailShell({
+    heading: PASSWORD_RESET_SUBJECT,
+    preheader: "The link works once, for 30 minutes.",
+    cards: [card],
+    footnote: "If you did not ask for this, ignore this email. Your password stays as it is.",
+  });
+}
+
+/**
+ * Send a password reset link. Throws when it was not sent, as the other
+ * senders do, so the caller can spend the token it would otherwise leave live.
+ */
+async function sendPasswordResetEmail({ to, link }) {
+  if (!to || !link) throw new Error("Email and link are required");
+  const result = await getResend().emails.send({
+    from: process.env.NOTIFICATIONS_FROM_EMAIL,
+    to,
+    subject: PASSWORD_RESET_SUBJECT,
+    html: buildPasswordResetHtml({ link }),
+  });
+  if (result?.error) {
+    throw new Error(`Email service error: ${result.error.message ?? result.error.name ?? "unknown"}`);
+  }
+  return result;
+}
+
+module.exports = {
+  sendDigestEmail,
+  sendEmailVerificationCode,
+  buildDigestHtml,
+  sendTicketAlertEmail,
+  buildTicketAlertHtml,
+  sendPasswordResetEmail,
+  buildPasswordResetHtml,
+};
