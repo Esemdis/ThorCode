@@ -59,6 +59,48 @@ const sameIds = (a, b) => a.length === b.length && a.every((id, i) => id === b[i
 const unionIds = (a, b) => [...new Set([...a, ...b])].sort((x, y) => x - y);
 
 /**
+ * Whether a request asks for the night's picks rather than every file of it
+ * (THO-849). A POST's JSON carries a boolean; a DELETE's query carries text.
+ *
+ * @returns {boolean|undefined|null} undefined when it is not given at all,
+ *   which each route answers its own way; null when it is given as anything
+ *   else, which is refused rather than read as one or the other — a typo here
+ *   must not share every file of a night when its picks were asked for.
+ */
+function parsePicksOnly(raw) {
+  if (raw === undefined) return undefined;
+  if (raw === true || raw === 'true' || raw === '1') return true;
+  if (raw === false || raw === 'false' || raw === '0') return false;
+  return null;
+}
+
+/**
+ * Which files a link shows: those filed under its attendances and, for a
+ * picks link, only the picked ones. The listing and the byte route both ask
+ * this, so a file a picks link does not list is not one its token opens
+ * either — the ids are sequential, and the next one along is a guess away.
+ */
+function albumMediaWhere(link, attendanceIds) {
+  return {
+    attendance_id: { in: attendanceIds },
+    ...(link.picks_only && { picked: true }),
+  };
+}
+
+/**
+ * Whether a link opens this one file: filed under one of its attendances, the
+ * link's owner's, and picked when the link is for the picks. The byte route's
+ * form of albumMediaWhere, for a row it has fetched by id.
+ *
+ * @param {object} row - A ConcertMedia row with attendance_rel.wishlist_rel.
+ */
+function albumServesFile(link, row) {
+  if (!row || !link.attendance_ids.includes(row.attendance_id)) return false;
+  if (row.attendance_rel?.wishlist_rel?.user_id !== link.user_id) return false;
+  return !link.picks_only || row.picked === true;
+}
+
+/**
  * The configured public base URL, checked once per listing: absolute, and
  * over http(s). The reasons are beside mediaUrls() in mediaTokens.js. Once
  * and not per file, because a festival night is hundreds of files and the
@@ -142,6 +184,10 @@ function albumPayload({ link, attendances, media, otherBands = [], baseUrl }) {
 
   return {
     expires_at: link.expires_at,
+    // So the page can say these are the owner's picks and not the whole
+    // night, which a recipient who was there would otherwise read as files
+    // missing (THO-849).
+    picks_only: Boolean(link.picks_only),
     night: {
       date: dated ? dateOnly(dated.concert_date) : null,
       venues: [...new Set(concerts.map((c) => c.venue).filter(Boolean))],
@@ -168,5 +214,5 @@ function albumPayload({ link, attendances, media, otherBands = [], baseUrl }) {
 
 module.exports = {
   ALBUM_TTL_MS, MAX_ALBUM_ATTENDANCES, albumExpiry, normaliseAttendanceIds, sameIds, unionIds,
-  albumBase, albumMediaUrls, albumPayload,
+  albumBase, albumMediaUrls, albumPayload, parsePicksOnly, albumMediaWhere, albumServesFile,
 };

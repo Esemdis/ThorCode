@@ -18,18 +18,20 @@ const { serialise } = require('../../../utils/serialQueue');
 const { rateLimiter } = require('../../../utils/rateLimiter');
 const { generateShareToken } = require('../../../utils/mediaShareToken');
 const {
-  albumExpiry, normaliseAttendanceIds, sameIds, unionIds, albumPayload,
+  albumExpiry, normaliseAttendanceIds, sameIds, unionIds, albumPayload, parsePicksOnly, albumMediaWhere,
 } = require('../../../utils/mediaAlbumShare');
 const { liveAlbumLink } = require('./shared');
 
 const router = express.Router();
 
-// A live link of this user's that takes in any of these attendances.
-const liveFor = (userId, ids, now = new Date()) => ({
+// A live link of this user's that takes in any of these attendances, of the
+// one kind asked for: the picks and the whole night are separate links.
+const liveFor = (userId, ids, picksOnly, now = new Date()) => ({
   user_id: userId,
   revoked_at: null,
   expires_at: { gt: now },
   attendance_ids: { hasSome: ids },
+  picks_only: picksOnly,
 });
 
 /**
@@ -59,6 +61,12 @@ const liveFor = (userId, ids, now = new Date()) => ({
  *
  * Answers the token, not a URL. The page a recipient opens is the frontend's,
  * and only the frontend knows its own origin.
+ *
+ * `picks_only: true` asks for a link to the night's picks instead (THO-849):
+ * the files the owner marked, not every one. It is a link of its own beside a
+ * whole-night link, found, widened and expired by the same rules, so a URL
+ * already sent never turns from one into the other. Left out, it is the whole
+ * night, as it was before picks could be shared.
  */
 router.post(
   '/album-shares',
@@ -67,6 +75,9 @@ router.post(
     try {
       const ids = normaliseAttendanceIds(req.body?.attendance_ids);
       if (!ids) return badRequest(res, 'attendance_ids must be a list of attendance ids');
+      const picksAsked = parsePicksOnly(req.body?.picks_only);
+      if (picksAsked === null) return badRequest(res, 'picks_only must be true or false');
+      const picksOnly = picksAsked ?? false;
 
       // Every one of them the caller's, or nothing is shared. Not found for
       // somebody else's as for one that does not exist: which attendance ids
@@ -82,13 +93,17 @@ router.post(
       const link = await serialise(`album-share:${req.user.id}`, async () => {
         const now = new Date();
         const live = await prisma.mediaAlbumShareLink.findFirst({
-          where: liveFor(req.user.id, ids, now),
+          where: liveFor(req.user.id, ids, picksOnly, now),
           orderBy: { created_at: 'desc' },
         });
         if (!live) {
           return prisma.mediaAlbumShareLink.create({
             data: {
-              user_id: req.user.id, attendance_ids: ids, token: generateShareToken(), expires_at: albumExpiry(now),
+              user_id: req.user.id,
+              attendance_ids: ids,
+              picks_only: picksOnly,
+              token: generateShareToken(),
+              expires_at: albumExpiry(now),
             },
           });
         }
@@ -97,7 +112,7 @@ router.post(
         return prisma.mediaAlbumShareLink.update({ where: { id: live.id }, data: { attendance_ids: widened } });
       });
 
-      return success(res, 200, { token: link.token, expires_at: link.expires_at });
+      return success(res, 200, { token: link.token, expires_at: link.expires_at, picks_only: link.picks_only });
     } catch (err) {
       return fail(res, err, { context: 'POST /album-shares' });
     }
@@ -108,6 +123,11 @@ router.post(
 // travel in the query because a DELETE's body is not something every client
 // and proxy carries. Nothing live is a quiet no-op, and so is an attendance
 // that is not the caller's: the where clause is scoped to their own links.
+//
+// `picks_only=1` stops only the picks link and `picks_only=0` only the
+// whole-night one (THO-849). Left out, it stops both: that is what Stop
+// sharing meant to an app that knew of one link per night, and ending more
+// than asked is the safe way for a stop to be wrong.
 router.delete(
   '/album-shares',
   [auth, roleCheck(['ADMIN', 'USER'])],
@@ -115,11 +135,18 @@ router.delete(
     try {
       const ids = normaliseAttendanceIds(req.query.attendance_ids);
       if (!ids) return badRequest(res, 'attendance_ids must be a list of attendance ids');
+      const picksOnly = parsePicksOnly(req.query.picks_only);
+      if (picksOnly === null) return badRequest(res, 'picks_only must be 1 or 0');
 
       // Under the same queue as the find-or-create, so a link minted while
       // this runs is either revoked here or made after the owner stopped.
       await serialise(`album-share:${req.user.id}`, () => prisma.mediaAlbumShareLink.updateMany({
-        where: { user_id: req.user.id, revoked_at: null, attendance_ids: { hasSome: ids } },
+        where: {
+          user_id: req.user.id,
+          revoked_at: null,
+          attendance_ids: { hasSome: ids },
+          ...(picksOnly !== undefined && { picks_only: picksOnly }),
+        },
         data: { revoked_at: new Date() },
       }));
       return res.status(204).end();
@@ -165,8 +192,10 @@ router.get('/album-shares/:token', albumLimiter, async (req, res) => {
     });
     if (!attendances.length) return notFound(res, 'Album not found');
 
+    // A picks link lists only what is picked now (THO-849): picking a file
+    // after sharing puts it in, unpicking takes it out.
     const media = await prisma.concertMedia.findMany({
-      where: { attendance_id: { in: attendances.map((a) => a.id) } },
+      where: albumMediaWhere(link, attendances.map((a) => a.id)),
       // The night in the order it happened, as the owner's own view has it.
       orderBy: [{ taken_at: { sort: 'asc', nulls: 'last' } }, { id: 'asc' }],
     });

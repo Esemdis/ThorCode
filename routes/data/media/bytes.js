@@ -27,6 +27,7 @@ const { isActiveShareLink } = require('../../../utils/mediaShareToken');
 const { rateLimiter } = require('../../../utils/rateLimiter');
 const { clipFiles, isClip, prepareClip } = require('../../../utils/mediaClips');
 const { ensurePublicCopy, masterCopyKey, renditionCopyKey } = require('../../../utils/mediaPublicCopy');
+const { albumServesFile } = require('../../../utils/mediaAlbumShare');
 const { withOwner, liveAlbumLink, INT32_MAX } = require('./shared');
 
 const router = express.Router();
@@ -397,12 +398,11 @@ async function servePublicAlbumMedia(req, res) {
     const link = await liveAlbumLink(req.params.token);
     if (!link) return res.status(404).end();
 
+    // Its night, its owner, and for a link to the night's picks a file that
+    // is picked (THO-849) — the question the listing asks, so a file the page
+    // does not show is not one the token opens.
     const row = await prisma.concertMedia.findUnique({ where: { id: mediaId }, include: withOwner });
-    if (!row
-        || !link.attendance_ids.includes(row.attendance_id)
-        || row.attendance_rel.wishlist_rel.user_id !== link.user_id) {
-      return res.status(404).end();
-    }
+    if (!albumServesFile(link, row)) return res.status(404).end();
 
     if (which === 'file') res.attachment(row.filename);
 

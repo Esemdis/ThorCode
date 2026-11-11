@@ -144,20 +144,27 @@ router.get(
       // takes in this show works, or null (THO-892). On the listing so the
       // night can say it is shared as it opens; finding out by asking for the
       // link would mint one.
-      const album = await prisma.mediaAlbumShareLink.findFirst({
+      //
+      // Asked once for the whole-night link and once for the picks link
+      // (THO-849): they are separate links with separate dates, and the night
+      // says which of the two is out.
+      const liveAlbumUntil = (picksOnly) => prisma.mediaAlbumShareLink.findFirst({
         where: {
           user_id: req.user.id,
           revoked_at: null,
           expires_at: { gt: new Date() },
           attendance_ids: { has: attendanceId },
+          picks_only: picksOnly,
         },
         orderBy: { expires_at: 'desc' },
         select: { expires_at: true },
       });
+      const [album, picks] = await Promise.all([liveAlbumUntil(false), liveAlbumUntil(true)]);
 
       return success(res, 200, {
         files: rows.map((m) => ({ ...m, ...mint(m.id), shared_until: shared.get(m.id) ?? null })),
         album_shared_until: album ? new Date(album.expires_at).toISOString() : null,
+        album_picks_shared_until: picks ? new Date(picks.expires_at).toISOString() : null,
         untagged,
         bands,
         // Which show this is. A festival day is one show per stage, so this is

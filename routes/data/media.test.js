@@ -1474,6 +1474,18 @@ describe('GET /attendances/:id/media', () => {
     });
   });
 
+  it('says until when the night\'s picks are shared, apart from the whole night (THO-849)', async () => {
+    const picksUntilTho849 = new Date(Date.now() + 2 * 24 * 3600e3);
+    prisma.mediaAlbumShareLink.findFirst = vi.fn(async ({ where }) => (where.picks_only ? { expires_at: picksUntilTho849 } : null));
+    const res = await request(app())
+      .get('/data/concerts/attendances/1/media').set(...authHeader({ id: 'user-1' })).expect(200);
+    expect(res.body.data.album_shared_until).toBeNull();
+    expect(res.body.data.album_picks_shared_until).toBe(picksUntilTho849.toISOString());
+    // Each asked for its own kind, so a picks link never reads as the whole
+    // night being out, nor the other way round.
+    expect(prisma.mediaAlbumShareLink.findFirst.mock.calls.map(([q]) => q.where.picks_only).sort()).toEqual([false, true]);
+  });
+
   it('says until when each file is shared: its latest live link, or null', async () => {
     // The route hands back one live link per file, but nothing in the table
     // stops two, so the answer is the last of them to run out.
