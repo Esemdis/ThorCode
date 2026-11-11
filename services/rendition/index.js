@@ -52,7 +52,9 @@ const {
   pendingInShow, isAbandonedPart, partNameFor, FAILED_SUFFIX,
 } = require('../../utils/renditionPlan');
 const { playableFor } = require('../../utils/mediaRenditions');
-const { clipFiles, parseClipRequest, planClips } = require('../../utils/mediaClips');
+const {
+  clipFiles, parseClipRequest, planClips, stalePublicTemps,
+} = require('../../utils/mediaClips');
 
 const args = process.argv.slice(2);
 const once = args.includes('--once');
@@ -353,8 +355,27 @@ async function clips({ withPublic = false } = {}) {
   }
 }
 
+/**
+ * Delete the temp copies in cache/public that a dead API process left
+ * (THO-894; see stalePublicTemps). On the archive pass, like the public clip
+ * sweep, and only the `.tmp` names are stat'ed.
+ */
+async function sweepPublicTemps() {
+  const root = publicCacheRoot();
+  const entries = [];
+  for (const name of (await filesIn(root)).filter((n) => n.endsWith('.tmp'))) {
+    const info = await stat(path.join(root, name)).catch(() => null);
+    if (info) entries.push({ name, mtimeMs: info.mtimeMs });
+  }
+  for (const name of stalePublicTemps(entries)) {
+    if (dryRun) log(`would remove ${name}, an abandoned public copy`);
+    else await unlink(path.join(root, name)).catch(() => {});
+  }
+}
+
 async function pass() {
   await clips({ withPublic: true });
+  await sweepPublicTemps();
   const shows = await showDirs();
   let pending = 0;
   let done = 0;

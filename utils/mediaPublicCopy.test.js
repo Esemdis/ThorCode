@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import {
+  describe, it, expect, beforeEach, afterEach, vi,
+} from 'vitest';
 import {
   mkdtemp, readdir, readFile, stat, utimes, writeFile,
 } from 'node:fs/promises';
@@ -11,6 +13,7 @@ import { jpegWithGpsTho894, minimalJpegTho894 } from '../test/exifFixture.js';
 
 const require = createRequire(import.meta.url);
 const { ensurePublicCopy, removePublicCopies } = require('./mediaPublicCopy.js');
+const { stalePublicTemps } = require('./mediaClips.js');
 const { planScrub, applyPatches } = require('./mediaScrub.js');
 const fsPromises = require('node:fs/promises');
 
@@ -21,6 +24,9 @@ beforeEach(async () => {
   rootTho894 = await mkdtemp(join(tmpdir(), 'public-copy-'));
   vi.stubEnv('MEDIA_ROOT', rootTho894);
 });
+
+// A spy left behind by a failing test would wrap the next test's spy.
+afterEach(() => { vi.restoreAllMocks(); });
 
 async function sourceTho894(name, bytes) {
   const p = join(rootTho894, name);
@@ -99,11 +105,7 @@ describe('ensurePublicCopy', () => {
     spy.mockRestore();
   });
 
-  it('refuses a file it cannot parse, and caches no verdict for it', async () => {
-    const absPath = await sourceTho894('IMG_4.jpg', 'master bytes');
-    await expect(ensurePublicCopy({ absPath, key: 'bad.jpg' })).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
-    expect(await readdir(rootTho894)).toEqual(['IMG_4.jpg']);
-  });
+
 
   it('says NO_SOURCE for a file that is not there', async () => {
     await expect(ensurePublicCopy({ absPath: join(rootTho894, 'gone.jpg'), key: 'gone.jpg' }))
@@ -162,5 +164,77 @@ describe('ensurePublicCopy', () => {
     }
     await removePublicCopies({ sha256: 'abc123', rel_path: 'u/show/VID_1.MP4' });
     expect(await readdir(publicDirTho894())).toEqual(['def456.jpg']);
+  });
+
+  it('refuses a file it cannot parse, and remembers the refusal until the file changes', async () => {
+    // Re-reading and re-planning a refused file on every request let a legal
+    // but slow file (200 MB of stuffed scan, say) hold the loop each time.
+    const absPath = await sourceTho894('IMG_4.jpg', 'master bytes');
+    await expect(ensurePublicCopy({ absPath, key: 'bad.jpg' })).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+    expect(await readdir(publicDirTho894())).toEqual(['bad.jpg.refused']);
+    await expect(ensurePublicCopy({ absPath, key: 'bad.jpg' }))
+      .rejects.toMatchObject({ code: 'UNSCRUBBABLE', message: expect.stringMatching(/refused before/) });
+
+    // The file replaced with one it can read: looked at again, and served.
+    await writeFile(absPath, minimalJpegTho894);
+    const later = new Date(Date.now() + 60_000);
+    await utimes(absPath, later, later);
+    expect(await ensurePublicCopy({ absPath, key: 'bad.jpg' })).toBe(absPath);
+  });
+
+  it('copies a file once for two rows with the same bytes, whose mtimes differ', async () => {
+    // A master's key is its checksum, so two rows with one sha256 share it. A
+    // stamp with the source's mtime made each request for the other row copy
+    // the whole file again — for a video, on every Range request.
+    const { jpeg } = jpegWithGpsTho894();
+    const a = await sourceTho894('A.jpg', jpeg);
+    const b = await sourceTho894('B.jpg', jpeg);
+    const earlier = new Date(Date.now() - 86_400_000);
+    await utimes(b, earlier, earlier);
+    const copyFile = vi.spyOn(fsPromises, 'copyFile');
+    for (let i = 0; i < 6; i += 1) {
+      await ensurePublicCopy({ absPath: i % 2 ? b : a, key: 'deadbeef.jpg', keyedByContent: true });
+    }
+    expect(copyFile).toHaveBeenCalledTimes(1);
+    copyFile.mockRestore();
+  });
+
+  it('serves each row its own source when shared bytes have nothing to strip', async () => {
+    const a = await sourceTho894('CA.jpg', minimalJpegTho894);
+    const b = await sourceTho894('CB.jpg', minimalJpegTho894);
+    const [fromA, fromB] = await Promise.all([
+      ensurePublicCopy({ absPath: a, key: 'cafe.jpg', keyedByContent: true }),
+      ensurePublicCopy({ absPath: b, key: 'cafe.jpg', keyedByContent: true }),
+    ]);
+    expect([fromA, fromB]).toEqual([a, b]);
+  });
+
+  it('puts no copy back for a file deleted while its copy was being made', async () => {
+    // DELETE /media removes the copies; a copy still in flight then renamed
+    // itself into place after the delete and stayed for good.
+    const { jpeg } = jpegWithGpsTho894();
+    const absPath = await sourceTho894('IMG_D.jpg', jpeg);
+    const realCopy = fsPromises.copyFile;
+    const spy = vi.spyOn(fsPromises, 'copyFile').mockImplementation(async (from, to) => {
+      await realCopy(from, to);
+      await fsPromises.unlink(absPath);
+    });
+    await expect(ensurePublicCopy({ absPath, key: 'gone-mid.jpg' })).rejects.toMatchObject({ code: 'NO_SOURCE' });
+    expect(await readdir(publicDirTho894())).toEqual([]);
+    spy.mockRestore();
+  });
+});
+
+describe('stalePublicTemps', () => {
+  it('names the temp copies a crash left behind, and none still being written', () => {
+    const now = Date.parse('2026-11-11T12:00:00Z');
+    const day = 86_400_000;
+    const entries = [
+      { name: 'abc.mp4.123.5f0c3a3e-1d2b-4c5d-8e9f-0a1b2c3d4e5f.tmp', mtimeMs: now - 2 * day },
+      { name: 'web-abc.mp4.9.0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d.tmp', mtimeMs: now - 60_000 },
+      { name: 'abc.mp4', mtimeMs: now - 30 * day },
+      { name: 'abc.mp4.stamp', mtimeMs: now - 30 * day },
+    ];
+    expect(stalePublicTemps(entries, now)).toEqual(['abc.mp4.123.5f0c3a3e-1d2b-4c5d-8e9f-0a1b2c3d4e5f.tmp']);
   });
 });

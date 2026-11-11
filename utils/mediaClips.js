@@ -36,7 +36,11 @@ const TEMP_NAME = /^\.\d+\.json\.[0-9a-f]+\.tmp$/;
 // A moment's scrubbed copy in cache/public and its markers (THO-894). Its temp
 // file, `<name>.<pid>.<uuid>.tmp`, does not match: one swept mid-write would
 // fail the request that was making it.
-const PUBLIC_CLIP_NAME = /^clip-(\d+)\.mp4(\.stamp|\.clean)?$/;
+const PUBLIC_CLIP_NAME = /^clip-(\d+)\.mp4(\.stamp|\.clean|\.refused)?$/;
+// mediaPublicCopy's temp name, `<key>.<pid>.<uuid>.tmp`.
+const PUBLIC_TEMP_NAME = /^[A-Za-z0-9_-][A-Za-z0-9._-]*\.\d+\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+// A copy of the largest upload takes minutes; a day old is a dead process's.
+const PUBLIC_TEMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 // cache/public, the sibling of the clip root.
 const publicDirOf = (root) => path.join(path.dirname(root), 'public');
@@ -186,6 +190,23 @@ function planClips(names, requests, now = new Date(), publicNames = []) {
 }
 
 /**
+ * The temp copies in cache/public that a process died in the middle of — a
+ * deploy during the first request of a long video, say. The request that made
+ * one unlinks it on any error it sees; a crash sees none, and nothing else
+ * would ever remove it. Only by age, so a copy still being made is left alone.
+ *
+ * @param {Array<{name: string, mtimeMs: number}>} entries - cache/public's
+ *   `.tmp` entries with their mtimes
+ * @param {number} now - ms since the epoch
+ * @returns {string[]} the names to delete
+ */
+function stalePublicTemps(entries, now = Date.now()) {
+  return entries
+    .filter((e) => PUBLIC_TEMP_NAME.test(e.name) && now - e.mtimeMs > PUBLIC_TEMP_MAX_AGE_MS)
+    .map((e) => e.name);
+}
+
+/**
  * Where a link's clip stands — 'ready', 'failed' or 'preparing' — writing the
  * request for the service when there is nothing yet.
  *
@@ -281,6 +302,7 @@ module.exports = {
   clipRequest,
   parseClipRequest,
   planClips,
+  stalePublicTemps,
   prepareClip,
   removeClip,
   retargetClipRequests,

@@ -9,12 +9,19 @@
  * the content it was made from, so the directory can be deleted at any time.
  *
  * A file with nothing to strip is not copied: a `.clean` marker records that,
- * and the original is served. A copy that was made has a `.stamp` beside it.
- * Both hold the scrubber's version and the source's size and mtime, and either
- * is ignored when they no longer match: a rendition can be made again under
- * the same key, and the new one may carry what the old one did not; and a
- * scrubber that has learned to strip more must look again at what an older
- * one let through (SCRUB_VERSION in mediaScrub.js).
+ * and the original is served. A copy that was made has a `.stamp` beside it,
+ * and a file that could not be scrubbed a `.refused` marker, so a refusal is a
+ * cheap 404 the next time rather than another read and plan of up to 256 MB.
+ * All three hold the scrubber's version and the source's size and mtime, and
+ * any of them is ignored when those no longer match: a rendition can be made
+ * again under the same key, and the new one may carry what the old one did
+ * not; and a scrubber that has learned to strip more must look again at what
+ * an older one let through or refused (SCRUB_VERSION in mediaScrub.js).
+ *
+ * A master's key is its checksum, so it names the content: two rows with the
+ * same bytes share it, and their stamps leave the mtime out (keyedByContent),
+ * or each request for the other row would find a mismatch and copy the file
+ * again.
  *
  * Nothing here ever falls back to the original on failure. A scrub that throws
  * propagates, and the route answers 404.
@@ -33,7 +40,7 @@ const { publicCachePath, publicCopyFiles } = require('./mediaPaths');
 // way another key's marker or temp file does, or one could be read as the
 // other.
 const SAFE_KEY = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,200}$/;
-const MARKER_NAME = /\.(clean|stamp|tmp)$/;
+const MARKER_NAME = /\.(clean|stamp|refused|tmp)$/;
 
 // Two first requests for one file — an album grid opened twice, a video's
 // first Range requests — share one copy instead of racing two.
@@ -47,7 +54,13 @@ function tagged(code, message) {
   return err;
 }
 
-const stampOf = (info) => `v${SCRUB_VERSION}:${info.size}:${Math.trunc(info.mtimeMs)}`;
+const stampOf = (info, keyedByContent) => (keyedByContent
+  ? `v${SCRUB_VERSION}:${info.size}`
+  : `v${SCRUB_VERSION}:${info.size}:${Math.trunc(info.mtimeMs)}`);
+
+// What makeCopy answers for a file with nothing to strip. Each caller then
+// serves its own source: two rows with the same bytes can share one request.
+const CLEAN = Symbol('clean');
 
 const readStamp = (p) => fs.readFile(p, 'utf8').then((text) => text.trim(), () => null);
 
@@ -60,28 +73,45 @@ async function statSource(absPath) {
   }
 }
 
-async function makeCopy(absPath, key) {
-  const [target, stampFile, marker] = publicCopyFiles(key);
+async function makeCopy(absPath, key, keyedByContent) {
+  const [target, stampFile, marker, refusedFile] = publicCopyFiles(key);
   // The source is looked at on every request, hit or not. A copy can only be
   // trusted while it is still the copy of this source by this scrubber, and a
   // source that is gone answers NO_SOURCE (a 404) like everywhere else.
   const before = await statSource(absPath);
-  const stamp = stampOf(before);
+  const stamp = stampOf(before, keyedByContent);
   if (await readStamp(stampFile) === stamp && await exists(target)) return target;
-  if (await readStamp(marker) === stamp) return absPath;
+  if (await readStamp(marker) === stamp) return CLEAN;
+  if (await readStamp(refusedFile) === stamp) throw tagged('UNSCRUBBABLE', `refused before: ${key}`);
 
-  const plan = await planScrubFile(absPath);
   await fs.mkdir(path.dirname(target), { recursive: true });
+  try {
+    return await scrubInto({
+      absPath, target, stampFile, marker, refusedFile, stamp, keyedByContent,
+    });
+  } catch (err) {
+    // Remembered, with the same stamp, so the next request is a cheap 404.
+    // Not a source that changed under the read: that one may well work next.
+    if (err.code === 'UNSCRUBBABLE' && !err.transient) await fs.writeFile(refusedFile, stamp).catch(() => {});
+    throw err;
+  }
+}
+
+async function scrubInto({
+  absPath, target, stampFile, marker, refusedFile, stamp, keyedByContent,
+}) {
+  const plan = await planScrubFile(absPath);
   if (plan.length === 0) {
     // Checked again after the read: a source replaced while it was being
     // planned would otherwise be served on the strength of the old one's plan.
     const after = await statSource(absPath);
-    if (stampOf(after) !== stamp) throw tagged('UNSCRUBBABLE', `${absPath} changed while being read`);
+    if (stampOf(after, keyedByContent) !== stamp) {
+      throw Object.assign(tagged('UNSCRUBBABLE', `${absPath} changed while being read`), { transient: true });
+    }
     await fs.writeFile(marker, stamp);
     // A copy of what the source used to be is of no use any more.
-    await fs.unlink(stampFile).catch(() => {});
-    await fs.unlink(target).catch(() => {});
-    return absPath;
+    for (const p of [stampFile, target, refusedFile]) await fs.unlink(p).catch(() => {});
+    return CLEAN;
   }
 
   // Unique per write for the reason writeWebp's temp name is (mediaThumbs.js).
@@ -100,11 +130,16 @@ async function makeCopy(absPath, key) {
     }
     const left = await planScrubFile(temp);
     if (left.length) throw tagged('UNSCRUBBABLE', `${left.length} patches left after scrubbing ${absPath}`);
+    // Still there? A file deleted while its copy was being made had its
+    // copies removed by the delete; renaming this one into place after that
+    // would leave a copy nothing reaches and nothing removes.
+    await statSource(absPath);
     await fs.rename(temp, target);
     // After the rename, so a stamp never vouches for a copy that is not there
     // yet. The stamp is the source as it was before the copy: had it changed
     // since, the next request finds a mismatch and makes the copy again.
     await fs.writeFile(stampFile, stamp);
+    await fs.unlink(refusedFile).catch(() => {});
     return target;
   } catch (err) {
     await fs.unlink(temp).catch(() => {});
@@ -116,21 +151,24 @@ async function makeCopy(absPath, key) {
  * The path to serve a stranger for `absPath`: the cached scrubbed copy, or the
  * source itself when it has nothing to strip.
  *
- * @param {{absPath: string, key: string}} args - `key` names the copy in
- *   cache/public and must change whenever the source's content can.
+ * @param {{absPath: string, key: string, keyedByContent?: boolean}} args -
+ *   `key` names the copy in cache/public and must change whenever the
+ *   source's content can. `keyedByContent` says the key is the content's own
+ *   checksum, so any source under it holds the same bytes.
  * @returns {Promise<string>}
  * @throws code NO_SOURCE when the source is gone, UNSCRUBBABLE when it cannot
  *   be scrubbed
  */
-function ensurePublicCopy({ absPath, key }) {
+function ensurePublicCopy({ absPath, key, keyedByContent = false }) {
   if (!SAFE_KEY.test(String(key)) || MARKER_NAME.test(String(key))) {
     return Promise.reject(new Error(`unsafe public copy key: ${key}`));
   }
-  const pending = inFlight.get(key);
-  if (pending) return pending;
-  const work = makeCopy(absPath, key).finally(() => inFlight.delete(key));
-  inFlight.set(key, work);
-  return work;
+  let work = inFlight.get(key);
+  if (!work) {
+    work = makeCopy(absPath, key, keyedByContent).finally(() => inFlight.delete(key));
+    inFlight.set(key, work);
+  }
+  return work.then((result) => (result === CLEAN ? absPath : result));
 }
 
 // The names a row's copies go by. A master's is its checksum, with the

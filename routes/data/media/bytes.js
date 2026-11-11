@@ -102,6 +102,9 @@ async function sendMediaBytes(res, row, which, context, { cacheControl, publicCo
   // video's rendition — which are the ones a public route must scrub.
   let archiveBytes = false;
   let publicKey = null;
+  // A master's key is its own checksum; a rendition's is made again under
+  // the same name. See keyedByContent in mediaPublicCopy.js.
+  let keyedByContent = false;
   // /view is what the lightbox shows. A video's viewing copy is whatever /play
   // chooses, so for a video /view is /play in every respect — the short cache
   // while the original stands in for a rendition included.
@@ -111,6 +114,7 @@ async function sendMediaBytes(res, row, which, context, { cacheControl, publicCo
     servingOriginalForPlayback = !chosen.rendition && row.kind === 'VIDEO';
     archiveBytes = true;
     publicKey = chosen.rendition ? renditionCopyKey(row) : masterCopyKey(row);
+    keyedByContent = !chosen.rendition;
   } else if (which === 'thumb') {
     try {
       absPath = await ensureThumb({
@@ -140,10 +144,13 @@ async function sendMediaBytes(res, row, which, context, { cacheControl, publicCo
     absPath = archivePath;
     archiveBytes = true;
     publicKey = masterCopyKey(row);
+    keyedByContent = true;
   }
 
   if (publicCopy && archiveBytes) {
-    absPath = await publicCopyOr404(res, { absPath, key: publicKey, what: `media ${row.id}` });
+    absPath = await publicCopyOr404(res, {
+      absPath, key: publicKey, keyedByContent, what: `media ${row.id}`,
+    });
     if (!absPath) return undefined;
   }
 
@@ -169,10 +176,12 @@ async function sendMediaBytes(res, row, which, context, { cacheControl, publicCo
  * is what the share routes say about a file that is not there. The headers a
  * route set for the file it expected to send go, so the miss is not cached.
  */
-async function publicCopyOr404(res, { absPath, key, what }) {
+async function publicCopyOr404(res, {
+  absPath, key, keyedByContent = false, what,
+}) {
   try {
     if (!key) throw Object.assign(new Error('no checksum to name its copy by'), { code: 'UNSCRUBBABLE' });
-    return await ensurePublicCopy({ absPath, key });
+    return await ensurePublicCopy({ absPath, key, keyedByContent });
   } catch (err) {
     if (err.code !== 'UNSCRUBBABLE' && err.code !== 'NO_SOURCE') throw err;
     console.warn(`[media] not serving ${what} publicly: ${err.message}`);

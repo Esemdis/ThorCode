@@ -40,8 +40,12 @@ so the picture and the video stream are byte for byte the original's (THO-894).
 a shared moment. Beside each copy, `<name>.stamp` records the scrubber version
 and the size and mtime of the file it was made from; a `<name>.clean` marker
 instead means that file had nothing to strip and the original is served as it
-is. Either is ignored, and the file looked at again, once the source or the
-scrubber has changed. It is keyed by checksum and safe to delete at any time;
+is, and `<name>.refused` that it could not be stripped, so the share link
+answers 404 at once instead of reading it again. Any of them is ignored, and
+the file looked at again, once the source or the scrubber has changed. A
+master's are stamped with the version and size only: its name is its checksum,
+and two rows with the same bytes would otherwise keep re-making each other's
+copy. It is keyed by checksum and safe to delete at any time;
 the next request makes the copy again. A file that cannot be read well enough
 to strip (a format it does not know, a damaged header, anything far outside
 what a camera writes) is answered 404 on the share link, with
@@ -55,7 +59,19 @@ verdict until someone empties the directory.
 
 Copies go when nothing can reach them: deleting a file removes its copies,
 stopping a moment's link removes the moment's, and the rendition service sweeps
-the copy of a moment whose link has expired on each archive pass.
+the copy of a moment whose link has expired, and any `<name>.<pid>.<uuid>.tmp`
+more than a day old (a copy the API died in the middle of), on each archive
+pass.
+
+Besides location, camera and serials, the copy loses XMP, IPTC kept inside
+EXIF, the owner's name wherever a format keeps one (EXIF Artist, Copyright,
+XPAuthor; PNG Author, Copyright and Source; QuickTime and 3GPP author and
+copyright), Apple's Live Photo `content.identifier`, and C2PA manifests (JPEG
+APP11, PNG `caBX`, the MP4 uuid box), whose signature the patching breaks
+anyway. Blanking XMP also removes an HDR photo's gain-map description (Ultra
+HDR's `Container:Directory` and `hdrgm:*`, Apple's `HDRGainMap`), so a shared
+Pixel or iPhone HDR JPEG without an ISO 21496-1 APP2 block shows as SDR. The
+pixels are untouched.
 
 What the copy still carries, on purpose or because it is not reached yet:
 the capture time and its offset, Orientation and the colour profile (needed to
@@ -63,7 +79,15 @@ show the picture right); EXIF ImageDescription, UserComment and Software
 (the software version, not the device); a location track recorded inside the
 video stream itself (GoPro GPMF, Apple `mebx`, Android GPS tracks), which lives
 in `mdat` and cannot be reached by a same-length patch; and, until THO-899,
-the video a motion photo appends after its JPEG and IPTC in a JPEG's APP13.
+anything after a JPEG's last image: the video a motion photo appends and
+Samsung's SEF trailer (including `MCCData`, the mobile country code), plus
+IPTC in a JPEG's APP13.
+
+A file far outside what a camera writes (more than 250,000 MP4 boxes or a
+million image chunks or segments, more than 10,000 patches, boxes 32 deep) is
+refused rather than walked. The one slow shape left is a JPEG whose scan is
+hundreds of megabytes of stuffed `FF 00` bytes, under a second to plan; its
+verdict is then cached like any other.
 
 The thing to understand before touching any of this: **`concert-media.json` is
 the record of truth and Postgres is a disposable index of it.** Every sidecar

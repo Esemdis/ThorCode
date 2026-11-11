@@ -53,10 +53,11 @@ function publicCachePath(key) {
 }
 
 // Every file one public copy can leave in cache/public: the copy, the stamp of
-// the source and scrubber it was made from, and the marker that says the file
-// had nothing to strip. Here rather than in mediaPublicCopy.js because the
-// rendition service sweeps them too, and its image carries only a few utils.
-const PUBLIC_COPY_SUFFIXES = ['', '.stamp', '.clean'];
+// the source and scrubber it was made from, the marker that says the file had
+// nothing to strip, and the one that says it could not be stripped. Here
+// rather than in mediaPublicCopy.js because the rendition service sweeps them
+// too, and its image carries only a few utils.
+const PUBLIC_COPY_SUFFIXES = ['', '.stamp', '.clean', '.refused'];
 
 function publicCopyFiles(key, dir = publicCacheRoot()) {
   return PUBLIC_COPY_SUFFIXES.map((suffix) => path.join(dir, `${key}${suffix}`));
