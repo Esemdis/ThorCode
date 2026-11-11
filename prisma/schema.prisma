@@ -299,6 +299,12 @@ model ConcertAttendance {
   wishlist_id  Int
   concert_id   Int
   created_at   DateTime               @default(now())
+  /// The owner's diary of the night (THO-823): their own words and their own
+  /// 1-to-5, never shown to anyone else. The range and the 5000-character cap
+  /// are the route's to enforce, as VenueReview's rating is; no CHECK, so a
+  /// later change to either is not a migration.
+  notes        String?                @db.Text
+  rating       Int?
   wishlist_rel Wishlist               @relation("WishlistAttendance", fields: [wishlist_id], references: [id])
   concert_rel  Concert                @relation("ConcertAttendances", fields: [concert_id], references: [id])
   media        ConcertMedia[]         @relation("AttendanceMedia")
