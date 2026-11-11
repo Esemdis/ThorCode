@@ -318,8 +318,11 @@ function planApp11(ctx, payload, end, c2paInstances) {
 // and went out with its GPS and serial (THO-894 review). So "Exif\0" at the
 // start is planned whatever its sixth byte (planTiff refuses it without a
 // TIFF header), and anything else that a reader could take for EXIF is
-// refused rather than passed through.
-const LOOKS_LIKE_EXIF = /^[\s\S]{0,4}Exif/;
+// refused rather than passed through. In any case: exiftool matches the
+// header case-insensitively, and "EXIF\0\0" planned nothing and went out
+// with its GPS (round 2 of the review). Only the exact "Exif\0" is planned;
+// every other spelling is refused.
+const LOOKS_LIKE_EXIF = /^[\s\S]{0,4}exif/i;
 
 function planApp1(ctx, payload, end) {
   const { buf } = ctx;

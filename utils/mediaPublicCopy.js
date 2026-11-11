@@ -87,12 +87,27 @@ const sourceTag = (absPath) => createHash('sha256').update(String(absPath)).dige
 const stampOf = (info, keyedByContent, absPath) => (keyedByContent
   ? `v${SCRUB_VERSION}:${info.size}`
   : `v${SCRUB_VERSION}:${info.size}:${Math.trunc(info.mtimeMs)}:${sourceTag(absPath)}`);
-// The "clean" and "refused" markers are verdicts on one file, so they always
-// name it. A copy under a checksum key is scrubbed bytes any row may be
-// handed; a "clean" verdict is not: it sends the caller's own file unplanned,
-// and with only the size in it row A's verdict let row B's same-size file
-// out raw, whenever B's bytes no longer matched the checksum.
-const verdictOf = (stamp, keyedByContent, absPath) => (keyedByContent ? `${stamp}:${sourceTag(absPath)}` : stamp);
+// The "clean" and "refused" markers are verdicts on one file, so each names
+// it, with its size and mtime. A copy under a checksum key is scrubbed bytes
+// any row may be handed; a "clean" verdict is not: it sends the caller's own
+// file unplanned. With only the size in it, row A's verdict let row B's
+// same-size file out raw whenever B's bytes no longer matched the checksum,
+// and a master rewritten in place at the same size kept its old "clean".
+const verdictOf = (info, absPath) => `v${SCRUB_VERSION}:${info.size}:${Math.trunc(info.mtimeMs)}:${sourceTag(absPath)}`;
+
+// A marker holds one verdict per line, so two rows under one key (the same
+// bytes filed twice) each keep their own: one verdict that the other
+// overwrote made every request re-plan the whole file. Rewritten from the
+// newest alone past a handful, so files that kept changing cannot grow it.
+const MAX_VERDICTS = 16;
+const readVerdicts = (p) => fs.readFile(p, 'utf8').then((text) => text.split('\n').filter(Boolean), () => []);
+const hasVerdict = async (p, verdict) => (await readVerdicts(p)).includes(verdict);
+async function addVerdict(p, verdict) {
+  const verdicts = await readVerdicts(p);
+  if (verdicts.includes(verdict)) return;
+  if (verdicts.length >= MAX_VERDICTS) await fs.writeFile(p, `${verdict}\n`);
+  else await fs.appendFile(p, `${verdict}\n`);
+}
 
 // What makeCopy answers for a file with nothing to strip. Each caller then
 // serves its own source: two rows with the same bytes can share one request.
@@ -116,10 +131,10 @@ async function makeCopy(absPath, key, keyedByContent) {
   // source that is gone answers NO_SOURCE (a 404) like everywhere else.
   const before = await statSource(absPath);
   const stamp = stampOf(before, keyedByContent, absPath);
-  const verdict = verdictOf(stamp, keyedByContent, absPath);
+  const verdict = verdictOf(before, absPath);
   if (await readStamp(stampFile) === stamp && await exists(target)) return target;
-  if (await readStamp(marker) === verdict) return CLEAN;
-  if (await readStamp(refusedFile) === verdict) throw tagged('UNSCRUBBABLE', `refused before: ${key}`);
+  if (await hasVerdict(marker, verdict)) return CLEAN;
+  if (await hasVerdict(refusedFile, verdict)) throw tagged('UNSCRUBBABLE', `refused before: ${key}`);
 
   await fs.mkdir(path.dirname(target), { recursive: true });
   try {
@@ -129,7 +144,7 @@ async function makeCopy(absPath, key, keyedByContent) {
   } catch (err) {
     // Remembered, with the same stamp, so the next request is a cheap 404.
     // Not a source that changed under the read: that one may well work next.
-    if (err.code === 'UNSCRUBBABLE' && !err.transient) await fs.writeFile(refusedFile, verdict).catch(() => {});
+    if (err.code === 'UNSCRUBBABLE' && !err.transient) await addVerdict(refusedFile, verdict).catch(() => {});
     throw err;
   }
 }
@@ -145,9 +160,11 @@ async function scrubInto({
     if (stampOf(after, keyedByContent, absPath) !== stamp) {
       throw Object.assign(tagged('UNSCRUBBABLE', `${absPath} changed while being read`), { transient: true });
     }
-    await fs.writeFile(marker, verdict);
-    // A copy of what the source used to be is of no use any more.
-    for (const p of [stampFile, target, refusedFile]) await fs.unlink(p).catch(() => {});
+    await addVerdict(marker, verdict);
+    // A copy of what the source used to be is of no use any more. The
+    // refusals stay: they are other files' verdicts, or this file's at
+    // another mtime, which can no longer match.
+    for (const p of [stampFile, target]) await fs.unlink(p).catch(() => {});
     return CLEAN;
   }
 
@@ -176,7 +193,6 @@ async function scrubInto({
     // yet. The stamp is the source as it was before the copy: had it changed
     // since, the next request finds a mismatch and makes the copy again.
     await fs.writeFile(stampFile, stamp);
-    await fs.unlink(refusedFile).catch(() => {});
     // And once more, which closes the race the check above only narrows: the
     // delete unlinks the source before it removes the copies, so either this
     // sees the source gone and takes the copy out, or it ran before the

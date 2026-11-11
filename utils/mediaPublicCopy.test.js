@@ -285,6 +285,38 @@ describe('ensurePublicCopy', () => {
     expect((await readFile(served)).includes(Buffer.from('SN-1234567890'))).toBe(false);
   });
 
+  // One marker per key held one verdict, so two rows with the same bytes
+  // overwrote each other's "clean" and every request re-planned the file.
+  it('keeps each row\'s clean verdict under a shared checksum key, rather than one overwriting the other', async () => {
+    const a = await sourceTho894('MASTER_DA.jpg', minimalJpegTho894);
+    const b = await sourceTho894('MASTER_DB.jpg', minimalJpegTho894);
+
+    expect(await ensurePublicCopy({ absPath: a, key: 'cafe-dup.jpg', keyedByContent: true })).toBe(a);
+    expect(await ensurePublicCopy({ absPath: b, key: 'cafe-dup.jpg', keyedByContent: true })).toBe(b);
+
+    const verdicts = (await readFile(join(publicDirTho894(), 'cafe-dup.jpg.clean'), 'utf8')).split('\n').filter(Boolean);
+    expect(verdicts).toHaveLength(2);
+    // And a third request finds its own verdict: nothing new is written.
+    await ensurePublicCopy({ absPath: a, key: 'cafe-dup.jpg', keyedByContent: true });
+    expect((await readFile(join(publicDirTho894(), 'cafe-dup.jpg.clean'), 'utf8')).split('\n').filter(Boolean)).toEqual(verdicts);
+  });
+
+  // The master's verdict held only the size, so a file rewritten in place at
+  // the same size kept its "clean" and went out unplanned.
+  it('looks again at a master rewritten in place at the same size', async () => {
+    const { jpeg } = jpegWithGpsTho894();
+    const cleanBytes = applyPatches(jpeg, await planScrub(jpeg));
+    const absPath = await sourceTho894('MASTER_RW.jpg', cleanBytes);
+    expect(await ensurePublicCopy({ absPath, key: 'cafe-rw.jpg', keyedByContent: true })).toBe(absPath);
+
+    await writeFile(absPath, jpeg);
+    const later = new Date(Date.now() + 5000);
+    await utimes(absPath, later, later);
+
+    const served = await ensurePublicCopy({ absPath, key: 'cafe-rw.jpg', keyedByContent: true });
+    expect((await readFile(served)).includes(Buffer.from('SN-1234567890'))).toBe(false);
+  });
+
   it('does not let one row\'s refusal under a checksum key refuse another row\'s file', async () => {
     // Same size, so only the marker naming its file tells the two apart. A's
     // first segment claims to run past the end of the file, which is refused.

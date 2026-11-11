@@ -656,6 +656,16 @@ describe('planScrub on a loose EXIF header (THO-894 review, round 4)', () => {
     expect(await planScrub(out)).toEqual([]);
   });
 
+  // exiftool matches the header case-insensitively: "EXIF\0\0" with GPS
+  // planned nothing and went out as it was (round 2 of the review).
+  it('refuses EXIF behind a header in another case, which readers still take for EXIF', async () => {
+    for (const header of ['EXIF\0\0', 'exif\0\0', 'eXiF\0\x01']) {
+      const odd = withExifHeaderTho894Round4(header);
+      expect(containsTho894(odd, 'SN-1234567890')).toBe(true);
+      await expect(planScrub(odd)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+    }
+  });
+
   it('refuses an APP1 a reader could take for EXIF that the planner does not read, rather than call it clean', async () => {
     // Shifted by one byte: exiftool still finds "Exif\0" within four bytes.
     const { jpeg } = jpegWithGpsTho894();
