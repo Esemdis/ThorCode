@@ -12,8 +12,9 @@
  * and the original is served. A copy that was made has a `.stamp` beside it,
  * and a file that could not be scrubbed a `.refused` marker, so a refusal is a
  * cheap 404 the next time rather than another read and plan of up to 256 MB.
- * All three hold the scrubber's version and the source's size and mtime, and
- * any of them is ignored when those no longer match: a rendition can be made
+ * All three hold the scrubber's version and the source's size and mtime (and,
+ * under a rendition or clip key, which file it was), and any of them is
+ * ignored when those no longer match: a rendition can be made
  * again under the same key, and the new one may carry what the old one did
  * not; and a scrubber that has learned to strip more must look again at what
  * an older one let through or refused (SCRUB_VERSION in mediaScrub.js).
@@ -31,7 +32,7 @@
 // step of a copy fail.
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, createHash } = require('node:crypto');
 const { planScrubFile, SCRUB_VERSION } = require('./mediaScrub');
 const { publicCachePath, publicCopyFiles } = require('./mediaPaths');
 
@@ -54,9 +55,14 @@ function tagged(code, message) {
   return err;
 }
 
-const stampOf = (info, keyedByContent) => (keyedByContent
+// A rendition or clip key is shared by rows whose files differ, so its stamp
+// names the source too: two renditions of one size, written in the same
+// millisecond, shared one `.clean` verdict, and the second was served
+// unplanned. A checksum key names its content, so any source may share it.
+const sourceTag = (absPath) => createHash('sha256').update(String(absPath)).digest('hex').slice(0, 16);
+const stampOf = (info, keyedByContent, absPath) => (keyedByContent
   ? `v${SCRUB_VERSION}:${info.size}`
-  : `v${SCRUB_VERSION}:${info.size}:${Math.trunc(info.mtimeMs)}`);
+  : `v${SCRUB_VERSION}:${info.size}:${Math.trunc(info.mtimeMs)}:${sourceTag(absPath)}`);
 
 // What makeCopy answers for a file with nothing to strip. Each caller then
 // serves its own source: two rows with the same bytes can share one request.
@@ -79,7 +85,7 @@ async function makeCopy(absPath, key, keyedByContent) {
   // trusted while it is still the copy of this source by this scrubber, and a
   // source that is gone answers NO_SOURCE (a 404) like everywhere else.
   const before = await statSource(absPath);
-  const stamp = stampOf(before, keyedByContent);
+  const stamp = stampOf(before, keyedByContent, absPath);
   if (await readStamp(stampFile) === stamp && await exists(target)) return target;
   if (await readStamp(marker) === stamp) return CLEAN;
   if (await readStamp(refusedFile) === stamp) throw tagged('UNSCRUBBABLE', `refused before: ${key}`);
@@ -105,7 +111,7 @@ async function scrubInto({
     // Checked again after the read: a source replaced while it was being
     // planned would otherwise be served on the strength of the old one's plan.
     const after = await statSource(absPath);
-    if (stampOf(after, keyedByContent) !== stamp) {
+    if (stampOf(after, keyedByContent, absPath) !== stamp) {
       throw Object.assign(tagged('UNSCRUBBABLE', `${absPath} changed while being read`), { transient: true });
     }
     await fs.writeFile(marker, stamp);
@@ -143,7 +149,8 @@ async function scrubInto({
     // And once more, which closes the race the check above only narrows: the
     // delete unlinks the source before it removes the copies, so either this
     // sees the source gone and takes the copy out, or it ran before the
-    // delete's own removal, which then finds the copy in place.
+    // delete's own removal, which then finds the copy in place. Another row's
+    // request already handed this copy can then get a 404; never other bytes.
     try {
       await statSource(absPath);
     } catch (err) {
@@ -173,11 +180,13 @@ function ensurePublicCopy({ absPath, key, keyedByContent = false }) {
   if (!SAFE_KEY.test(String(key)) || MARKER_NAME.test(String(key))) {
     return Promise.reject(new Error(`unsafe public copy key: ${key}`));
   }
-  // A request only joins one in flight whose verdict is about its own bytes:
-  // under a checksum key any source holds the same bytes, but a rendition or
-  // clip key is shared by rows whose files differ, and "clean" for one row's
-  // file said nothing about the other's — which was then served unplanned.
-  const flightKey = keyedByContent ? key : `${key}\0${absPath}`;
+  // A request only joins one in flight for its own file: "clean" is handed
+  // back as the caller's own path, so it must be a verdict on that path. Under
+  // a rendition or clip key, rows' files differ, and the other row's file was
+  // served unplanned. Under a checksum key the bytes should be the same, but
+  // a joined caller's file was never even stat'ed, so a file that no longer
+  // matched its checksum went out raw; the same row's requests still share.
+  const flightKey = `${key}\0${absPath}`;
   let work = inFlight.get(flightKey);
   if (!work) {
     work = makeCopy(absPath, key, keyedByContent).finally(() => inFlight.delete(flightKey));

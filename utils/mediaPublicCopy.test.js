@@ -238,6 +238,39 @@ describe('ensurePublicCopy', () => {
     expect((await readFile(fromB)).includes(Buffer.from('SN-1234567890'))).toBe(false);
   });
 
+  it('does not share a clean verdict between two renditions of one size written in the same millisecond', async () => {
+    // A rendition key's stamp was size and mtime only, so the second file,
+    // GPS and all, was served on the first one's `.clean` marker.
+    const { jpeg } = jpegWithGpsTho894();
+    const cleanBytes = applyPatches(jpeg, await planScrub(jpeg));
+    const same = new Date('2026-06-12T20:00:00.000Z');
+    const a = await sourceTho894('RENDITION_A.jpg', cleanBytes);
+    const b = await sourceTho894('RENDITION_B.jpg', jpeg);
+    await utimes(a, same, same);
+    await utimes(b, same, same);
+
+    expect(await ensurePublicCopy({ absPath: a, key: 'web-shared-ms.mp4' })).toBe(a);
+    const served = await ensurePublicCopy({ absPath: b, key: 'web-shared-ms.mp4' });
+    expect(served).not.toBe(b);
+    expect((await readFile(served)).includes(Buffer.from('SN-1234567890'))).toBe(false);
+  });
+
+  it('plans a joining request\'s own file under a checksum key, rather than trusting the checksum', async () => {
+    // A request that joined another in flight got its own path back on
+    // "clean" without that file being looked at, not even its size; a file
+    // that no longer matched its checksum went out raw.
+    const { jpeg } = jpegWithGpsTho894();
+    const cleanBytes = applyPatches(jpeg, await planScrub(jpeg));
+    const a = await sourceTho894('MASTER_A.jpg', cleanBytes);
+    const b = await sourceTho894('MASTER_B.jpg', jpeg);
+
+    const [, served] = await Promise.all([
+      ensurePublicCopy({ absPath: a, key: 'cafe-join.jpg', keyedByContent: true }),
+      ensurePublicCopy({ absPath: b, key: 'cafe-join.jpg', keyedByContent: true }),
+    ]);
+    expect((await readFile(served)).includes(Buffer.from('SN-1234567890'))).toBe(false);
+  });
+
   it('takes the copy back out when its file is deleted just as the copy lands', async () => {
     // The delete unlinks the source before it removes the copies, so a check
     // after the rename either sees the source gone or ran before the delete's
