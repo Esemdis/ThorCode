@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import request from 'supertest';
 import bcrypt from 'bcrypt';
 import { buildApp, authHeader, installFakePrisma } from '../test/routeApp.js';
+import { REGISTRATION_CLOSED_MESSAGE } from '../utils/accounts.js';
 
 const prisma = installFakePrisma({
   user: { findUnique: vi.fn(), findFirst: vi.fn(), findMany: vi.fn(), create: vi.fn(), update: vi.fn() },
@@ -63,6 +64,19 @@ describe('POST /users/login', () => {
     }));
   });
 
+  it('matches % and _ in an address as themselves, not as wildcards', async () => {
+    // Prisma's insensitive equals is an ILIKE on Postgres with the value
+    // unescaped, so `v_ctim@…` signed in to (and the forgot form mailed)
+    // victim@…; test/integration/passwordReset.test.js shows it on Postgres.
+    prisma.user.findMany.mockResolvedValue([]);
+
+    await request(app).post('/users/login').send({ ...body, email: 'v_c%tim@example.test' });
+
+    expect(prisma.user.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { email: { equals: 'v\\_c\\%tim@example.test', mode: 'insensitive' } },
+    }));
+  });
+
   it('takes the exact address when two old accounts differ only by case', async () => {
     // The migration that lowercased stored addresses leaves such a pair alone
     // rather than failing on the unique key. Either one is only a guess.
@@ -78,45 +92,53 @@ describe('POST /users/login', () => {
   });
 });
 
-describe('POST /users/register', () => {
-  const body = { email: 'new@example.test', password: 'Password1' };
+describe('POST /users/register, now that sign-up is closed', () => {
+  const closedSignupBody = { email: 'stranger@example.test', password: 'Password1' };
 
-  it('creates the account and its wishlist in one write', async () => {
-    prisma.user.findFirst.mockResolvedValue(null);
-    prisma.user.create.mockResolvedValue({ id: 'u2', email: body.email });
+  it('refuses with 403 and the sentence the sign-up pages show', async () => {
+    const res = await request(app).post('/users/register').send(closedSignupBody);
 
-    const res = await request(app).post('/users/register').send(body);
-
-    expect(res.status).toBe(201);
-    expect(prisma.user.create).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ wishlists: { create: { name: 'My Wishlist' } } }),
-    }));
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: REGISTRATION_CLOSED_MESSAGE });
+    expect(prisma.user.create).not.toHaveBeenCalled();
   });
 
-  it('answers 409 when a second request registered the address first', async () => {
-    prisma.user.findFirst.mockResolvedValue(null);
-    prisma.user.create.mockRejectedValue(Object.assign(new Error('unique'), { code: 'P2002' }));
+  it('does not look the address up, so the answer says nothing about who has an account', async () => {
+    prisma.user.findFirst.mockResolvedValue({ id: 'u1', email: closedSignupBody.email });
 
-    const res = await request(app).post('/users/register').send(body);
+    const res = await request(app).post('/users/register').send(closedSignupBody);
 
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(403);
+    expect(prisma.user.findFirst).not.toHaveBeenCalled();
+    expect(prisma.user.findMany).not.toHaveBeenCalled();
   });
 
-  it('stores the address lowercased, and refuses one that differs only by case', async () => {
-    prisma.user.findFirst.mockResolvedValueOnce(null);
-    prisma.user.create.mockResolvedValue({ id: 'u2', email: body.email });
+  it('answers a malformed request the same 403, not a list of what was wrong with it', async () => {
+    const res = await request(app).post('/users/register').send({ email: 'not-an-address', password: 'x' });
 
-    await request(app).post('/users/register').send({ ...body, email: ' New@Example.TEST' });
+    expect(res.status).toBe(403);
+    expect(res.body.errors).toBeUndefined();
+  });
 
-    expect(prisma.user.create.mock.calls[0][0].data.email).toBe('new@example.test');
+  it('cannot be opened from the environment', async () => {
+    // The first version of this had a REGISTRATION_OPEN switch. Pinned so it
+    // does not come back by accident: while it was on, anyone could sign up.
+    vi.stubEnv('REGISTRATION_OPEN', 'true');
 
-    prisma.user.findFirst.mockResolvedValueOnce({ id: 'u2', email: 'new@example.test' });
-    const res = await request(app).post('/users/register').send({ ...body, email: 'NEW@example.test' });
+    const res = await request(app).post('/users/register').send(closedSignupBody);
 
-    expect(res.status).toBe(409);
-    expect(prisma.user.findFirst).toHaveBeenLastCalledWith(expect.objectContaining({
-      where: { email: { equals: 'new@example.test', mode: 'insensitive' } },
-    }));
+    vi.unstubAllEnvs();
+    expect(res.status).toBe(403);
+  });
+
+  it('leaves signing in alone', async () => {
+    prisma.user.findMany.mockResolvedValue([{
+      id: 'u1', email: closedSignupBody.email, role: 'USER', password_hash: await bcrypt.hash(closedSignupBody.password, 4),
+    }]);
+
+    const res = await request(app).post('/users/login').send(closedSignupBody);
+
+    expect(res.status).toBe(200);
   });
 });
 

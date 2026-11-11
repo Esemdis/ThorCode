@@ -67,6 +67,35 @@ describe.skipIf(!url)('password reset links', () => {
     expect(await bcrypt.compare(winner, stored)).toBe(true);
   });
 
+  it('mails nobody for an address that only matches an account by LIKE wildcard', async () => {
+    // Prisma's insensitive equals is an ILIKE with the value unescaped, so
+    // `…-w_ld@` and `…-w%@` found `…-wild@` and mailed its owner a link, each
+    // variant from a fresh per-address rate-limit bucket.
+    process.env.CONCERT_MAP_URL = 'https://map.example.test';
+    const send = vi.spyOn(mail, 'sendPasswordResetEmail').mockResolvedValue({ data: { id: 'm' } });
+    try {
+      const user = await makePasswordResetUser('wild');
+      const ask = (email) => request(app)
+        .post('/users/password/forgot')
+        .set('X-Forwarded-For', passwordResetIntNextIp())
+        .send({ email });
+
+      await ask(`${RUN}-w_ld@example.test`);
+      await ask(`${RUN}-w%@example.test`);
+      // The real address last, so there is something to wait for: the
+      // wildcard requests' detached work ran before this one's did.
+      await ask(user.email);
+      await vi.waitFor(() => expect(send).toHaveBeenCalled());
+      await new Promise((resolve) => { setTimeout(resolve, 300); });
+
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0][0].to).toBe(user.email);
+    } finally {
+      send.mockRestore();
+      delete process.env.CONCERT_MAP_URL;
+    }
+  });
+
   it('keeps one live link per user when asked twice', async () => {
     process.env.CONCERT_MAP_URL = 'https://map.example.test';
     const send = vi.spyOn(mail, 'sendPasswordResetEmail').mockResolvedValue({ data: { id: 'm' } });
