@@ -16,6 +16,8 @@ function rateLimiter({
   // otherwise say the same thing.
   handler,
   standardHeaders = true,
+  // Requests this returns true for are neither counted nor limited.
+  skip,
 } = {}) {
   return rateLimit({
     windowMs,
@@ -31,6 +33,7 @@ function rateLimiter({
     skipSuccessfulRequests,
     ...(keyGenerator && { keyGenerator }),
     ...(handler && { handler }),
+    ...(skip && { skip }),
   });
 }
 

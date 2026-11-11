@@ -483,12 +483,20 @@ const forgotIpLimit = rateLimiter({
   standardHeaders: false,
 });
 
+// What the handler accepts as an address, shared with the limiter below.
+const isForgotAddress = (value) => typeof value === 'string' && validateEmail(normaliseEmail(value));
+
 // Per address, whichever IPs ask: without it, rotating IPs could fill one
-// person's inbox with reset mail.
+// person's inbox with reset mail. Something that is not an address is left to
+// the handler's 400: a blank or missing one normalised to '', so every such
+// request from every IP shared one bucket, and after three of them everyone
+// got the quiet 200 instead. Skipping turns on the shape of what was typed,
+// never on whether an account uses it, so it says nothing about accounts.
 const forgotAddressLimit = rateLimiter({
   windowMs: 60 * 60 * 1000,
   max: 3,
   keyGenerator: (req) => `addr:${normaliseEmail(req.body?.email)}`,
+  skip: (req) => !isForgotAddress(req.body?.email),
   handler: answerForgotSent,
   standardHeaders: false,
 });
@@ -552,10 +560,10 @@ async function issuePasswordReset(email) {
  * @throws {400} Not an email address
  */
 router.post('/password/forgot', forgotIpLimit, upload.none(), forgotAddressLimit, (req, res) => {
-  const email = normaliseEmail(req.body?.email);
-  if (typeof req.body?.email !== 'string' || !validateEmail(email)) {
+  if (!isForgotAddress(req.body?.email)) {
     return response.badRequest(res, 'Valid email required');
   }
+  const email = normaliseEmail(req.body.email);
 
   response.success(res, 200, {}, FORGOT_SENT);
 

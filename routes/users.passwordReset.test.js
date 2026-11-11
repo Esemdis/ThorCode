@@ -189,6 +189,20 @@ describe('POST /users/password/forgot', () => {
     expect(prisma.passwordReset.upsert).not.toHaveBeenCalled();
   });
 
+  // A blank or missing address normalised to '', so every such request, from
+  // any IP, landed in one per-address bucket: after the third, everyone got
+  // the quiet 200 instead of "Valid email required". Whether the limiter
+  // counts depends only on the address's shape, never on whether it has an
+  // account, so this tells a stranger nothing.
+  it('keeps answering a blank or missing address with 400, however many ask', async () => {
+    for (const email of ['', '   ', undefined, '', 'not-an-address', 'not-an-address', 'not-an-address', 'not-an-address']) {
+      const res = await forgot(email);
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe('Valid email required');
+    }
+    expect(prisma.user.findMany).not.toHaveBeenCalled();
+  });
+
   it('gives the fourth request for one address in an hour the same 200, and sends nothing for it', async () => {
     const email = resetTestAddress();
     const send = vi.spyOn(mail, 'sendPasswordResetEmail').mockResolvedValue({ data: { id: 'm' } });
