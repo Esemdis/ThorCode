@@ -138,20 +138,23 @@ describe('the order a tick reads them in', () => {
   it('reads a sale about to open in the next tick even after a "Check all now" of more shows than a tick reads', () => {
     const tickTho779Order = new Date('2026-11-11T09:58:00Z');
     const askedTho779Order = new Date('2026-11-11T09:57:00Z');
+    // The hot show has the highest id, so no tie-break can put it first: only
+    // the hot rank for an asked-for show does.
+    const hotIdTho779Order = 40;
     const rows = Array.from({ length: 40 }, (_, i) => ({
       concert: followedShowTho779({
         id: i + 1,
-        ...(i === 0 && { ticket_sale_start: new Date('2026-11-11T10:00:00Z') }),
+        ...(i + 1 === hotIdTho779Order && { ticket_sale_start: new Date('2026-11-11T10:00:00Z') }),
       }),
       check: {
-        attempted_at: i === 0 ? new Date('2026-11-11T09:53:00Z') : minutesAgoTho779(20 + i, tickTho779Order),
+        attempted_at: i + 1 === hotIdTho779Order ? new Date('2026-11-11T09:53:00Z') : minutesAgoTho779(20 + i, tickTho779Order),
         requested_at: askedTho779Order,
       },
     }));
     const due = dueChecks(rows, { now: tickTho779Order, limit: 30 });
     expect(due).toHaveLength(30);
-    expect(due[0].concert_id).toBe(1);
-    expect(dueChecks(rows, { now: tickTho779Order, limit: 30, busy: true })[0].concert_id).toBe(1);
+    expect(due[0].concert_id).toBe(hotIdTho779Order);
+    expect(dueChecks(rows, { now: tickTho779Order, limit: 30, busy: true })[0].concert_id).toBe(hotIdTho779Order);
   });
 
   it('reads the asked-for in the order they were asked, not by their last attempt', () => {
