@@ -20,7 +20,6 @@ const { enrichConcertBands } = require("../../../utils/setlistEnrich");
 const { upsertSetlistConcert } = require("../../../utils/setlistConcert");
 const { retargetSidecars, undoRetarget } = require("../../../utils/mediaRetarget");
 const { acquire } = require("../../../utils/serialQueue");
-const { isActiveShareLink } = require("../../../utils/mediaShareToken");
 const { ownWishlist } = require("./shared");
 // Called through the module rather than destructured, so a test can stand in
 // for setlist.fm on the router's own copy of it.
@@ -410,6 +409,11 @@ router.post(
 // on what one row can grow to.
 const DIARY_NOTES_MAX = 5000;
 
+// express-validator runs a standard validator on each element of a list, so
+// `{rating: []}` passed isInt (nothing failed), reached Prisma as NaN and was
+// a 500, and `{rating: [4, 5]}` was stored as 4. One value or nothing.
+const isScalar = (value) => value === null || (typeof value !== "object" && typeof value !== "function");
+
 // PATCH /wishlists/:id/attendance/:concertId — the owner's notes and 1-to-5
 // rating for a show they went to (THO-823)
 //
@@ -423,9 +427,9 @@ router.patch(
     roleCheck(["ADMIN", "USER"]),
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
     param("concertId").isInt().withMessage("Concert ID must be an integer"),
-    body("notes").optional({ values: "null" }).isString().isLength({ max: DIARY_NOTES_MAX })
+    body("notes").optional({ values: "null" }).custom(isScalar).bail().isString().isLength({ max: DIARY_NOTES_MAX })
       .withMessage(`notes must be text of at most ${DIARY_NOTES_MAX} characters`),
-    body("rating").optional({ values: "null" }).isInt({ min: 1, max: 5 })
+    body("rating").optional({ values: "null" }).custom(isScalar).bail().isInt({ min: 1, max: 5 })
       .withMessage("rating must be a whole number from 1 to 5"),
   ],
   async (req, res) => {
@@ -503,10 +507,12 @@ router.post(
     setlistFmLimit,
     param("id").isInt().withMessage("Wishlist ID must be an integer"),
     param("concertId").isInt().withMessage("Concert ID must be an integer"),
-    body("concert_id").optional({ values: "null" }).isInt().withMessage("concert_id must be an integer"),
-    body("setlistfm_id").optional({ values: "null" }).custom(setlistFm.isSetlistId)
+    body("concert_id").optional({ values: "null" }).custom(isScalar).bail().isInt()
+      .withMessage("concert_id must be an integer"),
+    body("setlistfm_id").optional({ values: "null" }).custom(isScalar).bail().custom(setlistFm.isSetlistId)
       .withMessage("setlistfm_id must be a setlist.fm id"),
-    body("band_id").optional({ values: "null" }).isInt().withMessage("band_id must be an integer"),
+    body("band_id").optional({ values: "null" }).custom(isScalar).bail().isInt()
+      .withMessage("band_id must be an integer"),
   ],
   async (req, res) => {
     let release = null;
@@ -533,23 +539,6 @@ router.post(
         select: { id: true },
       });
       if (!attendance) return res.status(404).json({ error: "Attendance record not found" });
-
-      // THO-895: sharing a night widens any live album link that has one of
-      // the night's attendances in it, and nights are grouped by date and
-      // city. A link naming this attendance together with others is a night
-      // shared as a whole; moving one show out of it would let the next share
-      // of the show's new night widen that link into a second night. Refused
-      // rather than narrowing the link, because a URL already sent must not
-      // lose files. A link to this show alone is fine: wherever the show goes,
-      // the link is still to one night.
-      const now = new Date();
-      const links = await prisma.mediaAlbumShareLink.findMany({
-        where: { user_id: req.user.id, revoked_at: null, expires_at: { gt: now }, attendance_ids: { has: attendance.id } },
-        select: { attendance_ids: true, revoked_at: true, expires_at: true },
-      });
-      if (links.some((l) => isActiveShareLink(l, now) && l.attendance_ids.some((id) => id !== attendance.id))) {
-        return conflict(res, "This show is shared by album link together with other shows. Stop sharing that night before you change the date.");
-      }
 
       const alreadyAttending = (concertId) => prisma.concertAttendance.findUnique({
         where: { wishlist_id_concert_id: { wishlist_id: wishlistId, concert_id: concertId } },
@@ -593,6 +582,19 @@ router.post(
 
       if (target.id === fromConcertId) {
         return res.json({ attendance_id: attendance.id, concert_id: target.id });
+      }
+
+      // The states the rest of the API refuses an attended show. Without a
+      // date, the upload route refuses it and the band page drops it, so its
+      // photos vanish from there. Still to come, it is a Going row, and the
+      // next sync's movedFields can move its date without touching the
+      // folders, undoing the correction; with no photos nothing can drift.
+      if (!target.concert_date) {
+        return res.status(400).json({ error: "This show has no confirmed date yet" });
+      }
+      if (new Date(target.concert_date).getTime() > Date.now()
+        && (await prisma.concertMedia.count({ where: { attendance_id: attendance.id } })) > 0) {
+        return res.status(400).json({ error: "That show has not happened yet, and this one has photos" });
       }
 
       // The upload route's lock on this show. An upload chooses its folder and

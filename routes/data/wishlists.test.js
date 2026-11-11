@@ -1386,6 +1386,19 @@ describe('PATCH /wishlists/:id/attendance/:concertId (THO-823)', () => {
     expect((await tho823Patch({ notes: 12 })).status).toBe(400);
   });
 
+  // express-validator checks a list one element at a time: [] passed isInt,
+  // reached Prisma as NaN and was a 500; [4, 5] was stored as 4.
+  it.each([
+    ['an empty list for rating', { rating: [] }],
+    ['a list of ratings', { rating: [4, 5] }],
+    ['a list of notes', { notes: ['one', 'two'] }],
+  ])('refuses %s with 400 and writes nothing', async (_, body) => {
+    const res = await tho823Patch(body);
+
+    expect(res.status).toBe(400);
+    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+  });
+
   it('needs at least one of notes or rating', async () => {
     const res = await tho823Patch({});
 
@@ -1594,29 +1607,69 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
     expect(await tho823ReadSidecar('user-1/a')).toEqual(tho823OldSidecar([]));
   });
 
-  it('refuses to split a night shared by album link with other shows (THO-895)', async () => {
-    prisma.mediaAlbumShareLink.findMany.mockResolvedValue([
-      { attendance_ids: [41, 42], revoked_at: null, expires_at: new Date(Date.now() + 60_000) },
-    ]);
-
-    const res = await tho823Move({ concert_id: THO823_RIGHT.id });
-
-    expect(res.status).toBe(409);
-    expect(prisma.mediaAlbumShareLink.findMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({ user_id: 'user-1', revoked_at: null, attendance_ids: { has: 42 } }),
-    }));
-    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
-  });
-
-  it('moves a show whose album link is to that show alone', async () => {
-    prisma.mediaAlbumShareLink.findMany.mockResolvedValue([
-      { attendance_ids: [42], revoked_at: null, expires_at: new Date(Date.now() + 60_000) },
-    ]);
-
+  // The THO-895 guard that refused this is gone: since #50, sharing the
+  // show's new night never widens a link spanning two nights
+  // (albumLinkForNight), so the move needs no album check of its own.
+  it('moves a show its album link shares with other shows, asking nothing of album links', async () => {
     const res = await tho823Move({ concert_id: THO823_RIGHT.id });
     await tho823Settle();
 
     expect(res.status).toBe(200);
+    expect(prisma.mediaAlbumShareLink.findMany).not.toHaveBeenCalled();
+  });
+
+  it('refuses a concert with no date yet, which uploads and the band page refuse too', async () => {
+    prisma.concert.findUnique.mockResolvedValue({ ...THO823_RIGHT, concert_date: null });
+
+    const res = await tho823Move({ concert_id: THO823_RIGHT.id });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('This show has no confirmed date yet');
+    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+  });
+
+  // Still to come, the row is a Going row, and the next sync's movedFields can
+  // move its date without touching the photo folders.
+  it('refuses a concert still to come for a show with photos, and allows it for one without', async () => {
+    const tho823Future = { ...THO823_RIGHT, concert_date: new Date(Date.now() + 30 * 24 * 3600 * 1000) };
+    prisma.concert.findUnique.mockResolvedValue(tho823Future);
+    prisma.concertMedia.count.mockResolvedValue(2);
+
+    const refused = await tho823Move({ concert_id: THO823_RIGHT.id });
+    expect(refused.status).toBe(400);
+    expect(prisma.concertMedia.count).toHaveBeenCalledWith({ where: { attendance_id: 42 } });
+    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+
+    prisma.concertMedia.count.mockResolvedValue(0);
+    const allowed = await tho823Move({ concert_id: THO823_RIGHT.id });
+    await tho823Settle();
+    expect(allowed.status).toBe(200);
+  });
+
+  // Another request added the setlist.fm show between the pre-check and the
+  // update: the unique key catches it, as on the concert_id form.
+  it('refuses with 409 when the setlist.fm show was added to the list since it checked', async () => {
+    prisma.concertAttendance.update.mockRejectedValue(Object.assign(new Error('unique'), { code: 'P2002' }));
+
+    const res = await tho823Move({ setlistfm_id: '63de4613', band_id: 3 });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('You already have that show in your list.');
+    expect(prisma.concertMedia.findMany).not.toHaveBeenCalled();
+  });
+
+  // express-validator checks a list one element at a time: [] passed isInt
+  // and reached Prisma as NaN.
+  it.each([
+    ['an empty list for concert_id', { concert_id: [] }],
+    ['a list for concert_id', { concert_id: [77] }],
+    ['a list for band_id', { setlistfm_id: '63de4613', band_id: [] }],
+    ['a list for setlistfm_id', { setlistfm_id: ['63de4613'], band_id: 3 }],
+  ])('refuses %s with 400', async (_, body) => {
+    const res = await tho823Move(body);
+
+    expect(res.status).toBe(400);
+    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
   });
 
   it('answers the same show with 200 and writes nothing', async () => {
