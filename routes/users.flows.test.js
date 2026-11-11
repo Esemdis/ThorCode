@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import bcrypt from 'bcrypt';
 import { buildApp, authHeader, installFakePrisma } from '../test/routeApp.js';
@@ -80,6 +80,11 @@ describe('POST /users/login', () => {
 
 describe('POST /users/register', () => {
   const body = { email: 'new@example.test', password: 'Password1' };
+
+  // Registration is closed unless this is set (utils/registration.js). The
+  // tests below are about what an open route does with a request.
+  beforeEach(() => { vi.stubEnv('REGISTRATION_OPEN', 'true'); });
+  afterEach(() => { vi.unstubAllEnvs(); });
 
   it('creates the account and its wishlist in one write', async () => {
     prisma.user.findFirst.mockResolvedValue(null);
@@ -186,5 +191,59 @@ describe('the email change codes', () => {
       .send({ code: '123456' });
 
     expect(res.status).toBe(409);
+  });
+});
+
+describe('POST /users/register while sign-up is closed', () => {
+  const closedSignupBody = { email: 'stranger@example.test', password: 'Password1' };
+
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it('refuses with 403 and makes no account when REGISTRATION_OPEN is unset', async () => {
+    vi.stubEnv('REGISTRATION_OPEN', undefined);
+
+    const res = await request(app).post('/users/register').send(closedSignupBody);
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: 'Sign-up is closed. Ask the owner for an account.' });
+    expect(prisma.user.create).not.toHaveBeenCalled();
+  });
+
+  it('does not look the address up, so the answer says nothing about who has an account', async () => {
+    vi.stubEnv('REGISTRATION_OPEN', undefined);
+    prisma.user.findFirst.mockResolvedValue({ id: 'u1', email: closedSignupBody.email });
+
+    const res = await request(app).post('/users/register').send(closedSignupBody);
+
+    expect(res.status).toBe(403);
+    expect(prisma.user.findFirst).not.toHaveBeenCalled();
+  });
+
+  it('answers a malformed request the same 403, not a list of what was wrong with it', async () => {
+    vi.stubEnv('REGISTRATION_OPEN', undefined);
+
+    const res = await request(app).post('/users/register').send({ email: 'not-an-address', password: 'x' });
+
+    expect(res.status).toBe(403);
+    expect(res.body.errors).toBeUndefined();
+  });
+
+  it('stays closed for a value that is not exactly "true"', async () => {
+    vi.stubEnv('REGISTRATION_OPEN', '1');
+
+    const res = await request(app).post('/users/register').send(closedSignupBody);
+
+    expect(res.status).toBe(403);
+  });
+
+  it('leaves signing in alone', async () => {
+    vi.stubEnv('REGISTRATION_OPEN', undefined);
+    prisma.user.findMany.mockResolvedValue([{
+      id: 'u1', email: closedSignupBody.email, role: 'USER', password_hash: await bcrypt.hash(closedSignupBody.password, 4),
+    }]);
+
+    const res = await request(app).post('/users/login').send(closedSignupBody);
+
+    expect(res.status).toBe(200);
   });
 });

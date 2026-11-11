@@ -20,6 +20,7 @@ const {
   emailVerificationRateLimiter,
 } = require('../utils/emailRateLimiter');
 const response = require('../utils/apiResponse');
+const { requireOpenRegistration } = require('../utils/registration');
 
 // Wrong passwords, per IP: ten per quarter hour. Successful sign-ins do not
 // count. Login and register used to share one limiter at rateLimiter's default
@@ -73,6 +74,8 @@ const DUMMY_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);
 
 router.post(
   '/register',
+  // Closed unless REGISTRATION_OPEN=true; see utils/registration.js.
+  requireOpenRegistration,
   registerLimit,
   upload.none(),
   userValidation,
