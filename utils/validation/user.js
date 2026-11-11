@@ -5,8 +5,11 @@ const { normaliseEmail } = require("./email");
 // a password to exactly what registering does (THO-808). Kept in one place:
 // two copies would drift, and an account reset to a password register would
 // refuse is an account the rules no longer describe.
-const passwordValidation = [
-  body("password")
+//
+// A function of the field, because changing a password while signed in
+// (THO-810) checks `newPassword` and leaves `password` unchecked.
+const passwordRulesFor = (field) => [
+  body(field)
     // express-validator runs the checks below on each element of an array and
     // on an object's "[object Object]", so `["Abcdefgh1"]` or `{}` passed them
     // and reached bcrypt, which threw: a 500, and on a reset a link left live.
@@ -23,6 +26,7 @@ const passwordValidation = [
     .matches(/[a-z]/)
     .withMessage("Password must contain at least one lowercase letter"),
 ];
+const passwordValidation = passwordRulesFor("password");
 
 const userValidation = [
   // Normalised before it is checked, so every route below reads the address
@@ -32,3 +36,4 @@ const userValidation = [
 ];
 module.exports = userValidation;
 module.exports.passwordValidation = passwordValidation;
+module.exports.passwordRulesFor = passwordRulesFor;
