@@ -185,6 +185,20 @@ describe('DELETE /users/me (THO-810)', () => {
     expect((await request(app).delete('/users/me').send({ currentPassword: CURRENT })).status).toBe(401);
   });
 
+  // concert-map's "already deleted" handling keys on exactly this answer, for
+  // a token whose account is gone (a second device, an overlapping delete).
+  // Reworded, the client would show a generic error instead.
+  it('answers 404 "User not found" to a token whose account is already gone', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique.mockResolvedValue(null);
+
+    const res = await deleteAccount(id, { currentPassword: CURRENT });
+
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ error: 'User not found' });
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
   it('refuses a wrong current password with 403 and deletes nothing', async () => {
     const id = accountSettingsUserId();
     prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id));
