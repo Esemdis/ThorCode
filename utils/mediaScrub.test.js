@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  planScrub, applyPatches, crc32,
+  planScrub, applyPatches, crc32, planSource,
 } from './mediaScrub.js';
 import { exifCapturedAt } from './exifCapturedAt.js';
 import {
@@ -443,5 +443,162 @@ describe('planScrub after the THO-894 review', () => {
   it('refuses a JPEG that carries more images than any phone appends', async () => {
     const many = Buffer.concat(Array.from({ length: 100 }, () => minimalJpegTho894));
     await expect(planScrub(many)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round 2 of the THO-894 review: a box budget so a file of millions of tiny
+// boxes is a cheap refusal, not a heap OOM or an hour of reads; and the last
+// identifying keys and manifests.
+
+const tinyBoxesTho894Round2 = (count, type = 'zzzz') => {
+  const b = Buffer.alloc(count * 8);
+  for (let i = 0; i < count; i += 1) {
+    b.writeUInt32BE(8, i * 8);
+    b.write(type, i * 8 + 4, 'latin1');
+  }
+  return b;
+};
+
+// A source over a buffer that counts its reads, as planScrubFile's does off disk.
+const countingSourceTho894Round2 = (buf) => {
+  const source = {
+    size: buf.length,
+    reads: 0,
+    read: async (offset, length) => { source.reads += 1; return buf.subarray(offset, offset + length); },
+  };
+  return source;
+};
+
+describe('planScrub after the THO-894 review, round 2', () => {
+  it('refuses a meta with more boxes than any real file holds, without collecting them first', async () => {
+    // 31M empty children of one meta were 31M objects in an array and a heap
+    // OOM that took the whole API down: not an exception, so no 404 either.
+    const box = mp4BoxTho894Review;
+    const meta = box('meta', u32Tho894Review(0), box('hdlr', u32Tho894Review(0), u32Tho894Review(0), 'mdir', Buffer.alloc(12)),
+      tinyBoxesTho894Round2(300000));
+    const mp4 = Buffer.concat([box('ftyp', 'isom', u32Tho894Review(0x200), 'isommp42'), box('moov', box('mvhd', Buffer.alloc(100)), meta)]);
+    await expect(planScrub(mp4)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
+  it('refuses a moov of more boxes than any real file holds', async () => {
+    const box = mp4BoxTho894Review;
+    const mp4 = Buffer.concat([box('ftyp', 'isom', u32Tho894Review(0x200), 'isommp42'),
+      box('moov', box('mvhd', Buffer.alloc(100)), tinyBoxesTho894Round2(300000))]);
+    await expect(planScrub(mp4)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
+  it('refuses an Apple keys box with more entries than any real file holds', async () => {
+    const box = mp4BoxTho894Review;
+    const meta = box('meta', box('hdlr', u32Tho894Review(0), u32Tho894Review(0), 'mdta', Buffer.alloc(12)),
+      box('keys', u32Tho894Review(0), u32Tho894Review(300000), tinyBoxesTho894Round2(300000, 'mdta')), box('ilst'));
+    const mp4 = Buffer.concat([box('ftyp', 'isom', u32Tho894Review(0x200), 'isommp42'), box('moov', box('mvhd', Buffer.alloc(100)), meta)]);
+    await expect(planScrub(mp4)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
+  it('reads an MP4\'s top-level box headers a window at a time, not one read per box', async () => {
+    // One read per box was 36 s for a million top-level boxes off disk.
+    const box = mp4BoxTho894Review;
+    const mp4 = Buffer.concat([box('ftyp', 'isom', u32Tho894Review(0x200), 'isommp42'),
+      tinyBoxesTho894Round2(5000, 'free'), box('moov', box('mvhd', Buffer.alloc(100)))]);
+    const source = countingSourceTho894Round2(mp4);
+    expect(await planSource(source)).toEqual([]);
+    expect(source.reads).toBeLessThan(10);
+  });
+
+  it('refuses a top level of more boxes than any recording has', async () => {
+    const box = mp4BoxTho894Review;
+    const mp4 = Buffer.concat([box('ftyp', 'isom', u32Tho894Review(0x200), 'isommp42'),
+      tinyBoxesTho894Round2(300000, 'free'), box('moov', box('mvhd', Buffer.alloc(100)))]);
+    const source = countingSourceTho894Round2(mp4);
+    await expect(planSource(source)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+    expect(source.reads).toBeLessThan(100);
+  });
+
+  it('refuses an image of more chunks or segments than any encoder writes', async () => {
+    const pngChunks = Buffer.alloc(1100000 * 12);
+    for (let i = 0; i < 1100000; i += 1) pngChunks.write('abCd', i * 12 + 4, 'latin1');
+    const png = Buffer.concat([PNG_SIGNATURE_THO894, IHDR_THO894, pngChunks, IDAT_THO894, IEND_THO894]);
+    await expect(planScrub(png)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+
+    const comments = Buffer.alloc(1100000 * 4);
+    for (let i = 0; i < 1100000; i += 1) comments.writeUInt32BE(0xfffe0002, i * 4);
+    const jpeg = Buffer.concat([minimalJpegTho894.subarray(0, 2), comments, minimalJpegTho894.subarray(2)]);
+    await expect(planScrub(jpeg)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+
+    const body = Buffer.alloc(4 + 1100000 * 8);
+    body.write('WEBP', 0, 'latin1');
+    for (let i = 0; i < 1100000; i += 1) body.write('abcd', 4 + i * 8, 'latin1');
+    const head = Buffer.alloc(8);
+    head.write('RIFF', 0, 'latin1');
+    head.writeUInt32LE(body.length, 4);
+    await expect(planScrub(Buffer.concat([head, body]))).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
+  it('neutralises Apple\'s content identifier, the video\'s ImageUniqueID', async () => {
+    const mp4 = mp4WithLocationTho894({
+      extraAppleKeysTho900: [['com.apple.quicktime.content.identifier', 'E1F3A6C2-LIVE-PHOTO-PAIR']],
+    });
+    const out = await scrubbedTho894(mp4);
+    expect(containsTho894(out, 'LIVE-PHOTO-PAIR')).toBe(false);
+    expect(containsTho894(out, '18.1')).toBe(true);
+  });
+
+  it('treats a PNG Source like Author, since it names the device', async () => {
+    const png = Buffer.concat([
+      PNG_SIGNATURE_THO894, IHDR_THO894,
+      pngChunkTho894('tEXt', Buffer.from('Source\0Source-Pixel 8 Pro', 'latin1')),
+      IDAT_THO894, IEND_THO894,
+    ]);
+    const out = await scrubbedTho894(png);
+    expect(containsTho894(out, 'Source-Pixel')).toBe(false);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('blanks a C2PA manifest in a JPEG, a PNG and an MP4, which can carry the place and the person', async () => {
+    // A JUMBF superbox labelled c2pa, split over two APP11 segments of one box
+    // instance, the way a manifest larger than a segment is written.
+    const app11 = (seq, body) => {
+      const payload = Buffer.concat([Buffer.from('JP', 'latin1'), Buffer.from([0, 7]), u32Tho894Review(seq), body]);
+      const head = Buffer.alloc(4);
+      head.writeUInt16BE(0xffeb, 0);
+      head.writeUInt16BE(payload.length + 2, 2);
+      return Buffer.concat([head, payload]);
+    };
+    const jumbHead = Buffer.concat([u32Tho894Review(200), Buffer.from('jumb', 'latin1')]);
+    const first = Buffer.concat([jumbHead, u32Tho894Review(29), Buffer.from('jumd', 'latin1'),
+      Buffer.from('6332706100110010800000aa00389b71', 'hex'), Buffer.from([3]), Buffer.from('c2pa\0', 'latin1'),
+      Buffer.from('c2pa-part-one GPS 59.9139', 'latin1')]);
+    const second = Buffer.concat([jumbHead, Buffer.from('c2pa-part-two Owner-Name', 'latin1')]);
+    const jpeg = Buffer.concat([minimalJpegTho894.subarray(0, 2), app11(1, first), app11(2, second), minimalJpegTho894.subarray(2)]);
+
+    const png = Buffer.concat([
+      PNG_SIGNATURE_THO894, IHDR_THO894,
+      pngChunkTho894('caBX', Buffer.concat([jumbHead, Buffer.from('c2pa-png GPS 59.9139', 'latin1')])),
+      IDAT_THO894, IEND_THO894,
+    ]);
+
+    const c2paUuid = mp4BoxTho894Review('uuid', Buffer.from('d8fec3d61b0e483c92975828877ec481', 'hex'), 'c2pa-mp4 GPS 59.9139');
+    const mp4 = mp4WithLocationTho894({ location: false, topLevelTho894Review: [c2paUuid] });
+
+    for (const file of [jpeg, png, mp4]) {
+      const out = await scrubbedTho894(file);
+      expect(out.length).toBe(file.length);
+      expect(containsTho894(out, 'GPS 59.9139')).toBe(false);
+      expect(containsTho894(out, 'Owner-Name')).toBe(false);
+      expect(await planScrub(out)).toEqual([]);
+    }
+  });
+
+  it('leaves an APP11 that is not a C2PA manifest alone', async () => {
+    // JPEG XT keeps an HDR residual in APP11 JUMBF boxes too; only c2pa goes.
+    const payload = Buffer.concat([Buffer.from('JP', 'latin1'), Buffer.from([0, 1]), u32Tho894Review(1),
+      u32Tho894Review(40), Buffer.from('jumb', 'latin1'), u32Tho894Review(24), Buffer.from('jumd', 'latin1'),
+      Buffer.alloc(16, 0x11), Buffer.from([3]), Buffer.from('xt\0', 'latin1')]);
+    const head = Buffer.alloc(4);
+    head.writeUInt16BE(0xffeb, 0);
+    head.writeUInt16BE(payload.length + 2, 2);
+    const jpeg = Buffer.concat([minimalJpegTho894.subarray(0, 2), head, payload, minimalJpegTho894.subarray(2)]);
+    expect(await planScrub(jpeg)).toEqual([]);
   });
 });

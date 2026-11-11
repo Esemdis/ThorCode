@@ -52,6 +52,16 @@ function unscrubbable(reason) {
 // boxes is a refusal rather than millions of patch objects in the heap.
 const MAX_PATCHES = 10000;
 
+// How many boxes (MP4) or chunks and segments (images) one file may have
+// walked, counted as they are walked rather than after: a meta of 31 million
+// empty children was 31 million objects and a heap OOM, which takes the whole
+// API down and is no exception a route can answer with a 404. A phone moov has
+// a few hundred boxes and a long fragmented recording tens of thousands, so
+// 250,000 leaves room. An image gets more: a big PNG may be cut into tens of
+// thousands of IDAT chunks, while a million costs well under a second.
+const MAX_MP4_BOXES = 250000;
+const MAX_IMAGE_BLOCKS = 1000000;
+
 /**
  * The limits one file's planning shares across every block it walks.
  *
@@ -59,8 +69,14 @@ const MAX_PATCHES = 10000;
  * real metadata values never overlap, so a plan can only exceed it when many
  * entries point at the same bytes — five hundred EXIF entries at one 200 MB
  * value were five hundred 200 MB copies. Charged before anything is allocated.
+ * `blocks` counts down the boxes, chunks or segments still allowed.
  */
-const budgetFor = (size) => ({ bytes: size, patches: 0 });
+const budgetFor = (size, blocks) => ({ bytes: size, patches: 0, blocks });
+
+function step(ctx) {
+  ctx.budget.blocks -= 1;
+  if (ctx.budget.blocks < 0) throw unscrubbable('more boxes or chunks than any real file has');
+}
 
 function charge(ctx, length) {
   ctx.budget.bytes -= length;
@@ -263,6 +279,34 @@ function startsWith(buf, at, end, text) {
   return end - at >= text.length && buf.toString('latin1', at, at + text.length) === text;
 }
 
+// A C2PA manifest store, as the JUMBF description box's type: the manifest
+// can carry the capture's EXIF (GPS included) and the creator's identity, and
+// the scrub has already broken its signature by patching the file it signs.
+const C2PA_JUMBF_TYPE = Buffer.from('6332706100110010800000aa00389b71', 'hex');
+
+/**
+ * APP11 holds JUMBF boxes, one box instance split over as many segments as it
+ * needs, each opening `JP`, the instance number and a sequence number. Only a
+ * C2PA manifest is blanked, every segment of its instance: JPEG XT keeps an
+ * HDR residual in APP11 too, and that is the picture, not metadata.
+ */
+function planApp11(ctx, payload, end, c2paInstances) {
+  const { buf } = ctx;
+  if (!startsWith(buf, payload, end, 'JP') || end - payload < 8) return;
+  const instance = buf.readUInt16BE(payload + 2);
+  const sequence = buf.readUInt32BE(payload + 4);
+  if (sequence === 1) {
+    const box = payload + 8;
+    const isC2pa = end - box >= 41
+      && buf.toString('latin1', box + 4, box + 8) === 'jumb'
+      && buf.toString('latin1', box + 12, box + 16) === 'jumd'
+      && (buf.compare(C2PA_JUMBF_TYPE, 0, 16, box + 16, box + 32) === 0
+        || startsWith(buf, box + 33, end, 'c2pa'));
+    if (isC2pa) c2paInstances.add(instance);
+  }
+  if (c2paInstances.has(instance)) fill(ctx, payload, end - payload, 0);
+}
+
 function planApp1(ctx, payload, end) {
   const { buf } = ctx;
   if (startsWith(buf, payload, end, 'Exif\0\0')) {
@@ -292,8 +336,10 @@ function skipEntropy(buf, pos) {
 // One JPEG from its SOI to just past its EOI.
 function planOneJpeg(ctx, start) {
   const { buf } = ctx;
+  const c2paInstances = new Set();
   let pos = start + 2;
   for (;;) {
+    step(ctx);
     if (pos + 2 > buf.length || buf[pos] !== 0xff) throw unscrubbable('JPEG marker expected');
     while (pos + 2 < buf.length && buf[pos + 1] === 0xff) pos += 1;
     const marker = buf[pos + 1];
@@ -305,6 +351,7 @@ function planOneJpeg(ctx, start) {
     const segEnd = pos + buf.readUInt16BE(pos);
     if (segEnd < pos + 2 || segEnd > buf.length) throw unscrubbable('JPEG segment overruns the file');
     if (marker === 0xe1) planApp1(ctx, pos + 2, segEnd);
+    else if (marker === 0xeb) planApp11(ctx, pos + 2, segEnd, c2paInstances);
     pos = segEnd;
     if (marker === 0xda) pos = skipEntropy(buf, pos);
   }
@@ -350,9 +397,12 @@ function crc32(buf) {
 
 // Text chunks that are metadata blocks in disguise — XMP, and the "raw
 // profile" chunks ImageMagick and exiftool write EXIF, XMP and IPTC into as
-// hex — and the two standard keywords that name a person, as EXIF's Artist
-// and Copyright do.
-const PNG_METADATA_KEYWORD = /^(XML:com\.adobe\.xmp|Raw profile type (exif|xmp|app1|iptc|8bim)|Author|Copyright)$/i;
+// hex — and the standard keywords that name a person or the device, as EXIF's
+// Artist, Copyright and Model do (`Source` is "the device used to create the
+// image").
+const PNG_METADATA_KEYWORD = /^(XML:com\.adobe\.xmp|Raw profile type (exif|xmp|app1|iptc|8bim)|Author|Copyright|Source)$/i;
+// Whole chunks that go: `caBX` is a C2PA manifest (see C2PA_JUMBF_TYPE).
+const PNG_NEUTRALISE = new Set(['caBX']);
 const PNG_TEXT_CHUNKS = new Set(['tEXt', 'iTXt', 'zTXt']);
 
 // A private, ancillary, safe-to-copy chunk type that no reader interprets: the
@@ -363,6 +413,7 @@ function planPng(ctx) {
   const { buf } = ctx;
   let pos = 8;
   for (;;) {
+    step(ctx);
     if (pos + 12 > buf.length) throw unscrubbable('PNG ends without IEND');
     const length = buf.readUInt32BE(pos);
     const type = buf.toString('latin1', pos + 4, pos + 8);
@@ -375,6 +426,9 @@ function planPng(ctx) {
     const chunk = { buf, base: ctx.base, out: [], budget: ctx.budget };
     if (type === 'eXIf') {
       planTiff(chunk, exifPrefixed(buf, data, dataEnd), dataEnd);
+    } else if (PNG_NEUTRALISE.has(type)) {
+      put(chunk, pos + 4, PNG_NEUTRAL);
+      fill(chunk, data, length, 0);
     } else if (PNG_TEXT_CHUNKS.has(type)) {
       const nul = buf.indexOf(0, data);
       const keyword = nul >= 0 && nul < dataEnd ? buf.toString('latin1', data, nul) : '';
@@ -407,6 +461,7 @@ function planWebp(ctx) {
   if (riffEnd > buf.length) throw unscrubbable('WebP RIFF overruns the file');
   let pos = 12;
   while (pos < riffEnd) {
+    step(ctx);
     if (pos + 8 > riffEnd) throw unscrubbable('WebP chunk header truncated');
     const fourcc = buf.toString('latin1', pos, pos + 4);
     const size = buf.readUInt32LE(pos + 4);
@@ -442,8 +497,10 @@ const META_ITEMS = new Set(['iloc', 'iinf', 'idat']);
 // MP4 nests about eight levels at most. A file of a hundred thousand nested
 // udta boxes overflowed the stack: a 500, not the 404 every refusal is.
 const MAX_BOX_DEPTH = 32;
-// Adobe's XMP box, as a uuid box's user type.
+// Adobe's XMP box and the C2PA manifest box, as a uuid box's user type.
 const XMP_UUID = Buffer.from('be7acfcb97a942e89c71999491e3afac', 'hex');
+const C2PA_UUID = Buffer.from('d8fec3d61b0e483c92975828877ec481', 'hex');
+const METADATA_UUIDS = [XMP_UUID, C2PA_UUID];
 const FREE = Buffer.from('free', 'latin1');
 
 // mdta keys that say where, with what or whose: Apple's ISO 6709 position and
@@ -455,9 +512,12 @@ const FREE = Buffer.from('free', 'latin1');
 // unanchored on purpose: an iPhone also writes `camera.lens_model` ("iPhone 15
 // Pro back triple camera …"), and a match on `.model` let that through
 // (THO-900). Android names its maker `manufacturer`, which `make$` misses.
+// `content.identifier` is the Live Photo pairing UUID, the video's
+// ImageUniqueID; `camera.identifier` ("Back") goes with it, harmlessly.
 const isSensitiveAppleKey = (name) => /location/i.test(name)
   || /(make|model|manufacturer)$/i.test(name)
-  || /(author|artist|copyright)$/i.test(name);
+  || /(author|artist|copyright)$/i.test(name)
+  || /identifier$/i.test(name);
 
 // Big enough for a long recording's sample tables, small enough that a
 // corrupt size is a refusal rather than an attempt to read gigabytes into
@@ -496,6 +556,7 @@ function walkBoxes(ctx, start, end, visit) {
       headerLen = 16;
     }
     if (size < headerLen || size > left) throw unscrubbable('MP4 box overruns its parent');
+    step(ctx);
     visit({
       at: pos, type: buf.toString('latin1', pos + 4, pos + 8), headerLen, end: pos + size,
     });
@@ -508,16 +569,19 @@ function neutralise(ctx, box) {
   fill(ctx, box.at + box.headerLen, box.end - box.at - box.headerLen, 0);
 }
 
-const isXmpUuid = (buf, box) => box.end - (box.at + box.headerLen) >= 16
-  && buf.compare(XMP_UUID, 0, 16, box.at + box.headerLen, box.at + box.headerLen + 16) === 0;
+const isMetadataUuidAt = (buf, at, end) => end - at >= 16
+  && METADATA_UUIDS.some((uuid) => buf.compare(uuid, 0, 16, at, at + 16) === 0);
+const isMetadataUuid = (buf, box) => isMetadataUuidAt(buf, box.at + box.headerLen, box.end);
 
-function readAppleKeys(buf, box) {
+function readAppleKeys(ctx, box) {
+  const { buf } = ctx;
   const start = box.at + box.headerLen;
   if (start + 8 > box.end) throw unscrubbable('MP4 keys box truncated');
   const count = buf.readUInt32BE(start + 4);
   const names = [];
   let pos = start + 8;
   for (let i = 0; i < count; i += 1) {
+    step(ctx);
     if (pos + 8 > box.end) throw unscrubbable('MP4 keys entry truncated');
     const size = buf.readUInt32BE(pos);
     if (size < 8 || pos + size > box.end) throw unscrubbable('MP4 keys entry overruns its box');
@@ -549,7 +613,7 @@ function planMeta(ctx, box, depth) {
     // Apple's: each ilst item's box type is a 1-based index into `keys`, and
     // only the key's name says what the item holds.
     const keysBox = children.find((c) => c.type === 'keys');
-    const names = keysBox ? readAppleKeys(buf, keysBox) : [];
+    const names = keysBox ? readAppleKeys(ctx, keysBox) : [];
     for (const child of children) {
       if (child.type === 'ilst') {
         walkBoxes(ctx, child.at + child.headerLen, child.end, (item) => {
@@ -582,7 +646,7 @@ function planMoovChildren(ctx, start, end, single = null, depth = 0) {
   const visit = (box) => {
     if (box.type === 'cmov') throw unscrubbable('compressed MP4 header');
     if (MP4_NEUTRALISE.has(box.type)) return neutralise(ctx, box);
-    if (box.type === 'uuid') return isXmpUuid(ctx.buf, box) ? neutralise(ctx, box) : undefined;
+    if (box.type === 'uuid') return isMetadataUuid(ctx.buf, box) ? neutralise(ctx, box) : undefined;
     if (box.type === 'meta') return planMeta(ctx, box, depth + 1);
     if (MP4_CONTAINERS.has(box.type)) planMoovChildren(ctx, box.at + box.headerLen, box.end, null, depth + 1);
     return undefined;
@@ -596,20 +660,39 @@ function planMoovChildren(ctx, start, end, single = null, depth = 0) {
 // and meta), and a stray top-level udta.
 const MP4_READ_WHOLE = new Set(['moov', 'meta', 'moof', 'udta']);
 
+// Top-level headers are read through a window this big, not one read per box:
+// a file of a million 8-byte boxes was a million reads and 36 s off disk.
+const TOP_LEVEL_WINDOW = 64 * 1024;
+
 /**
  * The top level is walked off the file, not out of memory: `mdat` is most of
  * a video and the only part that is never needed. The boxes above, and a
- * top-level XMP uuid box, are read in whole.
+ * top-level XMP or C2PA uuid box, are read in whole.
  */
 async function planMp4(source) {
   const out = [];
-  const budget = budgetFor(source.size);
+  const budget = budgetFor(source.size, MAX_MP4_BOXES);
+  const top = { budget };
+  let window = Buffer.alloc(0);
+  let windowAt = 0;
+  // `length` bytes at `at`: out of the window when they are in it, through a
+  // fresh window when they fit in one, and read on their own (a moov) when not.
+  const readAt = async (at, length) => {
+    if (at >= windowAt && at + length <= windowAt + window.length) {
+      return window.subarray(at - windowAt, at - windowAt + length);
+    }
+    if (length > TOP_LEVEL_WINDOW) return source.read(at, length);
+    window = await source.read(at, Math.min(TOP_LEVEL_WINDOW, source.size - at));
+    windowAt = at;
+    return window.subarray(0, length);
+  };
   let pos = 0;
   let sawMoov = false;
   while (pos < source.size) {
+    step(top);
     const left = source.size - pos;
     if (left < 8) throw unscrubbable('MP4 ends inside a box header');
-    const head = await source.read(pos, Math.min(left, 32));
+    const head = await readAt(pos, Math.min(left, 32));
     let size = head.readUInt32BE(0);
     let headerLen = 8;
     if (size === 1) {
@@ -623,11 +706,10 @@ async function planMp4(source) {
     const type = head.toString('latin1', 4, 8);
 
     const readWhole = MP4_READ_WHOLE.has(type)
-      || (type === 'uuid' && head.length >= headerLen + 16
-        && head.compare(XMP_UUID, 0, 16, headerLen, headerLen + 16) === 0);
+      || (type === 'uuid' && isMetadataUuidAt(head, headerLen, head.length));
     if (readWhole) {
       if (size > MAX_MOOV_BYTES) throw unscrubbable(`MP4 ${type} too large`);
-      const buf = await source.read(pos, size);
+      const buf = await readAt(pos, size);
       const ctx = {
         buf, base: pos, out, budget,
       };
@@ -668,6 +750,11 @@ const MAX_IMAGE_BYTES = 256 * 1024 * 1024;
 
 const IMAGE_PLANNERS = { jpeg: planJpeg, png: planPng, webp: planWebp };
 
+/**
+ * The patches for a file behind `source` ({size, read(offset, length)}).
+ * Exported so a test can count the reads; planScrub and planScrubFile are the
+ * entry points.
+ */
 async function planSource(source) {
   const head = await source.read(0, Math.min(source.size, 16));
   const format = formatOf(head);
@@ -675,7 +762,7 @@ async function planSource(source) {
   if (format === 'mp4') return planMp4(source);
   if (source.size > MAX_IMAGE_BYTES) throw unscrubbable('image too large');
   const ctx = {
-    buf: await source.read(0, source.size), base: 0, out: [], budget: budgetFor(source.size),
+    buf: await source.read(0, source.size), base: 0, out: [], budget: budgetFor(source.size, MAX_IMAGE_BLOCKS),
   };
   IMAGE_PLANNERS[format](ctx);
   return ctx.out;
@@ -727,5 +814,5 @@ function applyPatches(buf, patches) {
 }
 
 module.exports = {
-  planScrub, planScrubFile, applyPatches, crc32, XMP_UUID, SCRUB_VERSION,
+  planScrub, planScrubFile, planSource, applyPatches, crc32, XMP_UUID, SCRUB_VERSION,
 };
