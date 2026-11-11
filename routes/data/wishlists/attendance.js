@@ -6,6 +6,7 @@
  * original declaration order — the manifest test in wishlists.test.js pins
  * the resulting surface.
  */
+const path = require("node:path");
 const express = require("express");
 const router = express.Router();
 const { validationResult, param, body } = require("express-validator");
@@ -16,18 +17,14 @@ const { storesRealInstant } = require("../../../utils/ics");
 const { conflict } = require("../../../utils/apiResponse");
 const { countMediaForAttendances } = require("../../../utils/mediaDetach");
 const { enrichConcertBands } = require("../../../utils/setlistEnrich");
-const { storedCity } = require("../../../utils/cityMatch");
-const { venueId } = require("../../../utils/venueMatch");
-const { canonicalBandName } = require("../../../utils/lineupNames");
+const { upsertSetlistConcert } = require("../../../utils/setlistConcert");
+const { retargetSidecars, undoRetarget } = require("../../../utils/mediaRetarget");
+const { acquire } = require("../../../utils/serialQueue");
 const { ownWishlist } = require("./shared");
 // Called through the module rather than destructured, so a test can stand in
 // for setlist.fm on the router's own copy of it.
 const setlistFm = require("../../../utils/setlistFm");
 const { setlistFmLimit } = require("../../../utils/setlistFmLimit");
-
-// A show logged "today" can be dated tomorrow in UTC, and setlist.fm takes the
-// venue's own date; a day of slack separates that from a show still to come.
-const FUTURE_SLACK_MS = 24 * 60 * 60 * 1000;
 
 // GET /wishlists/:id/attendance — all attended/going concerts for this wishlist
 router.get(
@@ -132,6 +129,11 @@ router.get(
           created_at: r.created_at,
           has_photos: attendanceIdsWithPhotos.has(r.id),
           has_videos: attendanceIdsWithVideos.has(r.id),
+          // The owner's diary of the night (THO-823). This read is the
+          // owner's own (ownWishlist, no admin exception), so it is never
+          // shown to anyone else.
+          notes: r.notes ?? null,
+          rating: r.rating ?? null,
           concert: {
             ...r.concert_rel,
             source: undefined,
@@ -374,142 +376,17 @@ router.post(
 
       if (!(await ownWishlist(req, res, { select: { id: true } }))) return;
 
-      const band = await prisma.band.findUnique({ where: { id: bandId }, select: { id: true, name: true, MBID: true } });
-      if (!band) return res.status(404).json({ error: "Band not found" });
-
-      if (!process.env.SETLIST_API_KEY) {
-        return res.status(503).json({ error: "Setlist.fm is not configured on this server" });
-      }
-
-      let setlist;
+      // The show itself, and the shared row for it, by the rules in
+      // utils/setlistConcert.js — which the move route below uses too.
+      let concert;
+      let show;
       try {
-        setlist = await setlistFm.fetchSetlistById(req.body.setlistfm_id);
+        ({ concert, show } = await upsertSetlistConcert(prisma, { setlistfmId: req.body.setlistfm_id, bandId }));
       } catch (error) {
-        if (error.response?.status === 404) return res.status(404).json({ error: "Setlist not found on setlist.fm" });
-        console.error("[from-setlist] setlist.fm lookup failed:", error.response?.status ?? error.message);
-        return res.status(502).json({ error: "Could not reach setlist.fm — try again shortly" });
+        if (error.setlistRefusal) return res.status(error.status).json({ error: error.message });
+        throw error;
       }
-
-      // The setlist has to be this band's. Quick-added bands often have no
-      // MBID, so compare canonical names until setlist.fm can fill that gap.
-      const artistMbid = setlist?.artist?.mbid ?? null;
-      if (band.MBID && artistMbid) {
-        if (band.MBID.toLowerCase() !== String(artistMbid).toLowerCase()) {
-          return res.status(400).json({ error: "That setlist is by a different artist" });
-        }
-      } else {
-        const bandName = canonicalBandName(band.name);
-        const artistName = canonicalBandName(setlist?.artist?.name);
-        if (!bandName || !artistName || bandName !== artistName) {
-          return res.status(400).json({ error: "That setlist is by a different artist" });
-        }
-
-        // Remember setlist.fm's MBID after the name check, so later requests
-        // can use the stronger identity check. Avoid claiming an MBID already
-        // assigned to a different band.
-        if (!band.MBID && artistMbid) {
-          const mbidOwner = await prisma.band.findUnique({
-            where: { MBID: String(artistMbid) },
-            select: { id: true },
-          });
-          if (!mbidOwner || mbidOwner.id === band.id) {
-            await prisma.band.updateMany({
-              where: { id: band.id, MBID: null },
-              data: { MBID: String(artistMbid) },
-            });
-          }
-        }
-      }
-
-      const show = setlistFm.setlistSummary(setlist);
-      const concertDate = setlistFm.setlistDate(show.date);
-      if (!concertDate) return res.status(422).json({ error: "setlist.fm has no usable date for that show" });
-      // Attended means it happened. setlist.fm does list shows ahead of time.
-      if (concertDate.getTime() > Date.now() + FUTURE_SLACK_MS) {
-        return res.status(400).json({ error: "That show has not happened yet" });
-      }
-      if (!show.venue || !show.city || !show.country) {
-        return res.status(422).json({ error: "setlist.fm has no venue for that show" });
-      }
-
-      const { venue, city, country, url } = show;
-      const coord = (v) => (v != null && Number.isFinite(Number(v)) ? Number(v) : null);
-      const latitude = coord(show.latitude);
-      const longitude = coord(show.longitude);
-      const hasCoords = latitude != null && longitude != null;
-      // Keyed on the id that was asked for and fetched, as it always was, so a
-      // response that somehow lacked one cannot file every such show under
-      // "sfm_null".
-      const eventId = `sfm_${req.body.setlistfm_id}`;
-
-      // Coordinates and a city link, both of which this route used to leave
-      // empty: a concert without a position is dropped by the map's grouping and
-      // simply never appears, and the city link is what carries reachability.
-      // A spelling of a place already stored nearby goes on that row.
-      const cityName = (await storedCity(prisma, { name: city, country, latitude, longitude }))?.name ?? city;
-      const cityRecord = await prisma.city.upsert({
-        where: { name_country: { name: cityName, country } },
-        create: {
-          name: cityName,
-          country,
-          latitude: hasCoords ? latitude : null,
-          longitude: hasCoords ? longitude : null,
-        },
-        update: {},
-        select: { id: true, latitude: true },
-      });
-      const cityId = cityRecord.id;
-      if (hasCoords && cityRecord.latitude == null) {
-        await prisma.city.update({
-          where: { id: cityRecord.id },
-          data: { latitude, longitude },
-        });
-      }
-
-      const concert = await prisma.concert.upsert({
-        where: { event_id: eventId },
-        create: {
-          event_id: eventId,
-          venue,
-          city: cityName,
-          country,
-          concert_date: concertDate,
-          on_sale: false,
-          created_at: new Date(),
-          url: url ?? null,
-          source: "setlistfm",
-          sources: ["setlistfm"],
-          latitude: hasCoords ? String(latitude) : null,
-          longitude: hasCoords ? String(longitude) : null,
-          city_id: cityId,
-          // No position: setlist.fm's is the city's (see below).
-          venue_id: await venueId(prisma, { name: venue, cityId }),
-        },
-        update: {},
-        select: { id: true },
-      });
-
-      // Gaps only, and never an overwrite. What setlist.fm returns is the
-      // venue's *city* coordinates, so a row already placed at the venue itself
-      // — by /bulk, or by the coordinate backfill — must keep what it has.
-      if (hasCoords) {
-        await prisma.concert.updateMany({
-          where: { id: concert.id, OR: [{ latitude: null }, { longitude: null }] },
-          data: { latitude: String(latitude), longitude: String(longitude) },
-        });
-      }
-      await prisma.concert.updateMany({
-        where: { id: concert.id, city_id: null },
-        data: { city_id: cityId },
-      });
-
-      // Link band to concert with the setlist setlist.fm has for it.
-      const setlistData = show.songs.length > 0 ? { songs: show.songs } : undefined;
-      await prisma.concertBandReference.upsert({
-        where: { concert_band: { concert: concert.id, band: bandId } },
-        create: { concert: concert.id, band: bandId, setlist: setlistData },
-        update: { ...(setlistData ? { setlist: setlistData } : {}) },
-      });
+      const { venue, city } = show;
 
       const attendance = await prisma.concertAttendance.upsert({
         where: { wishlist_id_concert_id: { wishlist_id: wishlistId, concert_id: concert.id } },
@@ -524,6 +401,264 @@ router.post(
     } catch (error) {
       console.error("Error adding from-setlist attendance:", error);
       return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// The longest a night's notes may be. Generous for a diary entry, and a bound
+// on what one row can grow to.
+const DIARY_NOTES_MAX = 5000;
+
+// express-validator runs a standard validator on each element of a list, so
+// `{rating: []}` passed isInt (nothing failed), reached Prisma as NaN and was
+// a 500, and `{rating: [4, 5]}` was stored as 4. One value or nothing.
+const isScalar = (value) => value === null || (typeof value !== "object" && typeof value !== "function");
+
+// PATCH /wishlists/:id/attendance/:concertId — the owner's notes and 1-to-5
+// rating for a show they went to (THO-823)
+//
+// Either key or both; a key left out is left alone, and null clears it. The
+// range is checked here rather than by a CHECK constraint, as VenueReview's
+// rating is.
+router.patch(
+  "/wishlists/:id/attendance/:concertId",
+  [
+    auth,
+    roleCheck(["ADMIN", "USER"]),
+    param("id").isInt().withMessage("Wishlist ID must be an integer"),
+    param("concertId").isInt().withMessage("Concert ID must be an integer"),
+    body("notes").optional({ values: "null" }).custom(isScalar).bail().isString().isLength({ max: DIARY_NOTES_MAX })
+      .withMessage(`notes must be text of at most ${DIARY_NOTES_MAX} characters`),
+    body("rating").optional({ values: "null" }).custom(isScalar).bail().isInt({ min: 1, max: 5 })
+      .withMessage("rating must be a whole number from 1 to 5"),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
+
+      const has = (key) => Object.prototype.hasOwnProperty.call(req.body ?? {}, key);
+      if (!has("notes") && !has("rating")) {
+        return res.status(400).json({ error: "Send notes, rating or both" });
+      }
+
+      const wishlistId = parseInt(req.params.id, 10);
+      const concertId = parseInt(req.params.concertId, 10);
+
+      if (!(await ownWishlist(req, res, { select: { id: true } }))) return;
+
+      const attendance = await prisma.concertAttendance.findUnique({
+        where: { wishlist_id_concert_id: { wishlist_id: wishlistId, concert_id: concertId } },
+        select: { id: true },
+      });
+      if (!attendance) return res.status(404).json({ error: "Attendance record not found" });
+
+      const data = {};
+      // Whitespace is not a note. Stored as null, so "has notes" is one test
+      // on every client rather than a trim in each.
+      if (has("notes")) data.notes = req.body.notes == null ? null : req.body.notes.trim() || null;
+      if (has("rating")) data.rating = req.body.rating == null ? null : parseInt(req.body.rating, 10);
+
+      const saved = await prisma.concertAttendance.update({
+        where: { id: attendance.id },
+        data,
+        select: { id: true, notes: true, rating: true },
+      });
+
+      res.json({ attendance_id: saved.id, notes: saved.notes, rating: saved.rating });
+    } catch (error) {
+      console.error("Error saving attendance notes:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// setlist.fm's search takes a date as dd-MM-yyyy. concert_date is a wall clock
+// wearing a UTC label, so its UTC getters are the venue's own date.
+const setlistSearchDate = (date) => {
+  const d = new Date(date);
+  return `${String(d.getUTCDate()).padStart(2, "0")}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${d.getUTCFullYear()}`;
+};
+
+// POST /wishlists/:id/attendance/:concertId/move — say which show this really
+// was (THO-823)
+//
+// A setlist.fm import with the wrong date could only be deleted and imported
+// again, and the delete is refused while it has photographs, so a wrong date
+// with photographs was permanent. This re-points the attendance at the right
+// Concert row instead. The attendance keeps its id, so its media, notes,
+// rating and missed marks all go with it, and the sidecars in its folders are
+// rewritten to name the new concert.
+//
+// A move and not an edit of the date: an sfm_ row is shared by everyone who
+// imported that setlist and has no owner, so changing its date in place would
+// change other people's shows. The old row stays for them.
+//
+// The target is an existing concert by id, or a setlist.fm show by id, whose
+// row is made from setlist.fm's own record exactly as from-setlist makes it.
+// Nothing the client says about the show is written.
+router.post(
+  "/wishlists/:id/attendance/:concertId/move",
+  [
+    auth,
+    roleCheck(["ADMIN", "USER"]),
+    // The setlist.fm form reads the show from setlist.fm and then searches it
+    // for the rest of the bill, as from-setlist does: the same budget.
+    setlistFmLimit,
+    param("id").isInt().withMessage("Wishlist ID must be an integer"),
+    param("concertId").isInt().withMessage("Concert ID must be an integer"),
+    body("concert_id").optional({ values: "null" }).custom(isScalar).bail().isInt()
+      .withMessage("concert_id must be an integer"),
+    body("setlistfm_id").optional({ values: "null" }).custom(isScalar).bail().custom(setlistFm.isSetlistId)
+      .withMessage("setlistfm_id must be a setlist.fm id"),
+    body("band_id").optional({ values: "null" }).custom(isScalar).bail().isInt()
+      .withMessage("band_id must be an integer"),
+  ],
+  async (req, res) => {
+    let release = null;
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
+
+      const byConcert = req.body.concert_id != null;
+      const bySetlist = req.body.setlistfm_id != null;
+      if (byConcert === bySetlist) {
+        return res.status(400).json({ error: "Send either concert_id, or setlistfm_id with band_id" });
+      }
+      if (bySetlist && req.body.band_id == null) {
+        return res.status(400).json({ error: "band_id is required with setlistfm_id" });
+      }
+
+      const wishlistId = parseInt(req.params.id, 10);
+      const fromConcertId = parseInt(req.params.concertId, 10);
+
+      if (!(await ownWishlist(req, res, { select: { id: true } }))) return;
+
+      const attendance = await prisma.concertAttendance.findUnique({
+        where: { wishlist_id_concert_id: { wishlist_id: wishlistId, concert_id: fromConcertId } },
+        select: { id: true },
+      });
+      if (!attendance) return res.status(404).json({ error: "Attendance record not found" });
+
+      const alreadyAttending = (concertId) => prisma.concertAttendance.findUnique({
+        where: { wishlist_id_concert_id: { wishlist_id: wishlistId, concert_id: concertId } },
+        select: { id: true },
+      });
+      const ALREADY_ATTENDING = "You already have that show in your list.";
+      const MOVED_MEANWHILE = "This show was just changed. Reload it and try again.";
+
+      let targetId;
+      let show = null;
+      if (byConcert) {
+        targetId = parseInt(req.body.concert_id, 10);
+      } else {
+        // Asked before setlist.fm is: a show already in the list is refused
+        // without spending the shared key, or writing to the shared row.
+        const known = await prisma.concert.findUnique({
+          where: { event_id: `sfm_${req.body.setlistfm_id}` },
+          select: { id: true },
+        });
+        if (known?.id === fromConcertId) {
+          return res.json({ attendance_id: attendance.id, concert_id: known.id });
+        }
+        if (known && (await alreadyAttending(known.id))) {
+          return conflict(res, ALREADY_ATTENDING);
+        }
+        try {
+          ({ concert: { id: targetId }, show } = await upsertSetlistConcert(prisma, {
+            setlistfmId: req.body.setlistfm_id,
+            bandId: parseInt(req.body.band_id, 10),
+          }));
+        } catch (error) {
+          if (error.setlistRefusal) return res.status(error.status).json({ error: error.message });
+          throw error;
+        }
+      }
+
+      const target = await prisma.concert.findUnique({
+        where: { id: targetId },
+        select: { id: true, concert_date: true, venue: true, city: true, country: true },
+      });
+      if (!target) return res.status(404).json({ error: "Concert not found" });
+
+      if (target.id === fromConcertId) {
+        return res.json({ attendance_id: attendance.id, concert_id: target.id });
+      }
+
+      // The upload route's lock on this show. An upload chooses its folder and
+      // writes its sidecar under it, so a move cannot rewrite the sidecars
+      // halfway through one, and the next upload reads where the files are.
+      // Taken before the checks below: counted outside it, an upload could add
+      // photos between the count and the move, and a second move could change
+      // the row under this one.
+      release = await acquire(`attendance:${attendance.id}`);
+
+      // The states the rest of the API refuses an attended show. Without a
+      // date, the upload route refuses it and the band page drops it, so its
+      // photos vanish from there. Still to come, it is a Going row, and the
+      // next sync's movedFields can move its date without touching the
+      // folders, undoing the correction; with no photos nothing can drift.
+      if (!target.concert_date) {
+        return res.status(400).json({ error: "This show has no confirmed date yet" });
+      }
+      if (new Date(target.concert_date).getTime() > Date.now()
+        && (await prisma.concertMedia.count({ where: { attendance_id: attendance.id } })) > 0) {
+        return res.status(400).json({ error: "That show has not happened yet, and this one has photos" });
+      }
+
+      // Only from the show this request read. A move that landed first (the
+      // lock is per attendance, but the row was read before it) leaves this
+      // one nothing to do but say so; moving on from there would rewrite
+      // sidecars, and on a failure put back, a concert this request never saw.
+      try {
+        const { count } = await prisma.concertAttendance.updateMany({
+          where: { id: attendance.id, concert_id: fromConcertId },
+          data: { concert_id: target.id },
+        });
+        if (count === 0) return conflict(res, MOVED_MEANWHILE);
+      } catch (error) {
+        // @@unique([wishlist_id, concert_id]): another request put that show
+        // in the list since the check above.
+        if (error.code === "P2002") return conflict(res, ALREADY_ATTENDING);
+        throw error;
+      }
+
+      const media = await prisma.concertMedia.findMany({
+        where: { attendance_id: attendance.id },
+        select: { rel_path: true },
+      });
+      const relDirs = [...new Set(media.map((m) => path.posix.dirname(m.rel_path)))];
+
+      try {
+        await retargetSidecars({ relDirs, concertId: target.id, concert: target });
+      } catch (error) {
+        // Disk and Postgres must agree at every exit. A sidecar left naming
+        // the old concert while the row names the new one would send the
+        // files back on the next rebuild, so both go back as they were.
+        console.error("[move] could not rewrite a sidecar:", error);
+        await undoRetarget(error.undo ?? []);
+        await prisma.concertAttendance.updateMany({
+          where: { id: attendance.id, concert_id: target.id },
+          data: { concert_id: fromConcertId },
+        });
+        return res.status(500).json({ error: "Could not update the photo folders; nothing was changed" });
+      }
+
+      res.json({ attendance_id: attendance.id, concert_id: target.id });
+
+      // Background, as for a new mark: the show's other acts and setlists.
+      // A setlist.fm show has its own date to search by; an existing row is
+      // searched by its date when it has happened.
+      if (show) {
+        enrichConcertBands(target.id, show.date, show.venue, show.city).catch(() => {});
+      } else if (target.concert_date && new Date(target.concert_date).getTime() < new Date().setUTCHours(0, 0, 0, 0)) {
+        enrichConcertBands(target.id, setlistSearchDate(target.concert_date), target.venue, target.city).catch(() => {});
+      }
+    } catch (error) {
+      console.error("Error moving attendance:", error);
+      if (!res.headersSent) return res.status(500).json({ error: "Internal server error" });
+    } finally {
+      if (release) release();
     }
   }
 );
