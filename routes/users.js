@@ -63,7 +63,15 @@ const UNIQUE_VIOLATION = 'P2002';
 // Any account whose address differs from this one only by case. Addresses are
 // stored lowercased now, but the migration that folded the old ones left alone
 // any two accounts that differ only by case, rather than fail on the unique key.
-const sameAddress = (email) => ({ email: { equals: email, mode: 'insensitive' } });
+//
+// Prisma's insensitive `equals` is an ILIKE on Postgres, and it passes the
+// value through unescaped: a `%` or `_` in an address was a wildcard, so
+// `vic%@…` and `v_ctim@…` found victim@… (checked against Postgres 16). That
+// let the forgot form mail one person's reset link from a fresh per-address
+// bucket per variant, and let /register answer 409 to a prefix. Escaped here,
+// with LIKE's default escape character, so only case is ignored.
+const escapeLike = (value) => value.replace(/[\\%_]/g, (c) => `\\${c}`);
+const sameAddress = (email) => ({ email: { equals: escapeLike(email), mode: 'insensitive' } });
 
 /**
  * The account an address signs in to, however it was capitalised. An exact
