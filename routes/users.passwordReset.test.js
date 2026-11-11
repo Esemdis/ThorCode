@@ -77,6 +77,37 @@ describe('POST /users/password/forgot', () => {
     await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
   });
 
+  // The point of answering first: awaited, a known address would answer only
+  // once the database and Resend had, and the delay alone would give it away.
+  it('answers before it has even looked the address up', async () => {
+    let finishLookup;
+    prisma.user.findMany.mockImplementation(() => new Promise((resolve) => { finishLookup = resolve; }));
+    const send = vi.spyOn(mail, 'sendPasswordResetEmail').mockResolvedValue({ data: { id: 'm' } });
+
+    const res = await forgot(resetTestAddress());
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(FORGOT_BODY);
+    expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled();
+    finishLookup([]);
+  });
+
+  // Addresses are matched case-insensitively, but the mail goes where the
+  // account says, not to however the stranger at the form spelled it.
+  it('mails the address stored on the account, not the one typed', async () => {
+    const typed = resetTestAddress();
+    const stored = typed.replace(/^reset/, 'Reset').replace('example', 'Example');
+    const send = vi.spyOn(mail, 'sendPasswordResetEmail').mockResolvedValue({ data: { id: 'm' } });
+    prisma.user.findMany.mockResolvedValue([resetTestAccount(stored)]);
+    prisma.passwordReset.upsert.mockResolvedValue({});
+
+    await forgot(typed);
+    await vi.waitFor(() => expect(send).toHaveBeenCalled());
+
+    expect(send.mock.calls[0][0].to).toBe(stored);
+  });
+
   it('refuses something that is not an email address', async () => {
     const res = await forgot('not-an-address');
 
@@ -282,6 +313,21 @@ describe('POST /users/password/reset', () => {
     expect(res.status).toBe(400);
     expect(res.body.errors[0].msg).toBe('Password must contain at least one uppercase letter');
     expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  // express-validator runs its string checks on each element of an array, and
+  // on an object's "[object Object]", so both passed register's rules and
+  // reached bcrypt, which threw: a 500, with the link still live.
+  it('refuses a password that is not a string, and leaves the link live', async () => {
+    prisma.passwordReset.findUnique.mockResolvedValue(live());
+
+    for (const password of [[NEW_PASSWORD], { a: NEW_PASSWORD }]) {
+      const res = await reset({ token: 'reset-token-non-string-password', password });
+      expect(res.status).toBe(400);
+      expect(res.body.errors[0].msg).toBe('Password must be text');
+    }
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.passwordReset.delete).not.toHaveBeenCalled();
   });
 
   it('allows eight attempts per IP in a quarter hour and answers the ninth with 429', async () => {

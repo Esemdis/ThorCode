@@ -7,6 +7,13 @@ const { normaliseEmail } = require("./email");
 // refuse is an account the rules no longer describe.
 const passwordValidation = [
   body("password")
+    // express-validator runs the checks below on each element of an array and
+    // on an object's "[object Object]", so `["Abcdefgh1"]` or `{}` passed them
+    // and reached bcrypt, which threw: a 500, and on a reset a link left live.
+    // A missing password still falls through to the length rule's message.
+    .custom((value) => value === undefined || typeof value === "string")
+    .withMessage("Password must be text")
+    .bail()
     .isLength({ min: 8, max: 100 })
     .withMessage(
       "Password must be at least 8 characters, at most 100 characters"
