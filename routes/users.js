@@ -7,7 +7,7 @@ const crypto = require('node:crypto');
 const upload = multer();
 
 const userValidation = require('../utils/validation/user');
-const { passwordValidation } = require('../utils/validation/user');
+const { passwordValidation, passwordRulesFor } = require('../utils/validation/user');
 const auth = require('../auth/verifyJWT');
 const roleCheck = require('../middlewares/roleCheck');
 const { paginationValidation } = require('../utils/validation/pagination');
@@ -31,6 +31,12 @@ const {
   emailVerificationRateLimiter,
 } = require('../utils/emailRateLimiter');
 const response = require('../utils/apiResponse');
+const {
+  accountDeletionRefusal,
+  accountDeletionOperations,
+  removeAccountMedia,
+  removeDerivedCopies,
+} = require('../utils/accountDeletion');
 const { REGISTRATION_CLOSED_MESSAGE } = require('../utils/accounts');
 
 // Wrong passwords, per IP: ten per quarter hour. Successful sign-ins do not
@@ -580,6 +586,173 @@ router.post('/password/reset', resetLimit, upload.none(), passwordValidation, as
     return response.success(res, 200, {}, 'Password changed');
   } catch (error) {
     console.error('Error resetting password:', error);
+    return response.serverError(res, 'Internal server error');
+  }
+});
+
+// --- Signed in: change the password, delete the account (THO-810) -----------
+
+const WRONG_CURRENT_PASSWORD = 'Your current password is not right';
+const NO_CURRENT_PASSWORD =
+  'This account has no password yet. Sign out and use "Forgot password?" to set one first.';
+
+// Wrong current passwords, per account, shared by both routes below: a stolen
+// session must not get a separate budget of guesses from each. Per account
+// rather than per IP, because the guesser already holds that account's token
+// and can ask from anywhere.
+const currentPasswordLimit = rateLimiter({
+  message: 'Too many wrong passwords. Please wait a few minutes and try again.',
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => `user:${req.user.id}`,
+  skipSuccessfulRequests: true,
+  // Only a wrong (or missing-on-the-account) current password is a guess, and
+  // both answer 403. Counting every 400 and 500 as one, someone retrying a
+  // stuck deletion, or a new password the rules refuse, was told "Too many
+  // wrong passwords" after giving the right one every time.
+  requestWasSuccessful: (req, res) => res.statusCode !== 403,
+});
+
+/**
+ * Why `given` does not prove the caller knows this account's password, or
+ * null when it does.
+ *
+ * Answered with 403, never 401: concert-map signs the user out on any 401,
+ * and a typo in a settings form must not end the session it was typed in.
+ */
+async function currentPasswordRefusal(user, given) {
+  if (!user.password_hash) return NO_CURRENT_PASSWORD;
+  return (await bcrypt.compare(given, user.password_hash)) ? null : WRONG_CURRENT_PASSWORD;
+}
+
+const readCurrentPassword = (req) => {
+  const value = req.body?.currentPassword;
+  return typeof value === 'string' && value ? value : null;
+};
+
+/**
+ * PATCH /users/me/password
+ * Changes the caller's password, given the current one.
+ * Ends no session: old tokens run to their own expiry (owner decision, THO-810).
+ * @body {string} currentPassword
+ * @body {string} newPassword - register's rules
+ * @returns {200} "Password changed"
+ * @throws {400} A missing current password, a new one the rules refuse, or the same one again
+ * @throws {403} The current password is wrong, or the account has none
+ * @throws {429} Too many wrong passwords for this account
+ */
+router.patch(
+  '/me/password',
+  auth,
+  currentPasswordLimit,
+  upload.none(),
+  passwordRulesFor('newPassword'),
+  async (req, res) => {
+    try {
+      const currentPassword = readCurrentPassword(req);
+      if (!currentPassword) return response.badRequest(res, 'Current password is required');
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const { newPassword } = req.body;
+
+      const user = await prisma.user.findUnique({
+        where: { id: req.user.id },
+        select: { id: true, password_hash: true },
+      });
+      if (!user) return response.notFound(res, 'User not found');
+
+      const refusal = await currentPasswordRefusal(user, currentPassword);
+      if (refusal) return response.forbidden(res, refusal);
+      // Someone rotating a leaked password who types the old one again would
+      // otherwise be told it changed when nothing did.
+      if (await bcrypt.compare(newPassword, user.password_hash)) {
+        return response.badRequest(res, 'Choose a password different from your current one');
+      }
+
+      const passwordHash = await bcrypt.hash(newPassword, 10);
+      // A reset link mailed before the change would undo it if used later, so
+      // it goes with it.
+      await prisma.$transaction([
+        prisma.user.update({ where: { id: user.id }, data: { password_hash: passwordHash } }),
+        prisma.passwordReset.deleteMany({ where: { user_id: user.id } }),
+      ]);
+
+      return response.success(res, 200, {}, 'Password changed');
+    } catch (error) {
+      console.error('Error changing password:', error);
+      return response.serverError(res, 'Internal server error');
+    }
+  },
+);
+
+/**
+ * DELETE /users/me
+ * Deletes the caller's account and everything it owns: concerts (wishlist,
+ * attendance, follows, subscriptions, reviews, share links), the photos and
+ * videos in the archive, music-service grants, and all Travel Bag data. See
+ * utils/accountDeletion.js for the order and why.
+ * @body {string} currentPassword
+ * @returns {200} "Account deleted"; the address is free again at once
+ * @throws {400} No current password
+ * @throws {403} The current password is wrong, the account has none, or it is the service account
+ * @throws {409} The last admin
+ * @throws {429} Too many wrong passwords for this account
+ * @throws {500} A file would not leave the archive; the account is still there.
+ *   Or the files went and the rows did not; a retry finishes it.
+ */
+router.delete('/me', auth, currentPasswordLimit, upload.none(), async (req, res) => {
+  try {
+    const currentPassword = readCurrentPassword(req);
+    if (!currentPassword) return response.badRequest(res, 'Current password is required');
+
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { id: true, role: true, password_hash: true },
+    });
+    if (!user) return response.notFound(res, 'User not found');
+
+    const wrong = await currentPasswordRefusal(user, currentPassword);
+    if (wrong) return response.forbidden(res, wrong);
+
+    const adminCount = user.role === 'ADMIN' ? await prisma.user.count({ where: { role: 'ADMIN' } }) : 0;
+    const refusal = accountDeletionRefusal(user, adminCount);
+    if (refusal) return response.error(res, refusal.status, refusal.message);
+
+    // Files first. A photograph removed is gone for good, so nothing else is
+    // deleted until all of them are; a failure leaves an account a retry can
+    // finish, never rows gone and files left with nothing pointing at them.
+    const media = await removeAccountMedia(prisma, user.id);
+    if (!media.ok) {
+      return response.serverError(
+        res,
+        'Some of your photos and videos could not be removed, so your account has not been deleted. Try again.',
+      );
+    }
+
+    // The files are already gone for good. If the rows now fail, say so: the
+    // catch-all's "Internal server error" read as if nothing had happened,
+    // and a retry is what finishes it.
+    try {
+      await prisma.$transaction(accountDeletionOperations(prisma, user.id));
+    } catch (error) {
+      // Two overlapping deletes (a double click, a retry after a timeout):
+      // both pass the read above, the first commits, and the second's
+      // user.delete finds no row. The account is gone, which is what was
+      // asked, so that is a success, not a "try again" that then 404s.
+      if (error?.code === 'P2025' && !(await prisma.user.findUnique({ where: { id: user.id }, select: { id: true } }))) {
+        return response.success(res, 200, {}, 'Account deleted');
+      }
+      console.error('Error deleting account rows after its files were removed:', error);
+      return response.serverError(
+        res,
+        'Your photos and videos were removed, but your account could not be deleted. Try again to finish.',
+      );
+    }
+    await removeDerivedCopies(prisma, media.sha256s);
+
+    return response.success(res, 200, {}, 'Account deleted');
+  } catch (error) {
+    console.error('Error deleting account:', error);
     return response.serverError(res, 'Internal server error');
   }
 });

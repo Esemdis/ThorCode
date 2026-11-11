@@ -10,7 +10,10 @@ import { PrismaClient } from '@prisma/client';
 // Constructing the client does not connect, so this needs no database. It pins
 // the accessors the code actually uses; rename a model and this fails here
 // rather than in a route.
-const ACCESSORS = ['oAuth', 'concert', 'band', 'concertBandReference', 'wishlist', 'user', 'concertMedia', 'mediaAlbumShareLink', 'passwordReset'];
+const ACCESSORS = ['oAuth', 'concert', 'band', 'concertBandReference', 'wishlist', 'user', 'concertMedia', 'mediaAlbumShareLink', 'passwordReset',
+  // What deleting an account clears (THO-810).
+  'concertAttendance', 'wishlistBandReference', 'activityLog', 'mediaShareLink', 'itemReview', 'tripReview',
+  'trip', 'loadout', 'template', 'gearItem', 'travelWishlistItem'];
 
 describe('the Prisma client exposes the models the routes reach for', () => {
   const client = new PrismaClient();

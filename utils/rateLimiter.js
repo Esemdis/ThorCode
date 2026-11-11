@@ -10,6 +10,10 @@ function rateLimiter({
   // Count only requests that failed. For a login that is the whole point: the
   // budget is for wrong guesses, and a household signing in is not guessing.
   skipSuccessfulRequests = false,
+  // With skipSuccessfulRequests, what counts as success. express-rate-limit's
+  // default is any status below 400, so a 400 or a 500 would be charged as a
+  // failure; a budget for wrong passwords wants only the 403 they get.
+  requestWasSuccessful,
   // A route that must not admit it was limited (THO-808: "forgot password"
   // answers the same whether or not the address has an account) sends its own
   // answer instead of the 429, and turns the budget headers off, which would
@@ -31,6 +35,7 @@ function rateLimiter({
     // X-RateLimit-* ones follow it here so turning them off means off.
     ...(standardHeaders === false && { legacyHeaders: false }),
     skipSuccessfulRequests,
+    ...(requestWasSuccessful && { requestWasSuccessful }),
     ...(keyGenerator && { keyGenerator }),
     ...(handler && { handler }),
     ...(skip && { skip }),
