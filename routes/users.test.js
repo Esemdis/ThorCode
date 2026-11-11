@@ -3,7 +3,7 @@ import { installFakePrisma, routeManifest } from '../test/routeApp.js';
 
 // Nothing here reaches the database — the point is that the module loads at all
 // — but prisma/client is required when the router is imported.
-installFakePrisma({ user: {}, emailChange: {} });
+installFakePrisma({ user: {}, emailChange: {}, passwordReset: {} });
 
 const { default: router } = await import('./users.js');
 
@@ -34,5 +34,25 @@ describe('the email change routes', () => {
     const verify = handlersFor('/email/verify-code');
 
     expect(request[1]).not.toBe(verify[1]);
+  });
+});
+
+describe('the forgotten-password routes (THO-808)', () => {
+  // Forgot: IP limit, multipart, address limit, handler. Reset: guess limit,
+  // multipart, register's password rules, handler. Neither takes `auth`: the
+  // person asking is, by definition, not signed in.
+  it('registers both, public, with their limiters and the password rules', () => {
+    const manifest = routeManifest(router);
+
+    expect(manifest).toContain('POST /password/forgot [4]');
+    expect(manifest).toContain('POST /password/reset [4]');
+  });
+
+  it('meters asking for a link separately from using one', () => {
+    const forgot = handlersFor('/password/forgot');
+    const reset = handlersFor('/password/reset');
+
+    expect(forgot[0]).not.toBe(reset[0]);
+    expect(forgot[0]).not.toBe(forgot[2]);
   });
 });

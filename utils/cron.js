@@ -62,6 +62,24 @@ async function cleanupExpiredEmailVerifications() {
   }
 }
 
+/**
+ * Delete forgotten-password links past their 30 minutes (THO-808). The reset
+ * route refuses an expired one by itself; this only keeps dead token hashes
+ * from sitting in the table.
+ */
+async function cleanupExpiredPasswordResets() {
+  try {
+    const deleted = await prisma.passwordReset.deleteMany({
+      where: { expires_at: { lt: new Date() } },
+    });
+    if (deleted.count > 0) {
+      console.log(`[cron] Cleaned up ${deleted.count} expired password reset link(s)`);
+    }
+  } catch (err) {
+    console.error("[cron] Password reset cleanup failed:", err);
+  }
+}
+
 function startCronJobs() {
   // Notification digest
   cron.schedule(NOTIFICATION_DIGEST_CRON, async () => {
@@ -87,6 +105,7 @@ function startCronJobs() {
 
   // Cleanup expired email verifications - runs every hour
   cron.schedule("0 * * * *", cleanupExpiredEmailVerifications);
+  cron.schedule("0 * * * *", cleanupExpiredPasswordResets);
 
   // Give newly added bands their Spotify artist id, so the band overview has a
   // photo before anyone has opened them. Silent when there is nothing to do —
@@ -144,5 +163,5 @@ function startCronJobs() {
   });
 }
 
-module.exports = { startCronJobs };
+module.exports = { startCronJobs, cleanupExpiredPasswordResets };
 
