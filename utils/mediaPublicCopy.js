@@ -140,6 +140,16 @@ async function scrubInto({
     // since, the next request finds a mismatch and makes the copy again.
     await fs.writeFile(stampFile, stamp);
     await fs.unlink(refusedFile).catch(() => {});
+    // And once more, which closes the race the check above only narrows: the
+    // delete unlinks the source before it removes the copies, so either this
+    // sees the source gone and takes the copy out, or it ran before the
+    // delete's own removal, which then finds the copy in place.
+    try {
+      await statSource(absPath);
+    } catch (err) {
+      for (const p of [target, stampFile]) await fs.unlink(p).catch(() => {});
+      throw err;
+    }
     return target;
   } catch (err) {
     await fs.unlink(temp).catch(() => {});
@@ -163,10 +173,15 @@ function ensurePublicCopy({ absPath, key, keyedByContent = false }) {
   if (!SAFE_KEY.test(String(key)) || MARKER_NAME.test(String(key))) {
     return Promise.reject(new Error(`unsafe public copy key: ${key}`));
   }
-  let work = inFlight.get(key);
+  // A request only joins one in flight whose verdict is about its own bytes:
+  // under a checksum key any source holds the same bytes, but a rendition or
+  // clip key is shared by rows whose files differ, and "clean" for one row's
+  // file said nothing about the other's — which was then served unplanned.
+  const flightKey = keyedByContent ? key : `${key}\0${absPath}`;
+  let work = inFlight.get(flightKey);
   if (!work) {
-    work = makeCopy(absPath, key, keyedByContent).finally(() => inFlight.delete(key));
-    inFlight.set(key, work);
+    work = makeCopy(absPath, key, keyedByContent).finally(() => inFlight.delete(flightKey));
+    inFlight.set(flightKey, work);
   }
   return work.then((result) => (result === CLEAN ? absPath : result));
 }

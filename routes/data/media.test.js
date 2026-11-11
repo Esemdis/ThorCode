@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
-import { mkdtemp, mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
+import {
+  mkdtemp, mkdir, readFile, writeFile, readdir, utimes,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -12,6 +14,7 @@ import {
 } from '../../test/exifFixture.js';
 import { clipCacheRoot } from '../../utils/mediaPaths.js';
 import { clipFiles, parseClipRequest } from '../../utils/mediaClips.js';
+import { planScrub, applyPatches } from '../../utils/mediaScrub.js';
 
 // The show locks, from the router's own copy of the queue. The router is
 // CommonJS and loads its dependencies through Node's require, so an `import`
@@ -3644,6 +3647,37 @@ describe('sharing one file by public link', () => {
       expect(res.body.length).toBe(rendition.length);
       expect(res.body.includes(Buffer.from('+59.9139+010.7522'))).toBe(false);
       expect(await readdir(join(root, 'cache', 'public'))).toEqual(['web-h1.mp4', 'web-h1.mp4.stamp']);
+    });
+
+    it('looks again at a rendition made again at the same size, which a checksum does not name', async () => {
+      // A rendition is re-made under the same web-<sha>.mp4 key, so its stamp
+      // must keep the mtime: stamped by size alone (as a master is), a clean
+      // verdict on the old one would send the new one out unlooked at.
+      await request(app())
+        .post('/data/concerts/attendances/1/media')
+        .set(...authHeader(admin))
+        .attach('files', Buffer.from('original bytes'), 'VID_1.mp4')
+        .expect(201);
+      prisma.concertMedia.findUnique = vi.fn(async () => ({
+        ...owned, kind: 'VIDEO', filename: 'VID_1.mp4',
+        rel_path: 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4',
+      }));
+      const dir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+      await mkdir(join(dir, '.web'), { recursive: true });
+      const withLocation = mp4WithLocationTho894();
+      // The same file already scrubbed: clean, and exactly as long.
+      const clean = applyPatches(withLocation, await planScrub(withLocation));
+      const renditionPath = join(dir, '.web', 'VID_1.mp4.mp4');
+      await writeFile(renditionPath, clean);
+      const token = tokenOf(await share().expect(200));
+      await rawBytesTho894(request(app()).get(`/data/concerts/media/share/${token}`)).expect(200);
+
+      await writeFile(renditionPath, withLocation);
+      const later = new Date(Date.now() + 60_000);
+      await utimes(renditionPath, later, later);
+      const res = await rawBytesTho894(request(app()).get(`/data/concerts/media/share/${token}`)).expect(200);
+      expect(res.body.length).toBe(withLocation.length);
+      expect(res.body.includes(Buffer.from('+59.9139+010.7522'))).toBe(false);
     });
 
     it('the owner\'s own download keeps the original byte for byte, location included', async () => {

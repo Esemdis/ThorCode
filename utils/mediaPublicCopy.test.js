@@ -223,6 +223,35 @@ describe('ensurePublicCopy', () => {
     expect(await readdir(publicDirTho894())).toEqual([]);
     spy.mockRestore();
   });
+
+  it('never serves a file nobody planned to a request that joins another for a different source', async () => {
+    // A rendition key is not a checksum: two rows with one sha256 share
+    // web-<sha>.mp4 but each has its own rendition. A request joining one in
+    // flight for the other row's clean file was handed its own source,
+    // unplanned, GPS and all (round-2 review).
+    const a = await sourceTho894('RA.jpg', minimalJpegTho894);
+    const b = await sourceTho894('RB.jpg', jpegWithGpsTho894().jpeg);
+    const [, fromB] = await Promise.all([
+      ensurePublicCopy({ absPath: a, key: 'web-join.jpg' }),
+      ensurePublicCopy({ absPath: b, key: 'web-join.jpg' }),
+    ]);
+    expect((await readFile(fromB)).includes(Buffer.from('SN-1234567890'))).toBe(false);
+  });
+
+  it('takes the copy back out when its file is deleted just as the copy lands', async () => {
+    // The delete unlinks the source before it removes the copies, so a check
+    // after the rename either sees the source gone or ran before the delete's
+    // own removal, which then finds the copy.
+    const { jpeg } = jpegWithGpsTho894();
+    const absPath = await sourceTho894('IMG_R.jpg', jpeg);
+    const realRename = fsPromises.rename;
+    vi.spyOn(fsPromises, 'rename').mockImplementation(async (from, to) => {
+      await realRename(from, to);
+      await fsPromises.unlink(absPath);
+    });
+    await expect(ensurePublicCopy({ absPath, key: 'del.jpg' })).rejects.toMatchObject({ code: 'NO_SOURCE' });
+    expect(await readdir(publicDirTho894())).toEqual([]);
+  });
 });
 
 describe('stalePublicTemps', () => {
