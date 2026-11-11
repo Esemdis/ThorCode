@@ -458,8 +458,12 @@ router.post('/email/request-change', auth, emailRequestRateLimiter, currentPassw
  * @returns {object} { success: true, data: { user: { id, email }, token }, message: string }
  * @throws {400} Invalid or expired verification code — including one that is
  *   someone else's, which is answered exactly like a wrong guess
- * @throws {401} Unauthorized
- * @throws {409} The new address was taken since the code was sent
+ * @throws {401} Unauthorized; or the password changed while this ran (a reset
+ *   from elsewhere), which ends this login session
+ * @throws {409} The new address was taken since the code was sent; "That code
+ *   is no longer valid. Ask for a new one." when another request-change (a
+ *   second tab) replaced the code; or, for a token that is not a login
+ *   session, the password changed while this ran
  * @throws {500} Server error
  */
 router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.none(), async (req, res) => {
@@ -725,7 +729,11 @@ router.post('/password/reset', resetLimit, upload.none(), passwordValidation, as
  * @body {string} newPassword - register's rules
  * @returns {200} "Password changed", with `data.token`, a new login token
  * @throws {400} A missing current password, a new one the rules refuse, or the same one again
+ * @throws {401} The password changed while this ran (a reset from elsewhere),
+ *   which ends this login session
  * @throws {403} The current password is wrong, or the account has none
+ * @throws {409} For a token that is not a login session: the password changed
+ *   while this ran; try again
  * @throws {429} Too many wrong passwords for this account
  */
 router.patch(

@@ -19,6 +19,10 @@ describe.skipIf(!url)('followed-show checker', () => {
   const RUN = `fc${Date.now()}`;
   const COUNTRY = 'XF';
   const bearer = (id, role = 'USER') => `Bearer ${require('../../auth/signJWT.js')({ user: { id, role } })}`;
+  // The sync service has no account row. A login token for a missing account
+  // is refused (THO-898), and python-crohn's real token, minted by
+  // scripts/generate-service-token.js outside the login route, is not one.
+  const serviceBearerTho779 = (id) => `Bearer ${require('jsonwebtoken').sign({ id, role: 'SYSTEM' }, process.env.JWT_SECRET)}`;
 
   beforeAll(() => {
     process.env.DATABASE_URL = url;
@@ -67,11 +71,11 @@ describe.skipIf(!url)('followed-show checker', () => {
     const pending = await request(app).get('/data/concerts/notifications/follows').set('Authorization', bearer(user.id));
     expect(pending.body[0].check.pending).toBe(true);
 
-    const due = await request(app).get('/data/concerts/follows/check-due?limit=100').set('Authorization', bearer('sync', 'SYSTEM'));
+    const due = await request(app).get('/data/concerts/follows/check-due?limit=100').set('Authorization', serviceBearerTho779('sync'));
     expect(due.status).toBe(200);
     expect(due.body).toContainEqual({ concert_id: show.id, url: `https://www.songkick.com/concerts/${eventNo}-opeth`, reason: 'requested' });
 
-    const posted = await request(app).post('/data/concerts/follows/checked').set('Authorization', bearer('sync', 'SYSTEM')).send({ results: [{
+    const posted = await request(app).post('/data/concerts/follows/checked').set('Authorization', serviceBearerTho779('sync')).send({ results: [{
       concert_id: show.id, ok: true, on_sale: true, sold_out: false, ticket_sale_start: null,
       price_min: 45, price_max: 60, price_currency: 'EUR', event_status: 'postponed',
       vendors: [
@@ -104,7 +108,7 @@ describe.skipIf(!url)('followed-show checker', () => {
     await prisma.concertFollow.create({ data: { user_id: user.id, concert_id: show.id, told_state: 'unknown' } });
 
     for (let i = 0; i < 2; i++) {
-      const res = await request(app).post('/data/concerts/follows/checked').set('Authorization', bearer('sync', 'SYSTEM'))
+      const res = await request(app).post('/data/concerts/follows/checked').set('Authorization', serviceBearerTho779('sync'))
         .send({ results: [{ concert_id: show.id, ok: false, error: 'timeout' }] });
       expect(res.body.failed).toBe(1);
     }
