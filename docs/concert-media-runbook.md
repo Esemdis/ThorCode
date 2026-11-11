@@ -65,11 +65,14 @@ its top. That is what makes every copy, `.clean` and `.refused` verdict already
 in `cache/public/` be looked at again; without it they keep the old verdict,
 and a refused file its 404, until someone empties the directory.
 
-Copies go when nothing can reach them: deleting a file removes its copies,
-stopping a moment's link removes the moment's, and the rendition service sweeps
-the copy of a moment whose link has expired, and any `<name>.<pid>.<uuid>.tmp`
-more than a day old (a copy the API died in the middle of), on each archive
-pass.
+Copies go with their row: deleting a file (one at a time, in bulk, or with
+its account) and detaching a show remove its copies, stopping a moment's link
+removes the moment's, and the rendition service sweeps the copy of a moment
+whose link has expired, and any `<name>.<pid>.<uuid>.tmp` more than a day old
+(a copy the API died in the middle of), on each archive pass. A copy whose row
+is still there stays, even when no live link reaches it any more: nothing
+bounds `cache/public` but the rows, so a superseded video master's copy, for
+one, stays until its row goes.
 
 Besides location, camera and serials, the copy loses XMP, IPTC kept inside
 EXIF, the owner's name wherever a format keeps one (EXIF Artist, Copyright,
@@ -110,9 +113,10 @@ than 250,000 MP4 boxes and key entries, or a million image chunks, segments
 and EXIF directory entries; an MP4 key name over 1 KB; more than 10,000
 patches; boxes 32 deep. The one slow shape left is a JPEG whose scan is
 hundreds of megabytes of stuffed `FF 00` bytes, under a second to plan; its
-verdict is then cached like any other. Nothing limits how many files are
-scrubbed at once: four 250 MB images opened together cost up to a gigabyte of
-memory while they are planned.
+verdict is then cached like any other. At most `MAX_CONCURRENT_SCRUBS` (2,
+in `utils/mediaPublicCopy.js`) files are scrubbed at once; the rest wait their
+turn, and a cached copy or verdict never waits. Two 250 MB images planned
+together still cost up to half a gigabyte of memory.
 
 The thing to understand before touching any of this: **`concert-media.json` is
 the record of truth and Postgres is a disposable index of it.** Every sidecar

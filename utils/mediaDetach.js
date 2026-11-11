@@ -16,6 +16,7 @@
 const path = require('node:path');
 const { mkdir, rename, access } = require('node:fs/promises');
 const { archiveRoot, resolveArchivePath, DETACHED_DIR } = require('./mediaPaths');
+const { removePublicCopies } = require('./mediaPublicCopy');
 
 async function countMediaForAttendances(prisma, attendanceIds) {
   if (!attendanceIds.length) return 0;
@@ -91,7 +92,7 @@ async function detachAttendances(prisma, attendanceIds, { fs = { mkdir, rename }
 
   const rows = await prisma.concertMedia.findMany({
     where: { attendance_id: { in: attendanceIds } },
-    select: { rel_path: true },
+    select: { rel_path: true, sha256: true },
   });
   if (!rows.length) return { detached: 0, folders: [] };
 
@@ -141,6 +142,12 @@ async function detachAttendances(prisma, attendanceIds, { fs = { mkdir, rename }
   }
 
   await prisma.concertMedia.deleteMany({ where: { attendance_id: { in: attendanceIds } } });
+  // The scrubbed copies share links served go with the rows, as on every
+  // other path that removes a row (removeMediaFiles): nothing reaches them
+  // after this, and an account deletion that detached the show first left
+  // full-resolution copies in cache/public for good. A rollback that brings
+  // the rows back costs only a fresh copy on the next request.
+  for (const row of rows) await removePublicCopies(row);
   return { detached: rows.length, folders };
 }
 

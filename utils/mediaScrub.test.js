@@ -732,6 +732,86 @@ describe('planScrub on a Samsung trailer (THO-899)', () => {
     await expect(planScrub(overlap)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
   });
 
+  // Round 2 of the THO-899 review: the cases above were refused by the name
+  // check before the overlap check or either gap fill ran, so deleting any of
+  // them left every test green.
+  const sefDirTho899Round2 = (file) => file.length - 8 - file.readUInt32LE(file.length - 8);
+  const sefBlocksTho899Round2 = [
+    { type: 0x0a01, name: 'Image_UTC_Data', data: Buffer.from('1781293108000', 'latin1') },
+    { type: 0x0b00, name: 'Vendor_Note', data: Buffer.from('home=+59.9139+010.7522', 'latin1') },
+    { type: 0x0aa1, name: 'MCC_Data', data: Buffer.from('242', 'latin1') },
+  ];
+  // A directory that names only some of the blocks: entries kept, in order,
+  // and the count set to match. The slots after them are left as they were.
+  const sefNamingOnlyTho899Round2 = (keep) => {
+    const { trailer } = samsungTrailerTho899(sefBlocksTho899Round2);
+    const file = Buffer.concat([minimalJpegTho894, trailer]);
+    const dirAt = sefDirTho899Round2(file);
+    const entries = keep.map((i) => Buffer.from(file.subarray(dirAt + 12 + 12 * i, dirAt + 24 + 12 * i)));
+    entries.forEach((entry, i) => entry.copy(file, dirAt + 12 + 12 * i));
+    file.writeUInt32LE(keep.length, dirAt + 8);
+    return file;
+  };
+
+  it('refuses two blocks over the same bytes, by the overlap check itself', async () => {
+    const { trailer } = samsungTrailerTho899(sefBlocksTho899Round2.slice(0, 2));
+    const file = Buffer.concat([minimalJpegTho894, trailer]);
+    const dirAt = sefDirTho899Round2(file);
+    // Block 0 keeps its offset and grows over block 1.
+    file.writeUInt32LE(file.readUInt32LE(dirAt + 12 + 8) + file.readUInt32LE(dirAt + 24 + 8), dirAt + 12 + 8);
+    await expect(planScrub(file)).rejects.toMatchObject({ code: 'UNSCRUBBABLE', message: expect.stringMatching(/overlap/) });
+  });
+
+  it('zeroes the bytes between two blocks that no entry names', async () => {
+    const file = sefNamingOnlyTho899Round2([0, 2]);
+    const out = await scrubbedTho894(file);
+    expect(containsTho894(out, 'Vendor_Note')).toBe(false);
+    expect(containsTho894(out, '+59.9139')).toBe(false);
+    expect(containsTho894(out, 'Image_UTC_Data1781293108000')).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('zeroes the bytes between the last named block and the directory', async () => {
+    const file = sefNamingOnlyTho899Round2([0, 1]);
+    const out = await scrubbedTho894(file);
+    expect(containsTho894(out, 'MCC_Data242')).toBe(false);
+    expect(containsTho894(out, 'MCC_Data')).toBe(false);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('zeroes what the directory holds past its entries', async () => {
+    const { trailer } = samsungTrailerTho899(sefBlocksTho899Round2.slice(0, 1));
+    const blocksEnd = trailer.length - 8 - (12 + 12);
+    const spare = Buffer.from('home=+59.9139+01', 'latin1');
+    const dir = Buffer.concat([trailer.subarray(blocksEnd, trailer.length - 8), spare]);
+    const len = Buffer.alloc(4);
+    len.writeUInt32LE(dir.length);
+    const file = Buffer.concat([minimalJpegTho894, trailer.subarray(0, blocksEnd), dir, len, Buffer.from('SEFT', 'latin1')]);
+    expect(containsTho894(file, '+59.9139')).toBe(true);
+
+    const out = await scrubbedTho894(file);
+
+    expect(containsTho894(out, '+59.9139')).toBe(false);
+    expect(containsTho894(out, 'Image_UTC_Data1781293108000')).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('zeroes a block name it does not know, which can be anything, and keeps the ones it does', async () => {
+    const { trailer } = samsungTrailerTho899([
+      { type: 0x0aa1, name: 'MCC_Data242', data: Buffer.alloc(0) },
+      { type: 0x0aa1, name: 'MCC_Data', data: Buffer.from('242', 'latin1') },
+    ]);
+    const out = await scrubbedTho894(Buffer.concat([minimalJpegTho894, trailer]));
+    expect(containsTho894(out, 'MCC_Data242')).toBe(false);
+    expect(containsTho894(out, 'MCC_Data\0\0\0')).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('refuses a block name longer than any Samsung writes', async () => {
+    const { trailer } = samsungTrailerTho899([{ type: 0x0b01, name: 'N'.repeat(65), data: Buffer.alloc(4) }]);
+    await expect(planScrub(Buffer.concat([minimalJpegTho894, trailer]))).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
   it('refuses a Samsung motion photo whose video is not an MP4', async () => {
     const { file } = samsungMotionPhotoTho899({ video: Buffer.from('not a video at all, but it says so', 'latin1') });
     await expect(planScrub(file)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
@@ -809,5 +889,38 @@ describe('planScrub after the THO-894 review, round 3', () => {
     const many = Buffer.concat(Array.from({ length: 200 }, () => segment));
     const jpeg = Buffer.concat([minimalJpegTho894.subarray(0, 2), many, minimalJpegTho894.subarray(2)]);
     await expect(planScrub(jpeg)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+});
+
+// Round 4 of the THO-894 review: an EXIF header a reader accepts and the
+// planner did not. "Exif\0\xFF" planned nothing and went out with its GPS.
+describe('planScrub on a loose EXIF header (THO-894 review, round 4)', () => {
+  const withExifHeaderTho894Round4 = (header) => {
+    const { jpeg } = jpegWithGpsTho894();
+    const exifAt = jpeg.indexOf('Exif\0\0', 0, 'latin1');
+    const out = Buffer.from(jpeg);
+    Buffer.from(header, 'latin1').copy(out, exifAt);
+    return out;
+  };
+
+  it('scrubs EXIF behind "Exif\\0" whatever its sixth byte, as exiftool reads it', async () => {
+    const odd = withExifHeaderTho894Round4('Exif\0\xff');
+    expect(containsTho894(odd, 'SN-1234567890')).toBe(true);
+    const out = await scrubbedTho894(odd);
+    expect(containsTho894(out, 'SN-1234567890')).toBe(false);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('refuses an APP1 a reader could take for EXIF that the planner does not read, rather than call it clean', async () => {
+    // Shifted by one byte: exiftool still finds "Exif\0" within four bytes.
+    const { jpeg } = jpegWithGpsTho894();
+    const exifAt = jpeg.indexOf('Exif\0\0', 0, 'latin1');
+    const shifted = Buffer.from(jpeg);
+    shifted.write('XExif\0', exifAt, 'latin1');
+    await expect(planScrub(shifted)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+    // And "Exif\0" with no TIFF header after it.
+    const noTiff = Buffer.from(jpeg);
+    noTiff.write('Exif\0\0ZZZZ', exifAt, 'latin1');
+    await expect(planScrub(noTiff)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
   });
 });
