@@ -9,6 +9,9 @@ const { rateLimiter } = require("../../utils/rateLimiter");
 const { ticketState } = require("../../utils/ticketState");
 const { isTimeZone } = require("../../utils/weeklyRecap");
 const { billForConcert } = require("../../utils/concertBill");
+const { checkView, checkable } = require("../../utils/followCheck");
+// Through the module, so a test can stand in for the call on this copy of it.
+const pythonService = require("../../utils/pythonService");
 
 const rateLimit = rateLimiter({
   message: "Too many requests to the notifications route, please try again later.",
@@ -151,10 +154,21 @@ const FOLLOWED_CONCERT = {
   on_sale: true,
   sold_out: true,
   ticket_sale_start: true,
+  price_min: true,
+  price_max: true,
+  price_currency: true,
+  // What the followed-show checker last read off the listing (THO-779).
+  vendors: true,
+  event_status: true,
+  tickets_opened_at: true,
   // The whole bill, not only the acts you wishlisted: the rest of the lineup
   // lives in metadata as plain names, and billForConcert puts the two together.
   metadata: true,
   bands: { select: { band_rel: { select: { id: true, name: true } } } },
+  // Read for the checker's line and dropped: the id only names the listing,
+  // and the check row is answered as `check` beside the show.
+  event_id: true,
+  listing_check: { select: { checked_at: true, attempted_at: true, requested_at: true, failures: true } },
 };
 
 const concertIdParam = param("concertId").isInt({ min: 1 }).withMessage("Invalid concert id");
@@ -178,11 +192,12 @@ router.get(
       res.json(follows.map(({ concert_id, created_at, concert_rel }) => {
         // metadata is read for the bill and then dropped: the list has no use
         // for the raw column, and on a festival it is the biggest field here.
-        const { metadata, ...concert } = concert_rel;
+        const { metadata, event_id: _eventId, listing_check, ...concert } = concert_rel;
         return {
           concert_id,
           created_at,
           tickets: ticketState(concert_rel, now),
+          check: checkView(concert_rel, listing_check, now),
           concert: {
             ...concert,
             bands: billForConcert({ bands: concert_rel.bands.map((b) => b.band_rel), metadata }),
@@ -191,6 +206,73 @@ router.get(
       }));
     } catch (error) {
       console.error("Error fetching followed shows:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// Its own budget: "Check all now" is one request however many shows, so a
+// handful a minute is plenty, and the reads it asks for are Songkick pages.
+const checkLimit = rateLimiter({ max: 10, message: "Too many checks at once, please try again shortly." });
+
+// POST /notifications/follows/check — ask for your followed shows' listings to
+// be read now: every upcoming one with `{}`, or one with `{ concert_id }`.
+// Answers what was asked for; the reads land on the list within about a
+// minute, and the client polls GET /notifications/follows until nothing is
+// pending.
+router.post(
+  "/notifications/follows/check",
+  [
+    auth,
+    roleCheck(["ADMIN", "USER"]),
+    body("concert_id").optional({ nullable: true }).isInt({ min: 1 }).withMessage("Invalid concert id"),
+  ],
+  checkLimit,
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: "Invalid concert id" });
+    const one = req.body?.concert_id != null ? parseInt(req.body.concert_id, 10) : null;
+
+    try {
+      const follows = await prisma.concertFollow.findMany({
+        where: { user_id: req.user.id, ...(one != null && { concert_id: one }) },
+        select: {
+          concert_id: true,
+          concert_rel: {
+            select: {
+              id: true, url: true, event_id: true, concert_date: true,
+              listing_check: { select: { attempted_at: true, requested_at: true } },
+            },
+          },
+        },
+      });
+      if (one != null && follows.length === 0) return res.status(404).json({ error: "You do not follow that show" });
+
+      const now = new Date();
+      const wanted = follows.filter(({ concert_rel }) => checkable(concert_rel, concert_rel.listing_check, now));
+      const concertIds = wanted.map((f) => f.concert_id);
+      for (const { concert_id, concert_rel } of wanted) {
+        // One already waiting keeps its first stamp: it is in the queue
+        // already, and stamping it again would only move it back.
+        const check = concert_rel.listing_check;
+        if (check?.requested_at && (!check.attempted_at || new Date(check.requested_at) > new Date(check.attempted_at))) continue;
+        await prisma.concertListingCheck.upsert({
+          where: { concert_id },
+          create: { concert_id, requested_at: now },
+          update: { requested_at: now },
+        });
+      }
+
+      if (concertIds.length > 0 && process.env.PYTHON_SERVICE_URL) {
+        // Woken rather than waited on: the sync service's own five-minute tick
+        // picks these up anyway, so a wake that fails costs a few minutes and
+        // nothing else. Not awaited, so the answer does not wait on it either.
+        pythonService.pythonServicePost("/check-follows", {}, { timeout: 5000 })
+          .catch((err) => console.warn("[follows/check] could not wake the sync service:", err.code || err.message));
+      }
+      res.json({ requested: concertIds.length, concert_ids: concertIds });
+    } catch (error) {
+      console.error("Error asking for followed shows to be checked:", error);
       res.status(500).json({ error: "Internal server error" });
     }
   }

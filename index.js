@@ -15,6 +15,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use("/users", require("./routes/users"));
 app.use("/data/concerts", require("./routes/data/concerts"))
 app.use("/data/concerts", require("./routes/data/notifications"))
+app.use("/data/concerts", require("./routes/data/followChecks"))
 app.use("/data/concerts", require("./routes/data/playlists"))
 app.use("/data/concerts", require("./routes/data/media"))
 app.use("/data/concerts", require("./routes/data/health"))
