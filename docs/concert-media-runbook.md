@@ -129,6 +129,13 @@ of `name`, `start_ms`, `end_ms`; absent means none). `scripts/rebuild-media-inde
 database from those files alone. That is what lets you treat the share as the
 thing being protected and the application as replaceable.
 
+A folder's name is chosen by its first upload and never read back. Correcting
+the date of a show you went to (THO-823, `POST
+/wishlists/:id/attendance/:concertId/move`) rewrites `concert_id` and the
+`concert` block in each of its sidecars and leaves the folder where it is, so a
+folder named for 23 June can hold a show the sidecar says was on 24 June. The
+sidecar is the one to believe.
+
 `.web/` holds viewing copies and is disposable, despite living inside
 `archive/`. It is in there rather than in `cache/` because it is keyed by the
 clip's filename and has to travel with the show folder — a show moved to

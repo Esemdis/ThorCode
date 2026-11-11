@@ -156,8 +156,11 @@ async function scrubInto({
   if (plan.length === 0) {
     // Checked again after the read: a source replaced while it was being
     // planned would otherwise be served on the strength of the old one's plan.
+    // By the full verdict, size and mtime and file: under a checksum key the
+    // stamp is the size alone, and a master rewritten at the same size during
+    // the plan, GPS and all, passed and went out raw (round 3 of the review).
     const after = await statSource(absPath);
-    if (stampOf(after, keyedByContent, absPath) !== stamp) {
+    if (verdictOf(after, absPath) !== verdict) {
       throw Object.assign(tagged('UNSCRUBBABLE', `${absPath} changed while being read`), { transient: true });
     }
     await addVerdict(marker, verdict);

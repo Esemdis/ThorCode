@@ -209,6 +209,27 @@ describe('POST /attendances/:id/media', () => {
       .expect(403);
   });
 
+  // THO-823: a move takes this show's lock and changes its concert. An upload
+  // that read the show before the lock and filed by it afterwards put the
+  // files in a folder, and a sidecar, for a concert this user no longer has.
+  it('asks for a retry when the show was moved to another concert while it waited for the lock', async () => {
+    let readsTho823 = 0;
+    prisma.concertAttendance.findUnique = vi.fn(async () => {
+      readsTho823 += 1;
+      return readsTho823 === 1 ? attendanceRow : { ...attendanceRow, concert_id: 9999 };
+    });
+
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', '92')
+      .attach('files', jpeg(), 'IMG_1.jpg');
+
+    expect(res.status).toBe(409);
+    expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+    await expect(readdir(join(root, 'archive', 'user-1'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('writes the file into the show folder under the caller subtree', async () => {
     await request(app())
       .post('/data/concerts/attendances/1/media')

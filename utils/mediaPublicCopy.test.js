@@ -317,6 +317,35 @@ describe('ensurePublicCopy', () => {
     expect((await readFile(served)).includes(Buffer.from('SN-1234567890'))).toBe(false);
   });
 
+  // The check after the plan compared the stamp, which under a checksum key
+  // is the size alone: a master rewritten at the same size while it was
+  // being planned (clean bytes planned, GPS bytes served) went out raw.
+  it('does not serve a master rewritten at the same size while it was being planned', async () => {
+    const { jpeg } = jpegWithGpsTho894();
+    const cleanBytes = applyPatches(jpeg, await planScrub(jpeg));
+    const absPath = await sourceTho894('MASTER_RACE.jpg', cleanBytes);
+    const realStat = fsPromises.stat;
+    let statsTho894Race = 0;
+    vi.spyOn(fsPromises, 'stat').mockImplementation(async (p, ...rest) => {
+      if (p === absPath && ++statsTho894Race === 2) {
+        // The second look is the one after the plan.
+        await writeFile(absPath, jpeg);
+        const later = new Date(Date.now() + 5000);
+        await utimes(absPath, later, later);
+      }
+      return realStat(p, ...rest);
+    });
+
+    const served = await ensurePublicCopy({ absPath, key: 'cafe-race.jpg', keyedByContent: true }).catch((err) => err);
+
+    if (served instanceof Error) expect(served.code).toBe('UNSCRUBBABLE');
+    else expect((await readFile(served)).includes(Buffer.from('SN-1234567890'))).toBe(false);
+    // And the next request plans the file as it is now.
+    vi.restoreAllMocks();
+    const next = await ensurePublicCopy({ absPath, key: 'cafe-race.jpg', keyedByContent: true });
+    expect((await readFile(next)).includes(Buffer.from('SN-1234567890'))).toBe(false);
+  });
+
   it('does not let one row\'s refusal under a checksum key refuse another row\'s file', async () => {
     // Same size, so only the marker naming its file tells the two apart. A's
     // first segment claims to run past the end of the file, which is refused.
