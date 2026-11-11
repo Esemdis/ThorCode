@@ -452,9 +452,17 @@ function planAfterImage(ctx, pos) {
 // planned as an MP4. The capture time is kept, as EXIF's is. Every other
 // block's data is zeroed: `MCC_Data` is the mobile country code, a location;
 // `DualShot_1` and the like are whole second photographs with their own EXIF;
-// and the rest are undocumented. Their names stay, so the trailer still reads.
+// and the rest are undocumented. The directory stays, so the trailer still
+// reads.
+//
+// A name is whatever its block says, up to the whole block: a crafted one can
+// carry `MCC_Data242` as a "name" with no data at all. So only the names this
+// knows stay as they are, and any other name is zeroed with its data. Real
+// names are short; one past SEF_MAX_NAME is not a name, and is refused.
 const SEF_VIDEO_BLOCK = 'MotionPhoto_Data';
 const SEF_KEEP_BLOCKS = new Set(['Image_UTC_Data']);
+const SEF_KNOWN_NAMES = new Set([SEF_VIDEO_BLOCK, ...SEF_KEEP_BLOCKS, 'MCC_Data', 'DualShot_1', 'DualShot_2']);
+const SEF_MAX_NAME = 64;
 const SEF_ENTRY_BYTES = 12;
 
 /**
@@ -484,10 +492,15 @@ function planSamsungTrailer(ctx) {
     const start = dirAt - back;
     const nameLength = buf.readUInt32LE(start + 4);
     if (nameLength > length - 8) throw unscrubbable('Samsung block name overruns its block');
+    if (nameLength > SEF_MAX_NAME) throw unscrubbable('Samsung block name longer than any Samsung writes');
+    const name = buf.toString('latin1', start + 8, start + 8 + nameLength);
     blocks.push({
       start,
       end: start + length,
-      name: buf.toString('latin1', start + 8, start + 8 + nameLength),
+      name,
+      // Where zeroing starts for a block that is not kept: its data, or its
+      // name too when the name is not one this knows.
+      blank: SEF_KNOWN_NAMES.has(name) ? start + 8 + nameLength : start + 8,
       data: start + 8 + nameLength,
     });
   }
@@ -501,10 +514,14 @@ function planSamsungTrailer(ctx) {
     // Bytes between blocks that no entry names are zeroed like any unknown.
     fill(ctx, covered, block.start - covered, 0);
     if (block.name === SEF_VIDEO_BLOCK) ctx.videos.push({ start: ctx.base + block.data, end: ctx.base + block.end });
-    else if (!SEF_KEEP_BLOCKS.has(block.name)) fill(ctx, block.data, block.end - block.data, 0);
+    else if (!SEF_KEEP_BLOCKS.has(block.name)) fill(ctx, block.blank, block.end - block.blank, 0);
     covered = block.end;
   }
   fill(ctx, covered, dirAt - covered, 0);
+  // The directory is 12 bytes and an entry per block. Whatever its length
+  // says beyond that is no entry, and nothing reads it but a stranger.
+  const entriesEnd = dirAt + 12 + count * SEF_ENTRY_BYTES;
+  fill(ctx, entriesEnd, size - 8 - entriesEnd, 0);
   return trailerAt;
 }
 
