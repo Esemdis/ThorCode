@@ -253,6 +253,34 @@ function emailShell({ heading, preheader, cards, footnote }) {
 }
 
 /**
+ * A card that asks the reader to do one thing: a few lines of text, a button,
+ * and the same link written out underneath (THO-808).
+ *
+ * The link is printed as text as well because some clients strip or block
+ * buttons, and a reader whose client shows nothing to click still has to be
+ * able to get back into their account.
+ *
+ * @param {object} card
+ * @param {string[]} card.lines - Paragraphs, plain text.
+ * @param {string} card.label - The button's words.
+ * @param {string} card.href - Where it goes; dropped unless http(s).
+ * @returns {string}
+ */
+function actionCard({ lines = [], label, href }) {
+  const url = href ? safeHref(href) : null;
+  const text = lines
+    .map((line) => `<div class="t" style="margin-bottom:12px;color:${C.text};font:400 15px/1.55 ${FONT}">${escapeHtml(line)}</div>`)
+    .join("");
+  const action = url
+    ? `<div style="margin:6px 0 16px"><a href="${escapeHtml(url)}" style="display:inline-block;padding:11px 20px;border-radius:8px;background:${C.accent};color:#ffffff;font:700 15px/1.2 ${FONT};text-decoration:none">${escapeHtml(label)}</a></div>
+      <div class="m" style="color:${C.muted};font:400 12px/1.5 ${FONT};word-break:break-all">Or open this link: <a class="link" href="${escapeHtml(url)}" style="color:${C.accent}">${escapeHtml(url)}</a></div>`
+    : "";
+  return `<table class="card" role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:separate;background:${C.card};border:1px solid ${C.border};border-radius:12px">
+    <tr><td style="padding:20px 22px">${text}${action}</td></tr>
+  </table>`;
+}
+
+/**
  * A few names for a subject line, counting the rest.
  *
  * A subject naming thirty acts is a subject nothing can read, and the inbox cuts
@@ -270,4 +298,4 @@ function nameSummary(names, max = 3) {
   return rest > 0 ? `${shown.join(", ")} +${rest} more` : shown.join(", ");
 }
 
-module.exports = { emailShell, showCard, nameSummary, fmtDate };
+module.exports = { emailShell, showCard, actionCard, nameSummary, fmtDate };

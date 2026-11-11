@@ -64,6 +64,19 @@ describe('POST /users/login', () => {
     }));
   });
 
+  it('matches % and _ in an address as themselves, not as wildcards', async () => {
+    // Prisma's insensitive equals is an ILIKE on Postgres with the value
+    // unescaped, so `v_ctim@…` signed in to (and the forgot form mailed)
+    // victim@…; test/integration/passwordReset.test.js shows it on Postgres.
+    prisma.user.findMany.mockResolvedValue([]);
+
+    await request(app).post('/users/login').send({ ...body, email: 'v_c%tim@example.test' });
+
+    expect(prisma.user.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { email: { equals: 'v\\_c\\%tim@example.test', mode: 'insensitive' } },
+    }));
+  });
+
   it('takes the exact address when two old accounts differ only by case', async () => {
     // The migration that lowercased stored addresses leaves such a pair alone
     // rather than failing on the unique key. Either one is only a guess.
