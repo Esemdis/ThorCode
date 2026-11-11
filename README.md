@@ -14,7 +14,7 @@ The API runs as one Node process against Postgres through Prisma. Two other serv
 
 | Area | Mounted at | Code |
 | --- | --- | --- |
-| Accounts | `/users` | `routes/users.js`. Covers register, login, settings and email change. Email verification goes through Resend. |
+| Accounts | `/users` | `routes/users.js`. Covers register, login, settings, email change, changing the password while signed in and deleting the account (`utils/accountDeletion.js`, which also clears the account's Travel Bag data and archive folder). Email verification goes through Resend. |
 | Bands and concerts | `/data/concerts` | `routes/data/bands/`. Covers ingest from the scraper, search, band pages, setlists and admin. |
 | Wishlists and attendance | `/data/concerts` | `routes/data/wishlists/`. Covers wishlists, the shows you went to and the ones you missed, and the ICS calendar feed. `GET /data/concerts/nearby` (`routes/data/concertsNearby.js`) lists the caller's wishlist shows within a radius of a point on some dates, for wander's trip page (THO-667). |
 | Notifications | `/data/concerts` | `routes/data/notifications.js` handles subscriptions to a band, a city or a festival. New shows go to the wishlist's Discord webhook as the scraper reports them, and a daily email digest goes out by cron. |

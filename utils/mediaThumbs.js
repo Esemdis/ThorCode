@@ -163,5 +163,5 @@ async function ensureDisplay({ absPath, sha256 }) {
 }
 
 module.exports = {
-  THUMB_WIDTH, DISPLAY_EDGE, storePoster, ensureThumb, ensureDisplay,
+  THUMB_WIDTH, DISPLAY_EDGE, storePoster, ensureThumb, ensureDisplay, displayPath,
 };
