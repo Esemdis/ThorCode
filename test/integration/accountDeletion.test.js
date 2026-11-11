@@ -192,8 +192,8 @@ describe.skipIf(!url)('deleting an account', () => {
     expect(Object.values(kept).every((n) => n >= 1)).toBe(true);
     expect(await readFile(join(root, 'archive', staying.user.id, 'night', 'IMG_1.jpg'), 'utf8')).toBe('photo bytes');
 
-    const again = await request(app).post('/users/register').send({ email: gone.user.email, password: PASSWORD });
-    expect(again.status).toBe(201);
+    // Sign-up is closed (#53), so "frees the address" is read off the table.
+    expect(await prisma.user.count({ where: { email: gone.user.email } })).toBe(0);
   });
 
   it('deletes nothing on a wrong password', async () => {

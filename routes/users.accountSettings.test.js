@@ -206,6 +206,22 @@ describe('DELETE /users/me (THO-810)', () => {
     expect(prisma.user.delete).toHaveBeenCalledWith({ where: { id } });
   });
 
+  // The files are gone for good by the time the transaction runs. If it then
+  // fails, "Internal server error" would leave the person thinking nothing
+  // happened, when their photos are already gone and a retry finishes it.
+  it('says the photos are gone and to try again when the rows fail after the files went', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id));
+    prisma.$transaction.mockRejectedValueOnce(new Error('foreign key'));
+
+    const res = await deleteAccount(id, { currentPassword: CURRENT });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe(
+      'Your photos and videos were removed, but your account could not be deleted. Try again to finish.',
+    );
+  });
+
   // No archive here (MEDIA_ROOT unset), so every file fails to go: the
   // account must stay, whole, for a retry.
   it('keeps the account when a photo or video cannot be removed from the archive', async () => {

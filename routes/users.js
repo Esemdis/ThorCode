@@ -687,12 +687,13 @@ router.patch(
  * videos in the archive, music-service grants, and all Travel Bag data. See
  * utils/accountDeletion.js for the order and why.
  * @body {string} currentPassword
- * @returns {200} "Account deleted"; the address can register again at once
+ * @returns {200} "Account deleted"; the address is free again at once
  * @throws {400} No current password
  * @throws {403} The current password is wrong, the account has none, or it is the service account
  * @throws {409} The last admin
  * @throws {429} Too many wrong passwords for this account
- * @throws {500} A file would not leave the archive; the account is still there
+ * @throws {500} A file would not leave the archive; the account is still there.
+ *   Or the files went and the rows did not; a retry finishes it.
  */
 router.delete('/me', auth, currentPasswordLimit, upload.none(), async (req, res) => {
   try {
@@ -723,7 +724,18 @@ router.delete('/me', auth, currentPasswordLimit, upload.none(), async (req, res)
       );
     }
 
-    await prisma.$transaction(accountDeletionOperations(prisma, user.id));
+    // The files are already gone for good. If the rows now fail, say so: the
+    // catch-all's "Internal server error" read as if nothing had happened,
+    // and a retry is what finishes it.
+    try {
+      await prisma.$transaction(accountDeletionOperations(prisma, user.id));
+    } catch (error) {
+      console.error('Error deleting account rows after its files were removed:', error);
+      return response.serverError(
+        res,
+        'Your photos and videos were removed, but your account could not be deleted. Try again to finish.',
+      );
+    }
     await removeDerivedCopies(prisma, media.sha256s);
 
     return response.success(res, 200, {}, 'Account deleted');
