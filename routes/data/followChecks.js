@@ -27,6 +27,8 @@ const CHECKED_CONCERT = {
   on_sale: true, sold_out: true, ticket_sale_start: true,
   price_min: true, price_max: true, price_currency: true,
   vendors: true, event_status: true, tickets_opened_at: true,
+  // When the checker last read it, which tickets_opened_at needs (THO-779).
+  listing_check: { select: { checked_at: true } },
 };
 
 // GET /follows/check-due?limit=30&busy=1 — the listings to read this tick,
@@ -105,11 +107,12 @@ router.post(
         // Applied whether anyone still follows the show or not: unfollowed
         // between the list and the post, the read is still the listing's news.
         const outcome = await prisma.$transaction(async (tx) => {
-          const stored = await tx.concert.findUnique({ where: { id: concertId }, select: CHECKED_CONCERT });
-          if (!stored) return "unknown";
+          const row = await tx.concert.findUnique({ where: { id: concertId }, select: CHECKED_CONCERT });
+          if (!row) return "unknown";
+          const { listing_check: check, ...stored } = row;
           const readAt = readTime(result.read_at);
           if (result.ok === true) {
-            const fields = checkedFields(stored, result, readAt);
+            const fields = checkedFields(stored, result, readAt, check?.checked_at ?? null);
             if (Object.keys(fields).length > 0) await tx.concert.update({ where: { id: concertId }, data: fields });
             await tx.concertListingCheck.upsert({
               where: { concert_id: concertId },

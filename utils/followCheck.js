@@ -248,17 +248,21 @@ const finite = (value) => (typeof value === "number" && Number.isFinite(value) &
  * page that dropped its JSON-LD does not un-cancel a show.
  *
  * `tickets_opened_at` is stamped once, when a read sees on sale a show that
- * was waiting on a sale day that is today or still ahead. Not on the first
- * read of a show already on sale when it was followed, nor of one whose sale
- * day has passed: "opened 10:02" would then be the time of the read, not of
- * the sale, and a guessed time that looks measured is worse than none.
+ * was waiting on a sale day that is today or still ahead, and the checker's
+ * previous successful read of it was recent. Not on the first read of a show
+ * already on sale when it was followed, nor of one whose sale day has passed,
+ * nor of one whose sale opened hours before the first read that saw it:
+ * "opened 14:00" would then be the time of the read, not of the sale, and a
+ * guessed time that looks measured is worse than none.
  *
  * @param {object} stored - the Concert row
  * @param {object} result - one `ok` result from POST /follows/checked
- * @param {Date} [now]
+ * @param {Date} [now] - when the page was read
+ * @param {Date|null} [previousReadAt] - the check row's `checked_at` before
+ *   this read: when the checker last read the page successfully
  * @returns {object}
  */
-function checkedFields(stored, result, now = new Date()) {
+function checkedFields(stored, result, now = new Date(), previousReadAt = null) {
   const incoming = {
     on_sale: typeof result.on_sale === "boolean" ? result.on_sale : null,
     sold_out: result.sold_out === true,
@@ -301,7 +305,16 @@ function checkedFields(stored, result, now = new Date()) {
   // flipped, and the first read after it would stamp a sale that opened weeks
   // ago with the time of the read (THO-907). A day-only sale is on_sale_soon
   // all of its own day, so the hot-window reads this field is for still count.
-  if (!stored.tickets_opened_at && after === "on_sale" && before === "on_sale_soon") {
+  //
+  // And only after a recent read, which still saw it waiting: on_sale_soon is
+  // the whole sale day, a timed sale whose hour has passed included, so the
+  // first read of a show followed on the day its tickets dropped stamped
+  // "opened 14:00" for a 09:00 sale, for good. With a read at most one
+  // half-hourly round before, the stamp is off by no more than the gap
+  // between the two (five minutes in the hot window).
+  const since = previousReadAt ? now.getTime() - new Date(previousReadAt).getTime() : null;
+  const followsRecentRead = since != null && since >= 0 && since <= (STALE_MIN + TICK_SLACK_MIN) * MIN;
+  if (!stored.tickets_opened_at && after === "on_sale" && before === "on_sale_soon" && followsRecentRead) {
     fields.tickets_opened_at = now;
   }
   return fields;

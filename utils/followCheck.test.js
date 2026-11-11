@@ -212,7 +212,8 @@ describe('what a successful read writes onto the show', () => {
 
   it('stamps when a sale it was waiting on opened, once, and keeps it if the page goes back to "soon"', () => {
     const waiting = followedShowTho779({ ticket_sale_start: new Date('2026-11-11T00:00:00Z') });
-    const opened = checkedFields(waiting, readTho779({ on_sale: true }), NOW_THO779);
+    // The read before it, five minutes earlier in the hot window, saw it not on sale.
+    const opened = checkedFields(waiting, readTho779({ on_sale: true }), NOW_THO779, minutesAgoTho779(5));
     expect(opened).toMatchObject({ on_sale: true, tickets_opened_at: NOW_THO779 });
 
     const later = new Date('2026-11-11T09:30:00Z');
@@ -242,6 +243,43 @@ describe('what a successful read writes onto the show', () => {
     const fields = checkedFields(pastSaleTho907, readTho779({ on_sale: true }), readAtTho907);
     expect(fields).toMatchObject({ on_sale: true });
     expect(fields).not.toHaveProperty('tickets_opened_at');
+  });
+
+  // The 18:20 review. on_sale_soon covers the whole sale day, a timed sale
+  // whose hour has passed included, so the first read of a show followed on
+  // the day its tickets dropped stamped "opened 14:00" for a 09:00 sale, and
+  // the stamp is kept for good. Only a read that follows a recent read which
+  // still saw it waiting knows, to within the gap between them, when it opened.
+  describe('a sale that opened earlier on the day of the read (THO-779)', () => {
+    const saleDayReadTho779 = new Date('2026-11-11T14:00:00Z');
+    const timedSaleTho779 = followedShowTho779({ ticket_sale_start: new Date('2026-11-11T09:00:00Z') });
+    const dayOnlySaleTho779 = followedShowTho779({ ticket_sale_start: new Date('2026-11-11T00:00:00Z') });
+
+    it('does not stamp the first read of a timed sale hours after it opened', () => {
+      const fields = checkedFields(timedSaleTho779, readTho779({ on_sale: true }), saleDayReadTho779, null);
+      expect(fields).toMatchObject({ on_sale: true });
+      expect(fields).not.toHaveProperty('tickets_opened_at');
+    });
+
+    it('does not stamp the first read of a day-only sale that evening', () => {
+      const evening = new Date('2026-11-11T20:00:00Z');
+      expect(checkedFields(dayOnlySaleTho779, readTho779({ on_sale: true }), evening))
+        .not.toHaveProperty('tickets_opened_at');
+    });
+
+    it('does not stamp when the read before it was hours ago', () => {
+      const fields = checkedFields(
+        timedSaleTho779, readTho779({ on_sale: true }), saleDayReadTho779, minutesAgoTho779(5 * 60, saleDayReadTho779),
+      );
+      expect(fields).not.toHaveProperty('tickets_opened_at');
+    });
+
+    it('stamps when the read before it was within the half-hourly round', () => {
+      const fields = checkedFields(
+        timedSaleTho779, readTho779({ on_sale: true }), saleDayReadTho779, minutesAgoTho779(31, saleDayReadTho779),
+      );
+      expect(fields).toMatchObject({ tickets_opened_at: saleDayReadTho779 });
+    });
   });
 
   it('marks it sold out', () => {

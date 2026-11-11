@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import { buildApp, authHeader, installFakePrisma } from '../../test/routeApp.js';
 
@@ -32,6 +32,8 @@ beforeEach(() => {
   txTho779.concertListingCheck.upsert.mockResolvedValue({});
   txTho779.concert.update.mockResolvedValue({});
 });
+// One test pins the clock; a failure partway must not leave it pinned.
+afterEach(() => { vi.useRealTimers(); });
 
 describe('which followed shows are due a read', () => {
   it('lists upcoming followed shows with a listing, never-read first, for the sync service only', async () => {
@@ -132,6 +134,38 @@ describe('storing what the reads said', () => {
     const [read, failedRead] = txTho779.concertListingCheck.upsert.mock.calls.map(([args]) => args.update);
     expect(read).toMatchObject({ checked_at: readAtTho907, attempted_at: readAtTho907 });
     expect(failedRead).toMatchObject({ attempted_at: readAtTho907 });
+  });
+
+  // The previous successful read is what makes the stamp a measurement: the
+  // route has to hand its time to checkedFields, and keep the check row out of
+  // the Concert write.
+  it('stamps tickets_opened_at only when the read before it was recent', async () => {
+    // Only Date is faked: supertest still needs real timers.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-11T14:01:00Z'));
+    const saleTodayTho779 = new Date('2026-11-11T09:00:00Z');
+    const readNowTho779 = new Date('2026-11-11T14:00:00Z');
+    const postRead = () => request(app).post('/follows/checked').set(...systemTho779).send({ results: [
+      { concert_id: 300, ok: true, on_sale: true, read_at: readNowTho779.toISOString() },
+    ] });
+
+    txTho779.concert.findUnique.mockResolvedValue(storedShowTho779({
+      ticket_sale_start: saleTodayTho779, listing_check: null,
+    }));
+    await postRead();
+    const firstRead = txTho779.concert.update.mock.calls[0][0].data;
+    expect(firstRead).toMatchObject({ on_sale: true });
+    expect(firstRead).not.toHaveProperty('tickets_opened_at');
+    expect(firstRead).not.toHaveProperty('listing_check');
+
+    txTho779.concert.update.mockClear();
+    txTho779.concert.findUnique.mockResolvedValue(storedShowTho779({
+      ticket_sale_start: saleTodayTho779,
+      listing_check: { checked_at: new Date(readNowTho779.getTime() - 5 * 60 * 1000) },
+    }));
+    await postRead();
+    expect(txTho779.concert.update.mock.calls[0][0].data).toMatchObject({ tickets_opened_at: readNowTho779 });
+    expect(txTho779.concert.findUnique.mock.calls[0][0].select.listing_check).toEqual({ select: { checked_at: true } });
   });
 
   it('counts a show deleted since it was listed, or an id that is not one, as unknown', async () => {
