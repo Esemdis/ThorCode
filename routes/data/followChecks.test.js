@@ -9,6 +9,7 @@ const txTho779 = {
 };
 const prisma = installFakePrisma({
   concert: { findMany: vi.fn() },
+  concertListingCheck: { upsert: vi.fn() },
   $transaction: vi.fn(),
 });
 
@@ -189,6 +190,28 @@ describe('storing what the reads said', () => {
     ] });
 
     expect(res.body).toEqual({ updated: 1, failed: 0, unknown: 0, errors: 1 });
+  });
+
+  // Left where it was, a show whose row will not write stayed due, and a
+  // "Check now" on it on its way, on every tick: its page read every five
+  // minutes for good. The read happened, so the attempt moves; the listing
+  // did not fail, so nothing else does.
+  it('moves the attempt on, outside the failed write, and nothing else', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    prisma.$transaction.mockImplementation(async () => { throw new Error('deadlock'); });
+    prisma.concertListingCheck.upsert.mockResolvedValue({});
+    const readAt = new Date(Date.now() - 60 * 1000);
+
+    const res = await request(app).post('/follows/checked').set(...systemTho779).send({ results: [
+      { concert_id: 300, ok: true, read_at: readAt.toISOString() },
+    ] });
+
+    expect(res.body).toEqual({ updated: 0, failed: 0, unknown: 0, errors: 1 });
+    expect(prisma.concertListingCheck.upsert).toHaveBeenCalledWith({
+      where: { concert_id: 300 },
+      create: { concert_id: 300, attempted_at: readAt },
+      update: { attempted_at: readAt },
+    });
   });
 
   it('refuses a batch that is not a list, one over a hundred, and a user token', async () => {

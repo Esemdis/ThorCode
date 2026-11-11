@@ -9,7 +9,7 @@ const { rateLimiter } = require("../../utils/rateLimiter");
 const { ticketState } = require("../../utils/ticketState");
 const { isTimeZone } = require("../../utils/weeklyRecap");
 const { billForConcert } = require("../../utils/concertBill");
-const { checkView, checkable } = require("../../utils/followCheck");
+const { checkView, checkable, isPending } = require("../../utils/followCheck");
 // Through the module, so a test can stand in for the call on this copy of it.
 const pythonService = require("../../utils/pythonService");
 
@@ -254,8 +254,9 @@ router.post(
       for (const { concert_id, concert_rel } of wanted) {
         // One already waiting keeps its first stamp: it is in the queue
         // already, and stamping it again would only move it back.
-        const check = concert_rel.listing_check;
-        if (check?.requested_at && (!check.attempted_at || new Date(check.requested_at) > new Date(check.attempted_at))) continue;
+        // One that waited past PENDING_MAX_MIN was skipped, so it is stamped
+        // afresh, or it would stay expired and never be on its way again.
+        if (isPending(concert_rel.listing_check, now)) continue;
         await prisma.concertListingCheck.upsert({
           where: { concert_id },
           create: { concert_id, requested_at: now },

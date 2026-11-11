@@ -36,6 +36,13 @@ const DAY_ONLY_HOT_UTC = [6, 12];
 // "Check now" within this long of the last attempt asks for nothing: the row
 // already says "Checked just now", and a double tap must not be two reads.
 const RECHECK_GUARD_MIN = 2;
+// A "Check now" nobody answered stops being "on its way" after this long. The
+// sync service can skip whole ticks without asking what is due (an hour's hold
+// on Songkick after a block, its hourly page budget), and then nothing moves
+// attempted_at: the row said "Check on its way", with its button disabled, for
+// up to an hour. Past this the show falls back to its own due reason, and the
+// button can ask again.
+const PENDING_MAX_MIN = 15;
 // Failed reads in a row before the row says it cannot read the listing. One is
 // a page that timed out; two, half an hour apart at least, is worth saying.
 const FAILING_AFTER = 2;
@@ -52,7 +59,12 @@ const MAX_VENDORS = 20;
 const MAX_VENDOR_NAME = 80;
 const MAX_VENDOR_PRICE = 30;
 const MAX_ERROR = 300;
-const DAY = /^\d{4}-\d{2}-\d{2}$/;
+const DAY_SHAPE = /^\d{4}-\d{2}-\d{2}$/;
+// A real calendar day, not just its shape: "2026-13-01" made Invalid Date and
+// a RangeError inside mergeTicketFields, and "2026-02-31" went in as 3 March.
+const isCalendarDay = (value) => typeof value === "string" && DAY_SHAPE.test(value)
+  && !Number.isNaN(Date.parse(`${value}T00:00:00Z`))
+  && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
 
 function isSongkick(url) {
   const href = safeHref(url);
@@ -118,10 +130,14 @@ function isHot(concert, now) {
 
 const at = (value) => (value ? new Date(value).getTime() : null);
 
-/** Someone asked for a read, and none has been tried since. */
-function isPending(check) {
+/**
+ * Someone asked for a read, none has been tried since, and the ask is not so
+ * old that it was plainly skipped (PENDING_MAX_MIN).
+ */
+function isPending(check, now = new Date()) {
   const requested = at(check?.requested_at);
   if (requested == null) return false;
+  if (now.getTime() - requested > PENDING_MAX_MIN * MIN) return false;
   const attempted = at(check?.attempted_at);
   return attempted == null || requested > attempted;
 }
@@ -139,7 +155,7 @@ function isPending(check) {
  */
 function checkDue(concert, check, now = new Date()) {
   if (!listingUrl(concert) || !upcoming(concert, now)) return null;
-  if (isPending(check)) return "requested";
+  if (isPending(check, now)) return "requested";
   const attempted = at(check?.attempted_at);
   const age = attempted == null ? Infinity : now.getTime() - attempted;
   if (isHot(concert, now)) return age >= (HOT_MIN - TICK_SLACK_MIN) * MIN ? "hot" : null;
@@ -147,11 +163,29 @@ function checkDue(concert, check, now = new Date()) {
   return age >= (STALE_MIN - TICK_SLACK_MIN) * MIN ? "stale" : null;
 }
 
-const DUE_ORDER = { requested: 0, hot: 1, never: 2, stale: 3 };
+const DUE_ORDER = { hot: 0, requested: 1, never: 2, stale: 3 };
 
 /**
- * The shows to read this tick, most wanted first: someone waiting on it, a
- * sale about to open, never read, then the longest since a read was tried.
+ * Where a due show goes in the tick. A sale about to open comes first, also
+ * when someone asked for it: with "requested" first, one "Check all now" of
+ * more shows than a tick reads pushed a sale-morning read out of the tick,
+ * and a hot show, read five minutes before, sorted last among the asked-for.
+ */
+const dueRank = ({ concert, reason }, now) => (
+  reason === "requested" && isHot(concert, now) ? DUE_ORDER.hot : DUE_ORDER[reason]
+);
+
+// Within a rank: the asked-for in the order they were asked, so one row's
+// "Check now" does not queue behind someone else's whole list; the rest by
+// the longest since a read was tried.
+const dueSince = ({ check, reason }, rank) => (
+  rank === DUE_ORDER.requested && reason === "requested" ? at(check?.requested_at) : at(check?.attempted_at)
+) ?? 0;
+
+/**
+ * The shows to read this tick, most wanted first: a sale about to open (asked
+ * for or not), someone waiting on it, never read, then the longest since a
+ * read was tried.
  *
  * While a full sync is running (`busy`) only the first two: that pass has a
  * browser of its own on Songkick, and a half-hourly refresh can wait for it.
@@ -164,8 +198,9 @@ function dueChecks(rows, { now = new Date(), limit = 30, busy = false } = {}) {
   return rows
     .map(({ concert, check }) => ({ concert, check, reason: checkDue(concert, check, now) }))
     .filter(({ reason }) => reason && (!busy || reason === "requested" || reason === "hot"))
-    .sort((a, b) => DUE_ORDER[a.reason] - DUE_ORDER[b.reason]
-      || (at(a.check?.attempted_at) ?? 0) - (at(b.check?.attempted_at) ?? 0)
+    .map((row) => ({ ...row, rank: dueRank(row, now) }))
+    .sort((a, b) => a.rank - b.rank
+      || dueSince(a, a.rank) - dueSince(b, b.rank)
       || a.concert.id - b.concert.id)
     .slice(0, limit)
     .map(({ concert, reason }) => ({ concert_id: concert.id, url: listingUrl(concert), reason }));
@@ -181,7 +216,7 @@ function checkView(concert, check, now = new Date()) {
   if (!listingUrl(concert)) return null;
   return {
     checked_at: check?.checked_at ?? null,
-    pending: isPending(check),
+    pending: isPending(check, now),
     hot: upcoming(concert, now) && isHot(concert, now),
     failing: (check?.failures ?? 0) >= FAILING_AFTER,
   };
@@ -194,7 +229,7 @@ function checkView(concert, check, now = new Date()) {
  */
 function checkable(concert, check, now = new Date()) {
   if (!listingUrl(concert) || !upcoming(concert, now)) return false;
-  if (isPending(check)) return true;
+  if (isPending(check, now)) return true;
   const attempted = at(check?.attempted_at);
   return attempted == null || now.getTime() - attempted >= RECHECK_GUARD_MIN * MIN;
 }
@@ -228,7 +263,7 @@ function sanitizeVendors(vendors) {
       name,
       url,
       state: VENDOR_STATES.has(raw.state) ? raw.state : "unknown",
-      sale_date: typeof raw.sale_date === "string" && DAY.test(raw.sale_date) ? raw.sale_date : null,
+      sale_date: isCalendarDay(raw.sale_date) ? raw.sale_date : null,
       price,
     });
   }
@@ -266,9 +301,7 @@ function checkedFields(stored, result, now = new Date(), previousReadAt = null) 
   const incoming = {
     on_sale: typeof result.on_sale === "boolean" ? result.on_sale : null,
     sold_out: result.sold_out === true,
-    ticket_sale_start: typeof result.ticket_sale_start === "string" && DAY.test(result.ticket_sale_start)
-      ? result.ticket_sale_start
-      : null,
+    ticket_sale_start: isCalendarDay(result.ticket_sale_start) ? result.ticket_sale_start : null,
     price_min: finite(result.price_min),
     price_max: finite(result.price_max),
     price_currency: text(result.price_currency, 8),
@@ -312,8 +345,16 @@ function checkedFields(stored, result, now = new Date(), previousReadAt = null) 
   // "opened 14:00" for a 09:00 sale, for good. With a read at most one
   // half-hourly round before, the stamp is off by no more than the gap
   // between the two (five minutes in the hot window).
+  //
+  // And only when that read was on the sale day itself. On that day a read
+  // that saw the tickets on sale would have written it, so the row still
+  // waiting means the read saw it waiting. A read the day before proves
+  // nothing: with the sale day still ahead, mergeTicketFields refuses its
+  // "on sale" (a vendor that opened early), and the first read after
+  // midnight UTC stamped "opened 00:05" for a sale a day older.
   const since = previousReadAt ? now.getTime() - new Date(previousReadAt).getTime() : null;
-  const followsRecentRead = since != null && since >= 0 && since <= (STALE_MIN + TICK_SLACK_MIN) * MIN;
+  const followsRecentRead = since != null && since >= 0 && since <= (STALE_MIN + TICK_SLACK_MIN) * MIN
+    && new Date(previousReadAt).toISOString().slice(0, 10) === saleDay(stored);
   if (!stored.tickets_opened_at && after === "on_sale" && before === "on_sale_soon" && followsRecentRead) {
     fields.tickets_opened_at = now;
   }
@@ -358,6 +399,7 @@ module.exports = {
   HOT_AFTER_MIN,
   DAY_ONLY_HOT_UTC,
   RECHECK_GUARD_MIN,
+  PENDING_MAX_MIN,
   FAILING_AFTER,
   listingUrl,
   upcoming,

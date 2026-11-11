@@ -121,19 +121,69 @@ describe('the order a tick reads them in', () => {
     { concert: followedShowTho779({ id: 6 }), check: { attempted_at: minutesAgoTho779(1) } },
   ];
 
-  it('puts asked-for first, then a sale opening, then never read, then the stalest', () => {
+  it('puts a sale opening first, then asked-for, then never read, then the stalest', () => {
     expect(dueChecks(rowsTho779, { now: NOW_THO779 }).map((d) => [d.concert_id, d.reason])).toEqual([
-      [5, 'requested'], [4, 'hot'], [3, 'never'], [2, 'stale'], [1, 'stale'],
+      [4, 'hot'], [5, 'requested'], [3, 'never'], [2, 'stale'], [1, 'stale'],
     ]);
   });
 
   it('keeps to the limit, and only what cannot wait while a full sync has Songkick open', () => {
-    expect(dueChecks(rowsTho779, { now: NOW_THO779, limit: 2 }).map((d) => d.concert_id)).toEqual([5, 4]);
-    expect(dueChecks(rowsTho779, { now: NOW_THO779, busy: true }).map((d) => d.concert_id)).toEqual([5, 4]);
+    expect(dueChecks(rowsTho779, { now: NOW_THO779, limit: 2 }).map((d) => d.concert_id)).toEqual([4, 5]);
+    expect(dueChecks(rowsTho779, { now: NOW_THO779, busy: true }).map((d) => d.concert_id)).toEqual([4, 5]);
+  });
+
+  // With "requested" ranked first and sorted by the oldest attempt, one
+  // "Check all now" of 40 shows at 09:57 left the show whose sale opened at
+  // 10:00 (read at 09:53, so the newest attempt) out of the 09:58 tick.
+  it('reads a sale about to open in the next tick even after a "Check all now" of more shows than a tick reads', () => {
+    const tickTho779Order = new Date('2026-11-11T09:58:00Z');
+    const askedTho779Order = new Date('2026-11-11T09:57:00Z');
+    const rows = Array.from({ length: 40 }, (_, i) => ({
+      concert: followedShowTho779({
+        id: i + 1,
+        ...(i === 0 && { ticket_sale_start: new Date('2026-11-11T10:00:00Z') }),
+      }),
+      check: {
+        attempted_at: i === 0 ? new Date('2026-11-11T09:53:00Z') : minutesAgoTho779(20 + i, tickTho779Order),
+        requested_at: askedTho779Order,
+      },
+    }));
+    const due = dueChecks(rows, { now: tickTho779Order, limit: 30 });
+    expect(due).toHaveLength(30);
+    expect(due[0].concert_id).toBe(1);
+    expect(dueChecks(rows, { now: tickTho779Order, limit: 30, busy: true })[0].concert_id).toBe(1);
+  });
+
+  it('reads the asked-for in the order they were asked, not by their last attempt', () => {
+    const rows = [
+      { concert: followedShowTho779({ id: 7 }), check: { attempted_at: minutesAgoTho779(40), requested_at: minutesAgoTho779(1) } },
+      { concert: followedShowTho779({ id: 8 }), check: { attempted_at: minutesAgoTho779(10), requested_at: minutesAgoTho779(3) } },
+    ];
+    expect(dueChecks(rows, { now: NOW_THO779 }).map((d) => d.concert_id)).toEqual([8, 7]);
   });
 
   it('hands over the page to read', () => {
     expect(dueChecks(rowsTho779, { now: NOW_THO779 })[0].url).toBe('https://www.songkick.com/concerts/42938629-opeth-at-fallan');
+  });
+});
+
+describe('a "Check now" nobody answered (THO-779)', () => {
+  // The sync service can skip whole ticks without asking what is due (its
+  // hour's hold on Songkick after a block, its hourly budget), and nothing
+  // then moves attempted_at: the row said "Check on its way" for an hour.
+  it('stops being on its way after fifteen minutes, and falls back to the show\'s own due reason', () => {
+    const show = followedShowTho779();
+    const skipped = { attempted_at: minutesAgoTho779(60), requested_at: minutesAgoTho779(16) };
+    expect(checkDue(show, skipped, NOW_THO779)).toBe('stale');
+    expect(checkView(show, skipped, NOW_THO779).pending).toBe(false);
+    expect(checkable(show, skipped, NOW_THO779)).toBe(true);
+  });
+
+  it('is still on its way within the fifteen minutes', () => {
+    const show = followedShowTho779();
+    const waiting = { attempted_at: minutesAgoTho779(60), requested_at: minutesAgoTho779(14) };
+    expect(checkDue(show, waiting, NOW_THO779)).toBe('requested');
+    expect(checkView(show, waiting, NOW_THO779).pending).toBe(true);
   });
 });
 
@@ -274,6 +324,19 @@ describe('what a successful read writes onto the show', () => {
       expect(fields).not.toHaveProperty('tickets_opened_at');
     });
 
+    // The day before, the read could not write its "on sale": the stored day
+    // was still ahead (a vendor that opened early). So a read before midnight
+    // says nothing about whether it was waiting, and the first read after
+    // midnight UTC stamped "opened 00:05" for a sale a day older.
+    it('does not stamp after midnight from a read the day before the sale day', () => {
+      const saleTomorrow = followedShowTho779({ ticket_sale_start: new Date('2026-11-21T00:00:00Z') });
+      const fields = checkedFields(
+        saleTomorrow, readTho779({ on_sale: true }), new Date('2026-11-21T00:05:00Z'), new Date('2026-11-20T23:36:00Z'),
+      );
+      expect(fields).toMatchObject({ on_sale: true });
+      expect(fields).not.toHaveProperty('tickets_opened_at');
+    });
+
     it('stamps when the read before it was within the half-hourly round', () => {
       const fields = checkedFields(
         timedSaleTho779, readTho779({ on_sale: true }), saleDayReadTho779, minutesAgoTho779(31, saleDayReadTho779),
@@ -311,6 +374,18 @@ describe('what a successful read writes onto the show', () => {
     expect(checkedFields(followedShowTho779({ event_status: 'cancelled' }), readTho779({ event_status: null }), NOW_THO779))
       .not.toHaveProperty('event_status');
     expect(checkedFields(followedShowTho779(), readTho779({ event_status: 'drop table' }), NOW_THO779)).not.toHaveProperty('event_status');
+  });
+
+  // The shape alone let "2026-13-01" through to a RangeError inside
+  // mergeTicketFields (the row then never wrote), and "2026-02-31" in as
+  // 3 March.
+  it('ignores a sale day that is not a real calendar day, in the read and in its vendors', () => {
+    for (const day of ['2026-13-01', '2026-02-31', '2026-00-10']) {
+      const fields = checkedFields(followedShowTho779(), readTho779({ ticket_sale_start: day }), NOW_THO779);
+      expect(fields).not.toHaveProperty('ticket_sale_start');
+      expect(sanitizeVendors([{ name: 'Ticketmaster', sale_date: day }])[0].sale_date).toBeNull();
+    }
+    expect(sanitizeVendors([{ name: 'Ticketmaster', sale_date: '2028-02-29' }])[0].sale_date).toBe('2028-02-29');
   });
 
   it('ignores a malformed sale day and a negative price', () => {

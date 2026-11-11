@@ -248,6 +248,19 @@ describe('asking for followed shows to be checked now', () => {
     expect(prisma.concertListingCheck.upsert).not.toHaveBeenCalled();
   });
 
+  // Past fifteen minutes the request was skipped, not queued: kept, its old
+  // stamp would leave it expired and never on its way again.
+  it('stamps a request again once the last one waited past fifteen minutes', async () => {
+    prisma.concertFollow.findMany.mockResolvedValue([
+      songkickFollowTho779({ listing_check: { attempted_at: new Date(Date.now() - 60 * 60 * 1000), requested_at: new Date(Date.now() - 20 * 60 * 1000) } }),
+    ]);
+
+    const res = await request(app).post('/notifications/follows/check').set(...me).send({});
+
+    expect(res.body).toEqual({ requested: 1, concert_ids: [300] });
+    expect(prisma.concertListingCheck.upsert).toHaveBeenCalledTimes(1);
+  });
+
   it('answers 404 for a show you do not follow, 400 for an id that is not one, 401 without a token', async () => {
     prisma.concertFollow.findMany.mockResolvedValue([]);
     expect((await request(app).post('/notifications/follows/check').set(...me).send({ concert_id: 999 })).status).toBe(404);

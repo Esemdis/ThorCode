@@ -103,6 +103,7 @@ router.post(
         unknown += 1;
         continue;
       }
+      const readAt = readTime(result?.read_at);
       try {
         // Applied whether anyone still follows the show or not: unfollowed
         // between the list and the post, the read is still the listing's news.
@@ -110,7 +111,6 @@ router.post(
           const row = await tx.concert.findUnique({ where: { id: concertId }, select: CHECKED_CONCERT });
           if (!row) return "unknown";
           const { listing_check: check, ...stored } = row;
-          const readAt = readTime(result.read_at);
           if (result.ok === true) {
             const fields = checkedFields(stored, result, readAt, check?.checked_at ?? null);
             if (Object.keys(fields).length > 0) await tx.concert.update({ where: { id: concertId }, data: fields });
@@ -136,9 +136,22 @@ router.post(
         else if (outcome === "failed") failed += 1;
         else unknown += 1;
       } catch (error) {
-        // Logged, counted and skipped: the show stays due and is read again.
+        // Logged and counted. The read itself still happened, so attempted_at
+        // moves on its own, outside the failed transaction: left where it was,
+        // a row that will not write stayed due (and "on its way") on every
+        // tick, its page read every five minutes for good. checked_at and the
+        // failure count stay, because the listing did not fail; we did.
         console.error(`Error storing the check of concert ${concertId}:`, error);
         errored += 1;
+        try {
+          await prisma.concertListingCheck.upsert({
+            where: { concert_id: concertId },
+            create: { concert_id: concertId, attempted_at: readAt },
+            update: { attempted_at: readAt },
+          });
+        } catch (stampError) {
+          console.error(`Error moving the attempt time of concert ${concertId}:`, stampError);
+        }
       }
     }
     res.json({ updated, failed, unknown, errors: errored });
