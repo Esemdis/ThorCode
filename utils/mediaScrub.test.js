@@ -807,6 +807,25 @@ describe('planScrub on a Samsung trailer (THO-899)', () => {
     expect(await planScrub(out)).toEqual([]);
   });
 
+  // Round 3 of the THO-899 review: the name alone decided, so a block that
+  // called itself Image_UTC_Data kept whatever it held, a photograph included.
+  it('keeps Image_UTC_Data only as Samsung writes it: type 0x0a01 and a few digits', async () => {
+    const { jpeg } = jpegWithGpsTho894();
+    for (const block of [
+      { type: 0x0a01, name: 'Image_UTC_Data', data: jpeg },
+      { type: 0x0b02, name: 'Image_UTC_Data', data: Buffer.from('1781293108000', 'latin1') },
+    ]) {
+      const { trailer } = samsungTrailerTho899([block]);
+      const out = await scrubbedTho894(Buffer.concat([minimalJpegTho894, trailer]));
+      expect(containsTho894(out, 'SN-1234567890')).toBe(false);
+      expect(containsTho894(out, '1781293108000')).toBe(false);
+      expect(await planScrub(out)).toEqual([]);
+    }
+    const { trailer } = samsungTrailerTho899([{ type: 0x0a01, name: 'Image_UTC_Data', data: Buffer.from('1781293108000', 'latin1') }]);
+    const kept = await scrubbedTho894(Buffer.concat([minimalJpegTho894, trailer]));
+    expect(containsTho894(kept, 'Image_UTC_Data1781293108000')).toBe(true);
+  });
+
   it('refuses a block name longer than any Samsung writes', async () => {
     const { trailer } = samsungTrailerTho899([{ type: 0x0b01, name: 'N'.repeat(65), data: Buffer.alloc(4) }]);
     await expect(planScrub(Buffer.concat([minimalJpegTho894, trailer]))).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
@@ -909,6 +928,16 @@ describe('planScrub on a loose EXIF header (THO-894 review, round 4)', () => {
     const out = await scrubbedTho894(odd);
     expect(containsTho894(out, 'SN-1234567890')).toBe(false);
     expect(await planScrub(out)).toEqual([]);
+  });
+
+  // exiftool matches the header case-insensitively: "EXIF\0\0" with GPS
+  // planned nothing and went out as it was (round 2 of the review).
+  it('refuses EXIF behind a header in another case, which readers still take for EXIF', async () => {
+    for (const header of ['EXIF\0\0', 'exif\0\0', 'eXiF\0\x01']) {
+      const odd = withExifHeaderTho894Round4(header);
+      expect(containsTho894(odd, 'SN-1234567890')).toBe(true);
+      await expect(planScrub(odd)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+    }
   });
 
   it('refuses an APP1 a reader could take for EXIF that the planner does not read, rather than call it clean', async () => {
