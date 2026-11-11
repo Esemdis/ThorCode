@@ -362,9 +362,12 @@ const FREE = Buffer.from('free', 'latin1');
 // accuracy, the body and the phone's model. Matched loosely rather than by
 // Apple's names alone, because ffmpeg with `use_metadata_tags` writes the same
 // position under plain keys (`location`, `location-eng`) — measured on a file
-// re-muxed that way, which kept its coordinates under an exact match.
+// re-muxed that way, which kept its coordinates under an exact match. The
+// make/model match is unanchored on purpose: an iPhone also writes
+// `camera.lens_model` ("iPhone 15 Pro back triple camera …"), and a match on
+// `.model` let that through (THO-900).
 const isSensitiveAppleKey = (name) => /location/i.test(name)
-  || /(^|\.)(make|model)$/i.test(name);
+  || /(make|model)$/i.test(name);
 
 // Big enough for a long recording's sample tables, small enough that a
 // corrupt size is a refusal rather than an attempt to read gigabytes into

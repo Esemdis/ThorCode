@@ -244,9 +244,13 @@ const u32Tho894 = (v) => { const b = Buffer.alloc(4); b.writeUInt32BE(v); return
  * @param {boolean} [options.location] - false leaves every one of them out.
  * @param {boolean} [options.mdat64] - write mdat with a 64-bit size.
  * @param {boolean} [options.moovAtEnd] - moov after mdat, as a phone writes it.
+ * @param {Array<[string, string]>} [options.extraAppleKeysTho900] - more mdta
+ *   keys and their values, appended after the four above.
  * @returns {Buffer}
  */
-export function mp4WithLocationTho894({ location = true, mdat64 = false, moovAtEnd = true } = {}) {
+export function mp4WithLocationTho894({
+  location = true, mdat64 = false, moovAtEnd = true, extraAppleKeysTho900 = [],
+} = {}) {
   const ftyp = mp4Box('ftyp', 'isom', u32Tho894(0x200), 'isommp42');
   const media = Buffer.from('frame-data-that-must-never-change'.repeat(4), 'latin1');
   let mdat;
@@ -265,8 +269,12 @@ export function mp4WithLocationTho894({ location = true, mdat64 = false, moovAtE
   const keyNames = [
     'com.apple.quicktime.location.ISO6709', 'com.apple.quicktime.make',
     'com.apple.quicktime.model', 'com.apple.quicktime.software',
+    ...extraAppleKeysTho900.map(([name]) => name),
   ];
-  const values = ['+59.9139+010.7522+012.000/', 'Apple', 'iPhone 15 Pro', '18.1'];
+  const values = [
+    '+59.9139+010.7522+012.000/', 'Apple', 'iPhone 15 Pro', '18.1',
+    ...extraAppleKeysTho900.map(([, value]) => value),
+  ];
   const ilstItem = (index, value) => {
     const b = mp4Box('xxxx', mp4Box('data', u32Tho894(1), u32Tho894(0), value));
     b.writeUInt32BE(index, 4);

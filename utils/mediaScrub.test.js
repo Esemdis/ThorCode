@@ -167,6 +167,24 @@ describe('planScrub on an MP4', () => {
     expect(await planScrub(out)).toEqual([]);
   });
 
+  it('neutralises the Apple lens make and model, which name the phone as plainly as its model does', async () => {
+    // An iPhone writes `com.apple.quicktime.camera.lens_model` ("iPhone 15 Pro
+    // back triple camera …"). The key ends in `_model`, not `.model`, so a
+    // match anchored on the dot let it through a public share link (THO-900).
+    const mp4 = mp4WithLocationTho894({
+      extraAppleKeysTho900: [
+        ['com.apple.quicktime.camera.lens_model', 'Lens: iPhone 15 Pro back triple camera 6.765mm f/1.78'],
+        ['com.apple.quicktime.camera.lens_make', 'LensMaker-Apple'],
+      ],
+    });
+    const out = await scrubbedTho894(mp4);
+    expect(out.length).toBe(mp4.length);
+    expect(containsTho894(out, 'back triple camera')).toBe(false);
+    expect(containsTho894(out, 'LensMaker-Apple')).toBe(false);
+    expect(containsTho894(out, '18.1')).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
   it('finds moov after a 64-bit mdat', async () => {
     const mp4 = mp4WithLocationTho894({ mdat64: true, moovAtEnd: true });
     const out = await scrubbedTho894(mp4);
