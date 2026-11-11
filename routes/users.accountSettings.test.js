@@ -90,7 +90,9 @@ describe('PATCH /users/me/password (THO-810)', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ success: true, data: { token: expect.any(String) }, message: 'Password changed' });
     const { where, data } = prisma.user.update.mock.calls[0][0];
-    expect(where).toEqual({ id });
+    // Conditional on the state it read: a reset that lands during the bcrypt
+    // work makes this write fail instead of undoing the reset.
+    expect(where).toEqual({ id, password_changed_at: null });
 
     // Sign in against what was stored.
     prisma.user.findMany.mockResolvedValue([accountSettingsUser(id, { password_hash: data.password_hash })]);
@@ -147,6 +149,32 @@ describe('PATCH /users/me/password (THO-810)', () => {
     const used = await request(app).patch('/users/me/password')
       .set('Authorization', `Bearer ${login.body.token}`).send({});
     expect(used.status).toBe(401);
+  });
+
+  // THO-898 review: a change still in flight from a session a reset has just
+  // ended wrote `where: { id }` after its bcrypt work, undid the reset and got
+  // a fresh token back. The write is now conditional on the state it read.
+  it('does not undo a reset that lands while the change is being worked out, and ends that session', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id, { password_changed_at: null }));
+    prisma.$transaction.mockRejectedValueOnce(Object.assign(new Error('Record to update not found.'), { code: 'P2025' }));
+
+    const res = await request(app).patch('/users/me/password').set(...authHeader({ id, kind: 'login', pwc: 0 }))
+      .send({ currentPassword: CURRENT, newPassword: 'NewPass123' });
+
+    expect(res.status).toBe(401);
+    expect(res.body.data?.token).toBeUndefined();
+    expect(prisma.user.update.mock.calls[0][0].where).toEqual({ id, password_changed_at: null });
+  });
+
+  it('asks a token that is not a session to try again when the state moved under it', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id));
+    prisma.$transaction.mockRejectedValueOnce(Object.assign(new Error('Record to update not found.'), { code: 'P2025' }));
+
+    const res = await changePassword(id, { currentPassword: CURRENT, newPassword: 'NewPass123' });
+
+    expect(res.status).toBe(409);
   });
 
   // A link mailed before the change would put the old state back if used.

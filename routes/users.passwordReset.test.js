@@ -3,7 +3,7 @@ import { createRequire } from 'node:module';
 import crypto from 'node:crypto';
 import request from 'supertest';
 import bcrypt from 'bcrypt';
-import { buildApp, installFakePrisma } from '../test/routeApp.js';
+import { buildApp, installFakePrisma, authHeader } from '../test/routeApp.js';
 
 const prisma = installFakePrisma({
   user: { findUnique: vi.fn(), findFirst: vi.fn(), findMany: vi.fn(), create: vi.fn(), update: vi.fn() },
@@ -261,6 +261,31 @@ describe('POST /users/password/reset', () => {
     expect(await bcrypt.compare(NEW_PASSWORD, data.password_hash)).toBe(true);
     // Answers with no token: a reset signs nobody in.
     expect(res.body.data.token).toBeUndefined();
+  });
+
+  // THO-898: the reset is the flow that ends a thief's session. The token's
+  // state is cached for a minute, so without the forget after the reset the
+  // old session went on working for up to that long; nothing caught it.
+  it('ends a login session at once, though its state was already cached', async () => {
+    const resetSessionUser = 'u-reset-session';
+    let resetSessionChangedAt = null;
+    prisma.user.findUnique.mockImplementation(async () => ({
+      id: resetSessionUser, email: 'held@example.test', role: 'USER', password_changed_at: resetSessionChangedAt,
+    }));
+    const heldSession = authHeader({ id: resetSessionUser, kind: 'login', pwc: 0 });
+    // Fills the cache with "never changed".
+    expect((await request(app).get('/users/me').set(...heldSession)).status).toBe(200);
+
+    prisma.passwordReset.findUnique.mockResolvedValue(live({ user_id: resetSessionUser }));
+    prisma.passwordReset.delete.mockResolvedValue({});
+    prisma.user.update.mockImplementation(async ({ data }) => {
+      resetSessionChangedAt = data.password_changed_at;
+      return {};
+    });
+    expect((await reset({ token: 'reset-token-ends-session', password: NEW_PASSWORD })).status).toBe(200);
+
+    const after = await request(app).get('/users/me').set(...heldSession);
+    expect(after.status).toBe(401);
   });
 
   // THO-898: the time it records is what ends the account's login sessions.

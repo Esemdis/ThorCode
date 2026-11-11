@@ -14,7 +14,7 @@ const { paginationValidation } = require('../utils/validation/pagination');
 const { rateLimiter } = require('../utils/rateLimiter');
 const prisma = require('../prisma/client');
 const signJWT = require('../auth/signJWT');
-const { forgetPasswordChange } = require('../auth/loginRevocation');
+const { forgetPasswordChange, isLoginToken, passwordChangeStamp } = require('../auth/loginRevocation');
 const { sendEmailVerificationCode } = require('../utils/mail');
 // Reached through the module object, not destructured, so a test can replace
 // one sender with vi.spyOn and the route sees the replacement.
@@ -274,6 +274,30 @@ router.get(
 
 // --- Proving the current password (THO-810, THO-898) ----------------------
 
+// A write that changes the password state (a change, an email change) reads
+// the row, works for a while (three bcrypt rounds, about 200 ms, on a
+// change) and then writes. Written `where: { id }`, one still in flight from
+// a session a reset had just ended overwrote the reset and came back with a
+// fresh token that passed every check (THO-898 review). So the write is
+// conditional on the state it read (`update` with `password_changed_at` in
+// its where throws P2025 when that moved), and a login token must still
+// carry that state when the work starts.
+const SESSION_ENDED = 'Your password was changed. Sign in again.';
+const STATE_MOVED = 'Your password was changed while this was being saved. Try again.';
+
+/** Whether a login token was signed against a password state other than this one. */
+const sessionPredates = (req, passwordChangedAt) => isLoginToken(req.user)
+  && req.user.pwc !== passwordChangeStamp(passwordChangedAt);
+
+/**
+ * The answer when the state a request read moved before it wrote: the
+ * session is over for a login token (and concert-map signs out on that 401,
+ * which is right); anything else may simply try again.
+ */
+const stateMovedAnswer = (req, res) => (isLoginToken(req.user)
+  ? response.unauthorized(res, SESSION_ENDED)
+  : response.conflict(res, STATE_MOVED));
+
 const WRONG_CURRENT_PASSWORD = 'Your current password is not right';
 const NO_CURRENT_PASSWORD =
   'This account has no password yet. Sign out and use "Forgot password?" to set one first.';
@@ -472,12 +496,17 @@ router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.non
     // It also counts as a password change (owner decision on THO-898): an
     // address change is how an account is taken over, so it ends the other
     // login sessions the same way.
+    const current = await prisma.user.findUnique({ where: { id: userId }, select: { password_changed_at: true } });
+    if (!current) return response.notFound(res, 'User not found');
+    const readChangedAt = current.password_changed_at ?? null;
+    if (sessionPredates(req, readChangedAt)) return response.unauthorized(res, SESSION_ENDED);
+
     const changedAt = new Date();
     let updated;
     try {
       [updated] = await prisma.$transaction([
         prisma.user.update({
-          where: { id: userId },
+          where: { id: userId, password_changed_at: readChangedAt },
           data: { email: verification.new_email, password_changed_at: changedAt },
           select: { id: true, email: true, role: true },
         }),
@@ -485,6 +514,7 @@ router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.non
       ]);
     } catch (error) {
       if (error.code === UNIQUE_VIOLATION) return response.conflict(res, 'Email already in use');
+      if (error.code === RECORD_NOT_FOUND) return stateMovedAnswer(req, res);
       throw error;
     }
     forgetPasswordChange(userId);
@@ -703,9 +733,11 @@ router.patch(
 
       const user = await prisma.user.findUnique({
         where: { id: req.user.id },
-        select: { id: true, email: true, role: true, password_hash: true },
+        select: { id: true, email: true, role: true, password_hash: true, password_changed_at: true },
       });
       if (!user) return response.notFound(res, 'User not found');
+      const readChangedAt = user.password_changed_at ?? null;
+      if (sessionPredates(req, readChangedAt)) return response.unauthorized(res, SESSION_ENDED);
 
       const refusal = await currentPasswordRefusal(user, currentPassword);
       if (refusal) return response.forbidden(res, refusal);
@@ -719,13 +751,18 @@ router.patch(
       const changedAt = new Date();
       // A reset link mailed before the change would undo it if used later, so
       // it goes with it.
-      await prisma.$transaction([
-        prisma.user.update({
-          where: { id: user.id },
-          data: { password_hash: passwordHash, password_changed_at: changedAt },
-        }),
-        prisma.passwordReset.deleteMany({ where: { user_id: user.id } }),
-      ]);
+      try {
+        await prisma.$transaction([
+          prisma.user.update({
+            where: { id: user.id, password_changed_at: readChangedAt },
+            data: { password_hash: passwordHash, password_changed_at: changedAt },
+          }),
+          prisma.passwordReset.deleteMany({ where: { user_id: user.id } }),
+        ]);
+      } catch (error) {
+        if (error.code === RECORD_NOT_FOUND) return stateMovedAnswer(req, res);
+        throw error;
+      }
       forgetPasswordChange(user.id);
 
       // Signed after the change, so it is the one session that outlives it.
