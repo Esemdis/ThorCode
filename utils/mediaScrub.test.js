@@ -636,3 +636,36 @@ describe('planScrub after the THO-894 review, round 3', () => {
     await expect(planScrub(jpeg)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
   });
 });
+
+// Round 4 of the THO-894 review: an EXIF header a reader accepts and the
+// planner did not. "Exif\0\xFF" planned nothing and went out with its GPS.
+describe('planScrub on a loose EXIF header (THO-894 review, round 4)', () => {
+  const withExifHeaderTho894Round4 = (header) => {
+    const { jpeg } = jpegWithGpsTho894();
+    const exifAt = jpeg.indexOf('Exif\0\0', 0, 'latin1');
+    const out = Buffer.from(jpeg);
+    Buffer.from(header, 'latin1').copy(out, exifAt);
+    return out;
+  };
+
+  it('scrubs EXIF behind "Exif\\0" whatever its sixth byte, as exiftool reads it', async () => {
+    const odd = withExifHeaderTho894Round4('Exif\0\xff');
+    expect(containsTho894(odd, 'SN-1234567890')).toBe(true);
+    const out = await scrubbedTho894(odd);
+    expect(containsTho894(out, 'SN-1234567890')).toBe(false);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('refuses an APP1 a reader could take for EXIF that the planner does not read, rather than call it clean', async () => {
+    // Shifted by one byte: exiftool still finds "Exif\0" within four bytes.
+    const { jpeg } = jpegWithGpsTho894();
+    const exifAt = jpeg.indexOf('Exif\0\0', 0, 'latin1');
+    const shifted = Buffer.from(jpeg);
+    shifted.write('XExif\0', exifAt, 'latin1');
+    await expect(planScrub(shifted)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+    // And "Exif\0" with no TIFF header after it.
+    const noTiff = Buffer.from(jpeg);
+    noTiff.write('Exif\0\0ZZZZ', exifAt, 'latin1');
+    await expect(planScrub(noTiff)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+});

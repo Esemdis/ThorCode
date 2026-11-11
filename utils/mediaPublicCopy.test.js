@@ -271,6 +271,34 @@ describe('ensurePublicCopy', () => {
     expect((await readFile(served)).includes(Buffer.from('SN-1234567890'))).toBe(false);
   });
 
+  // The clean marker held only the version and the size, so under one
+  // checksum key row A's "clean" let row B's same-size file go out unplanned
+  // once B's bytes no longer matched the checksum (THO-894 review, round 4).
+  it('does not let one row\'s clean verdict under a checksum key send another row\'s file unplanned', async () => {
+    const { jpeg } = jpegWithGpsTho894();
+    const cleanBytes = applyPatches(jpeg, await planScrub(jpeg));
+    const a = await sourceTho894('MASTER_CA.jpg', cleanBytes);
+    const b = await sourceTho894('MASTER_CB.jpg', jpeg);
+
+    expect(await ensurePublicCopy({ absPath: a, key: 'cafe-clean.jpg', keyedByContent: true })).toBe(a);
+    const served = await ensurePublicCopy({ absPath: b, key: 'cafe-clean.jpg', keyedByContent: true });
+    expect((await readFile(served)).includes(Buffer.from('SN-1234567890'))).toBe(false);
+  });
+
+  it('does not let one row\'s refusal under a checksum key refuse another row\'s file', async () => {
+    // Same size, so only the marker naming its file tells the two apart. A's
+    // first segment claims to run past the end of the file, which is refused.
+    const broken = Buffer.from(minimalJpegTho894);
+    broken.writeUInt16BE(0xffff, 4);
+    const a = await sourceTho894('MASTER_RA.jpg', broken);
+    const b = await sourceTho894('MASTER_RB.jpg', minimalJpegTho894);
+    expect(await planScrub(minimalJpegTho894)).toEqual([]);
+
+    await expect(ensurePublicCopy({ absPath: a, key: 'cafe-refused.jpg', keyedByContent: true }))
+      .rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+    expect(await ensurePublicCopy({ absPath: b, key: 'cafe-refused.jpg', keyedByContent: true })).toBe(b);
+  });
+
   it('takes the copy back out when its file is deleted just as the copy lands', async () => {
     // The delete unlinks the source before it removes the copies, so a check
     // after the rename either sees the source gone or ran before the delete's

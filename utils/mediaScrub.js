@@ -312,10 +312,21 @@ function planApp11(ctx, payload, end, c2paInstances) {
   if (c2paInstances.has(instance)) fill(ctx, payload, end - payload, 0);
 }
 
+// Readers are looser about the EXIF header than "Exif\0\0": exiftool takes up
+// to four bytes before "Exif\0" and any byte after it. Recognising only the
+// exact header, an APP1 of "Exif\0\xFF" planned nothing, was called clean
+// and went out with its GPS and serial (THO-894 review). So "Exif\0" at the
+// start is planned whatever its sixth byte (planTiff refuses it without a
+// TIFF header), and anything else that a reader could take for EXIF is
+// refused rather than passed through.
+const LOOKS_LIKE_EXIF = /^[\s\S]{0,4}Exif/;
+
 function planApp1(ctx, payload, end) {
   const { buf } = ctx;
-  if (startsWith(buf, payload, end, 'Exif\0\0')) {
+  if (startsWith(buf, payload, end, 'Exif\0')) {
     planTiff(ctx, payload + 6, end);
+  } else if (LOOKS_LIKE_EXIF.test(buf.toString('latin1', payload, Math.min(end, payload + 8)))) {
+    throw unscrubbable('EXIF behind a header this planner does not read');
   } else if (XMP_NAMESPACES.some((ns) => startsWith(buf, payload, end, ns))) {
     // The namespace goes too, so what is left is an APP1 nobody claims, which
     // every reader skips; an XMP header in front of spaces is a broken packet.
