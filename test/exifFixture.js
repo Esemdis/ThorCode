@@ -246,10 +246,15 @@ const u32Tho894 = (v) => { const b = Buffer.alloc(4); b.writeUInt32BE(v); return
  * @param {boolean} [options.moovAtEnd] - moov after mdat, as a phone writes it.
  * @param {Array<[string, string]>} [options.extraAppleKeysTho900] - more mdta
  *   keys and their values, appended after the four above.
+ * @param {Array<[string, string]>} [options.extraUdtaTho894Review] - more
+ *   boxes for moov/udta, as type and payload.
+ * @param {Buffer[]} [options.topLevelTho894Review] - whole boxes appended at
+ *   the end of the file, after everything else.
  * @returns {Buffer}
  */
 export function mp4WithLocationTho894({
   location = true, mdat64 = false, moovAtEnd = true, extraAppleKeysTho900 = [],
+  extraUdtaTho894Review = [], topLevelTho894Review = [],
 } = {}) {
   const ftyp = mp4Box('ftyp', 'isom', u32Tho894(0x200), 'isommp42');
   const media = Buffer.from('frame-data-that-must-never-change'.repeat(4), 'latin1');
@@ -294,11 +299,73 @@ export function mp4WithLocationTho894({
       mp4Box('\xa9mak', Buffer.from([0, 6, 0x15, 0xc7]), 'Google'),
       mp4Box('\xa9mod', Buffer.from([0, 7, 0x15, 0xc7]), 'Pixel 8'),
       mp4Box('\xa9nam', Buffer.from([0, 4, 0x15, 0xc7]), 'Gig!'),
+      ...extraUdtaTho894Review.map(([type, payload]) => mp4Box(type, payload)),
     )
-    : mp4Box('udta', mp4Box('\xa9nam', Buffer.from([0, 4, 0x15, 0xc7]), 'Gig!'));
+    : mp4Box(
+      'udta',
+      mp4Box('\xa9nam', Buffer.from([0, 4, 0x15, 0xc7]), 'Gig!'),
+      ...extraUdtaTho894Review.map(([type, payload]) => mp4Box(type, payload)),
+    );
   const moov = mp4Box('moov', mvhd, mp4Box('trak', tkhd), udta, ...(location ? [appleMeta] : []));
   const xmp = location
     ? [mp4Box('uuid', Buffer.from('be7acfcb97a942e89c71999491e3afac', 'hex'), '<x:xmpmeta>59,54.08N</x:xmpmeta>')]
     : [];
-  return Buffer.concat(moovAtEnd ? [ftyp, ...xmp, mdat, moov] : [ftyp, moov, ...xmp, mdat]);
+  return Buffer.concat([
+    ...(moovAtEnd ? [ftyp, ...xmp, mdat, moov] : [ftyp, moov, ...xmp, mdat]),
+    ...topLevelTho894Review,
+  ]);
+}
+
+/** One MP4 box, for a test that builds its own (THO-894 review fixes). */
+export const mp4BoxTho894Review = mp4Box;
+
+/**
+ * A TIFF block from a list of directories, for the THO-894 review fixes: any
+ * tag, any type, pointers between directories and a chain of IFDs.
+ *
+ * @param {Array<Array<{tag: number, type: number, value?: Buffer, pointer?: number}>>} ifds
+ *   - `pointer` is the index of the directory a LONG entry points at.
+ * @param {{little?: boolean, next?: Record<number, number>}} [options] - `next`
+ *   maps a directory's index to the index of the one its next pointer names.
+ * @returns {{tiff: Buffer, dirAt: number[], valueAt: Map<object, number>}}
+ */
+export function tiffFromIfdsTho894Review(ifds, { little = true, next = {} } = {}) {
+  const width = {
+    1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1,
+  };
+  const dirAt = [];
+  let cursor = 8;
+  for (const entries of ifds) { dirAt.push(cursor); cursor += 2 + entries.length * 12 + 4; }
+  const valueAt = new Map();
+  for (const entries of ifds) {
+    for (const e of entries) {
+      if (e.value && e.value.length > 4) { valueAt.set(e, cursor); cursor += e.value.length + (e.value.length & 1); }
+    }
+  }
+  const out = Buffer.alloc(cursor);
+  const w16 = (at, v) => (little ? out.writeUInt16LE(v, at) : out.writeUInt16BE(v, at));
+  const w32 = (at, v) => (little ? out.writeUInt32LE(v, at) : out.writeUInt32BE(v, at));
+  out.write(little ? 'II' : 'MM', 0, 'latin1');
+  w16(2, 42);
+  w32(4, dirAt[0]);
+  ifds.forEach((entries, d) => {
+    w16(dirAt[d], entries.length);
+    entries.forEach((e, i) => {
+      const entry = dirAt[d] + 2 + i * 12;
+      w16(entry, e.tag);
+      w16(entry + 2, e.type);
+      if (e.pointer !== undefined) {
+        w32(entry + 4, 1);
+        w32(entry + 8, dirAt[e.pointer]);
+        return;
+      }
+      w32(entry + 4, e.value.length / width[e.type]);
+      if (!valueAt.has(e)) { e.value.copy(out, entry + 8); valueAt.set(e, entry + 8); } else {
+        w32(entry + 8, valueAt.get(e));
+        e.value.copy(out, valueAt.get(e));
+      }
+    });
+    w32(dirAt[d] + 2 + entries.length * 12, next[d] === undefined ? 0 : dirAt[next[d]]);
+  });
+  return { tiff: out, dirAt, valueAt };
 }

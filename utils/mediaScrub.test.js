@@ -5,6 +5,7 @@ import {
 import { exifCapturedAt } from './exifCapturedAt.js';
 import {
   jpegWithGpsTho894, buildExifWithGpsTho894, minimalJpegTho894, mp4WithLocationTho894, xmpApp1Tho894,
+  jpegWithExif, tiffFromIfdsTho894Review, mp4BoxTho894Review,
 } from '../test/exifFixture.js';
 
 // THO-894: what a stranger's copy of a file must not carry, cut out by
@@ -251,5 +252,196 @@ describe('planScrub refusing', () => {
     other.write('http://example.com/other/1.0/', 4, 'latin1');
     const jpeg = Buffer.concat([minimalJpegTho894.subarray(0, 2), other, minimalJpegTho894.subarray(2)]);
     expect(await planScrub(jpeg)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The THO-894 review fixes: owner names beyond the ticket's list, places the
+// first walk did not look, and limits that turn a hostile file into a refusal.
+
+const asciiTho894Review = (text) => Buffer.from(`${text}\0`, 'latin1');
+const shortTho894Review = (v) => { const b = Buffer.alloc(2); b.writeUInt16LE(v); return b; };
+const u32Tho894Review = (v) => { const b = Buffer.alloc(4); b.writeUInt32BE(v); return b; };
+
+describe('planScrub after the THO-894 review', () => {
+  it('blanks the copyright, the host computer, the Windows author and an XMP or IPTC tag inside EXIF', async () => {
+    const { tiff } = tiffFromIfdsTho894Review([[
+      { tag: 0x0112, type: 3, value: shortTho894Review(6) },
+      { tag: 0x013c, type: 2, value: asciiTho894Review('HostComputer-iPhone 15 Pro') },
+      { tag: 0x02bc, type: 1, value: Buffer.from('<x:xmpmeta>XMP-in-TIFF 59,54.08N</x:xmpmeta>', 'latin1') },
+      { tag: 0x8298, type: 2, value: asciiTho894Review('Copyright Owner-Name') },
+      { tag: 0x83bb, type: 7, value: Buffer.from('IPTC-City-Oslo-Grunerlokka', 'latin1') },
+      { tag: 0x9c9d, type: 1, value: Buffer.from('XPAuthor-Name\0', 'utf16le') },
+    ]]);
+    const jpeg = jpegWithExif(minimalJpegTho894, tiff);
+    const out = await scrubbedTho894(jpeg);
+    for (const gone of ['HostComputer-iPhone', 'XMP-in-TIFF', 'Owner-Name', 'IPTC-City']) {
+      expect(containsTho894(out, gone)).toBe(false);
+    }
+    expect(out.includes(Buffer.from('XPAuthor', 'utf16le'))).toBe(false);
+    // Orientation is the one thing in that directory a viewer needs.
+    expect(out.includes(Buffer.from([0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00]))).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('empties a GPS directory that the second IFD points at, not only one the first does', async () => {
+    const latitude = Buffer.alloc(24, 0x11);
+    const { tiff, dirAt } = tiffFromIfdsTho894Review([
+      [{ tag: 0x0112, type: 3, value: shortTho894Review(1) }],
+      [{ tag: 0x8825, type: 4, pointer: 2 }],
+      [{ tag: 0x0002, type: 5, value: latitude }],
+    ], { next: { 0: 1 } });
+    const jpeg = jpegWithExif(minimalJpegTho894, tiff);
+    const tiffAt = jpeg.indexOf('Exif\0\0', 0, 'latin1') + 6;
+    const out = await scrubbedTho894(jpeg);
+    expect(out.readUInt16LE(tiffAt + dirAt[2])).toBe(0);
+    expect(out.includes(latitude)).toBe(false);
+  });
+
+  it('treats a PNG Author or Copyright like the EXIF owner fields, and an IPTC raw profile like XMP', async () => {
+    const png = Buffer.concat([
+      PNG_SIGNATURE_THO894, IHDR_THO894,
+      pngChunkTho894('tEXt', Buffer.from('Author\0PNG-Author-Name', 'latin1')),
+      pngChunkTho894('iTXt', Buffer.from('Copyright\0\0\0\0\0PNG-Copyright-Name', 'latin1')),
+      pngChunkTho894('tEXt', Buffer.from('Raw profile type iptc\0\niptc\n 4\n4f736c6f\n', 'latin1')),
+      pngChunkTho894('tEXt', Buffer.from('Title\0Gojira, Oslo', 'latin1')),
+      IDAT_THO894, IEND_THO894,
+    ]);
+    const out = await scrubbedTho894(png);
+    for (const gone of ['PNG-Author-Name', 'PNG-Copyright-Name', '4f736c6f']) {
+      expect(containsTho894(out, gone)).toBe(false);
+    }
+    expect(containsTho894(out, 'Gojira, Oslo')).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('neutralises the author and the copyright in an MP4, and Android\'s manufacturer key', async () => {
+    const mp4 = mp4WithLocationTho894({
+      extraUdtaTho894Review: [
+        ['\xa9aut', 'udta-aut-Owner'], ['\xa9ART', 'udta-ART-Owner'], ['auth', 'udta-auth-Owner'],
+        ['\xa9cpy', 'udta-cpy-Owner'], ['cprt', 'udta-cprt-Owner'],
+      ],
+      extraAppleKeysTho900: [
+        ['com.apple.quicktime.author', 'mdta-author-Owner'],
+        ['com.apple.quicktime.artist', 'mdta-artist-Owner'],
+        ['com.apple.quicktime.copyright', 'mdta-copyright-Owner'],
+        ['com.android.manufacturer', 'mdta-manufacturer-Samsung'],
+      ],
+    });
+    const out = await scrubbedTho894(mp4);
+    expect(out.length).toBe(mp4.length);
+    for (const gone of ['udta-aut', 'udta-ART', 'udta-auth', 'udta-cpy', 'udta-cprt',
+      'mdta-author', 'mdta-artist', 'mdta-copyright', 'mdta-manufacturer']) {
+      expect(containsTho894(out, gone)).toBe(false);
+    }
+    expect(containsTho894(out, 'Gig!')).toBe(true);
+    expect(containsTho894(out, '18.1')).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('searches a file-level meta and a movie fragment the way it searches moov', async () => {
+    const box = mp4BoxTho894Review;
+    const key = (name) => Buffer.concat([u32Tho894Review(name.length + 8), Buffer.from('mdta', 'latin1'), Buffer.from(name, 'latin1')]);
+    const item = box('xxxx', box('data', u32Tho894Review(1), u32Tho894Review(0), 'file-meta +48.85+002.35/'));
+    item.writeUInt32BE(1, 4);
+    const fileMeta = box(
+      'meta',
+      u32Tho894Review(0),
+      box('hdlr', u32Tho894Review(0), u32Tho894Review(0), 'mdta', Buffer.alloc(12), '\0'),
+      box('keys', u32Tho894Review(0), u32Tho894Review(1), key('com.apple.quicktime.location.ISO6709')),
+      box('ilst', item),
+    );
+    const moof = box(
+      'moof',
+      box('mfhd', Buffer.alloc(8)),
+      box('traf', box('udta', box('\xa9xyz', Buffer.from([0, 18, 0x15, 0xc7]), 'fragment +51.50-000.12/'))),
+    );
+    const mp4 = mp4WithLocationTho894({ location: false, topLevelTho894Review: [fileMeta, moof] });
+    const out = await scrubbedTho894(mp4);
+    expect(containsTho894(out, 'file-meta +48.85')).toBe(false);
+    expect(containsTho894(out, 'fragment +51.50')).toBe(false);
+    expect(out.length).toBe(mp4.length);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('refuses a file-level meta whose items live somewhere it does not read', async () => {
+    // An `iloc` points at item data (an Exif item, say) elsewhere in the file,
+    // usually in mdat, which is never read: "nothing found" would be a guess.
+    const box = mp4BoxTho894Review;
+    const fileMeta = box(
+      'meta',
+      u32Tho894Review(0),
+      box('hdlr', u32Tho894Review(0), u32Tho894Review(0), 'pict', Buffer.alloc(12), '\0'),
+      box('iloc', Buffer.alloc(8)),
+    );
+    const mp4 = mp4WithLocationTho894({ location: false, topLevelTho894Review: [fileMeta] });
+    await expect(planScrub(mp4)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
+  it('refuses an EXIF chain longer than any camera writes, rather than walk it', async () => {
+    // A WebP or PNG EXIF chunk is not capped at 64 KB as a JPEG APP1 is: a
+    // chain of sixteen million empty IFDs held the event loop for seconds.
+    const ifds = Array.from({ length: 40 }, () => []);
+    const next = Object.fromEntries(ifds.slice(1).map((_, i) => [i, i + 1]));
+    const { tiff } = tiffFromIfdsTho894Review(ifds, { next });
+    await expect(planScrub(jpegWithExif(minimalJpegTho894, tiff))).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
+  it('refuses an EXIF block that asks for more blanking than the file holds', async () => {
+    // Five hundred Make entries all pointing at one value: each would have been
+    // its own zeroed copy, which at 256 MB is the whole heap many times over.
+    const value = Buffer.alloc(4096, 0x41);
+    const shared = { tag: 0x010f, type: 2, value };
+    const { tiff, valueAt } = tiffFromIfdsTho894Review([[shared]]);
+    const many = Buffer.alloc(tiff.length + 500 * 12);
+    tiff.copy(many);
+    // Rewrite IFD0 as 500 copies of the entry, values after them.
+    const dir = 8;
+    many.writeUInt16LE(500, dir);
+    const valuesAt = dir + 2 + 500 * 12 + 4;
+    for (let i = 0; i < 500; i += 1) {
+      const entry = dir + 2 + i * 12;
+      many.writeUInt16LE(0x010f, entry);
+      many.writeUInt16LE(2, entry + 2);
+      many.writeUInt32LE(value.length, entry + 4);
+      many.writeUInt32LE(valuesAt, entry + 8);
+    }
+    many.writeUInt32LE(0, dir + 2 + 500 * 12);
+    value.copy(many, valuesAt);
+    expect(valueAt.size).toBe(1);
+    const block = many.subarray(0, valuesAt + value.length);
+    await expect(planScrub(jpegWithExif(minimalJpegTho894, block))).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
+  it('refuses more patches than any real file needs', async () => {
+    // Two million empty ©xyz boxes made two million patches and 356 MB of heap.
+    const xyz = mp4BoxTho894Review('\xa9xyz', 'x');
+    const many = mp4BoxTho894Review('udta', Buffer.concat(Array.from({ length: 6000 }, () => xyz)));
+    const mp4 = mp4WithLocationTho894({ location: false, extraUdtaTho894Review: [] });
+    const moovAt = mp4.lastIndexOf(Buffer.from('moov', 'latin1')) - 4;
+    const grown = Buffer.concat([mp4.subarray(0, moovAt + 8), many, mp4.subarray(moovAt + 8)]);
+    grown.writeUInt32BE(grown.readUInt32BE(moovAt) + many.length, moovAt);
+    await expect(planScrub(grown)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
+  it('refuses boxes nested deeper than any MP4 nests them, as a refusal rather than a crash', async () => {
+    // 100,000 nested udta boxes overflowed the stack: a RangeError and a 500
+    // where every other refusal is a quiet 404.
+    const depth = 100000;
+    const nest = Buffer.alloc(depth * 8);
+    for (let i = 0; i < depth; i += 1) {
+      nest.writeUInt32BE((depth - i) * 8, i * 8);
+      nest.write('udta', i * 8 + 4, 'latin1');
+    }
+    const mp4 = mp4WithLocationTho894({ location: false });
+    const moovAt = mp4.lastIndexOf(Buffer.from('moov', 'latin1')) - 4;
+    const grown = Buffer.concat([mp4.subarray(0, moovAt + 8), nest, mp4.subarray(moovAt + 8)]);
+    grown.writeUInt32BE(grown.readUInt32BE(moovAt) + nest.length, moovAt);
+    await expect(planScrub(grown)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
+  it('refuses a JPEG that carries more images than any phone appends', async () => {
+    const many = Buffer.concat(Array.from({ length: 100 }, () => minimalJpegTho894));
+    await expect(planScrub(many)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
   });
 });

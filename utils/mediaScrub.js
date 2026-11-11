@@ -31,21 +31,67 @@
 const { open } = require('node:fs/promises');
 const { TYPE_BYTES, readHeader } = require('./exifCapturedAt');
 
+/**
+ * What this planner knows how to strip. mediaPublicCopy.js writes it into
+ * every verdict it caches, so a copy made, or a file called clean, by an older
+ * planner is looked at again rather than trusted. Bump it whenever the planner
+ * learns to remove something it used to leave (THO-899, say): without that,
+ * every file a share link had already served would keep its old verdict until
+ * someone emptied cache/public by hand.
+ */
+const SCRUB_VERSION = 1;
+
 function unscrubbable(reason) {
   const err = new Error(`cannot scrub: ${reason}`);
   err.code = 'UNSCRUBBABLE';
   return err;
 }
 
+// Far above anything a real file needs — a phone JPEG plans about ten patches,
+// a phone video a dozen — and low enough that a file made of millions of tiny
+// boxes is a refusal rather than millions of patch objects in the heap.
+const MAX_PATCHES = 10000;
+
+/**
+ * The limits one file's planning shares across every block it walks.
+ *
+ * `bytes` is how much may be blanked in all, and it is the file's own size:
+ * real metadata values never overlap, so a plan can only exceed it when many
+ * entries point at the same bytes — five hundred EXIF entries at one 200 MB
+ * value were five hundred 200 MB copies. Charged before anything is allocated.
+ */
+const budgetFor = (size) => ({ bytes: size, patches: 0 });
+
+function charge(ctx, length) {
+  ctx.budget.bytes -= length;
+  if (ctx.budget.bytes < 0) throw unscrubbable('more to blank than the file holds');
+}
+
+function push(ctx, at, bytes) {
+  ctx.budget.patches += 1;
+  if (ctx.budget.patches > MAX_PATCHES) throw unscrubbable('more patches than any real file needs');
+  ctx.out.push({ offset: ctx.base + at, bytes });
+}
+
 // A patch is only planned when it changes something, so a scrubbed file plans
 // to nothing — the re-check after patching depends on that.
 function put(ctx, at, bytes) {
   if (at < 0 || at + bytes.length > ctx.buf.length) throw unscrubbable('patch outside the file');
+  charge(ctx, bytes.length);
   if (ctx.buf.compare(bytes, 0, bytes.length, at, at + bytes.length) === 0) return;
-  ctx.out.push({ offset: ctx.base + at, bytes: Buffer.from(bytes) });
+  push(ctx, at, Buffer.from(bytes));
 }
 
-const fill = (ctx, at, length, byte) => put(ctx, at, Buffer.alloc(length, byte));
+// The same for a run of one byte, checked before the run is allocated: a
+// region that is already blank costs nothing but the look.
+function fill(ctx, at, length, byte) {
+  if (at < 0 || at + length > ctx.buf.length) throw unscrubbable('patch outside the file');
+  charge(ctx, length);
+  let i = at;
+  while (i < at + length && ctx.buf[i] === byte) i += 1;
+  if (i === at + length) return;
+  push(ctx, at, Buffer.alloc(length, byte));
+}
 
 // ---------------------------------------------------------------------------
 // EXIF (a TIFF block), shared by JPEG, PNG and WebP.
@@ -61,6 +107,11 @@ const BLANK_TAGS = new Set([
   0x010f, // Make
   0x0110, // Model
   0x013b, // Artist
+  0x013c, // HostComputer — Apple writes the phone's model here on edited shots
+  0x02bc, // XMLPacket — XMP kept inside the EXIF block instead of its own APP1
+  0x8298, // Copyright — usually the owner's name
+  0x83bb, // IPTC-NAA — IPTC inside the EXIF block: city, sub-location, by-line
+  0x9c9d, // XPAuthor — Windows' author field, UTF-16
   0x927c, // MakerNote — Apple and Samsung keep location and serials in here too
   0xa420, // ImageUniqueID
   0xa430, // CameraOwnerName
@@ -77,6 +128,10 @@ const SCRUB_TYPE_BYTES = { ...TYPE_BYTES, 13: 4 };
 // As in exifCapturedAt: a real IFD holds a few dozen entries.
 const MAX_IFD_ENTRIES = 512;
 const ENTRY_BYTES = 12;
+// A camera writes two to four directories: IFD0, the thumbnail's IFD1, Exif
+// and GPS. A PNG or WebP EXIF chunk is not capped at 64 KB as an APP1 is, and
+// a chain of sixteen million empty IFDs held the event loop for eight seconds.
+const MAX_IFDS = 32;
 
 /**
  * Plan the patches for one TIFF block that runs from `start` to `end` in
@@ -108,6 +163,7 @@ function planTiff(ctx, start, end) {
   function readDir(off) {
     if (seen.has(off)) throw unscrubbable('EXIF directories loop');
     seen.add(off);
+    if (seen.size > MAX_IFDS) throw unscrubbable('more EXIF directories than any camera writes');
     const base = at(off, 2);
     const count = r16(base);
     if (count > MAX_IFD_ENTRIES) throw unscrubbable('EXIF directory too large');
@@ -161,24 +217,33 @@ function planTiff(ctx, start, end) {
     put(ctx, dir.base, w16(0));
   }
 
-  let off = ifd0;
-  let first = true;
-  while (off !== 0) {
-    const dir = readDir(off);
+  // The Exif and GPS pointers are followed from every directory, not only
+  // IFD0 where the standard puts them: a GPS directory reached from IFD1 is
+  // just as readable to anyone who looks. Two pointers to one GPS directory
+  // empty it once; a GPS pointer at a directory already read as something
+  // else is a loop, and refused like one.
+  const emptied = new Set();
+  function visit(dir) {
     blankIn(dir);
-    if (first) {
-      for (const e of dir.entries) {
-        if (e.unmeasured) continue;
-        if (e.tag === TAG_EXIF_IFD) {
-          const subOff = pointer(e);
-          if (subOff !== 0) blankIn(readDir(subOff));
-        } else if (e.tag === TAG_GPS_IFD) {
-          const gpsOff = pointer(e);
-          if (gpsOff !== 0) emptyGps(gpsOff);
+    for (const e of dir.entries) {
+      if (e.unmeasured) continue;
+      if (e.tag === TAG_EXIF_IFD) {
+        const subOff = pointer(e);
+        if (subOff !== 0 && !seen.has(subOff)) visit(readDir(subOff));
+      } else if (e.tag === TAG_GPS_IFD) {
+        const gpsOff = pointer(e);
+        if (gpsOff !== 0 && !emptied.has(gpsOff)) {
+          emptied.add(gpsOff);
+          emptyGps(gpsOff);
         }
       }
     }
-    first = false;
+  }
+
+  let off = ifd0;
+  while (off !== 0) {
+    const dir = readDir(off);
+    visit(dir);
     off = dir.next;
   }
 }
@@ -212,12 +277,14 @@ function planApp1(ctx, payload, end) {
 // Past a scan's entropy-coded data to the next marker. Inside it a 0xFF is
 // either stuffed (FF 00), a restart marker (FF D0–D7) or fill before the next
 // real marker.
+// indexOf rather than a byte loop: the scan is nearly all of a photograph,
+// and native search is many times faster over tens of megabytes.
 function skipEntropy(buf, pos) {
-  for (let i = pos; i < buf.length - 1; i += 1) {
-    if (buf[i] !== 0xff) continue;
+  let i = buf.indexOf(0xff, pos);
+  while (i >= 0 && i < buf.length - 1) {
     const next = buf[i + 1];
-    if (next === 0x00 || (next >= 0xd0 && next <= 0xd7) || next === 0xff) continue;
-    return i;
+    if (!(next === 0x00 || (next >= 0xd0 && next <= 0xd7) || next === 0xff)) return i;
+    i = buf.indexOf(0xff, i + 1);
   }
   throw unscrubbable('JPEG ends inside a scan');
 }
@@ -247,10 +314,14 @@ function planOneJpeg(ctx, start) {
 // gain map a current phone appends. Each carries its own APP1, and an Apple
 // gain map's has been seen with the same EXIF as the primary.
 const NEXT_JPEG = Buffer.from([0xff, 0xd8, 0xff]);
+// A phone appends one to three (MPF secondaries, a gain map). A file of
+// millions of four-byte JPEGs would otherwise be millions of walks.
+const MAX_JPEG_IMAGES = 64;
 
 function planJpeg(ctx) {
   let pos = 0;
-  for (;;) {
+  for (let images = 1; ; images += 1) {
+    if (images > MAX_JPEG_IMAGES) throw unscrubbable('more images in one JPEG than any phone writes');
     pos = planOneJpeg(ctx, pos);
     const next = ctx.buf.indexOf(NEXT_JPEG, pos);
     if (next < 0) return;
@@ -277,9 +348,11 @@ function crc32(buf) {
   return (c ^ 0xffffffff) >>> 0;
 }
 
-// Text chunks that are metadata blocks in disguise: XMP, and the "raw profile"
-// chunks ImageMagick and exiftool write EXIF and XMP into as hex.
-const PNG_METADATA_KEYWORD = /^(XML:com\.adobe\.xmp|Raw profile type (exif|xmp|app1))$/i;
+// Text chunks that are metadata blocks in disguise — XMP, and the "raw
+// profile" chunks ImageMagick and exiftool write EXIF, XMP and IPTC into as
+// hex — and the two standard keywords that name a person, as EXIF's Artist
+// and Copyright do.
+const PNG_METADATA_KEYWORD = /^(XML:com\.adobe\.xmp|Raw profile type (exif|xmp|app1|iptc|8bim)|Author|Copyright)$/i;
 const PNG_TEXT_CHUNKS = new Set(['tEXt', 'iTXt', 'zTXt']);
 
 // A private, ancillary, safe-to-copy chunk type that no reader interprets: the
@@ -297,7 +370,9 @@ function planPng(ctx) {
     const dataEnd = data + length;
     if (length > 0x7fffffff || dataEnd + 4 > buf.length) throw unscrubbable('PNG chunk overruns the file');
 
-    const chunk = { buf, base: ctx.base, out: [] };
+    // Its own list, so a changed chunk's CRC can be recomputed from just its
+    // patches; the limits are the file's.
+    const chunk = { buf, base: ctx.base, out: [], budget: ctx.budget };
     if (type === 'eXIf') {
       planTiff(chunk, exifPrefixed(buf, data, dataEnd), dataEnd);
     } else if (PNG_TEXT_CHUNKS.has(type)) {
@@ -348,26 +423,41 @@ function planWebp(ctx) {
 // ---------------------------------------------------------------------------
 // MP4 / QuickTime
 
-// Renamed to `free` and zeroed wherever they are found under moov: the
-// location (QuickTime's ©xyz, 3GPP's loci), the camera (©mak, ©mod) and the
-// QuickTime XMP box.
-const MP4_NEUTRALISE = new Set(['\xa9xyz', 'loci', '\xa9mak', '\xa9mod', 'XMP_']);
-// The boxes that can hold one of those somewhere below them.
-const MP4_CONTAINERS = new Set(['moov', 'trak', 'mdia', 'udta']);
+// Renamed to `free` and zeroed wherever they are found below moov, moof or a
+// file-level meta: the location (QuickTime's ©xyz, 3GPP's loci), the camera
+// (©mak, ©mod), the person (QuickTime's ©aut and ©ART, 3GPP's auth; the
+// copyright, ©cpy and cprt, which is usually the owner's name, as EXIF's is)
+// and the QuickTime XMP box.
+const MP4_NEUTRALISE = new Set([
+  '\xa9xyz', 'loci', '\xa9mak', '\xa9mod', '\xa9aut', '\xa9ART', 'auth', '\xa9cpy', 'cprt', 'XMP_',
+]);
+// The boxes that can hold one of those somewhere below them. A fragmented
+// MP4's moof and traf may carry their own udta and meta.
+const MP4_CONTAINERS = new Set(['moov', 'trak', 'mdia', 'udta', 'moof', 'traf']);
+// Inside an ISO meta: an XML box can be the XMP packet itself.
+const META_NEUTRALISE = new Set(['xml ', 'bxml']);
+// Item boxes: the meta lists items whose bytes live somewhere else, usually in
+// mdat, which is never read. An Exif item there would go out untouched.
+const META_ITEMS = new Set(['iloc', 'iinf', 'idat']);
+// MP4 nests about eight levels at most. A file of a hundred thousand nested
+// udta boxes overflowed the stack: a 500, not the 404 every refusal is.
+const MAX_BOX_DEPTH = 32;
 // Adobe's XMP box, as a uuid box's user type.
 const XMP_UUID = Buffer.from('be7acfcb97a942e89c71999491e3afac', 'hex');
 const FREE = Buffer.from('free', 'latin1');
 
-// mdta keys that say where or with what: Apple's ISO 6709 position and its
-// accuracy, the body and the phone's model. Matched loosely rather than by
-// Apple's names alone, because ffmpeg with `use_metadata_tags` writes the same
-// position under plain keys (`location`, `location-eng`) — measured on a file
-// re-muxed that way, which kept its coordinates under an exact match. The
-// make/model match is unanchored on purpose: an iPhone also writes
-// `camera.lens_model` ("iPhone 15 Pro back triple camera …"), and a match on
-// `.model` let that through (THO-900).
+// mdta keys that say where, with what or whose: Apple's ISO 6709 position and
+// its accuracy, the body and the phone's model, and the author, artist and
+// copyright. Matched loosely rather than by Apple's names alone, because
+// ffmpeg with `use_metadata_tags` writes the same position under plain keys
+// (`location`, `location-eng`) — measured on a file re-muxed that way, which
+// kept its coordinates under an exact match. The make/model match is
+// unanchored on purpose: an iPhone also writes `camera.lens_model` ("iPhone 15
+// Pro back triple camera …"), and a match on `.model` let that through
+// (THO-900). Android names its maker `manufacturer`, which `make$` misses.
 const isSensitiveAppleKey = (name) => /location/i.test(name)
-  || /(make|model)$/i.test(name);
+  || /(make|model|manufacturer)$/i.test(name)
+  || /(author|artist|copyright)$/i.test(name);
 
 // Big enough for a long recording's sample tables, small enough that a
 // corrupt size is a refusal rather than an attempt to read gigabytes into
@@ -437,7 +527,7 @@ function readAppleKeys(buf, box) {
   return names;
 }
 
-function planMeta(ctx, box) {
+function planMeta(ctx, box, depth) {
   const { buf } = ctx;
   let start = box.at + box.headerLen;
   if (start === box.end) return;
@@ -449,6 +539,7 @@ function planMeta(ctx, box) {
 
   const children = [];
   walkBoxes(ctx, start, box.end, (child) => children.push(child));
+  if (children.some((c) => META_ITEMS.has(c.type))) throw unscrubbable('MP4 meta with items stored elsewhere');
   const hdlr = children.find((c) => c.type === 'hdlr');
   const handler = hdlr && hdlr.end - hdlr.at >= hdlr.headerLen + 12
     ? buf.toString('latin1', hdlr.at + hdlr.headerLen + 8, hdlr.at + hdlr.headerLen + 12)
@@ -468,8 +559,10 @@ function planMeta(ctx, box) {
           if (name === undefined) throw unscrubbable('MP4 ilst item without a key');
           if (isSensitiveAppleKey(name)) neutralise(ctx, item);
         });
+      } else if (META_NEUTRALISE.has(child.type)) {
+        neutralise(ctx, child);
       } else if (child.type !== 'keys') {
-        planMoovChildren(ctx, child.at, child.end, child);
+        planMoovChildren(ctx, child.at, child.end, child, depth + 1);
       }
     }
     return;
@@ -477,32 +570,40 @@ function planMeta(ctx, box) {
   for (const child of children) {
     // An iTunes-style list's items are named boxes, so a ©mak in one is found
     // by its name like anywhere else.
-    if (child.type === 'ilst') planMoovChildren(ctx, child.at + child.headerLen, child.end);
-    else planMoovChildren(ctx, child.at, child.end, child);
+    if (child.type === 'ilst') planMoovChildren(ctx, child.at + child.headerLen, child.end, null, depth + 1);
+    else if (META_NEUTRALISE.has(child.type)) neutralise(ctx, child);
+    else planMoovChildren(ctx, child.at, child.end, child, depth + 1);
   }
 }
 
 // One box, or the run of boxes from start to end, below moov.
-function planMoovChildren(ctx, start, end, single = null) {
+function planMoovChildren(ctx, start, end, single = null, depth = 0) {
+  if (depth > MAX_BOX_DEPTH) throw unscrubbable('MP4 boxes nested deeper than any file nests them');
   const visit = (box) => {
     if (box.type === 'cmov') throw unscrubbable('compressed MP4 header');
     if (MP4_NEUTRALISE.has(box.type)) return neutralise(ctx, box);
     if (box.type === 'uuid') return isXmpUuid(ctx.buf, box) ? neutralise(ctx, box) : undefined;
-    if (box.type === 'meta') return planMeta(ctx, box);
-    if (MP4_CONTAINERS.has(box.type)) planMoovChildren(ctx, box.at + box.headerLen, box.end);
+    if (box.type === 'meta') return planMeta(ctx, box, depth + 1);
+    if (MP4_CONTAINERS.has(box.type)) planMoovChildren(ctx, box.at + box.headerLen, box.end, null, depth + 1);
     return undefined;
   };
   if (single) visit(single);
   else walkBoxes(ctx, start, end, visit);
 }
 
+// Top-level boxes read in whole and searched like moov: the movie header, a
+// file-level ISO meta, a fragmented file's moof (which can carry its own udta
+// and meta), and a stray top-level udta.
+const MP4_READ_WHOLE = new Set(['moov', 'meta', 'moof', 'udta']);
+
 /**
  * The top level is walked off the file, not out of memory: `mdat` is most of
- * a video and the only part that is never needed. `moov`, and a top-level XMP
- * uuid box, are read in whole.
+ * a video and the only part that is never needed. The boxes above, and a
+ * top-level XMP uuid box, are read in whole.
  */
 async function planMp4(source) {
   const out = [];
+  const budget = budgetFor(source.size);
   let pos = 0;
   let sawMoov = false;
   while (pos < source.size) {
@@ -521,20 +622,20 @@ async function planMp4(source) {
     if (size < headerLen || size > left) throw unscrubbable('MP4 box overruns the file');
     const type = head.toString('latin1', 4, 8);
 
-    const readWhole = type === 'moov'
+    const readWhole = MP4_READ_WHOLE.has(type)
       || (type === 'uuid' && head.length >= headerLen + 16
         && head.compare(XMP_UUID, 0, 16, headerLen, headerLen + 16) === 0);
     if (readWhole) {
       if (size > MAX_MOOV_BYTES) throw unscrubbable(`MP4 ${type} too large`);
       const buf = await source.read(pos, size);
-      const ctx = { buf, base: pos, out };
+      const ctx = {
+        buf, base: pos, out, budget,
+      };
       const box = { at: 0, type, headerLen, end: size };
-      if (type === 'moov') {
-        sawMoov = true;
-        planMoovChildren(ctx, headerLen, size);
-      } else {
-        neutralise(ctx, box);
-      }
+      if (type === 'moov') sawMoov = true;
+      if (type === 'uuid') neutralise(ctx, box);
+      else if (type === 'meta') planMeta(ctx, box, 0);
+      else planMoovChildren(ctx, headerLen, size);
     }
     pos += size;
   }
@@ -573,7 +674,9 @@ async function planSource(source) {
   if (!format) throw unscrubbable('unrecognised format');
   if (format === 'mp4') return planMp4(source);
   if (source.size > MAX_IMAGE_BYTES) throw unscrubbable('image too large');
-  const ctx = { buf: await source.read(0, source.size), base: 0, out: [] };
+  const ctx = {
+    buf: await source.read(0, source.size), base: 0, out: [], budget: budgetFor(source.size),
+  };
   IMAGE_PLANNERS[format](ctx);
   return ctx.out;
 }
@@ -624,5 +727,5 @@ function applyPatches(buf, patches) {
 }
 
 module.exports = {
-  planScrub, planScrubFile, applyPatches, crc32, XMP_UUID,
+  planScrub, planScrubFile, applyPatches, crc32, XMP_UUID, SCRUB_VERSION,
 };
