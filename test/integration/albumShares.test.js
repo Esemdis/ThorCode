@@ -161,4 +161,35 @@ describe.skipIf(!url)('album share links', () => {
     const again = await share(owner.user.id, [a1.id, a2.id]).expect(200);
     expect(again.body.data.token).not.toBe(token);
   });
+  it('mints a link to the other night rather than widening this one\'s, once a show\'s date was corrected (THO-895)', async () => {
+    const owner = await makeAlbumUser('tho895');
+    const showOnTho895 = (venue, day) => prisma.concert.create({
+      data: {
+        country: COUNTRY, city: `${RUN} Oslo`, venue, created_at: new Date(), on_sale: false,
+        concert_date: new Date(`${day}T19:00:00Z`),
+      },
+    });
+    const attendTho895 = (concert) => prisma.concertAttendance.create({
+      data: { wishlist_id: owner.wishlist.id, concert_id: concert.id },
+    });
+    const main = await showOnTho895('Main Stage', '2026-06-12');
+    const tent = await showOnTho895('Tent', '2026-06-12');
+    const nextDay = await showOnTho895('Club', '2026-06-13');
+    const a1 = await attendTho895(main);
+    const a2 = await attendTho895(tent);
+    const a3 = await attendTho895(nextDay);
+
+    const nightA = (await share(owner.user.id, [a1.id, a2.id]).expect(200)).body.data.token;
+    // A scraper corrects the Tent show to the 13th: attendance 2 is night B's now.
+    await prisma.concert.update({ where: { id: tent.id }, data: { concert_date: new Date('2026-06-13T19:00:00Z') } });
+
+    const nightB = (await share(owner.user.id, [a2.id, a3.id]).expect(200)).body.data.token;
+
+    expect(nightB).not.toBe(nightA);
+    const sentA = await prisma.mediaAlbumShareLink.findUnique({ where: { token: nightA } });
+    expect(sentA.attendance_ids).toEqual([a1.id, a2.id].sort((x, y) => x - y));
+    // Night B's own link widens as before.
+    const a4 = await attendTho895(await showOnTho895('Basement', '2026-06-13'));
+    expect((await share(owner.user.id, [a2.id, a3.id, a4.id]).expect(200)).body.data.token).toBe(nightB);
+  });
 });

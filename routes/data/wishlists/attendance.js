@@ -88,6 +88,9 @@ router.get(
               longitude: true,
               on_sale: true,
               sold_out: true,
+              // on_sale defaults to true at the sources, so without the date a
+              // Going card would say "On sale" for a sale that has not opened.
+              ticket_sale_start: true,
               price_min: true,
               price_max: true,
               price_currency: true,
