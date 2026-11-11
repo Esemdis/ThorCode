@@ -78,10 +78,24 @@ the capture time and its offset, Orientation and the colour profile (needed to
 show the picture right); EXIF ImageDescription, UserComment and Software
 (the software version, not the device); a location track recorded inside the
 video stream itself (GoPro GPMF, Apple `mebx`, Android GPS tracks), which lives
-in `mdat` and cannot be reached by a same-length patch; and, until THO-899,
-anything after a JPEG's last image: the video a motion photo appends and
-Samsung's SEF trailer (including `MCCData`, the mobile country code), plus
-IPTC in a JPEG's APP13.
+in `mdat` and cannot be reached by a same-length patch; and Samsung's trailer
+`Image_UTC_Data` block, which is the capture time again.
+
+What follows a JPEG's last image (THO-899): a motion photo's video, whether
+appended after the JPEG (Pixel and the phones that copied its format) or in
+Samsung's SEF trailer as `MotionPhoto_Data`, is scrubbed like any MP4 and kept,
+so the clip still plays. Every other Samsung trailer block but
+`Image_UTC_Data` (`MCC_Data`, the
+mobile country code; `DualShot_*` second photographs; the undocumented rest)
+has its data zeroed, and the directory is left so the trailer still reads.
+Anything else after the last image that is not a JPEG, an MP4 or padding is
+zeroed, as are bytes after a PNG's IEND or a WebP's RIFF. A motion photo whose
+video does not parse, or a Samsung trailer whose directory does not, is
+refused (404). Blanking XMP takes away the `GCamera`/`Container` tags that
+point at the clip, so Google Photos shows a shared motion photo as a still;
+a reader of Samsung's trailer, such as exiftool, still finds it. A JPEG's APP13
+(Photoshop's IPTC: city, sub-location, country, by-line) is filled with spaces,
+as XMP is.
 
 A file far outside what a camera writes (more than 250,000 MP4 boxes or a
 million image chunks or segments, more than 10,000 patches, boxes 32 deep) is

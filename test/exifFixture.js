@@ -369,3 +369,154 @@ export function tiffFromIfdsTho894Review(ifds, { little = true, next = {} } = {}
   });
   return { tiff: out, dirAt, valueAt };
 }
+
+// ---------------------------------------------------------------------------
+// THO-899: what follows a JPEG's last image, and IPTC in APP13.
+
+const u32leTho899 = (v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v); return b; };
+
+/**
+ * A JPEG APP13 segment as exiftool writes one (`-IPTC:City=… -IPTC:By-line=…`,
+ * the bytes compared against its output): `Photoshop 3.0\0`, then an 8BIM
+ * resource 0x0404 holding IIM datasets — record 2, dataset 80 By-line, 90
+ * City, 92 Sub-location, 101 Country, 0 the record version — and, as
+ * Lightroom adds, a 0x0425 resource with the IPTC block's MD5 digest.
+ *
+ * @returns {Buffer}
+ */
+export function iptcApp13Tho899() {
+  const dataset = (number, text) => {
+    const value = Buffer.from(text, 'latin1');
+    const head = Buffer.from([0x1c, 2, number, 0, 0]);
+    head.writeUInt16BE(value.length, 3);
+    return Buffer.concat([head, value]);
+  };
+  const resource = (id, data) => {
+    const head = Buffer.alloc(12);
+    head.write('8BIM', 0, 'latin1');
+    head.writeUInt16BE(id, 4);
+    // An empty Pascal name, padded to an even length: two zero bytes.
+    head.writeUInt32BE(data.length, 8);
+    return Buffer.concat([head, data, data.length & 1 ? Buffer.alloc(1) : Buffer.alloc(0)]);
+  };
+  const iptc = Buffer.concat([
+    dataset(80, 'IPTC-Byline Owner Name'),
+    dataset(90, 'IPTC-City Oslo'),
+    dataset(92, 'IPTC-Sublocation Grunerlokka'),
+    dataset(101, 'IPTC-Country Norway'),
+    Buffer.from([0x1c, 2, 0, 0, 2, 0, 4]),
+  ]);
+  const payload = Buffer.concat([
+    Buffer.from('Photoshop 3.0\0', 'latin1'),
+    resource(0x0404, iptc),
+    resource(0x0425, Buffer.alloc(16, 0xab)),
+  ]);
+  const header = Buffer.alloc(4);
+  header.writeUInt16BE(0xffed, 0);
+  header.writeUInt16BE(payload.length + 2, 2);
+  return Buffer.concat([header, payload]);
+}
+
+/**
+ * The XMP a Pixel writes into a motion photo's primary image (Motion Photo
+ * format 1.0): the GCamera flags and a Container:Directory whose last item is
+ * the video, measured from the end of the file.
+ */
+function motionPhotoXmpApp1Tho899(videoLength, gainMapLength) {
+  const items = [
+    '<rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="image/jpeg" Item:Semantic="Primary" Item:Length="0" Item:Padding="0"/></rdf:li>',
+    ...(gainMapLength ? [`<rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="image/jpeg" Item:Semantic="GainMap" Item:Length="${gainMapLength}"/></rdf:li>`] : []),
+    `<rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="video/mp4" Item:Semantic="MotionPhoto" Item:Length="${videoLength}" Item:Padding="0"/></rdf:li>`,
+  ];
+  const packet = '<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+    + '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+    + '<rdf:Description rdf:about="" xmlns:GCamera="http://ns.google.com/photos/1.0/camera/"'
+    + ' xmlns:Container="http://ns.google.com/photos/1.0/container/"'
+    + ' xmlns:Item="http://ns.google.com/photos/1.0/container/item/"'
+    + ` GCamera:MotionPhoto="1" GCamera:MotionPhotoVersion="1" GCamera:MotionPhotoPresentationTimestampUs="968644" GCamera:MicroVideoOffset="${videoLength}">`
+    + `<Container:Directory><rdf:Seq>${items.join('')}</rdf:Seq></Container:Directory>`
+    + '</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="w"?>';
+  const payload = Buffer.concat([Buffer.from('http://ns.adobe.com/xap/1.0/\0', 'latin1'), Buffer.from(packet, 'latin1')]);
+  const header = Buffer.alloc(4);
+  header.writeUInt16BE(0xffe1, 0);
+  header.writeUInt16BE(payload.length + 2, 2);
+  return Buffer.concat([header, payload]);
+}
+
+/**
+ * A Pixel motion photo: the primary JPEG (EXIF with GPS, and the motion-photo
+ * XMP), optionally an HDR gain map JPEG with its own EXIF, then the MP4 with
+ * its location, running to the end of the file. That is the layout exiftool
+ * reads as `EmbeddedVideo` and `MotionPhotoVideo` (checked against 12.76).
+ *
+ * @param {object} [options]
+ * @param {boolean} [options.gainMap] - put a gain map image between the two.
+ * @param {Buffer} [options.video] - the MP4 to append instead of the default.
+ * @returns {{file: Buffer, videoAt: number, video: Buffer}}
+ */
+export function pixelMotionPhotoTho899({ gainMap = false, video = mp4WithLocationTho894({ moovAtEnd: true }) } = {}) {
+  const { jpeg } = jpegWithGpsTho894();
+  const gain = gainMap ? jpegWithGpsTho894().jpeg : Buffer.alloc(0);
+  const primary = Buffer.concat([
+    jpeg.subarray(0, 2), motionPhotoXmpApp1Tho899(video.length, gain.length), jpeg.subarray(2),
+  ]);
+  const file = Buffer.concat([primary, gain, video]);
+  return { file, videoAt: primary.length + gain.length, video };
+}
+
+/**
+ * Samsung's SEF trailer as exiftool's Samsung.pm reads it: data blocks, each
+ * `00 00 <type LE16> <name length LE32> <name> <data>`, then the `SEFH`
+ * directory (version, count, and per block `00 00 <type> <offset back from
+ * SEFH LE32> <size LE32>`), its length, and `SEFT` as the file's last bytes.
+ *
+ * @param {Array<{type: number, name: string, data: Buffer}>} blocks
+ * @returns {{trailer: Buffer, dataAt: number[]}} `dataAt` is where each
+ *   block's data starts inside the trailer.
+ */
+export function samsungTrailerTho899(blocks) {
+  const parts = [];
+  const placed = [];
+  let cursor = 0;
+  for (const block of blocks) {
+    const head = Buffer.alloc(8);
+    head.writeUInt16LE(block.type, 2);
+    head.writeUInt32LE(block.name.length, 4);
+    const whole = Buffer.concat([head, Buffer.from(block.name, 'latin1'), block.data]);
+    placed.push({ type: block.type, at: cursor, size: whole.length, dataAt: cursor + 8 + block.name.length });
+    parts.push(whole);
+    cursor += whole.length;
+  }
+  const dir = Buffer.alloc(12 + 12 * blocks.length);
+  dir.write('SEFH', 0, 'latin1');
+  dir.writeUInt32LE(107, 4);
+  dir.writeUInt32LE(blocks.length, 8);
+  placed.forEach((p, i) => {
+    dir.writeUInt16LE(p.type, 12 + 12 * i + 2);
+    dir.writeUInt32LE(cursor - p.at, 12 + 12 * i + 4);
+    dir.writeUInt32LE(p.size, 12 + 12 * i + 8);
+  });
+  const trailer = Buffer.concat([...parts, dir, u32leTho899(dir.length), Buffer.from('SEFT', 'latin1')]);
+  return { trailer, dataAt: placed.map((p) => p.dataAt) };
+}
+
+/**
+ * A Samsung motion photo: a JPEG with GPS, then a SEF trailer holding the MP4
+ * (`MotionPhoto_Data`, 0x0a30), the capture time (`Image_UTC_Data`, 0x0a01),
+ * the mobile country code (`MCC_Data`, 0x0aa1; 242 is Norway) and, when asked,
+ * a second photograph (`DualShot_1`, 0x0001) carrying its own GPS.
+ *
+ * @param {{dualShot?: boolean, video?: Buffer}} [options]
+ * @returns {{file: Buffer, trailerAt: number, dataAt: number[]}}
+ */
+export function samsungMotionPhotoTho899({ dualShot = false, video = mp4WithLocationTho894({ moovAtEnd: false }) } = {}) {
+  const { jpeg } = jpegWithGpsTho894();
+  const blocks = [
+    { type: 0x0a30, name: 'MotionPhoto_Data', data: video },
+    { type: 0x0a01, name: 'Image_UTC_Data', data: Buffer.from('1781293108000', 'latin1') },
+    { type: 0x0aa1, name: 'MCC_Data', data: Buffer.from('242', 'latin1') },
+    ...(dualShot ? [{ type: 0x0001, name: 'DualShot_1', data: jpegWithGpsTho894().jpeg }] : []),
+  ];
+  const { trailer, dataAt } = samsungTrailerTho899(blocks);
+  return { file: Buffer.concat([jpeg, trailer]), trailerAt: jpeg.length, dataAt };
+}
