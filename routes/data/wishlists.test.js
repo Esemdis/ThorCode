@@ -1470,7 +1470,7 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
     prisma.concertAttendance.findUnique.mockImplementation(async ({ where }) => (
       tho823Attending.get(where.wishlist_id_concert_id.concert_id) ?? null
     ));
-    prisma.concertAttendance.update.mockResolvedValue({ id: 42 });
+    prisma.concertAttendance.updateMany.mockResolvedValue({ count: 1 });
     prisma.mediaAlbumShareLink.findMany.mockResolvedValue([]);
     prisma.concert.findUnique.mockImplementation(async ({ where }) => (
       where.id === THO823_RIGHT.id ? THO823_RIGHT : null
@@ -1495,9 +1495,9 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
     expect(res.body).toEqual({ attendance_id: 42, concert_id: THO823_RIGHT.id });
     // An update of the same row, not a delete and a create: the media rows,
     // the missed marks and the diary all hang off attendance 42.
-    expect(prisma.concertAttendance.update).toHaveBeenCalledTimes(1);
-    expect(prisma.concertAttendance.update).toHaveBeenCalledWith({
-      where: { id: 42 }, data: { concert_id: THO823_RIGHT.id },
+    expect(prisma.concertAttendance.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.concertAttendance.updateMany).toHaveBeenCalledWith({
+      where: { id: 42, concert_id: THO823_FROM }, data: { concert_id: THO823_RIGHT.id },
     });
     expect(prisma.concertAttendance.delete).not.toHaveBeenCalled();
     expect(prisma.concertAttendance.create).not.toHaveBeenCalled();
@@ -1531,7 +1531,7 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
 
   it('refuses a concert the list already has with 409, and changes nothing', async () => {
     tho823Attending.set(THO823_RIGHT.id, { id: 43 });
-    prisma.concertAttendance.update.mockRejectedValue(Object.assign(new Error('unique'), { code: 'P2002' }));
+    prisma.concertAttendance.updateMany.mockRejectedValue(Object.assign(new Error('unique'), { code: 'P2002' }));
     await tho823WriteSidecar('user-1/night', tho823OldSidecar([]));
     prisma.concertMedia.findMany.mockResolvedValue([{ rel_path: 'user-1/night/IMG_1.jpg' }]);
 
@@ -1554,7 +1554,7 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
     expect(res.status).toBe(409);
     expect(setlistFm.fetchSetlistById).not.toHaveBeenCalled();
     expect(prisma.concert.upsert).not.toHaveBeenCalled();
-    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+    expect(prisma.concertAttendance.updateMany).not.toHaveBeenCalled();
   });
 
   it('makes the sfm_ row from setlist.fm, as from-setlist does, and moves onto it', async () => {
@@ -1573,8 +1573,8 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
       where: { event_id: 'sfm_63de4613' },
       create: expect.objectContaining({ venue: 'Fållan', concert_date: new Date('2026-06-24T12:00:00Z') }),
     }));
-    expect(prisma.concertAttendance.update).toHaveBeenCalledWith({
-      where: { id: 42 }, data: { concert_id: THO823_RIGHT.id },
+    expect(prisma.concertAttendance.updateMany).toHaveBeenCalledWith({
+      where: { id: 42, concert_id: THO823_FROM }, data: { concert_id: THO823_RIGHT.id },
     });
   });
 
@@ -1585,7 +1585,7 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('That show has not happened yet');
-    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+    expect(prisma.concertAttendance.updateMany).not.toHaveBeenCalled();
   });
 
   it('puts concert_id and the sidecars back when a sidecar cannot be written', async () => {
@@ -1601,7 +1601,7 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
     const res = await tho823Move({ concert_id: THO823_RIGHT.id });
 
     expect(res.status).toBe(500);
-    expect(prisma.concertAttendance.update.mock.calls.map((c) => c[0].data)).toEqual([
+    expect(prisma.concertAttendance.updateMany.mock.calls.map((c) => c[0].data)).toEqual([
       { concert_id: THO823_RIGHT.id }, { concert_id: THO823_FROM },
     ]);
     expect(await tho823ReadSidecar('user-1/a')).toEqual(tho823OldSidecar([]));
@@ -1625,7 +1625,7 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('This show has no confirmed date yet');
-    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+    expect(prisma.concertAttendance.updateMany).not.toHaveBeenCalled();
   });
 
   // Still to come, the row is a Going row, and the next sync's movedFields can
@@ -1638,7 +1638,7 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
     const refused = await tho823Move({ concert_id: THO823_RIGHT.id });
     expect(refused.status).toBe(400);
     expect(prisma.concertMedia.count).toHaveBeenCalledWith({ where: { attendance_id: 42 } });
-    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+    expect(prisma.concertAttendance.updateMany).not.toHaveBeenCalled();
 
     prisma.concertMedia.count.mockResolvedValue(0);
     const allowed = await tho823Move({ concert_id: THO823_RIGHT.id });
@@ -1646,10 +1646,49 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
     expect(allowed.status).toBe(200);
   });
 
+  // Counted before the lock, an upload could add photos between the count and
+  // the move, and the future-target rule would let them drift.
+  it('counts the photos under the show\'s lock, after any upload holding it', async () => {
+    const { acquire: acquireTho823 } = createRequire(import.meta.url)('../../utils/serialQueue.js');
+    prisma.concert.findUnique.mockResolvedValue({ ...THO823_RIGHT, concert_date: new Date(Date.now() + 30 * 24 * 3600 * 1000) });
+    prisma.concertMedia.count.mockResolvedValue(1);
+    const releaseUpload = await acquireTho823('attendance:42');
+    let pending;
+    try {
+      pending = tho823Move({ concert_id: THO823_RIGHT.id }).then((r) => r);
+      await vi.waitFor(() => expect(prisma.concert.findUnique).toHaveBeenCalled());
+      await tho823Settle();
+      expect(prisma.concertMedia.count).not.toHaveBeenCalled();
+    } finally {
+      releaseUpload();
+    }
+    expect((await pending).status).toBe(400);
+    expect(prisma.concertMedia.count).toHaveBeenCalledTimes(1);
+  });
+
+  // Two moves at once: the second, which read the row before the first
+  // changed it, moves nothing and says so, rather than rewrite (or on a
+  // failure put back) sidecars for a concert it never saw.
+  it('answers 409 when the show was moved by another request since it was read', async () => {
+    prisma.concertAttendance.updateMany.mockResolvedValue({ count: 0 });
+    await tho823WriteSidecar('user-1/night', tho823OldSidecar([]));
+    prisma.concertMedia.findMany.mockResolvedValue([{ rel_path: 'user-1/night/IMG_1.jpg' }]);
+
+    const res = await tho823Move({ concert_id: THO823_RIGHT.id });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('This show was just changed. Reload it and try again.');
+    expect(prisma.concertAttendance.updateMany).toHaveBeenCalledWith({
+      where: { id: 42, concert_id: THO823_FROM }, data: { concert_id: THO823_RIGHT.id },
+    });
+    expect(prisma.concertMedia.findMany).not.toHaveBeenCalled();
+    expect((await tho823ReadSidecar('user-1/night')).concert_id).toBe(THO823_FROM);
+  });
+
   // Another request added the setlist.fm show between the pre-check and the
   // update: the unique key catches it, as on the concert_id form.
   it('refuses with 409 when the setlist.fm show was added to the list since it checked', async () => {
-    prisma.concertAttendance.update.mockRejectedValue(Object.assign(new Error('unique'), { code: 'P2002' }));
+    prisma.concertAttendance.updateMany.mockRejectedValue(Object.assign(new Error('unique'), { code: 'P2002' }));
 
     const res = await tho823Move({ setlistfm_id: '63de4613', band_id: 3 });
 
@@ -1669,7 +1708,7 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
     const res = await tho823Move(body);
 
     expect(res.status).toBe(400);
-    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+    expect(prisma.concertAttendance.updateMany).not.toHaveBeenCalled();
   });
 
   it('answers the same show with 200 and writes nothing', async () => {
@@ -1678,7 +1717,7 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
     const res = await tho823Move({ concert_id: THO823_FROM });
 
     expect(res.status).toBe(200);
-    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+    expect(prisma.concertAttendance.updateMany).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -1690,7 +1729,7 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
     const res = await tho823Move(body);
 
     expect(res.status).toBe(400);
-    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+    expect(prisma.concertAttendance.updateMany).not.toHaveBeenCalled();
   });
 
   it('answers 404 for a show not in the list, and for a concert that does not exist', async () => {
@@ -1699,7 +1738,7 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
 
     tho823Attending.set(THO823_FROM, { id: 42 });
     expect((await tho823Move({ concert_id: 12345 })).status).toBe(404);
-    expect(prisma.concertAttendance.update).not.toHaveBeenCalled();
+    expect(prisma.concertAttendance.updateMany).not.toHaveBeenCalled();
   });
 });
 

@@ -545,6 +545,7 @@ router.post(
         select: { id: true },
       });
       const ALREADY_ATTENDING = "You already have that show in your list.";
+      const MOVED_MEANWHILE = "This show was just changed. Reload it and try again.";
 
       let targetId;
       let show = null;
@@ -584,6 +585,14 @@ router.post(
         return res.json({ attendance_id: attendance.id, concert_id: target.id });
       }
 
+      // The upload route's lock on this show. An upload chooses its folder and
+      // writes its sidecar under it, so a move cannot rewrite the sidecars
+      // halfway through one, and the next upload reads where the files are.
+      // Taken before the checks below: counted outside it, an upload could add
+      // photos between the count and the move, and a second move could change
+      // the row under this one.
+      release = await acquire(`attendance:${attendance.id}`);
+
       // The states the rest of the API refuses an attended show. Without a
       // date, the upload route refuses it and the band page drops it, so its
       // photos vanish from there. Still to come, it is a Going row, and the
@@ -597,16 +606,16 @@ router.post(
         return res.status(400).json({ error: "That show has not happened yet, and this one has photos" });
       }
 
-      // The upload route's lock on this show. An upload chooses its folder and
-      // writes its sidecar under it, so a move cannot rewrite the sidecars
-      // halfway through one, and the next upload reads where the files are.
-      release = await acquire(`attendance:${attendance.id}`);
-
+      // Only from the show this request read. A move that landed first (the
+      // lock is per attendance, but the row was read before it) leaves this
+      // one nothing to do but say so; moving on from there would rewrite
+      // sidecars, and on a failure put back, a concert this request never saw.
       try {
-        await prisma.concertAttendance.update({
-          where: { id: attendance.id },
+        const { count } = await prisma.concertAttendance.updateMany({
+          where: { id: attendance.id, concert_id: fromConcertId },
           data: { concert_id: target.id },
         });
+        if (count === 0) return conflict(res, MOVED_MEANWHILE);
       } catch (error) {
         // @@unique([wishlist_id, concert_id]): another request put that show
         // in the list since the check above.
@@ -628,8 +637,8 @@ router.post(
         // files back on the next rebuild, so both go back as they were.
         console.error("[move] could not rewrite a sidecar:", error);
         await undoRetarget(error.undo ?? []);
-        await prisma.concertAttendance.update({
-          where: { id: attendance.id },
+        await prisma.concertAttendance.updateMany({
+          where: { id: attendance.id, concert_id: target.id },
           data: { concert_id: fromConcertId },
         });
         return res.status(500).json({ error: "Could not update the photo folders; nothing was changed" });
