@@ -35,10 +35,12 @@ const { TYPE_BYTES, readHeader } = require('./exifCapturedAt');
  * What this planner knows how to strip. mediaPublicCopy.js writes it into
  * every verdict it caches, so a copy made, or a file called clean, by an older
  * planner is looked at again rather than trusted. Bump it whenever the planner
- * learns to remove something it used to leave: without that, every file a
- * share link had already served would keep its old verdict until someone
- * emptied cache/public by hand. 2: what follows a JPEG's last image, and IPTC
- * in APP13 (THO-899).
+ * learns to remove something it used to leave (THO-899, say), and whenever it
+ * refuses more or less than it did — a budget raised or lowered, a parse bug
+ * fixed, `cmov` accepted — because refusals are cached too. Without that, every
+ * file a share link had already served would keep its old verdict, and every
+ * refused one its 404, until someone emptied cache/public by hand. 2: what
+ * follows a JPEG's last image, and IPTC in APP13 (THO-899).
  */
 const SCRUB_VERSION = 2;
 
@@ -74,8 +76,8 @@ const MAX_IMAGE_BLOCKS = 1000000;
  */
 const budgetFor = (size, blocks) => ({ bytes: size, patches: 0, blocks });
 
-function step(ctx) {
-  ctx.budget.blocks -= 1;
+function step(ctx, count = 1) {
+  ctx.budget.blocks -= count;
   if (ctx.budget.blocks < 0) throw unscrubbable('more boxes or chunks than any real file has');
 }
 
@@ -185,6 +187,9 @@ function planTiff(ctx, start, end) {
     const base = at(off, 2);
     const count = r16(base);
     if (count > MAX_IFD_ENTRIES) throw unscrubbable('EXIF directory too large');
+    // Each entry is a block: bounded per TIFF block, but a JPEG of thousands
+    // of APP1 segments was 21.8M entries walked for nothing.
+    step(ctx, count + 1);
     at(off + 2, count * ENTRY_BYTES);
     const entries = [];
     for (let i = 0; i < count; i += 1) {
@@ -710,6 +715,10 @@ const isMetadataUuidAt = (buf, at, end) => end - at >= 16
   && METADATA_UUIDS.some((uuid) => buf.compare(uuid, 0, 16, at, at + 16) === 0);
 const isMetadataUuid = (buf, box) => isMetadataUuidAt(buf, box.at + box.headerLen, box.end);
 
+// Apple's key names are under 64 bytes. One entry may be the whole keys box,
+// and a 240 MiB name was a 240 MiB string and a second of blocked loop.
+const MAX_APPLE_KEY_BYTES = 1024;
+
 function readAppleKeys(ctx, box) {
   const { buf } = ctx;
   const start = box.at + box.headerLen;
@@ -722,6 +731,7 @@ function readAppleKeys(ctx, box) {
     if (pos + 8 > box.end) throw unscrubbable('MP4 keys entry truncated');
     const size = buf.readUInt32BE(pos);
     if (size < 8 || pos + size > box.end) throw unscrubbable('MP4 keys entry overruns its box');
+    if (size - 8 > MAX_APPLE_KEY_BYTES) throw unscrubbable('MP4 key name longer than any writer uses');
     names.push(buf.toString('utf8', pos + 8, pos + size));
     pos += size;
   }

@@ -18,11 +18,18 @@ const { serialise } = require('../../../utils/serialQueue');
 const { rateLimiter } = require('../../../utils/rateLimiter');
 const { generateShareToken } = require('../../../utils/mediaShareToken');
 const {
-  albumExpiry, normaliseAttendanceIds, sameIds, unionIds, albumPayload,
+  albumExpiry, normaliseAttendanceIds, sameIds, unionIds, albumNightKey, albumLinkForNight, albumPayload,
 } = require('../../../utils/mediaAlbumShare');
 const { liveAlbumLink } = require('./shared');
 
 const router = express.Router();
+
+// The night each of these attendances of the owner's is, as albumNightKey
+// reads it. Scoped to the owner, as every read of a link's ids is.
+const nightsOf = (userId, ids) => prisma.concertAttendance.findMany({
+  where: { id: { in: ids }, wishlist_rel: { user_id: userId } },
+  select: { id: true, concert_rel: { select: { concert_date: true, city: true } } },
+});
 
 // A live link of this user's that takes in any of these attendances.
 const liveFor = (userId, ids, now = new Date()) => ({
@@ -57,6 +64,12 @@ const liveFor = (userId, ids, now = new Date()) => ({
  * newest is the one widened; the other goes on showing its own stage until it
  * runs out. Stop sharing ends both.
  *
+ * Only a link to the same night is handed back or widened, read from the
+ * concerts' dates and cities as they are now, not from any one attendance the
+ * link shares with the request (THO-895, see albumLinkForNight): a corrected
+ * date moves an attendance into another night, and sharing that night widened
+ * the first one's link into it.
+ *
  * Answers the token, not a URL. The page a recipient opens is the frontend's,
  * and only the frontend knows its own origin.
  */
@@ -71,20 +84,25 @@ router.post(
       // Every one of them the caller's, or nothing is shared. Not found for
       // somebody else's as for one that does not exist: which attendance ids
       // exist is not the caller's to learn.
-      const owned = await prisma.concertAttendance.findMany({
-        where: { id: { in: ids }, wishlist_rel: { user_id: req.user.id } },
-        select: { id: true },
-      });
+      const owned = await nightsOf(req.user.id, ids);
       if (owned.length !== ids.length) return notFound(res, 'Attendance not found');
+      const nightById = new Map(owned.map((a) => [a.id, albumNightKey(a.concert_rel)]));
 
       // One find-or-create at a time per user, for the reason the single-file
       // route gives: two devices asking at once must not each mint a link.
       const link = await serialise(`album-share:${req.user.id}`, async () => {
         const now = new Date();
-        const live = await prisma.mediaAlbumShareLink.findFirst({
+        const candidates = await prisma.mediaAlbumShareLink.findMany({
           where: liveFor(req.user.id, ids, now),
-          orderBy: { created_at: 'desc' },
+          orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
         });
+        // The nights of the other attendances those links name, to tell
+        // whether a link and this request are still one night.
+        const others = [...new Set(candidates.flatMap((l) => l.attendance_ids))].filter((id) => !nightById.has(id));
+        if (others.length) {
+          for (const a of await nightsOf(req.user.id, others)) nightById.set(a.id, albumNightKey(a.concert_rel));
+        }
+        const live = albumLinkForNight(candidates, ids, nightById);
         if (!live) {
           return prisma.mediaAlbumShareLink.create({
             data: {
