@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  listingUrl, isHot, checkDue, dueChecks, checkView, checkable, sanitizeVendors, checkedFields,
+  listingUrl, isHot, checkDue, dueChecks, checkView, checkable, sanitizeVendors, checkedFields, readTime,
 } from './followCheck.js';
 
 const NOW_THO779 = new Date('2026-11-11T09:00:00Z');
@@ -233,6 +233,17 @@ describe('what a successful read writes onto the show', () => {
       .not.toHaveProperty('tickets_opened_at');
   });
 
+  it('does not stamp a sale whose day passed weeks before the read that first saw it on sale', () => {
+    // THO-907: a past sale day with on_sale still false reads as "unknown"
+    // (the full sync never flipped the flag), and stamping it gave a sale that
+    // opened on 20 Oct "opened 15:00, 11 Nov", the time of the read.
+    const pastSaleTho907 = followedShowTho779({ ticket_sale_start: new Date('2026-10-20T00:00:00Z') });
+    const readAtTho907 = new Date('2026-11-11T15:00:00Z');
+    const fields = checkedFields(pastSaleTho907, readTho779({ on_sale: true }), readAtTho907);
+    expect(fields).toMatchObject({ on_sale: true });
+    expect(fields).not.toHaveProperty('tickets_opened_at');
+  });
+
   it('marks it sold out', () => {
     expect(checkedFields(followedShowTho779({ on_sale: true }), readTho779({ sold_out: true }), NOW_THO779))
       .toMatchObject({ sold_out: true, on_sale: false });
@@ -269,5 +280,26 @@ describe('what a successful read writes onto the show', () => {
     expect(fields).not.toHaveProperty('ticket_sale_start');
     expect(fields).not.toHaveProperty('price_min');
     expect(fields).not.toHaveProperty('price_currency');
+  });
+});
+
+describe('when a read happened', () => {
+  const postedAtTho907 = new Date('2026-11-11T09:10:00Z');
+
+  it('takes the time the sync service read the page, not the time it posted the batch', () => {
+    expect(readTime('2026-11-11T09:07:30Z', postedAtTho907)).toEqual(new Date('2026-11-11T09:07:30Z'));
+  });
+
+  it('falls back to the post for a read without a time, or one that is not a time', () => {
+    expect(readTime(undefined, postedAtTho907)).toEqual(postedAtTho907);
+    expect(readTime('soon', postedAtTho907)).toEqual(postedAtTho907);
+    expect(readTime(1731316000000, postedAtTho907)).toEqual(postedAtTho907);
+  });
+
+  it('never puts a read in the future, nor further back than a tick could take', () => {
+    // A fast clock on the sync service must not make "Checked" lie ahead of
+    // now; a slow one is a wrong clock, not a slow tick, and is held at 15 min.
+    expect(readTime('2026-11-11T09:20:00Z', postedAtTho907)).toEqual(postedAtTho907);
+    expect(readTime('2026-11-11T07:00:00Z', postedAtTho907)).toEqual(new Date('2026-11-11T08:55:00Z'));
   });
 });

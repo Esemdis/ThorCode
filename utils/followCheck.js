@@ -248,10 +248,10 @@ const finite = (value) => (typeof value === "number" && Number.isFinite(value) &
  * page that dropped its JSON-LD does not un-cancel a show.
  *
  * `tickets_opened_at` is stamped once, when a read sees on sale a show that
- * was waiting on a known sale day. Not on the first read of a show already on
- * sale when it was followed: "opened 10:02" would then be the time of the
- * read, not of the sale, and a guessed time that looks measured is worse than
- * none.
+ * was waiting on a sale day that is today or still ahead. Not on the first
+ * read of a show already on sale when it was followed, nor of one whose sale
+ * day has passed: "opened 10:02" would then be the time of the read, not of
+ * the sale, and a guessed time that looks measured is worse than none.
  *
  * @param {object} stored - the Concert row
  * @param {object} result - one `ok` result from POST /follows/checked
@@ -296,11 +296,41 @@ function checkedFields(stored, result, now = new Date()) {
 
   const before = ticketState(stored, now);
   const after = ticketState({ ...stored, ...fields }, now);
-  if (!stored.tickets_opened_at && stored.ticket_sale_start && after === "on_sale"
-    && (before === "on_sale_soon" || before === "unknown")) {
+  // Only from on_sale_soon, the state of a sale day today or still ahead. Not
+  // from "unknown": that is also a sale day already past with the flag never
+  // flipped, and the first read after it would stamp a sale that opened weeks
+  // ago with the time of the read (THO-907). A day-only sale is on_sale_soon
+  // all of its own day, so the hot-window reads this field is for still count.
+  if (!stored.tickets_opened_at && after === "on_sale" && before === "on_sale_soon") {
     fields.tickets_opened_at = now;
   }
   return fields;
+}
+
+// How far back a read's own `read_at` is believed (THO-907). The sync service
+// posts once at the end of a tick, after up to FOLLOW_CHECK_MAX_PER_TICK (30)
+// page reads of up to half a minute each; anything older than that is a clock
+// that is wrong, not a slow tick.
+const READ_AT_MAX_AGE_MIN = 15;
+
+/**
+ * When a read happened: the `read_at` the sync service sent, else now.
+ *
+ * The batch is posted after the last page of a tick, so stamping every read
+ * with the time of the post made the first page of a batch minutes older than
+ * its "Checked just now", and a "Check now" pressed mid-tick was cleared by a
+ * read that ran before the press (THO-907). Clamped to now, so a fast clock
+ * cannot put a read in the future, and to READ_AT_MAX_AGE_MIN back.
+ *
+ * @param {unknown} value - the result's `read_at`, an ISO timestamp
+ * @param {Date} [now]
+ * @returns {Date}
+ */
+function readTime(value, now = new Date()) {
+  const parsed = typeof value === "string" ? new Date(value) : null;
+  if (!parsed || Number.isNaN(parsed.getTime())) return now;
+  const earliest = now.getTime() - READ_AT_MAX_AGE_MIN * MIN;
+  return new Date(Math.min(now.getTime(), Math.max(earliest, parsed.getTime())));
 }
 
 /** An error from the sync service, short enough to keep. */
@@ -326,5 +356,6 @@ module.exports = {
   checkable,
   sanitizeVendors,
   checkedFields,
+  readTime,
   errorText,
 };

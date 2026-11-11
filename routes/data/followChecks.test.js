@@ -118,6 +118,22 @@ describe('storing what the reads said', () => {
     expect(txTho779.concertListingCheck.upsert.mock.calls[0][0].update).not.toHaveProperty('checked_at');
   });
 
+  it('stamps each read with the time the page was read, so a "Check now" pressed mid-tick stays pending', async () => {
+    // THO-907: the batch is posted after the tick's last page, so stamping it
+    // with the post cleared a request made after this page had been read.
+    txTho779.concert.findUnique.mockResolvedValue(storedShowTho779({ vendors: [] }));
+    const readAtTho907 = new Date(Date.now() - 2 * 60 * 1000);
+
+    await request(app).post('/follows/checked').set(...systemTho779).send({ results: [
+      { concert_id: 300, ok: true, vendors: [], read_at: readAtTho907.toISOString() },
+      { concert_id: 301, ok: false, error: 'timeout', read_at: readAtTho907.toISOString() },
+    ] });
+
+    const [read, failedRead] = txTho779.concertListingCheck.upsert.mock.calls.map(([args]) => args.update);
+    expect(read).toMatchObject({ checked_at: readAtTho907, attempted_at: readAtTho907 });
+    expect(failedRead).toMatchObject({ attempted_at: readAtTho907 });
+  });
+
   it('counts a show deleted since it was listed, or an id that is not one, as unknown', async () => {
     txTho779.concert.findUnique.mockResolvedValue(null);
     const res = await request(app).post('/follows/checked').set(...systemTho779).send({ results: [

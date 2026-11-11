@@ -16,7 +16,7 @@ const { query, body, validationResult } = require("express-validator");
 const auth = require("../../auth/verifyJWT");
 const roleCheck = require("../../middlewares/roleCheck");
 const prisma = require("../../prisma/client");
-const { dueChecks, checkedFields, errorText } = require("../../utils/followCheck");
+const { dueChecks, checkedFields, readTime, errorText } = require("../../utils/followCheck");
 
 // One POST is at most one tick's worth and then some: the sync service reads
 // FOLLOW_CHECK_MAX_PER_TICK (30) a tick.
@@ -76,8 +76,10 @@ router.get(
 // POST /follows/checked — what the reads said, `{ results: [...] }`. Each is
 // `{ concert_id, ok: true, on_sale, sold_out, ticket_sale_start, price_min,
 // price_max, price_currency, vendors, event_status }` or `{ concert_id,
-// ok: false, error, blocked? }`. One transaction per show, so one row that
-// will not write does not lose the rest of the tick.
+// ok: false, error, blocked? }`, either with an optional `read_at` (ISO), the
+// time that page was read; without one the read is stamped with the post.
+// One transaction per show, so one row that will not write does not lose the
+// rest of the tick.
 router.post(
   "/follows/checked",
   [
@@ -105,14 +107,14 @@ router.post(
         const outcome = await prisma.$transaction(async (tx) => {
           const stored = await tx.concert.findUnique({ where: { id: concertId }, select: CHECKED_CONCERT });
           if (!stored) return "unknown";
-          const now = new Date();
+          const readAt = readTime(result.read_at);
           if (result.ok === true) {
-            const fields = checkedFields(stored, result, now);
+            const fields = checkedFields(stored, result, readAt);
             if (Object.keys(fields).length > 0) await tx.concert.update({ where: { id: concertId }, data: fields });
             await tx.concertListingCheck.upsert({
               where: { concert_id: concertId },
-              create: { concert_id: concertId, checked_at: now, attempted_at: now, failures: 0 },
-              update: { checked_at: now, attempted_at: now, failures: 0, last_error: null },
+              create: { concert_id: concertId, checked_at: readAt, attempted_at: readAt, failures: 0 },
+              update: { checked_at: readAt, attempted_at: readAt, failures: 0, last_error: null },
             });
             return "updated";
           }
@@ -122,8 +124,8 @@ router.post(
           const lastError = (result.blocked ? "blocked: " : "") + errorText(result.error);
           await tx.concertListingCheck.upsert({
             where: { concert_id: concertId },
-            create: { concert_id: concertId, attempted_at: now, failures: 1, last_error: lastError },
-            update: { attempted_at: now, failures: { increment: 1 }, last_error: lastError },
+            create: { concert_id: concertId, attempted_at: readAt, failures: 1, last_error: lastError },
+            update: { attempted_at: readAt, failures: { increment: 1 }, last_error: lastError },
           });
           return "failed";
         });
