@@ -606,6 +606,11 @@ const currentPasswordLimit = rateLimiter({
   max: 10,
   keyGenerator: (req) => `user:${req.user.id}`,
   skipSuccessfulRequests: true,
+  // Only a wrong (or missing-on-the-account) current password is a guess, and
+  // both answer 403. Counting every 400 and 500 as one, someone retrying a
+  // stuck deletion, or a new password the rules refuse, was told "Too many
+  // wrong passwords" after giving the right one every time.
+  requestWasSuccessful: (req, res) => res.statusCode !== 403,
 });
 
 /**
@@ -730,6 +735,13 @@ router.delete('/me', auth, currentPasswordLimit, upload.none(), async (req, res)
     try {
       await prisma.$transaction(accountDeletionOperations(prisma, user.id));
     } catch (error) {
+      // Two overlapping deletes (a double click, a retry after a timeout):
+      // both pass the read above, the first commits, and the second's
+      // user.delete finds no row. The account is gone, which is what was
+      // asked, so that is a success, not a "try again" that then 404s.
+      if (error?.code === 'P2025' && !(await prisma.user.findUnique({ where: { id: user.id }, select: { id: true } }))) {
+        return response.success(res, 200, {}, 'Account deleted');
+      }
       console.error('Error deleting account rows after its files were removed:', error);
       return response.serverError(
         res,

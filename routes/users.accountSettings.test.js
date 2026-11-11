@@ -163,6 +163,21 @@ describe('PATCH /users/me/password (THO-810)', () => {
     expect(limited.status).toBe(429);
     expect(prisma.user.update).not.toHaveBeenCalled();
   });
+
+  // The budget is for guesses. A 400 (no current password, a new one the
+  // rules refuse) or a 500 is not one, and counting them told someone who
+  // gave the right password every time that they had too many wrong ones.
+  it('does not count answers other than a wrong password against the budget', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id));
+
+    for (let i = 0; i < 11; i++) {
+      expect((await changePassword(id, { newPassword: 'NewPass123' })).status).toBe(400);
+    }
+    const res = await changePassword(id, { currentPassword: CURRENT, newPassword: 'NewPass123' });
+
+    expect(res.status).toBe(200);
+  });
 });
 
 describe('DELETE /users/me (THO-810)', () => {
@@ -220,6 +235,33 @@ describe('DELETE /users/me (THO-810)', () => {
     expect(res.body.error).toBe(
       'Your photos and videos were removed, but your account could not be deleted. Try again to finish.',
     );
+  });
+
+  // Two overlapping deletes: both read the account, the first commits, and
+  // the second's user.delete finds nothing (P2025). The account is gone, as
+  // asked; "try again" would only lead to a 404.
+  it('answers success to a second, overlapping delete whose account the first already removed', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique
+      .mockResolvedValueOnce(accountSettingsUser(id))
+      .mockResolvedValueOnce(null);
+    prisma.$transaction.mockRejectedValueOnce(Object.assign(new Error('Record to delete does not exist.'), { code: 'P2025' }));
+
+    const res = await deleteAccount(id, { currentPassword: CURRENT });
+
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe('Account deleted');
+  });
+
+  it('still says to try again when the rows fail with P2025 and the account is still there', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id));
+    prisma.$transaction.mockRejectedValueOnce(Object.assign(new Error('Record not found'), { code: 'P2025' }));
+
+    const res = await deleteAccount(id, { currentPassword: CURRENT });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toMatch(/Try again to finish/);
   });
 
   // No archive here (MEDIA_ROOT unset), so every file fails to go: the
