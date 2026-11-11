@@ -284,6 +284,7 @@ router.get(
 // carry that state when the work starts.
 const SESSION_ENDED = 'Your password was changed. Sign in again.';
 const STATE_MOVED = 'Your password was changed while this was being saved. Try again.';
+const CODE_GONE = 'That code is no longer valid. Ask for a new one.';
 
 /** Whether a login token was signed against a password state other than this one. */
 const sessionPredates = (req, passwordChangedAt) => isLoginToken(req.user)
@@ -514,7 +515,17 @@ router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.non
       ]);
     } catch (error) {
       if (error.code === UNIQUE_VIOLATION) return response.conflict(res, 'Email already in use');
-      if (error.code === RECORD_NOT_FOUND) return stateMovedAnswer(req, res);
+      if (error.code === RECORD_NOT_FOUND) {
+        // Either write can find nothing: the user row, when a reset moved the
+        // state it read, or the code, when a second request-change (another
+        // tab) replaced it. Only the first ends the session; read again to
+        // tell them apart, rather than sign someone out over a stale code.
+        const now = await prisma.user.findUnique({ where: { id: userId }, select: { password_changed_at: true } });
+        if (now && passwordChangeStamp(now.password_changed_at) === passwordChangeStamp(readChangedAt)) {
+          return response.conflict(res, CODE_GONE);
+        }
+        return stateMovedAnswer(req, res);
+      }
       throw error;
     }
     forgetPasswordChange(userId);

@@ -167,6 +167,25 @@ describe('PATCH /users/me/password (THO-810)', () => {
     expect(prisma.user.update.mock.calls[0][0].where).toEqual({ id, password_changed_at: null });
   });
 
+  // The route's own check, not verifyJWT's: a reset that commits after the
+  // token was checked but before the route reads the row. Without it the
+  // change went ahead on a session the reset had just ended.
+  it('refuses a login token signed against another password state before doing any work', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique
+      // verifyJWT's read: the token still matches what it sees.
+      .mockResolvedValueOnce(accountSettingsUser(id, { password_changed_at: null }))
+      // The route's own read, after a reset committed in between.
+      .mockResolvedValueOnce(accountSettingsUser(id, { password_changed_at: new Date('2026-11-11T20:00:00Z') }));
+
+    const res = await request(app).patch('/users/me/password').set(...authHeader({ id, kind: 'login', pwc: 0 }))
+      .send({ currentPassword: CURRENT, newPassword: 'NewPass123' });
+
+    expect(res.status).toBe(401);
+    expect(res.body.data?.token).toBeUndefined();
+    expect(prisma.user.update).not.toHaveBeenCalled();
+  });
+
   it('asks a token that is not a session to try again when the state moved under it', async () => {
     const id = accountSettingsUserId();
     prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id));

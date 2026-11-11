@@ -228,7 +228,13 @@ describe('the email change codes', () => {
   // login token must still carry that state.
   it('does not overwrite a reset that lands before the address is written, and ends that session', async () => {
     const changedAt = new Date('2026-11-11T20:00:00.123Z');
-    prisma.user.findUnique.mockResolvedValue({ password_changed_at: changedAt });
+    // verifyJWT's read and the route's see the state the token carries; the
+    // re-read after the failed write sees the reset that landed in between.
+    let resetRaceReads = 0;
+    prisma.user.findUnique.mockImplementation(async () => {
+      resetRaceReads += 1;
+      return { password_changed_at: resetRaceReads <= 2 ? changedAt : new Date('2026-11-11T20:00:01Z') };
+    });
     prisma.emailVerification.findFirst.mockResolvedValue({
       id: 5, user_id: 'user-1', new_email: 'thief@example.test', code: '123456', expires_at: new Date(Date.now() + 60_000),
     });
@@ -237,12 +243,34 @@ describe('the email change codes', () => {
 
     const res = await request(app)
       .post('/users/email/verify-code')
-      .set(...authHeader({ id: 'user-1', kind: 'login', pwc: changedAt.getTime() }))
+      .set(...authHeader({ id: 'user-reset-race', kind: 'login', pwc: changedAt.getTime() }))
       .send({ code: '123456' });
 
     expect(res.status).toBe(401);
     expect(res.body.data?.token).toBeUndefined();
-    expect(prisma.user.update.mock.calls[0][0].where).toEqual({ id: 'user-1', password_changed_at: changedAt });
+    expect(prisma.user.update.mock.calls[0][0].where).toEqual({ id: 'user-reset-race', password_changed_at: changedAt });
+  });
+
+  // The other write that can find nothing: the code, replaced by a second
+  // request-change from another tab. Read as a reset, it answered "Your
+  // password was changed" and concert-map signed the person out.
+  it('answers a code another request replaced with 409, and keeps the session', async () => {
+    const codeGoneAt = new Date('2026-11-11T19:00:00.456Z');
+    prisma.user.findUnique.mockResolvedValue({ password_changed_at: codeGoneAt });
+    prisma.emailVerification.findFirst.mockResolvedValue({
+      id: 7, user_id: 'user-code-gone', new_email: 'new@example.test', code: '123456', expires_at: new Date(Date.now() + 60_000),
+    });
+    prisma.user.update.mockResolvedValue({ id: 'user-code-gone', email: 'new@example.test', role: 'USER' });
+    prisma.emailVerification.delete.mockRejectedValue(Object.assign(new Error('Record to delete does not exist.'), { code: 'P2025' }));
+
+    const res = await request(app)
+      .post('/users/email/verify-code')
+      .set(...authHeader({ id: 'user-code-gone', kind: 'login', pwc: codeGoneAt.getTime() }))
+      .send({ code: '123456' });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('That code is no longer valid. Ask for a new one.');
+    expect(res.body.data?.token).toBeUndefined();
   });
 
   it('refuses a login token signed against another password state before writing anything', async () => {
