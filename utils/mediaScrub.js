@@ -464,9 +464,21 @@ function planAfterImage(ctx, pos) {
 // names are short; one past SEF_MAX_NAME is not a name, and is refused.
 const SEF_VIDEO_BLOCK = 'MotionPhoto_Data';
 const SEF_KEEP_BLOCKS = new Set(['Image_UTC_Data']);
+// The capture time is kept only as Samsung writes it: type 0x0a01 and a few
+// ASCII digits (milliseconds since 1970). A block that only calls itself
+// Image_UTC_Data could hold anything, a whole photograph with its GPS
+// included, and is zeroed like any other.
+const SEF_UTC_TYPE = 0x0a01;
+const SEF_UTC_DATA = /^\d{1,20}\0*$/;
 const SEF_KNOWN_NAMES = new Set([SEF_VIDEO_BLOCK, ...SEF_KEEP_BLOCKS, 'MCC_Data', 'DualShot_1', 'DualShot_2']);
 const SEF_MAX_NAME = 64;
 const SEF_ENTRY_BYTES = 12;
+
+/** Whether a trailer block is kept as it is: only a capture time that looks like one. */
+function sefKept(buf, block) {
+  if (!SEF_KEEP_BLOCKS.has(block.name) || block.type !== SEF_UTC_TYPE) return false;
+  return block.end - block.data <= 32 && SEF_UTC_DATA.test(buf.toString('latin1', block.data, block.end));
+}
 
 /**
  * Plan a Samsung trailer, if the file ends with one, and return where it
@@ -489,6 +501,7 @@ function planSamsungTrailer(ctx) {
     step(ctx);
     const entry = dirAt + 12 + i * SEF_ENTRY_BYTES;
     // Offsets count back from the directory.
+    const type = buf.readUInt16LE(entry + 2);
     const back = buf.readUInt32LE(entry + 4);
     const length = buf.readUInt32LE(entry + 8);
     if (back > dirAt || length < 8 || length > back) throw unscrubbable('Samsung block outside its trailer');
@@ -501,6 +514,7 @@ function planSamsungTrailer(ctx) {
       start,
       end: start + length,
       name,
+      type,
       // Where zeroing starts for a block that is not kept: its data, or its
       // name too when the name is not one this knows.
       blank: SEF_KNOWN_NAMES.has(name) ? start + 8 + nameLength : start + 8,
@@ -517,7 +531,7 @@ function planSamsungTrailer(ctx) {
     // Bytes between blocks that no entry names are zeroed like any unknown.
     fill(ctx, covered, block.start - covered, 0);
     if (block.name === SEF_VIDEO_BLOCK) ctx.videos.push({ start: ctx.base + block.data, end: ctx.base + block.end });
-    else if (!SEF_KEEP_BLOCKS.has(block.name)) fill(ctx, block.blank, block.end - block.blank, 0);
+    else if (!sefKept(buf, block)) fill(ctx, block.blank, block.end - block.blank, 0);
     covered = block.end;
   }
   fill(ctx, covered, dirAt - covered, 0);
