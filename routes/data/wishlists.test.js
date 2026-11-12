@@ -1420,6 +1420,7 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
   const setlistFm = createRequire(import.meta.url)('../../utils/setlistFm.js');
   const axios = createRequire(import.meta.url)('axios');
   const { readFile, writeFile, mkdir, mkdtemp } = createRequire(import.meta.url)('node:fs/promises');
+  const { readFileSync, writeFileSync } = createRequire(import.meta.url)('node:fs');
   const { tmpdir } = createRequire(import.meta.url)('node:os');
   const { join } = createRequire(import.meta.url)('node:path');
 
@@ -1645,6 +1646,35 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
     const restoreLines = tho823RevertLog.mock.calls.filter(([line]) => String(line).includes('RESTORE FAILED'));
     expect(restoreLines).toHaveLength(1);
     expect(restoreLines[0][0]).toMatch(/attendance 42 \(concert 99 -> 77\): row NOT restored/);
+  });
+
+  // The row going back is not enough: a photo folder whose sidecar still
+  // names the new concert hands its files to it on the next rebuild, so that
+  // answer must not say "nothing was changed" either.
+  it('says so when a photo folder will not go back even though the row did', async () => {
+    await tho823WriteSidecar('user-1/a', tho823OldSidecar([]));
+    await tho823WriteSidecar('user-1/b', { ...tho823OldSidecar([]), version: 99 });
+    prisma.concertMedia.findMany.mockResolvedValue([
+      { rel_path: 'user-1/a/IMG_1.jpg' }, { rel_path: 'user-1/b/IMG_2.jpg' },
+    ]);
+    // Once folder a has been rewritten and b has refused, a is made
+    // unreadable too, so its restore fails while the row's revert matches.
+    // Done synchronously inside the log of the rewrite failing, which the
+    // route writes just before it starts the undo.
+    const tho823StuckFolder = join(tho823Root, 'archive', 'user-1/a', 'concert-media.json');
+    const tho823RevertLog = vi.spyOn(console, 'error').mockImplementation((line) => {
+      if (String(line).includes('could not rewrite a sidecar')) {
+        const rewritten = JSON.parse(readFileSync(tho823StuckFolder, 'utf8'));
+        writeFileSync(tho823StuckFolder, JSON.stringify({ ...rewritten, version: 99 }));
+      }
+    });
+
+    const res = await tho823Move({ concert_id: THO823_RIGHT.id });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).not.toMatch(/nothing was changed/);
+    const restoreLine = tho823RevertLog.mock.calls.find(([line]) => String(line).includes('RESTORE FAILED'));
+    expect(restoreLine[0]).toMatch(/row restored; sidecars not restored: .*user-1\/a/);
   });
 
   // The THO-895 guard that refused this is gone: since #50, sharing the

@@ -40,9 +40,11 @@ const { TYPE_BYTES, readHeader } = require('./exifCapturedAt');
  * fixed, `cmov` accepted — because refusals are cached too. Without that, every
  * file a share link had already served would keep its old verdict, and every
  * refused one its 404, until someone emptied cache/public by hand. 2: what
- * follows a JPEG's last image, and IPTC in APP13 (THO-899).
+ * follows a JPEG's last image, and IPTC in APP13 (THO-899). 3: long blanked
+ * runs planned in FILL_CHUNK patches, each counted against MAX_PATCHES, so
+ * the files refused for too many patches changed (the bytes out did not).
  */
-const SCRUB_VERSION = 2;
+const SCRUB_VERSION = 3;
 
 function unscrubbable(reason) {
   const err = new Error(`cannot scrub: ${reason}`);
@@ -125,6 +127,11 @@ function fillRun(byte) {
 // The same for a run of one byte, checked before anything is planned: a chunk
 // that is already blank costs nothing but the look.
 function fill(ctx, at, length, byte) {
+  // Checked as a whole number first: a negative length planned nothing, and a
+  // NaN one passed every comparison below and charged NaN, which switched the
+  // byte budget off for the rest of the file. One Buffer.alloc refused both;
+  // the chunk loop does not.
+  if (!Number.isSafeInteger(length) || length < 0) throw unscrubbable('patch of no real length');
   if (at < 0 || at + length > ctx.buf.length) throw unscrubbable('patch outside the file');
   charge(ctx, length);
   for (let start = at; start < at + length; start += FILL_CHUNK) {
@@ -1045,4 +1052,7 @@ function applyPatches(buf, patches) {
 
 module.exports = {
   planScrub, planScrubFile, planSource, applyPatches, crc32, XMP_UUID, SCRUB_VERSION, FILL_CHUNK,
+  // Exported for its own guard's test: no file this parses can hand it a
+  // length that is not a whole number today, and the guard is for the day one can.
+  fill,
 };

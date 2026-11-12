@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  planScrub, applyPatches, crc32, planSource, FILL_CHUNK,
+  planScrub, applyPatches, crc32, planSource, FILL_CHUNK, fill,
 } from './mediaScrub.js';
 import { exifCapturedAt } from './exifCapturedAt.js';
 import {
@@ -974,6 +974,17 @@ describe('planScrub keeps a long blanked run from costing its own length (bounde
     expect(out.subarray(0, minimalJpegTho894.length).equals(minimalJpegTho894)).toBe(true);
     expect(out.subarray(minimalJpegTho894.length).equals(Buffer.alloc(trailerBoundedFill.length))).toBe(true);
     expect(await planScrub(out)).toEqual([]);
+  });
+
+  // One Buffer.alloc refused a negative or NaN length; the chunk loop planned
+  // nothing for either, and a NaN charged NaN, which turned the byte budget off.
+  it.each([NaN, -1, 1.5, Infinity])('refuses a run whose length is %s rather than planning around it', (badLength) => {
+    const ctxBoundedFill = {
+      buf: Buffer.alloc(64, 0x41), base: 0, out: [], budget: { bytes: 64, patches: 0, blocks: 10 },
+    };
+    expect(() => fill(ctxBoundedFill, 0, badLength, 0)).toThrow(expect.objectContaining({ code: 'UNSCRUBBABLE' }));
+    expect(ctxBoundedFill.budget.bytes).toBe(64);
+    expect(ctxBoundedFill.out).toEqual([]);
   });
 
   it('blanks a large unknown Samsung block the same way, with the directory left as it was', async () => {
