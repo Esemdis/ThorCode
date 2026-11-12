@@ -14,17 +14,22 @@ this says how to change it without breaking a deploy.
   not just the one that broke it. Check the Actions tab before you assume your
   change is live.
 - The `refs/heads/main` check on `deploy.yml`'s `build` job is all that keeps a
-  branch from publishing `:latest`, and a branch can edit it (THO-987). The
-  credential agents push with has the `workflow` scope today (a push changing
-  `deploy.yml` was accepted), so that is not hypothetical. Don't touch
-  `.github/workflows/` unless the ticket is about it, and never weaken that
-  check or add `packages: write` elsewhere. The real guards are settings only
-  the owner makes: first, no `workflow` scope and no run-a-workflow tool on
-  agent credentials; then a main-only Environment holding the publish token,
-  the build logging in with it, and only after that the package's Actions
-  access set to Read (before it, Read stops every deploy); and Watchtower on a
-  tag only that job moves. `.github/CODEOWNERS` asks for the owner's review
-  once a branch rule requires it, which gates the merge, not the PR's run.
+  branch from publishing `:latest`, and it only binds a branch that has it
+  (THO-987). A branch can edit it: the credential agents push with is a GitHub
+  App user token with the Workflows permission (the `workflow` scope, for a
+  PAT), and a push changing `deploy.yml` was accepted. And a branch cut before
+  the check (THO-563, b185eb3; 18 of 54 branches on 2026-11-12) still has the
+  old file, so a manual run on it publishes old code with no edit at all.
+  Don't touch `.github/workflows/` unless the ticket is about it, never start
+  a manual run of `deploy.yml` on a branch, and never weaken that check or add
+  `packages: write` elsewhere. The real guards are settings only the owner
+  makes: first, no Workflows permission and no ability to run workflows
+  (Actions: write) on agent credentials, both required; the stale branches
+  deleted; then a main-only Environment holding the publish token, the build
+  logging in with it, and only after that the package's Actions access set to
+  Read (before it, Read stops every deploy); and Watchtower on a tag only that
+  job moves. `.github/CODEOWNERS` asks for the owner's review once a branch
+  rule requires it, which gates the merge, not the PR's run.
 - The container boots with `npx prisma migrate deploy && node index.js`
   (`Dockerfile`), so a merged migration is applied to production the moment the
   image starts. A failed migration stops the API from starting.

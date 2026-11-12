@@ -82,29 +82,43 @@ jobs:
     # all. A manual run can be started on any branch and a pull request runs
     # this file too; this condition keeps both from publishing.
     #
-    # It guards against the accident, not against intent (THO-987). A pull
-    # request from a branch in this repo, and a manual run on a branch, use
-    # that branch's copy of this file. A branch's copy can drop this line and
-    # declare `packages: write`, and GitHub grants it, so anyone who can push
-    # a change to this file can publish :latest from an unmerged branch.
-    # Nothing in a workflow file can close that.
+    # It guards against the accident, not against intent (THO-987). A manual
+    # run uses the branch's own copy of this file, and a pull request runs it
+    # as merged with main, so a branch's edit to it takes effect in both. A
+    # branch's copy can drop this line and declare `packages: write`, and
+    # GitHub grants it, so anyone who can push a change to this file can
+    # publish :latest from an unmerged branch. Nothing in a workflow file can
+    # close that.
     #
-    # The agent pipeline's credential can push such a change today: a branch
-    # changing this file was accepted. Taking the `workflow` scope, and any
-    # tool that runs a workflow, away from agent credentials is the cheapest
-    # real guard: a branch that cannot edit this file cannot get past this
-    # condition, for pull requests and manual runs alike.
+    # And a branch cut before this condition existed (THO-563, b185eb3,
+    # 2026-10-26) still has the old file: `workflow_dispatch` and a build job
+    # that publishes :latest with no ref check. A manual run on one publishes
+    # weeks-old code, which Watchtower boots against a schema migrated past
+    # it, with no edit to anything. That was 18 of the 54 branches on origin
+    # on 2026-11-12. Pull requests are not affected that way: their merged
+    # copy has this condition unless the branch edits it.
     #
-    # The rest are GitHub settings the owner makes, in this order, so deploys
-    # never stop:
-    #   1. an Environment restricted to main, holding the publish token;
-    #   2. a change that names that Environment here and logs in with its
+    # The agent pipeline's credential is a GitHub App user token whose App has
+    # the Workflows permission (the `workflow` scope, for a personal access
+    # token): a branch changing this file was accepted. The guards, in an
+    # order that never stops a deploy:
+    #   1. Required, both halves: take the Workflows permission (`workflow`
+    #      scope) away from agent credentials, so a branch cannot edit this
+    #      file, and take away their ability to run workflows (Actions:
+    #      write, and any tool that runs one), so nobody can start a manual
+    #      run on a stale branch. (A classic PAT can dispatch with plain
+    #      `repo`, so only the App's Actions permission can be withdrawn on
+    #      its own.)
+    #   2. Delete the branches cut before this condition, or have them merge
+    #      main, so none still carries the old file.
+    #   3. An Environment restricted to main, holding the publish token.
+    #   4. A change that names that Environment here and logs in with its
     #      token (`environment:` is left out until the Environment exists, or
-    #      every deploy would stop);
-    #   3. only then, the GHCR package's Actions access for this repo set to
-    #      Read, so GITHUB_TOKEN can no longer push it. Set before 2, it
-    #      refuses main's own push below: no image, no deploy, no migrations;
-    #   4. Watchtower following a tag only that job moves.
+    #      every deploy would stop).
+    #   5. Only then, the GHCR package's Actions access for this repo set to
+    #      Read, so GITHUB_TOKEN can no longer push it. Set before 4, it
+    #      refuses main's own push below: no image, no deploy, no migrations.
+    #   6. Watchtower following a tag only that job moves.
     # A branch rule on main requiring code-owner review (.github/CODEOWNERS)
     # gates the merge, not the pull request's run, which publishes before
     # anyone reviews.
