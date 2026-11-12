@@ -26,6 +26,7 @@ const { verifyMediaToken } = require('../../../utils/mediaTokens');
 const { isActiveShareLink } = require('../../../utils/mediaShareToken');
 const { rateLimiter } = require('../../../utils/rateLimiter');
 const { clipFiles, isClip, prepareClip } = require('../../../utils/mediaClips');
+const { ensurePublicCopy, masterCopyKey, renditionCopyKey } = require('../../../utils/mediaPublicCopy');
 const { withOwner, liveAlbumLink, INT32_MAX } = require('./shared');
 
 const router = express.Router();
@@ -79,8 +80,13 @@ async function serveMedia(req, res, which) {
  *
  * `cacheControl` overrides the header below for a caller whose authorization
  * can end before the bytes change — see the share route.
+ *
+ * `publicCopy` is set by the routes a stranger reaches (THO-894): an original
+ * or a rendition is then served as its scrubbed copy, never as itself. The
+ * thumbnail, a photograph's viewing copy and a poster need nothing — sharp
+ * writes them without EXIF (writeWebp never asks for withMetadata()).
  */
-async function sendMediaBytes(res, row, which, context, { cacheControl } = {}) {
+async function sendMediaBytes(res, row, which, context, { cacheControl, publicCopy = false } = {}) {
   // Resolved before the thumb/poster branch, and outside its try: an
   // archive-escape refusal here is the single most important thing these
   // routes can produce and must reach the outer catch and get logged, not
@@ -92,6 +98,13 @@ async function sendMediaBytes(res, row, which, context, { cacheControl } = {}) {
   // original, so `immutable` is only claimed once there is nothing left to
   // supersede. See the Cache-Control below.
   let servingOriginalForPlayback = false;
+  // Set for the copies that are the archive's own bytes — the master, or a
+  // video's rendition — which are the ones a public route must scrub.
+  let archiveBytes = false;
+  let publicKey = null;
+  // A master's key is its own checksum; a rendition's is made again under
+  // the same name. See keyedByContent in mediaPublicCopy.js.
+  let keyedByContent = false;
   // /view is what the lightbox shows. A video's viewing copy is whatever /play
   // chooses, so for a video /view is /play in every respect — the short cache
   // while the original stands in for a rendition included.
@@ -99,6 +112,9 @@ async function sendMediaBytes(res, row, which, context, { cacheControl } = {}) {
     const chosen = await playableFor(archivePath, row.kind);
     absPath = chosen.absPath;
     servingOriginalForPlayback = !chosen.rendition && row.kind === 'VIDEO';
+    archiveBytes = true;
+    publicKey = chosen.rendition ? renditionCopyKey(row) : masterCopyKey(row);
+    keyedByContent = !chosen.rendition;
   } else if (which === 'thumb') {
     try {
       absPath = await ensureThumb({
@@ -126,6 +142,16 @@ async function sendMediaBytes(res, row, which, context, { cacheControl } = {}) {
     }
   } else {
     absPath = archivePath;
+    archiveBytes = true;
+    publicKey = masterCopyKey(row);
+    keyedByContent = true;
+  }
+
+  if (publicCopy && archiveBytes) {
+    absPath = await publicCopyOr404(res, {
+      absPath, key: publicKey, keyedByContent, what: `media ${row.id}`,
+    });
+    if (!absPath) return undefined;
   }
 
   // Immutable: these paths are keyed by content that never changes in place.
@@ -140,6 +166,31 @@ async function sendMediaBytes(res, row, which, context, { cacheControl } = {}) {
     ? 'private, max-age=300'
     : 'private, max-age=31536000, immutable'));
   return sendFileSafely(res, absPath, context);
+}
+
+/**
+ * The scrubbed copy to hand a stranger, or null once a 404 has been sent.
+ *
+ * Fail closed: a file that cannot be scrubbed is refused, never served as it
+ * is. 404 rather than 500 because it is not a fault a retry will cure, and it
+ * is what the share routes say about a file that is not there. The headers a
+ * route set for the file it expected to send go, so the miss is not cached.
+ */
+async function publicCopyOr404(res, {
+  absPath, key, keyedByContent = false, what,
+}) {
+  try {
+    if (!key) throw Object.assign(new Error('no checksum to name its copy by'), { code: 'UNSCRUBBABLE' });
+    return await ensurePublicCopy({ absPath, key, keyedByContent });
+  } catch (err) {
+    if (err.code !== 'UNSCRUBBABLE' && err.code !== 'NO_SOURCE') throw err;
+    console.warn(`[media] not serving ${what} publicly: ${err.message}`);
+    res.removeHeader('Cache-Control');
+    res.removeHeader('Content-Disposition');
+    res.removeHeader('Content-Type');
+    res.status(404).end();
+    return null;
+  }
 }
 
 /**
@@ -244,6 +295,11 @@ router.get('/media/:id/view', (req, res) => serveMedia(req, res, 'view'));
  * A moment of a video is its own cut, made by the rendition service; until it
  * exists the link answers a page that says so and reloads itself.
  *
+ * Whatever it serves is the scrubbed copy (THO-894): the recipient has no
+ * account, the link can be forwarded, and a phone original says where it was
+ * taken — at home, for a photograph taken before leaving for the show. Owner
+ * routes above keep the untouched master.
+ *
  * no-store, not the byte routes' year-long immutable: the link is meant to
  * stop working, and a cached copy would keep opening in the recipient's
  * browser after it had been revoked.
@@ -275,12 +331,19 @@ async function servePublicShare(req, res) {
     if (!row) return res.status(404).end();
 
     if (!isClip(link)) {
-      return await sendMediaBytes(res, row, 'play', SHARE_CONTEXT, { cacheControl: 'private, no-store' });
+      return await sendMediaBytes(res, row, 'play', SHARE_CONTEXT, { cacheControl: 'private, no-store', publicCopy: true });
     }
 
     const status = await prepareClip(link, row);
     res.set('Cache-Control', 'private, no-store');
-    if (status === 'ready') return sendFileSafely(res, clipFiles(link.id).output, SHARE_CONTEXT);
+    if (status === 'ready') {
+      // A cut keeps the source's metadata unless the service is told not to,
+      // so it is scrubbed like an original. Keyed by the link, as the cut is.
+      const cut = await publicCopyOr404(res, {
+        absPath: clipFiles(link.id).output, key: `clip-${link.id}.mp4`, what: `moment ${link.id} of media ${row.id}`,
+      });
+      return cut && sendFileSafely(res, cut, SHARE_CONTEXT);
+    }
     // A cut ffmpeg refused will not succeed on a reload, so not the page that
     // promises one.
     if (status === 'failed') return res.status(404).end();
@@ -305,6 +368,9 @@ router.get('/media/share/:token', shareLimiter, servePublicShare);
  * /file is the archive master, always as a download: that is the full-quality
  * copy the album is for, and a 4K HEVC original navigated to is a blank tab in
  * most browsers. /view and /thumb are what the page shows.
+ *
+ * /file, and /view of a video, are scrubbed copies (THO-894), for the reason
+ * the single link's is.
  *
  * A budget far above the single link's 300 an hour. That one is a single
  * request per opening; this is a grid of thumbnails, and a video being
@@ -347,6 +413,7 @@ async function servePublicAlbumMedia(req, res) {
     // recipient has not already seen.
     return await sendMediaBytes(res, row, which, ALBUM_BYTES_CONTEXT, {
       cacheControl: which === 'thumb' ? 'private, max-age=3600' : 'private, no-store',
+      publicCopy: true,
     });
   } catch (err) {
     return fail(res, err, { context: ALBUM_BYTES_CONTEXT });

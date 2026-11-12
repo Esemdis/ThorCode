@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -141,6 +141,20 @@ describe('planClips', () => {
     expect(jobs.map((j) => j.id)).toEqual([7]);
   });
 
+  it('sweeps the public copy of a moment whose link has expired or gone, and keeps a live one\'s', () => {
+    // cache/public's scrubbed cut of a moment (THO-894) is named by the link,
+    // as the cut is, and was only ever removed on a revoke: an expired link's
+    // stayed a full second copy of the video for good.
+    const { sweepPublic } = planClips(
+      ['7.json', '7.mp4', '8.json'],
+      new Map([['7.json', request(7)], ['8.json', request(8, { expires_at: new Date('2026-09-26T11:00:00Z') })]]),
+      now,
+      ['clip-7.mp4', 'clip-7.mp4.stamp', 'clip-8.mp4', 'clip-8.mp4.stamp', 'clip-9.mp4.clean',
+        'clip-9.mp4.123.0a1b.tmp', 'abc123.jpg', 'web-abc123.mp4'],
+    );
+    expect(sweepPublic.sort()).toEqual(['clip-8.mp4', 'clip-8.mp4.stamp', 'clip-9.mp4.clean']);
+  });
+
   it('never touches a request the API is still writing', () => {
     // Swept between the API's write and its rename, the rename would fail and
     // the share with it.
@@ -197,6 +211,17 @@ describe('prepareClip and removeClip', () => {
     await writeFile(clipFiles(7, root).output, 'mp4');
     await removeClip(7, root);
     expect(await readdir(root)).toEqual([]);
+  });
+
+  it('removes the scrubbed public copy and both its markers with the clip', async () => {
+    const clips = join(root, 'clips');
+    const publicDir = join(root, 'public');
+    await mkdir(publicDir, { recursive: true });
+    for (const name of ['clip-7.mp4', 'clip-7.mp4.stamp', 'clip-7.mp4.clean', 'clip-8.mp4']) {
+      await writeFile(join(publicDir, name), 'x');
+    }
+    await removeClip(7, clips);
+    expect(await readdir(publicDir)).toEqual(['clip-8.mp4']);
   });
 });
 
