@@ -175,3 +175,97 @@ describe('lineupGrew', () => {
     expect(lineupGrew(bill('Ghost'), 'not json')).toBe(false);
   });
 });
+
+// THO-971: the suffix patterns used to be regexes with a leading \s* (or a
+// [\d.,]* run) that the engine retried from every start position, so a long
+// run of spaces, digits or "(" took time proportional to its length squared.
+// 100,000 spaces took 31.6 s on one thread, and a name that long could be
+// stored and then matched against on every band add.
+describe('matching a hostile name (THO-971)', () => {
+  const tho971Long = 100_000;
+  const tho971Inputs = {
+    'spaces between a and x': `a${' '.repeat(tho971Long)}x`,
+    'digits then x': `${'1'.repeat(tho971Long)}x`,
+    'a 1.1.1 mix then x': `${'1.'.repeat(tho971Long / 2)}x`,
+    '"(" repeated': '('.repeat(tho971Long),
+    '1, spaces, then x': `1${' '.repeat(tho971Long)}x`,
+  };
+
+  for (const [label, input] of Object.entries(tho971Inputs)) {
+    it(`finishes in well under a second on 100,000 characters of ${label}`, () => {
+      // 250 ms is a generous ceiling for a linear scan of 100k characters
+      // (it takes a few ms); the old patterns took seconds on every one of
+      // these inputs, so the test cannot pass by luck on a slow machine.
+      for (const fn of [cleanLineupName, canonicalBandName]) {
+        const started = performance.now();
+        fn(input);
+        expect(performance.now() - started).toBeLessThan(250);
+      }
+    });
+  }
+});
+
+describe('the linear suffix strippers keep the old patterns\' answers (THO-971)', () => {
+  // The three regexes the strippers replaced, kept here as the reference they
+  // are checked against. Safe on the short strings below; never in the app.
+  const tho971OldFollower = /\s*\d[\d.,]*\s*[KMB]?\s*followers?\s*$/i;
+  const tho971OldProfile = /\s+official\s*$/i;
+  const tho971OldCountry = /\s*\([^)]*\)\s*$/;
+  const tho971OldClean = (name) => {
+    if (typeof name !== 'string') return '';
+    const cleaned = name.replace(tho971OldFollower, '').replace(tho971OldProfile, '').trim();
+    return cleaned || name.trim();
+  };
+  const tho971OldCountryStrip = (name) => {
+    const cleaned = tho971OldClean(name);
+    if (!cleaned) return '';
+    return cleaned.replace(tho971OldCountry, '').trim() || cleaned;
+  };
+  // The rest of canonicalBandName as it stands, so the comparison is of the
+  // suffix handling alone.
+  const tho971OldCanonical = (name) => tho971OldCountryStrip(name)
+    .normalize('NFD').replace(/[̀-ͯ]/g, '').normalize('NFC')
+    .toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+
+  it('cuts the edge cases where the old patterns did', () => {
+    const cases = [
+      ['Someone.5K followers', 'Someone.'],
+      ['Someone 5K\nFollowers', 'Someone'],
+      ['Someone\n5K followers\n', 'Someone'],
+      ['Someone5 k  follower ', 'Someone'],
+      ['Someone5KK followers', 'Someone5KK followers'],
+      ['Someone K followers', 'Someone K followers'],
+      ['x..5K Followers', 'x..'],
+      ['x5.,K Followers', 'x'],
+      ['thrown\tOFFICIAL ', 'thrown'],
+      ['thrownofficial', 'thrownofficial'],
+      ['official', 'official'],
+      ['Followers', 'Followers'],
+    ];
+    for (const [input, expected] of cases) {
+      expect(cleanLineupName(input)).toBe(expected);
+      expect(cleanLineupName(input)).toBe(tho971OldClean(input));
+    }
+    for (const input of ['Architects (UK', 'A (b (c))', 'A (b) (c)', 'A ((b)', '(UK)', 'Polaris\n(AUS) \n', 'A (b) c']) {
+      expect(canonicalBandName(input)).toBe(tho971OldCanonical(input));
+    }
+    expect(canonicalBandName('A (b) (c)')).toBe('ab');
+    expect(canonicalBandName('A ((b)')).toBe('a');
+  });
+
+  it('agrees with the old patterns on thousands of generated names', () => {
+    // A seeded generator over the pieces the patterns care about, so every
+    // run checks the same names and a failure can be reproduced.
+    const pieces = ['a', 'Z', ' ', '\n', '\t', '1', '0', '.', ',', 'K', 'm', 'b', '(', ')',
+      'followers', 'Follower', 'FOLLOWERS', 'official', 'Official', 'ö', 'ſ', 'K'];
+    let seed = 971;
+    const next = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed; };
+    for (let n = 0; n < 20_000; n++) {
+      const length = next() % 9;
+      let name = '';
+      for (let i = 0; i < length; i++) name += pieces[next() % pieces.length];
+      expect([name, cleanLineupName(name)]).toEqual([name, tho971OldClean(name)]);
+      expect([name, canonicalBandName(name)]).toEqual([name, tho971OldCanonical(name)]);
+    }
+  });
+});

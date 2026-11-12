@@ -1852,6 +1852,25 @@ describe('POST /wishlists/:id/bands', () => {
     expect(res.body.error).toMatch(/already on this wishlist/);
   });
 
+  it('answers 400 when band creation refuses the name as too long, and links nothing (THO-971)', async () => {
+    vi.spyOn(bandCreate, 'createBand').mockRejectedValue(new bandCreate.BandNameTooLongError());
+
+    const res = await add({ name: 'Gojira' });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'name must be at most 200 characters' });
+    expect(prisma.wishlistBandReference.create).not.toHaveBeenCalled();
+  });
+
+  it('refuses a 201-character name before any band is read (THO-971)', async () => {
+    const res = await add({ name: `  ${'a'.repeat(201)}  ` });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'name must be at most 200 characters' });
+    expect(prisma.band.findMany).not.toHaveBeenCalled();
+    expect(prisma.wishlistBandReference.create).not.toHaveBeenCalled();
+  });
+
   it('answers 404 for a Ticketmaster id no band has', async () => {
     vi.spyOn(bandCreate, 'createBand');
     prisma.band.findUnique.mockResolvedValue(null);
