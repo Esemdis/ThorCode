@@ -467,3 +467,148 @@ describe('GET /album-shares/:token/media/:id/:which', () => {
     await bytesAt('not-a-real-token', 1, 'file').expect(404);
   });
 });
+
+// A link to the night's picks rather than every file of it (THO-849).
+describe('sharing a night\'s picks', () => {
+  // The fakes above know nothing of either column; these add them, so a query
+  // that forgot to ask for one kind of link, or for picked files, finds rows
+  // the real one would not.
+  const picksMatchTho849 = (l, where) => where.picks_only === undefined || Boolean(l.picks_only) === where.picks_only;
+  beforeEach(() => {
+    prisma.mediaAlbumShareLink.findFirst = vi.fn(async ({ where }) => albumLinks
+      .filter((l) => matchesAlbumWhere(l, where) && picksMatchTho849(l, where))
+      .sort((a, b) => b.created_at - a.created_at)[0] ?? null);
+    // The POST reads every candidate since THO-895, to pick the one that is
+    // still this night's; the kind must filter that read too.
+    prisma.mediaAlbumShareLink.findMany = vi.fn(async ({ where }) => albumLinks
+      .filter((l) => matchesAlbumWhere(l, where) && picksMatchTho849(l, where))
+      .sort((a, b) => b.created_at - a.created_at || b.id - a.id));
+    prisma.mediaAlbumShareLink.updateMany = vi.fn(async ({ where, data }) => {
+      const hit = albumLinks.filter((l) => matchesAlbumWhere(l, where) && picksMatchTho849(l, where));
+      hit.forEach((l) => Object.assign(l, data));
+      return { count: hit.length };
+    });
+    prisma.concertMedia.findMany = vi.fn(async ({ where }) => mediaRows.filter((m) => where.attendance_id.in.includes(m.attendance_id)
+      && (where.picked === undefined || Boolean(m.picked) === where.picked)));
+  });
+
+  const sharePicksTho849 = (ids, body = { picks_only: true }) => request(app())
+    .post('/data/concerts/album-shares').set(...authHeader(ownerTho892)).send({ attendance_ids: ids, ...body });
+  const stopKindTho849 = (ids, kind) => request(app())
+    .delete(`/data/concerts/album-shares?attendance_ids=${ids.join(',')}${kind === undefined ? '' : `&picks_only=${kind}`}`)
+    .set(...authHeader(ownerTho892));
+  const pickedFileTho849 = async (id, picked, over = {}) => {
+    const row = await fileInAlbumTho892({ id, filename: `IMG_${id}.jpg`, ...over });
+    row.picked = picked;
+    return row;
+  };
+
+  it('mints a link of its own beside the whole night\'s, and hands it back when asked again', async () => {
+    const night = await shareNight([1]).expect(200);
+    const picks = await sharePicksTho849([1]).expect(200);
+    expect(picks.body.data.token).not.toBe(night.body.data.token);
+    expect(picks.body.data.picks_only).toBe(true);
+    expect(night.body.data.picks_only).toBe(false);
+    expect((await sharePicksTho849([1]).expect(200)).body.data.token).toBe(picks.body.data.token);
+    expect((await shareNight([1]).expect(200)).body.data.token).toBe(night.body.data.token);
+    expect(albumLinks.map((l) => l.picks_only)).toEqual([false, true]);
+  });
+
+  it('never hands back or widens a picks link for a whole-night request of the same night, nor the reverse', async () => {
+    // Since THO-895 the POST picks among every live candidate for the night.
+    // If the kind dropped out of that read, sharing the whole night would
+    // widen the picks link (or a picks request the whole night's), and a URL
+    // already sent would change what it shows.
+    const picks = await sharePicksTho849([1]).expect(200);
+    const night = await shareNight([1, 2]).expect(200);
+    expect(night.body.data.token).not.toBe(picks.body.data.token);
+    expect(night.body.data.picks_only).toBe(false);
+    expect(prisma.mediaAlbumShareLink.findMany.mock.calls.at(-1)[0].where.picks_only).toBe(false);
+
+    const morePicks = await sharePicksTho849([1, 2, 3]).expect(200);
+    expect(morePicks.body.data.token).toBe(picks.body.data.token);
+    expect(prisma.mediaAlbumShareLink.findMany.mock.calls.at(-1)[0].where.picks_only).toBe(true);
+
+    // Each link widened only by its own kind.
+    expect(albumLinks.map((l) => [l.picks_only, l.attendance_ids])).toEqual([[true, [1, 2, 3]], [false, [1, 2]]]);
+  });
+
+  it('refuses a picks_only it cannot read rather than sharing the whole night', async () => {
+    await sharePicksTho849([1], { picks_only: 'yes' }).expect(400);
+    await sharePicksTho849([1], { picks_only: 1 }).expect(400);
+    expect(albumLinks).toEqual([]);
+  });
+
+  it('lists only what is picked, says so, and follows picking after it was sent', async () => {
+    await pickedFileTho849(1, true);
+    const unpicked = await pickedFileTho849(2, false);
+    const { body } = await sharePicksTho849([1]).expect(200);
+
+    const first = (await openAlbum(body.data.token).expect(200)).body.data;
+    expect(first.picks_only).toBe(true);
+    expect(first.files.map((f) => f.id)).toEqual([1]);
+    expect(first.bands).toEqual([{ id: 92, name: 'Gojira', setlist: null }]);
+    // Whether a file is picked is the owner's business, as on the whole night.
+    expect(Object.keys(first.files[0])).not.toContain('picked');
+
+    unpicked.picked = true;
+    expect((await openAlbum(body.data.token).expect(200)).body.data.files.map((f) => f.id)).toEqual([1, 2]);
+    mediaRows[0].picked = false;
+    expect((await openAlbum(body.data.token).expect(200)).body.data.files.map((f) => f.id)).toEqual([2]);
+  });
+
+  it('opens a picked file\'s bytes and refuses an unpicked one of the same night, as one that does not exist', async () => {
+    // The ids are sequential: the file beside a picked one is a guess away.
+    await pickedFileTho849(1, true);
+    await pickedFileTho849(2, false);
+    const picks = (await sharePicksTho849([1]).expect(200)).body.data.token;
+    const night = (await shareNight([1]).expect(200)).body.data.token;
+    const bytesAt = (token, id, which) => request(app()).get(`/data/concerts/album-shares/${token}/media/${id}/${which}`);
+
+    for (const which of ['thumb', 'view', 'file']) {
+      await bytesAt(picks, 1, which).expect(200);
+      await bytesAt(picks, 2, which).expect(404);
+      await bytesAt(night, 2, which).expect(200);
+    }
+  });
+
+  it('hands a picked original out without the place it was taken', async () => {
+    // Through the same scrubbed copy as the whole night (THO-894), never a
+    // path of its own to the original.
+    const { jpeg, tiffAt, at } = jpegWithGpsTho894();
+    await pickedFileTho849(1, true, { bytes: jpeg });
+    const { body } = await sharePicksTho849([1]).expect(200);
+    const res = await request(app()).get(`/data/concerts/album-shares/${body.data.token}/media/1/file`).expect(200);
+    expect(res.body.readUInt16LE(tiffAt + at.gpsIfd)).toBe(0);
+  });
+
+  it('stops one kind of link or the other, and both when not told which', async () => {
+    const tokens = async () => ({
+      night: (await shareNight([1]).expect(200)).body.data.token,
+      picks: (await sharePicksTho849([1]).expect(200)).body.data.token,
+    });
+
+    let t = await tokens();
+    await stopKindTho849([1], 1).expect(204);
+    await openAlbum(t.picks).expect(404);
+    await openAlbum(t.night).expect(200);
+
+    t = await tokens();
+    await stopKindTho849([1], 0).expect(204);
+    await openAlbum(t.night).expect(404);
+    await openAlbum(t.picks).expect(200);
+
+    // The app from before picks could be shared stops "the night's link":
+    // ending both is the safe reading of that.
+    t = await tokens();
+    await stopKindTho849([1]).expect(204);
+    await openAlbum(t.night).expect(404);
+    await openAlbum(t.picks).expect(404);
+  });
+
+  it('refuses a picks_only on a stop that it cannot read, stopping nothing', async () => {
+    const { body } = await sharePicksTho849([1]).expect(200);
+    await stopKindTho849([1], 'maybe').expect(400);
+    await openAlbum(body.data.token).expect(200);
+  });
+});

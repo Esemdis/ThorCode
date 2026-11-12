@@ -513,6 +513,14 @@ model MediaAlbumShareLink {
   created_at     DateTime  @default(now())
   expires_at     DateTime
   revoked_at     DateTime?
+  /// Only the files the owner picked (ConcertMedia.picked), not the whole
+  /// night (THO-849): the handful someone sends a friend who was there,
+  /// rather than every file in full quality. Live like the list of
+  /// attendances: a file picked after sharing is in it, an unpicked one is
+  /// gone. A picks link and a whole-night link to the same night are separate
+  /// rows with their own tokens, so a URL already sent never changes from one
+  /// to the other.
+  picks_only     Boolean   @default(false)
 
   user_rel User @relation("UserMediaAlbumShareLinks", fields: [user_id], references: [id], onDelete: Cascade)
 

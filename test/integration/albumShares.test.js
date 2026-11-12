@@ -1,5 +1,6 @@
 /**
- * Sharing a whole night by public link (THO-892) against Postgres.
+ * Sharing a whole night, or its picks (THO-849), by public link (THO-892)
+ * against Postgres.
  *
  * The unit tests fake Prisma, and the fake answers `has` and `hasSome` on the
  * attendance_ids array with a few lines of JavaScript written to agree with
@@ -161,6 +162,44 @@ describe.skipIf(!url)('album share links', () => {
     const again = await share(owner.user.id, [a1.id, a2.id]).expect(200);
     expect(again.body.data.token).not.toBe(token);
   });
+
+  it('shares a night\'s picks as a link of its own, listing and serving only picked files (THO-849)', async () => {
+    // The new column and the `picked` filter against the real table: a picks
+    // link and a whole-night link to the same night are told apart by
+    // picks_only, and an unpicked file is outside the picks link's reach.
+    const owner = await makeAlbumUser('picks');
+    const show = await makeAlbumShow('Picks Stage');
+    const att = await prisma.concertAttendance.create({ data: { wishlist_id: owner.wishlist.id, concert_id: show.id } });
+    const picked = await makeAlbumFile({ attendanceId: att.id, userId: owner.user.id, filename: 'PICK_1.jpg' });
+    const unpicked = await makeAlbumFile({ attendanceId: att.id, userId: owner.user.id, filename: 'PICK_2.jpg' });
+    await prisma.concertMedia.update({ where: { id: picked.id }, data: { picked: true } });
+
+    const sharePicks = () => request(app)
+      .post('/data/concerts/album-shares').set('Authorization', bearer(owner.user.id))
+      .send({ attendance_ids: [att.id], picks_only: true });
+    const night = await share(owner.user.id, [att.id]).expect(200);
+    const picks = await sharePicks().expect(200);
+    expect(picks.body.data.token).not.toBe(night.body.data.token);
+    expect((await sharePicks().expect(200)).body.data.token).toBe(picks.body.data.token);
+
+    const listed = (await open(picks.body.data.token).expect(200)).body.data;
+    expect(listed.picks_only).toBe(true);
+    expect(listed.files.map((f) => f.id)).toEqual([picked.id]);
+    const bytesAt = (id) => request(app).get(`/data/concerts/album-shares/${picks.body.data.token}/media/${id}/file`);
+    await bytesAt(picked.id).expect(200);
+    await bytesAt(unpicked.id).expect(404);
+
+    const mine = (await listing(owner.user.id, att.id).expect(200)).body.data;
+    expect(mine.album_shared_until).toBe(night.body.data.expires_at);
+    expect(mine.album_picks_shared_until).toBe(picks.body.data.expires_at);
+
+    // Stopping the picks leaves the whole night shared.
+    await request(app).delete(`/data/concerts/album-shares?attendance_ids=${att.id}&picks_only=1`)
+      .set('Authorization', bearer(owner.user.id)).expect(204);
+    await open(picks.body.data.token).expect(404);
+    await open(night.body.data.token).expect(200);
+  });
+
   it('mints a link to the other night rather than widening this one\'s, once a show\'s date was corrected (THO-895)', async () => {
     const owner = await makeAlbumUser('tho895');
     const showOnTho895 = (venue, day) => prisma.concert.create({
