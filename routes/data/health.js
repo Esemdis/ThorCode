@@ -23,6 +23,7 @@ const { rateLimiter } = require("../../utils/rateLimiter");
 const { archiveStatus } = require("../../utils/mediaHealth");
 const { pythonServiceGet, pythonServiceFailure } = require("../../utils/pythonService");
 const { error: sendError } = require("../../utils/apiResponse");
+const { followCheckSummary } = require("../../utils/followCheck");
 
 const rateLimit = rateLimiter({
   message: "Too many requests to the health route, please try again later.",
@@ -44,7 +45,8 @@ const SETLIST_STALE_DAYS = 3;
  * GET /data/concerts/health — how much work each nightly job has waiting.
  *
  * Counts only. An admin looking at this wants to know whether pressing a
- * button will do anything, not which rows it will touch.
+ * button will do anything, not which rows it will touch. `follow_checks` is
+ * counts too, worked out here from the followed shows' few rows (#43).
  */
 router.get(
   "/health",
@@ -55,6 +57,8 @@ router.get(
       const forecastEnd = new Date(now.getTime() + FORECAST_DAYS * DAY_MS);
       const setlistStale = new Date(now.getTime() - SETLIST_STALE_DAYS * DAY_MS);
       const aDayAgo = new Date(now.getTime() - DAY_MS);
+      const startOfToday = new Date(now);
+      startOfToday.setUTCHours(0, 0, 0, 0);
 
       // The backfill's queue, spelled exactly as utils/setlistBackfill.js
       // spells it: a past show someone attended, still missing a setlist for a
@@ -71,6 +75,7 @@ router.get(
         bandsTotal, bandsNoSetlist, bandsStaleSetlist, bandsNoSpotifyId, bandsPhotoStale,
         upcoming, upcomingNoCoords, weatherMissing, weatherRefreshable,
         setlistQueue, setlistNeverChecked, setlistCheckedToday,
+        followed,
       ] = await prisma.$transaction([
         prisma.band.count(),
         prisma.band.count({ where: { setlist: { equals: Prisma.DbNull } } }),
@@ -117,6 +122,23 @@ router.get(
         prisma.concert.count({
           where: { ...backfillQueue, setlist_checked_at: { gte: aDayAgo } },
         }),
+
+        // The followed-show checker's shows (#43), as GET /follows/check-due
+        // reads them: rows, not a count, because which ones it can read is
+        // utils/followCheck.js listingUrl's call, not a column. One row per
+        // show however many follow it, and only shows still to come, so this
+        // stays the few hundred rows the checker already reads every five
+        // minutes.
+        prisma.concert.findMany({
+          where: {
+            follows: { some: {} },
+            OR: [{ concert_date: null }, { concert_date: { gte: startOfToday } }],
+          },
+          select: {
+            id: true, name: true, venue: true, concert_date: true, url: true, event_id: true,
+            listing_check: { select: { checked_at: true, attempted_at: true, failures: true, last_error: true } },
+          },
+        }),
       ]);
 
       // Not a queue like everything else here, and deliberately included
@@ -152,6 +174,7 @@ router.get(
           checked_today: setlistCheckedToday,
         },
         archive,
+        follow_checks: followCheckSummary(followed, now),
       });
     } catch (error) {
       console.error("Error building health counts:", error);

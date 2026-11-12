@@ -609,9 +609,16 @@ const currentPasswordLimit = rateLimiter({
   // Only a wrong (or missing-on-the-account) current password is a guess, and
   // both answer 403. Counting every 400 and 500 as one, someone retrying a
   // stuck deletion, or a new password the rules refuse, was told "Too many
-  // wrong passwords" after giving the right one every time.
-  requestWasSuccessful: (req, res) => res.statusCode !== 403,
+  // wrong passwords" after giving the right one every time. The service
+  // account's refusal to be deleted is a 403 too, but it comes after the
+  // password was accepted, so it is no guess either: a route marks the
+  // password accepted (acceptCurrentPassword) before any later 403.
+  requestWasSuccessful: (req, res) => res.statusCode !== 403 || res.locals.currentPasswordAccepted === true,
 });
+
+const acceptCurrentPassword = (res) => {
+  res.locals.currentPasswordAccepted = true;
+};
 
 /**
  * Why `given` does not prove the caller knows this account's password, or
@@ -663,6 +670,7 @@ router.patch(
 
       const refusal = await currentPasswordRefusal(user, currentPassword);
       if (refusal) return response.forbidden(res, refusal);
+      acceptCurrentPassword(res);
       // Someone rotating a leaked password who types the old one again would
       // otherwise be told it changed when nothing did.
       if (await bcrypt.compare(newPassword, user.password_hash)) {
@@ -684,6 +692,21 @@ router.patch(
     }
   },
 );
+
+/**
+ * Whether the account is gone, asked after a deletion's rows failed with
+ * P2025. Only a clear "no row" counts: if the question itself fails, the
+ * person must still hear that their photos went and a retry finishes it,
+ * not the catch-all's "Internal server error" that reads as nothing done.
+ */
+async function accountGoneAfterDeletion(userId) {
+  try {
+    return !(await prisma.user.findUnique({ where: { id: userId }, select: { id: true } }));
+  } catch (error) {
+    console.error('Error checking whether a deleted account is gone:', error);
+    return false;
+  }
+}
 
 /**
  * DELETE /users/me
@@ -713,6 +736,7 @@ router.delete('/me', auth, currentPasswordLimit, upload.none(), async (req, res)
 
     const wrong = await currentPasswordRefusal(user, currentPassword);
     if (wrong) return response.forbidden(res, wrong);
+    acceptCurrentPassword(res);
 
     const adminCount = user.role === 'ADMIN' ? await prisma.user.count({ where: { role: 'ADMIN' } }) : 0;
     const refusal = accountDeletionRefusal(user, adminCount);
@@ -739,7 +763,7 @@ router.delete('/me', auth, currentPasswordLimit, upload.none(), async (req, res)
       // both pass the read above, the first commits, and the second's
       // user.delete finds no row. The account is gone, which is what was
       // asked, so that is a success, not a "try again" that then 404s.
-      if (error?.code === 'P2025' && !(await prisma.user.findUnique({ where: { id: user.id }, select: { id: true } }))) {
+      if (error?.code === 'P2025' && (await accountGoneAfterDeletion(user.id))) {
         return response.success(res, 200, {}, 'Account deleted');
       }
       console.error('Error deleting account rows after its files were removed:', error);
