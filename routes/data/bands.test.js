@@ -375,6 +375,42 @@ describe('POST /bulk', () => {
       expect(prisma.city.upsert.mock.calls[0][0].update).toEqual({});
     });
 
+    // python-crohn sends reachable as "true" or "false" on every show, both
+    // truthy, and the upsert wrote it over whatever the city held: an admin's
+    // hand-set flag was undone by the next new show (THO-831).
+    it('keeps a reachable flag the city already has', async () => {
+      prisma.city.upsert.mockResolvedValue({ id: 7, latitude: 59.3293, longitude: 18.0686, reachable: 'false' });
+
+      const res = await request(app)
+        .post('/bulk').set(...authHeader(system)).send({ concerts: [placed({ reachable: 'true' })] });
+
+      expect(res.status).toBe(200);
+      expect(prisma.city.upsert.mock.calls[0][0].update).toEqual({});
+      expect(prisma.city.update).not.toHaveBeenCalled();
+    });
+
+    it('fills reachable on a city that has none, and sets it on a new one', async () => {
+      prisma.city.upsert.mockResolvedValue({ id: 7, latitude: 59.3293, longitude: 18.0686, reachable: null });
+
+      const res = await request(app)
+        .post('/bulk').set(...authHeader(system)).send({ concerts: [placed({ reachable: 'true' })] });
+
+      expect(res.status).toBe(200);
+      expect(prisma.city.update).toHaveBeenCalledWith({ where: { id: 7 }, data: { reachable: 'true' } });
+      expect(prisma.city.upsert.mock.calls[0][0].create).toMatchObject({ reachable: 'true' });
+    });
+
+    it('fills coordinates and reachable in one write when the city has neither', async () => {
+      prisma.city.upsert.mockResolvedValue({ id: 7, latitude: null, longitude: null, reachable: null });
+
+      await request(app).post('/bulk').set(...authHeader(system)).send({ concerts: [placed({ reachable: 'false' })] });
+
+      expect(prisma.city.update).toHaveBeenCalledTimes(1);
+      expect(prisma.city.update).toHaveBeenCalledWith({
+        where: { id: 7 }, data: { latitude: 59.2937, longitude: 18.0810, reachable: 'false' },
+      });
+    });
+
     it('files a show under the stored city it sits in, by that city\'s name', async () => {
       // Each spelling used to become its own City, and a watch on Stockholm
       // never saw a show filed under Johanneshov.

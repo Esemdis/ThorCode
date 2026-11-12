@@ -315,14 +315,11 @@ router.post(
                 longitude: hasCoords ? longitude : null,
                 reachable: concert.reachable ?? null,
               },
-              update: {
-                // Never overwrite manually set flight_price. Coordinates are
-                // backfilled below rather than here: what to write depends on
-                // what the row already holds, which an upsert's update cannot
-                // read.
-                ...(concert.reachable && { reachable: concert.reachable }),
-              },
-              select: { id: true, latitude: true, longitude: true },
+              // Nothing on an existing row: coordinates and reachable are
+              // backfilled below, because what to write depends on what the
+              // row already holds, which an upsert's update cannot read.
+              update: {},
+              select: { id: true, latitude: true, longitude: true, reachable: true },
             });
             cityId = cityRecord.id;
 
@@ -333,8 +330,18 @@ router.post(
             // and with it every distance and map pin drawn from the city rather
             // than the show. Written as a second statement, the way the
             // setlist.fm attendance route writes it.
-            if (hasCoords && (cityRecord.latitude == null || cityRecord.longitude == null)) {
-              await tx.city.update({ where: { id: cityId }, data: { latitude, longitude } });
+            //
+            // reachable the same way (THO-831): python-crohn sends "true" or
+            // "false" on every show, both truthy, so the next new show
+            // overwrote the flag an admin had set by hand (PATCH
+            // /data/cities/:id). Filled only while the city has none, as a
+            // city merge fills it (utils/cityMatch.js GAP_FIELDS).
+            const backfill = {
+              ...(hasCoords && (cityRecord.latitude == null || cityRecord.longitude == null) && { latitude, longitude }),
+              ...(concert.reachable && cityRecord.reachable == null && { reachable: concert.reachable }),
+            };
+            if (Object.keys(backfill).length) {
+              await tx.city.update({ where: { id: cityId }, data: backfill });
             }
           }
 
