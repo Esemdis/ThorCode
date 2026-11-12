@@ -27,6 +27,21 @@ class BandExistsError extends Error {
   }
 }
 
+// Band.name has no length limit in the schema and the body limit is 10 MB,
+// but every stored name is read and matched on each band add and in /bulk's
+// sync transaction, so one huge name slows every later add for everyone
+// (THO-971: a 60,002-character band made each add take 4.4 s, not 20 ms). The
+// longest real band names run to a few dozen characters. Counted after trim,
+// in JS string length, as quick-add always did.
+const BAND_NAME_MAX = 200;
+
+class BandNameTooLongError extends Error {
+  constructor() {
+    super(`name must be at most ${BAND_NAME_MAX} characters`);
+    this.name = 'BandNameTooLongError';
+  }
+}
+
 const UNIQUE_VIOLATION = 'P2002';
 
 /**
@@ -36,9 +51,13 @@ const UNIQUE_VIOLATION = 'P2002';
  *
  * @param {string} name - already trimmed and non-empty
  * @returns {Promise<{ band: object, songkickUrl: string|null, bandsintownUrl: string|null, warning: string|null }>}
+ * @throws {BandNameTooLongError} when the name is over BAND_NAME_MAX, before anything is read
  * @throws {BandExistsError} when a band by that name is already there
  */
 async function createBand(name) {
+  // First, before the lookup below reads every band and matches against them.
+  if (name.length > BAND_NAME_MAX) throw new BandNameTooLongError();
+
   // Canonical, not exact: "gojira" under "Gojira" is the same band, and Band
   // .name only refuses the byte-identical one.
   const existing = await findBandByCanonicalName(prisma, name, { MBID: true });
@@ -135,4 +154,4 @@ async function createBand(name) {
   };
 }
 
-module.exports = { createBand, BandExistsError };
+module.exports = { createBand, BandExistsError, BandNameTooLongError, BAND_NAME_MAX };

@@ -248,6 +248,11 @@ router.post(
           // identical to a clean add.
           lookupWarning = created.warning;
         } catch (error) {
+          // Before the wishlist reference: an over-long name made no band, so
+          // there is nothing to link (THO-971).
+          if (error instanceof bandCreate.BandNameTooLongError) {
+            return res.status(400).json({ error: error.message });
+          }
           if (!(error instanceof bandCreate.BandExistsError)) throw error;
           band = error.band;
         }

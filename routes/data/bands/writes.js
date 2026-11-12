@@ -45,10 +45,9 @@ const quickAddRateLimit = rateLimiter({
   keyGenerator: (req) => req.user?.id ?? req.ip,
 });
 
-// Band.name has no length limit in the schema, the body limit is 10 MB, and
-// /bulk loads every band name to match lineups against. The longest real band
-// names run to a few dozen characters.
-const QUICK_ADD_NAME_MAX = 200;
+// The same cap createBand enforces (THO-971; the reason is there). Quick-add
+// checks it itself because it can store a band without going through createBand.
+const QUICK_ADD_NAME_MAX = bandCreate.BAND_NAME_MAX;
 
 // A wishlist id arriving in a request body is a claim, not a fact. Wishlist
 // .user_id is unique — one wishlist per account — and ids are sequential
@@ -323,6 +322,9 @@ router.post(
             error: stored.name === name ? 'Band already exists.' : `Band already exists as "${stored.name}".`,
             band: { id: stored.id, name: stored.name },
           });
+        }
+        if (error instanceof bandCreate.BandNameTooLongError) {
+          return res.status(400).json({ error: error.message });
         }
         throw error;
       }
