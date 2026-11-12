@@ -510,9 +510,6 @@ function findStoredMatch(concert, bandIds, candidates, upgraded = new Set()) {
  */
 function mergedFields(stored, incoming, now = new Date()) {
   const lineup = cleanLineupJson(incoming.metadata);
-  // The price a row shows belongs to a listing, so only that listing's own
-  // source may change it. Any source may fill one in where there is none.
-  const ownsListing = !stored.source || stored.source === incoming.source;
 
   const wanted = {
     name: bestEventName(stored.name, incoming.name),
@@ -525,9 +522,7 @@ function mergedFields(stored, incoming, now = new Date()) {
     ...(incoming.festival && { festival: true }),
     ...adoptedTime(stored, incoming),
   };
-  for (const key of ['price_min', 'price_max', 'price_currency']) {
-    if (incoming[key] != null && (stored[key] == null || ownsListing)) wanted[key] = incoming[key];
-  }
+  Object.assign(wanted, mergedPrice(stored, incoming));
 
   const changed = ([key, value]) => {
     const was = stored[key];
@@ -547,6 +542,27 @@ function mergedFields(stored, incoming, now = new Date()) {
     // — a listing marked in stock by default must not clear a sale day.
     ...mergeTicketFields(stored, incoming, now),
   };
+}
+
+/**
+ * The price fields a scrape may write onto a stored row, unfiltered.
+ *
+ * The price a row shows belongs to a listing, so only that listing's own
+ * source may change it. Any source may fill one in where there is none.
+ * Shared with the followed-show checker (utils/followCheck.js), whose reads
+ * are Songkick's and follow the same rule.
+ *
+ * @param {object} stored
+ * @param {object} incoming - with `source`
+ * @returns {object}
+ */
+function mergedPrice(stored, incoming) {
+  const ownsListing = !stored.source || stored.source === incoming.source;
+  const wanted = {};
+  for (const key of ['price_min', 'price_max', 'price_currency']) {
+    if (incoming[key] != null && (stored[key] == null || ownsListing)) wanted[key] = incoming[key];
+  }
+  return wanted;
 }
 
 /**
@@ -780,6 +796,7 @@ module.exports = {
   deduplicateByCoords,
   checkDuplicateConcert,
   mergedFields,
+  mergedPrice,
   sourcesOf,
   // Response-time
   deduplicateConcerts,

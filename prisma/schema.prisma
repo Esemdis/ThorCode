@@ -95,6 +95,13 @@ model Concert {
   sold_out           Boolean?               @default(false)
   reachable          String?
   setlist_checked_at DateTime?
+  // What the followed-show checker last read off the Songkick listing
+  // (THO-779): each vendor as utils/followCheck.js sanitizeVendors keeps it,
+  // the JSON-LD eventStatus ('cancelled', 'postponed', …), and when a check
+  // first saw a sale it had been waiting on open. Null until a check reads one.
+  vendors            Json?
+  event_status       String?
+  tickets_opened_at  DateTime?
   // Set when a scheduled sync inserts the show or adds an act to it, cleared
   // once /wishlists/notify has posted it. A delivery that failed leaves it set,
   // and the next sync's /bulk hands the show back to be sent again — the
@@ -115,6 +122,7 @@ model Concert {
   attendances        ConcertAttendance[]    @relation("ConcertAttendances")
   deliveries         ConcertDelivery[]      @relation("ConcertDeliveries")
   follows            ConcertFollow[]        @relation("ConcertFollows")
+  listing_check      ConcertListingCheck?   @relation("ConcertListingCheck")
 
   @@index([city_id])
   @@index([venue_id])
@@ -253,6 +261,23 @@ model ConcertFollow {
 
   @@id([user_id, concert_id])
   @@index([concert_id])
+}
+
+// When the followed-show checker last read a show's Songkick listing, and
+// whether someone is waiting on a read (THO-779). One row per show, however
+// many follow it: the listing is the show's, so one read answers every
+// follower. `pending` is requested_at later than attempted_at; attempted_at
+// moves on a failure too, so a listing that will not load is not retried
+// every five minutes, and checked_at only on a read that worked.
+model ConcertListingCheck {
+  concert_id   Int       @id
+  checked_at   DateTime?
+  attempted_at DateTime?
+  requested_at DateTime?
+  // Failed reads in a row; two or more is "can't read the listing right now".
+  failures     Int       @default(0)
+  last_error   String?
+  concert_rel  Concert   @relation("ConcertListingCheck", fields: [concert_id], references: [id], onDelete: Cascade)
 }
 
 // One act on one show having reached one wishlist's Discord webhook. Per act
