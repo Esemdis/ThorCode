@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { buildApp, authHeader, installFakePrisma } from '../../test/routeApp.js';
 import {
   jpegWithGpsTho894, minimalJpegTho894, mp4WithLocationTho894,
+  pixelMotionPhotoTho899, samsungMotionPhotoTho899, iptcApp13Tho899,
 } from '../../test/exifFixture.js';
 
 // Sharing a whole night by public link (THO-892). Its own file rather than
@@ -375,6 +376,33 @@ describe('GET /album-shares/:token/media/:id/:which', () => {
       expect(res.body.includes(Buffer.from('+59.9139+010.7522'))).toBe(false);
       expect(res.body.includes(Buffer.from('iPhone 15 Pro'))).toBe(false);
     }
+  });
+
+  it('strips the location from the video inside a shared motion photo, and the IPTC city from a photo', async () => {
+    // THO-899: a Pixel motion photo appends its clip after the JPEG, a Samsung
+    // one keeps it in its SEF trailer beside the mobile country code, and a
+    // Lightroom export keeps the city in APP13. None of them was reached.
+    const { jpeg } = jpegWithGpsTho894();
+    const files = [
+      pixelMotionPhotoTho899().file,
+      samsungMotionPhotoTho899().file,
+      Buffer.concat([jpeg.subarray(0, 2), iptcApp13Tho899(), jpeg.subarray(2)]),
+    ];
+    for (const [i, bytes] of files.entries()) {
+      await fileInAlbumTho892({ id: i + 1, bytes, filename: `PXL_${i + 1}.MP.jpg` });
+    }
+    const { body } = await shareNight([1]).expect(200);
+
+    for (const [i, original] of files.entries()) {
+      const res = await rawBytesTho894(bytesAt(body.data.token, i + 1, 'file')).expect(200);
+      expect(res.body.length).toBe(original.length);
+      for (const gone of ['+59.9139+010.7522', 'iPhone 15 Pro', 'SN-1234567890', 'MCC_Data242', 'IPTC-City']) {
+        expect(res.body.includes(Buffer.from(gone, 'latin1'))).toBe(false);
+      }
+    }
+    // The video is still there, frames and all, for whoever wants to play it.
+    const pixel = await rawBytesTho894(bytesAt(body.data.token, 1, 'file')).expect(200);
+    expect(pixel.body.includes(Buffer.from('frame-data-that-must-never-change'.repeat(4)))).toBe(true);
   });
 
   it('answers 404, not the original, for a file it cannot strip', async () => {

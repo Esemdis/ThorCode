@@ -6,6 +6,7 @@ import { exifCapturedAt } from './exifCapturedAt.js';
 import {
   jpegWithGpsTho894, buildExifWithGpsTho894, minimalJpegTho894, mp4WithLocationTho894, xmpApp1Tho894,
   jpegWithExif, tiffFromIfdsTho894Review, mp4BoxTho894Review,
+  iptcApp13Tho899, pixelMotionPhotoTho899, samsungMotionPhotoTho899, samsungTrailerTho899,
 } from '../test/exifFixture.js';
 
 // THO-894: what a stranger's copy of a file must not carry, cut out by
@@ -600,6 +601,279 @@ describe('planScrub after the THO-894 review, round 2', () => {
     head.writeUInt16BE(payload.length + 2, 2);
     const jpeg = Buffer.concat([minimalJpegTho894.subarray(0, 2), head, payload, minimalJpegTho894.subarray(2)]);
     expect(await planScrub(jpeg)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THO-899: what a JPEG carries after its last image (a motion photo's video,
+// Samsung's SEF trailer), and IPTC in APP13.
+
+const VIDEO_LOCATION_THO899 = ['+59.9139+010.7522', 'iPhone 15 Pro', 'Pixel 8', '59,54.08N', 'home\0', '\xa9xyz', 'loci'];
+const VIDEO_FRAMES_THO899 = 'frame-data-that-must-never-change'.repeat(4);
+
+const expectNoVideoLocationTho899 = (out) => {
+  for (const gone of VIDEO_LOCATION_THO899) expect(containsTho894(out, gone)).toBe(false);
+};
+
+describe('planScrub on a motion photo (THO-899)', () => {
+  it('scrubs the video a Pixel motion photo appends, and keeps every frame of it', async () => {
+    const { file, videoAt, video } = pixelMotionPhotoTho899();
+    for (const there of ['+59.9139+010.7522', 'iPhone 15 Pro', 'loci']) expect(containsTho894(file, there)).toBe(true);
+    const out = await scrubbedTho894(file);
+    expect(out.length).toBe(file.length);
+    expectNoVideoLocationTho899(out);
+    // The primary's own GPS and serial go as before.
+    expect(containsTho894(out, 'SN-1234567890')).toBe(false);
+    // The video is still a video in the same place: same ftyp, same frames,
+    // and what says nothing about where (the title, the software) stays.
+    expect(out.toString('latin1', videoAt + 4, videoAt + 8)).toBe('ftyp');
+    expect(out.indexOf(VIDEO_FRAMES_THO899, 0, 'latin1') - videoAt).toBe(video.indexOf(VIDEO_FRAMES_THO899, 0, 'latin1'));
+    expect(containsTho894(out.subarray(videoAt), 'Gig!')).toBe(true);
+    expect(containsTho894(out.subarray(videoAt), '18.1')).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('finds the video behind an HDR gain map, the layout of an Ultra HDR motion photo', async () => {
+    const { file } = pixelMotionPhotoTho899({ gainMap: true });
+    const out = await scrubbedTho894(file);
+    expectNoVideoLocationTho899(out);
+    expect(containsTho894(out, 'SN-1234567890')).toBe(false);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('is not fooled by FF D8 FF inside the video\'s frames', async () => {
+    // The planner used to search for the next FF D8 FF anywhere after an
+    // image's end, took one inside the video's mdat for a second JPEG, and
+    // refused the whole photo: every such motion photo was a 404 (THO-894).
+    const video = mp4WithLocationTho894({ moovAtEnd: true });
+    const mdat = video.indexOf('frame-data', 0, 'latin1');
+    Buffer.from([0xff, 0xd8, 0xff, 0xe0]).copy(video, mdat + 8);
+    const { file } = pixelMotionPhotoTho899({ video });
+    const out = await scrubbedTho894(file);
+    expectNoVideoLocationTho899(out);
+    expect(out.includes(video.subarray(mdat, mdat + 40))).toBe(true);
+  });
+
+  it('refuses a motion photo whose video it cannot read, rather than send the video as it is', async () => {
+    const video = mp4WithLocationTho894({ moovAtEnd: true });
+    // Cut off inside moov: its size now claims more than the file holds.
+    const { file } = pixelMotionPhotoTho899({ video: video.subarray(0, video.length - 20) });
+    await expect(planScrub(file)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+    // And a video with no movie header at all.
+    const noMoov = mp4WithLocationTho894({ moovAtEnd: true });
+    noMoov.write('zzzz', noMoov.lastIndexOf(Buffer.from('moov', 'latin1')), 'latin1');
+    await expect(planScrub(pixelMotionPhotoTho899({ video: noMoov }).file)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
+  it('zeroes whatever follows the last image that it does not recognise, and leaves the picture alone', async () => {
+    const { jpeg } = jpegWithGpsTho894();
+    const trailer = Buffer.from('VendorTrailer owner=Owner-Name home=+59.9139+010.7522', 'latin1');
+    const file = Buffer.concat([jpeg, Buffer.alloc(3), trailer]);
+    const out = await scrubbedTho894(file);
+    expect(out.length).toBe(file.length);
+    expect(out.subarray(jpeg.length).equals(Buffer.alloc(3 + trailer.length))).toBe(true);
+    expect(scanOfTho894(out).subarray(0, scanOfTho894(jpeg).length)).toEqual(scanOfTho894(applyPatches(jpeg, await planScrub(jpeg))));
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('leaves zero padding after the last image alone, so a padded photo plans nothing', async () => {
+    const padded = Buffer.concat([minimalJpegTho894, Buffer.alloc(64), Buffer.alloc(8, 0xff)]);
+    expect(await planScrub(padded)).toEqual([]);
+  });
+});
+
+describe('planScrub on a Samsung trailer (THO-899)', () => {
+  it('scrubs a Samsung motion photo\'s video, blanks its country code and keeps the capture time', async () => {
+    const { file, trailerAt } = samsungMotionPhotoTho899();
+    expect(containsTho894(file, 'MCC_Data\x00\x00')).toBe(false);
+    const out = await scrubbedTho894(file);
+    expect(out.length).toBe(file.length);
+    expectNoVideoLocationTho899(out);
+    expect(containsTho894(out, 'SN-1234567890')).toBe(false);
+    // MCC 242 is Norway: a country, but a location all the same.
+    expect(containsTho894(out, 'MCC_Data242')).toBe(false);
+    expect(containsTho894(out, 'MCC_Data\0\0\0')).toBe(true);
+    expect(containsTho894(out, 'Image_UTC_Data1781293108000')).toBe(true);
+    expect(containsTho894(out.subarray(trailerAt), VIDEO_FRAMES_THO899)).toBe(true);
+    // The directory is untouched, so a reader still finds every block.
+    expect(out.subarray(out.length - 8).equals(file.subarray(file.length - 8))).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('blanks anything else a Samsung trailer carries, such as a second photograph with its own GPS', async () => {
+    const { file, dataAt, trailerAt } = samsungMotionPhotoTho899({ dualShot: true });
+    const dual = trailerAt + dataAt[3];
+    expect(file.readUInt16BE(dual)).toBe(0xffd8);
+    const out = await scrubbedTho894(file);
+    expect(out.subarray(dual, file.length - 8 - (12 + 12 * 4)).equals(Buffer.alloc(file.length - 8 - (12 + 12 * 4) - dual))).toBe(true);
+    expect(containsTho894(out, 'SN-1234567890')).toBe(false);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('refuses a Samsung trailer whose directory it cannot follow', async () => {
+    // A block said to start before the file does.
+    const { file } = samsungMotionPhotoTho899();
+    const dirAt = file.length - 8 - file.readUInt32LE(file.length - 8);
+    const outside = Buffer.from(file);
+    outside.writeUInt32LE(dirAt + 100, dirAt + 12 + 4);
+    await expect(planScrub(outside)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+    // A directory length that does not land on SEFH.
+    const lost = Buffer.from(file);
+    lost.writeUInt32LE(lost.readUInt32LE(lost.length - 8) + 4, lost.length - 8);
+    await expect(planScrub(lost)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+    // Two blocks over the same bytes.
+    const { trailer } = samsungTrailerTho899([
+      { type: 0x0a01, name: 'Image_UTC_Data', data: Buffer.from('1781293108000', 'latin1') },
+      { type: 0x0aa1, name: 'MCC_Data', data: Buffer.from('242', 'latin1') },
+    ]);
+    const overlap = Buffer.concat([minimalJpegTho894, trailer]);
+    const odir = overlap.length - 8 - overlap.readUInt32LE(overlap.length - 8);
+    overlap.writeUInt32LE(overlap.readUInt32LE(odir + 12 + 4), odir + 24 + 4);
+    await expect(planScrub(overlap)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
+  // Round 2 of the THO-899 review: the cases above were refused by the name
+  // check before the overlap check or either gap fill ran, so deleting any of
+  // them left every test green.
+  const sefDirTho899Round2 = (file) => file.length - 8 - file.readUInt32LE(file.length - 8);
+  const sefBlocksTho899Round2 = [
+    { type: 0x0a01, name: 'Image_UTC_Data', data: Buffer.from('1781293108000', 'latin1') },
+    { type: 0x0b00, name: 'Vendor_Note', data: Buffer.from('home=+59.9139+010.7522', 'latin1') },
+    { type: 0x0aa1, name: 'MCC_Data', data: Buffer.from('242', 'latin1') },
+  ];
+  // A directory that names only some of the blocks: entries kept, in order,
+  // and the count set to match. The slots after them are left as they were.
+  const sefNamingOnlyTho899Round2 = (keep) => {
+    const { trailer } = samsungTrailerTho899(sefBlocksTho899Round2);
+    const file = Buffer.concat([minimalJpegTho894, trailer]);
+    const dirAt = sefDirTho899Round2(file);
+    const entries = keep.map((i) => Buffer.from(file.subarray(dirAt + 12 + 12 * i, dirAt + 24 + 12 * i)));
+    entries.forEach((entry, i) => entry.copy(file, dirAt + 12 + 12 * i));
+    file.writeUInt32LE(keep.length, dirAt + 8);
+    return file;
+  };
+
+  it('refuses two blocks over the same bytes, by the overlap check itself', async () => {
+    const { trailer } = samsungTrailerTho899(sefBlocksTho899Round2.slice(0, 2));
+    const file = Buffer.concat([minimalJpegTho894, trailer]);
+    const dirAt = sefDirTho899Round2(file);
+    // Block 0 keeps its offset and grows over block 1.
+    file.writeUInt32LE(file.readUInt32LE(dirAt + 12 + 8) + file.readUInt32LE(dirAt + 24 + 8), dirAt + 12 + 8);
+    await expect(planScrub(file)).rejects.toMatchObject({ code: 'UNSCRUBBABLE', message: expect.stringMatching(/overlap/) });
+  });
+
+  it('zeroes the bytes between two blocks that no entry names', async () => {
+    const file = sefNamingOnlyTho899Round2([0, 2]);
+    const out = await scrubbedTho894(file);
+    expect(containsTho894(out, 'Vendor_Note')).toBe(false);
+    expect(containsTho894(out, '+59.9139')).toBe(false);
+    expect(containsTho894(out, 'Image_UTC_Data1781293108000')).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('zeroes the bytes between the last named block and the directory', async () => {
+    const file = sefNamingOnlyTho899Round2([0, 1]);
+    const out = await scrubbedTho894(file);
+    expect(containsTho894(out, 'MCC_Data242')).toBe(false);
+    expect(containsTho894(out, 'MCC_Data')).toBe(false);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('zeroes what the directory holds past its entries', async () => {
+    const { trailer } = samsungTrailerTho899(sefBlocksTho899Round2.slice(0, 1));
+    const blocksEnd = trailer.length - 8 - (12 + 12);
+    const spare = Buffer.from('home=+59.9139+01', 'latin1');
+    const dir = Buffer.concat([trailer.subarray(blocksEnd, trailer.length - 8), spare]);
+    const len = Buffer.alloc(4);
+    len.writeUInt32LE(dir.length);
+    const file = Buffer.concat([minimalJpegTho894, trailer.subarray(0, blocksEnd), dir, len, Buffer.from('SEFT', 'latin1')]);
+    expect(containsTho894(file, '+59.9139')).toBe(true);
+
+    const out = await scrubbedTho894(file);
+
+    expect(containsTho894(out, '+59.9139')).toBe(false);
+    expect(containsTho894(out, 'Image_UTC_Data1781293108000')).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('zeroes a block name it does not know, which can be anything, and keeps the ones it does', async () => {
+    const { trailer } = samsungTrailerTho899([
+      { type: 0x0aa1, name: 'MCC_Data242', data: Buffer.alloc(0) },
+      { type: 0x0aa1, name: 'MCC_Data', data: Buffer.from('242', 'latin1') },
+    ]);
+    const out = await scrubbedTho894(Buffer.concat([minimalJpegTho894, trailer]));
+    expect(containsTho894(out, 'MCC_Data242')).toBe(false);
+    expect(containsTho894(out, 'MCC_Data\0\0\0')).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  // Round 3 of the THO-899 review: the name alone decided, so a block that
+  // called itself Image_UTC_Data kept whatever it held, a photograph included.
+  it('keeps Image_UTC_Data only as Samsung writes it: type 0x0a01 and a few digits', async () => {
+    const { jpeg } = jpegWithGpsTho894();
+    for (const block of [
+      { type: 0x0a01, name: 'Image_UTC_Data', data: jpeg },
+      { type: 0x0b02, name: 'Image_UTC_Data', data: Buffer.from('1781293108000', 'latin1') },
+    ]) {
+      const { trailer } = samsungTrailerTho899([block]);
+      const out = await scrubbedTho894(Buffer.concat([minimalJpegTho894, trailer]));
+      expect(containsTho894(out, 'SN-1234567890')).toBe(false);
+      expect(containsTho894(out, '1781293108000')).toBe(false);
+      expect(await planScrub(out)).toEqual([]);
+    }
+    const { trailer } = samsungTrailerTho899([{ type: 0x0a01, name: 'Image_UTC_Data', data: Buffer.from('1781293108000', 'latin1') }]);
+    const kept = await scrubbedTho894(Buffer.concat([minimalJpegTho894, trailer]));
+    expect(containsTho894(kept, 'Image_UTC_Data1781293108000')).toBe(true);
+  });
+
+  it('refuses a block name longer than any Samsung writes', async () => {
+    const { trailer } = samsungTrailerTho899([{ type: 0x0b01, name: 'N'.repeat(65), data: Buffer.alloc(4) }]);
+    await expect(planScrub(Buffer.concat([minimalJpegTho894, trailer]))).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+
+  it('refuses a Samsung motion photo whose video is not an MP4', async () => {
+    const { file } = samsungMotionPhotoTho899({ video: Buffer.from('not a video at all, but it says so', 'latin1') });
+    await expect(planScrub(file)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+});
+
+describe('planScrub on IPTC (THO-899)', () => {
+  it('blanks IPTC in APP13: the city, the sub-location, the country and the owner\'s name', async () => {
+    const { jpeg } = jpegWithGpsTho894();
+    const file = Buffer.concat([jpeg.subarray(0, 2), iptcApp13Tho899(), jpeg.subarray(2)]);
+    const out = await scrubbedTho894(file);
+    expect(out.length).toBe(file.length);
+    for (const gone of ['IPTC-Byline', 'Owner Name', 'IPTC-City', 'IPTC-Sublocation', 'IPTC-Country', 'Photoshop 3.0', '8BIM']) {
+      expect(containsTho894(out, gone)).toBe(false);
+    }
+    // The segment stays, as an APP13 nobody claims, so nothing after it moves.
+    expect(out.readUInt16BE(2)).toBe(0xffed);
+    expect(scanOfTho894(out)).toEqual(scanOfTho894(file));
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('blanks Photoshop image resources kept inside EXIF, which can hold the same IPTC', async () => {
+    const { tiff } = tiffFromIfdsTho894Review([[
+      { tag: 0x0112, type: 3, value: shortTho894Review(6) },
+      { tag: 0x8649, type: 1, value: Buffer.from('8BIM\x04\x04\0\0\0\0\0\x10IPTC-City-Oslo!!', 'latin1') },
+    ]]);
+    const out = await scrubbedTho894(jpegWithExif(minimalJpegTho894, tiff));
+    expect(containsTho894(out, 'IPTC-City-Oslo')).toBe(false);
+    expect(await planScrub(out)).toEqual([]);
+  });
+});
+
+describe('planScrub on what follows a PNG or a WebP (THO-899)', () => {
+  it('zeroes bytes after a PNG\'s IEND and after a WebP\'s RIFF, as after a JPEG\'s last image', async () => {
+    const tail = Buffer.from('appended home=+59.9139+010.7522', 'latin1');
+    const png = Buffer.concat([PNG_SIGNATURE_THO894, IHDR_THO894, IDAT_THO894, IEND_THO894, tail]);
+    const webp = Buffer.concat([webpWithMetadataTho894(), tail]);
+    for (const file of [png, webp]) {
+      const out = await scrubbedTho894(file);
+      expect(out.length).toBe(file.length);
+      expect(containsTho894(out, '+59.9139')).toBe(false);
+      expect(await planScrub(out)).toEqual([]);
+    }
   });
 });
 

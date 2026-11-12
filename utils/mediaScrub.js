@@ -39,9 +39,10 @@ const { TYPE_BYTES, readHeader } = require('./exifCapturedAt');
  * refuses more or less than it did — a budget raised or lowered, a parse bug
  * fixed, `cmov` accepted — because refusals are cached too. Without that, every
  * file a share link had already served would keep its old verdict, and every
- * refused one its 404, until someone emptied cache/public by hand.
+ * refused one its 404, until someone emptied cache/public by hand. 2: what
+ * follows a JPEG's last image, and IPTC in APP13 (THO-899).
  */
-const SCRUB_VERSION = 1;
+const SCRUB_VERSION = 2;
 
 function unscrubbable(reason) {
   const err = new Error(`cannot scrub: ${reason}`);
@@ -129,6 +130,7 @@ const BLANK_TAGS = new Set([
   0x02bc, // XMLPacket — XMP kept inside the EXIF block instead of its own APP1
   0x8298, // Copyright — usually the owner's name
   0x83bb, // IPTC-NAA — IPTC inside the EXIF block: city, sub-location, by-line
+  0x8649, // Photoshop image resources — the APP13 block's contents, IPTC included
   0x9c9d, // XPAuthor — Windows' author field, UTF-16
   0x927c, // MakerNote — Apple and Samsung keep location and serials in here too
   0xa420, // ImageUniqueID
@@ -312,6 +314,19 @@ function planApp11(ctx, payload, end, c2paInstances) {
   if (c2paInstances.has(instance)) fill(ctx, payload, end - payload, 0);
 }
 
+/**
+ * APP13 is Photoshop's: `Photoshop 3.0\0` and its image resources, among them
+ * IPTC — City, Sub-location, Country and By-line, the owner's name. Lightroom
+ * and Google Photos exports write it (THO-899). Nothing in it is needed to show
+ * the picture (the colour profile is APP2's), so the whole payload goes, as
+ * XMP's does, identifier included, and what is left is an APP13 nobody claims.
+ * Every APP13, not only one that names Photoshop: the older
+ * `Adobe_Photoshop2.5:` block holds the same IPTC.
+ */
+function planApp13(ctx, payload, end) {
+  fill(ctx, payload, end - payload, 0x20);
+}
+
 // Readers are looser about the EXIF header than "Exif\0\0": exiftool takes up
 // to four bytes before "Exif\0" and any byte after it. Recognising only the
 // exact header, an APP1 of "Exif\0\xFF" planned nothing, was called clean
@@ -371,27 +386,173 @@ function planOneJpeg(ctx, start) {
     if (segEnd < pos + 2 || segEnd > buf.length) throw unscrubbable('JPEG segment overruns the file');
     if (marker === 0xe1) planApp1(ctx, pos + 2, segEnd);
     else if (marker === 0xeb) planApp11(ctx, pos + 2, segEnd, c2paInstances);
+    else if (marker === 0xed) planApp13(ctx, pos + 2, segEnd);
     pos = segEnd;
     if (marker === 0xda) pos = skipEntropy(buf, pos);
   }
 }
 
-// A second image after the first one's EOI: the MPF secondaries and the HDR
-// gain map a current phone appends. Each carries its own APP1, and an Apple
-// gain map's has been seen with the same EXIF as the primary.
-const NEXT_JPEG = Buffer.from([0xff, 0xd8, 0xff]);
 // A phone appends one to three (MPF secondaries, a gain map). A file of
 // millions of four-byte JPEGs would otherwise be millions of walks.
 const MAX_JPEG_IMAGES = 64;
 
+const isJpegAt = (buf, at, end) => end - at >= 3 && buf[at] === 0xff && buf[at + 1] === 0xd8 && buf[at + 2] === 0xff;
+const isFtypAt = (buf, at, end) => end - at >= 8 && buf[at + 4] === 0x66
+  && buf.toString('latin1', at + 4, at + 8) === 'ftyp'
+  && buf.readUInt32BE(at) >= 8 && at + buf.readUInt32BE(at) <= end;
+
+/**
+ * What follows an image's EOI, up to `end`: the next image's start, or -1.
+ *
+ * A decoder stops at EOI, so nothing after it is the picture, and phones put
+ * a lot there (THO-899):
+ *
+ *   - another JPEG straight after: the MPF secondaries and the HDR gain map a
+ *     current phone appends, each with its own APP1 (an Apple gain map's has
+ *     been seen with the same EXIF as the primary). Walked like the first.
+ *   - an MP4, from its `ftyp` to the end: a Pixel motion photo's video (and
+ *     Xiaomi's and others' that copied the format). Its moov carries the
+ *     clip's own ©xyz or Apple location key, so it is planned as any MP4 is,
+ *     at its offset in the file. exiftool reads the same layout as
+ *     EmbeddedVideo. The XMP that points at it (GCamera:MicroVideoOffset,
+ *     Container:Directory) is not needed to find it and is blanked anyway.
+ *   - zero or 0xFF padding, left as it is.
+ *   - anything else: zeroed to the end. A camera preview, a vendor's trailer,
+ *     a format nobody documents — it cannot be read, so it cannot be said to
+ *     hold no location, and the picture does not need it. Zeroing keeps the
+ *     photograph shareable where refusing would make it a 404.
+ *
+ * The next structure must start where the last one ended, past only padding.
+ * Searching ahead for FF D8 FF, as this used to, took one inside a motion
+ * photo's video frames for a JPEG and refused the photo, and let whatever it
+ * skipped over go out untouched.
+ */
+function planAfterImage(ctx, pos) {
+  const { buf } = ctx;
+  const end = buf.length;
+  // Past the padding in a tight loop: a hostile 250 MB of it took 1.4 s when
+  // every byte was also tried as the start of a JPEG and of an MP4.
+  let first = pos;
+  while (first < end && (buf[first] === 0x00 || buf[first] === 0xff)) first += 1;
+  if (first === end) return -1;
+  // Both need a byte that is not padding (D8, the `f` of ftyp), so the
+  // earliest either can start is four bytes before it: a box size made only
+  // of 00 and FF bytes, such as 0x000000FF, is still a size.
+  for (let at = Math.max(pos, first - 4); at <= first; at += 1) {
+    if (isJpegAt(buf, at, end)) return at;
+    if (isFtypAt(buf, at, end)) {
+      ctx.videos.push({ start: ctx.base + at, end: ctx.base + end });
+      return -1;
+    }
+  }
+  fill(ctx, first, end - first, 0);
+  return -1;
+}
+
+// Samsung's SEF trailer (THO-899): blocks of data, then a directory, as the
+// last bytes of the file. exiftool's Samsung.pm is the reference for the
+// layout. A motion photo's video is the `MotionPhoto_Data` block and is
+// planned as an MP4. The capture time is kept, as EXIF's is. Every other
+// block's data is zeroed: `MCC_Data` is the mobile country code, a location;
+// `DualShot_1` and the like are whole second photographs with their own EXIF;
+// and the rest are undocumented. The directory stays, so the trailer still
+// reads.
+//
+// A name is whatever its block says, up to the whole block: a crafted one can
+// carry `MCC_Data242` as a "name" with no data at all. So only the names this
+// knows stay as they are, and any other name is zeroed with its data. Real
+// names are short; one past SEF_MAX_NAME is not a name, and is refused.
+const SEF_VIDEO_BLOCK = 'MotionPhoto_Data';
+const SEF_KEEP_BLOCKS = new Set(['Image_UTC_Data']);
+// The capture time is kept only as Samsung writes it: type 0x0a01 and a few
+// ASCII digits (milliseconds since 1970). A block that only calls itself
+// Image_UTC_Data could hold anything, a whole photograph with its GPS
+// included, and is zeroed like any other.
+const SEF_UTC_TYPE = 0x0a01;
+const SEF_UTC_DATA = /^\d{1,20}\0*$/;
+const SEF_KNOWN_NAMES = new Set([SEF_VIDEO_BLOCK, ...SEF_KEEP_BLOCKS, 'MCC_Data', 'DualShot_1', 'DualShot_2']);
+const SEF_MAX_NAME = 64;
+const SEF_ENTRY_BYTES = 12;
+
+/** Whether a trailer block is kept as it is: only a capture time that looks like one. */
+function sefKept(buf, block) {
+  if (!SEF_KEEP_BLOCKS.has(block.name) || block.type !== SEF_UTC_TYPE) return false;
+  return block.end - block.data <= 32 && SEF_UTC_DATA.test(buf.toString('latin1', block.data, block.end));
+}
+
+/**
+ * Plan a Samsung trailer, if the file ends with one, and return where it
+ * starts: the images end there. A trailer that says it is Samsung's and does
+ * not read as one is refused, as every other structure is.
+ */
+function planSamsungTrailer(ctx) {
+  const { buf } = ctx;
+  const size = buf.length;
+  if (size < 8 || buf.toString('latin1', size - 4, size) !== 'SEFT') return size;
+  const dirLen = buf.readUInt32LE(size - 8);
+  const dirAt = size - 8 - dirLen;
+  if (dirLen < 12 || dirAt < 0 || buf.toString('latin1', dirAt, dirAt + 4) !== 'SEFH') {
+    throw unscrubbable('Samsung trailer without its directory');
+  }
+  const count = buf.readUInt32LE(dirAt + 8);
+  if (count > (dirLen - 12) / SEF_ENTRY_BYTES) throw unscrubbable('Samsung directory overruns itself');
+  const blocks = [];
+  for (let i = 0; i < count; i += 1) {
+    step(ctx);
+    const entry = dirAt + 12 + i * SEF_ENTRY_BYTES;
+    // Offsets count back from the directory.
+    const type = buf.readUInt16LE(entry + 2);
+    const back = buf.readUInt32LE(entry + 4);
+    const length = buf.readUInt32LE(entry + 8);
+    if (back > dirAt || length < 8 || length > back) throw unscrubbable('Samsung block outside its trailer');
+    const start = dirAt - back;
+    const nameLength = buf.readUInt32LE(start + 4);
+    if (nameLength > length - 8) throw unscrubbable('Samsung block name overruns its block');
+    if (nameLength > SEF_MAX_NAME) throw unscrubbable('Samsung block name longer than any Samsung writes');
+    const name = buf.toString('latin1', start + 8, start + 8 + nameLength);
+    blocks.push({
+      start,
+      end: start + length,
+      name,
+      type,
+      // Where zeroing starts for a block that is not kept: its data, or its
+      // name too when the name is not one this knows.
+      blank: SEF_KNOWN_NAMES.has(name) ? start + 8 + nameLength : start + 8,
+      data: start + 8 + nameLength,
+    });
+  }
+  blocks.sort((a, b) => a.start - b.start);
+  const trailerAt = blocks.length ? blocks[0].start : dirAt;
+  let covered = trailerAt;
+  for (const block of blocks) {
+    // Two blocks over the same bytes would each be planned by its own rule,
+    // and a kept block could keep what the other blanks.
+    if (block.start < covered) throw unscrubbable('Samsung blocks overlap');
+    // Bytes between blocks that no entry names are zeroed like any unknown.
+    fill(ctx, covered, block.start - covered, 0);
+    if (block.name === SEF_VIDEO_BLOCK) ctx.videos.push({ start: ctx.base + block.data, end: ctx.base + block.end });
+    else if (!sefKept(buf, block)) fill(ctx, block.blank, block.end - block.blank, 0);
+    covered = block.end;
+  }
+  fill(ctx, covered, dirAt - covered, 0);
+  // The directory is 12 bytes and an entry per block. Whatever its length
+  // says beyond that is no entry, and nothing reads it but a stranger.
+  const entriesEnd = dirAt + 12 + count * SEF_ENTRY_BYTES;
+  fill(ctx, entriesEnd, size - 8 - entriesEnd, 0);
+  return trailerAt;
+}
+
 function planJpeg(ctx) {
+  // The images are walked only up to a Samsung trailer, so their own trailer
+  // logic never mistakes the trailer for something unknown.
+  const imagesEnd = planSamsungTrailer(ctx);
+  const images = { ...ctx, buf: ctx.buf.subarray(0, imagesEnd) };
   let pos = 0;
-  for (let images = 1; ; images += 1) {
-    if (images > MAX_JPEG_IMAGES) throw unscrubbable('more images in one JPEG than any phone writes');
-    pos = planOneJpeg(ctx, pos);
-    const next = ctx.buf.indexOf(NEXT_JPEG, pos);
-    if (next < 0) return;
-    pos = next;
+  for (let count = 1; ; count += 1) {
+    if (count > MAX_JPEG_IMAGES) throw unscrubbable('more images in one JPEG than any phone writes');
+    pos = planOneJpeg(images, pos);
+    pos = planAfterImage(images, pos);
+    if (pos < 0) return;
   }
 }
 
@@ -466,7 +627,12 @@ function planPng(ctx) {
       put(chunk, dataEnd, crc);
       ctx.out.push(...chunk.out);
     }
-    if (type === 'IEND') return;
+    if (type === 'IEND') {
+      // Bytes after IEND are no part of the image; whatever they are is
+      // zeroed, as after a JPEG's last image (planAfterImage, THO-899).
+      fill(ctx, dataEnd + 4, buf.length - dataEnd - 4, 0);
+      return;
+    }
     pos = dataEnd + 4;
   }
 }
@@ -492,6 +658,8 @@ function planWebp(ctx) {
     // Chunks are padded to an even length, and the pad is not in the size.
     pos = end + (size & 1);
   }
+  // As after a PNG's IEND (THO-899): what follows the RIFF is not the image.
+  fill(ctx, riffEnd, buf.length - riffEnd, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -692,10 +860,11 @@ const TOP_LEVEL_WINDOW = 64 * 1024;
  * The top level is walked off the file, not out of memory: `mdat` is most of
  * a video and the only part that is never needed. The boxes above, and a
  * top-level XMP or C2PA uuid box, are read in whole.
+ *
+ * `base` is where the video starts in the file, for one embedded in a
+ * photograph (THO-899); it then shares the photograph's patches and limits.
  */
-async function planMp4(source) {
-  const out = [];
-  const budget = budgetFor(source.size, MAX_MP4_BOXES);
+async function planMp4(source, { base = 0, out = [], budget = budgetFor(source.size, MAX_MP4_BOXES) } = {}) {
   const top = { budget };
   let window = Buffer.alloc(0);
   let windowAt = 0;
@@ -735,7 +904,7 @@ async function planMp4(source) {
       if (size > MAX_MOOV_BYTES) throw unscrubbable(`MP4 ${type} too large`);
       const buf = await readAt(pos, size);
       const ctx = {
-        buf, base: pos, out, budget,
+        buf, base: base + pos, out, budget,
       };
       const box = { at: 0, type, headerLen, end: size };
       if (type === 'moov') sawMoov = true;
@@ -786,9 +955,23 @@ async function planSource(source) {
   if (format === 'mp4') return planMp4(source);
   if (source.size > MAX_IMAGE_BYTES) throw unscrubbable('image too large');
   const ctx = {
-    buf: await source.read(0, source.size), base: 0, out: [], budget: budgetFor(source.size, MAX_IMAGE_BLOCKS),
+    buf: await source.read(0, source.size),
+    base: 0,
+    out: [],
+    budget: budgetFor(source.size, MAX_IMAGE_BLOCKS),
+    videos: [],
   };
   IMAGE_PLANNERS[format](ctx);
+  // A video inside a photograph (a motion photo's, THO-899) is planned as an
+  // MP4 file of its own would be, out of the bytes already in memory, and
+  // held to an MP4's box limit as well as the photograph's other limits.
+  ctx.budget.blocks = Math.min(ctx.budget.blocks, MAX_MP4_BOXES);
+  for (const video of ctx.videos) {
+    await planMp4({
+      size: video.end - video.start,
+      read: async (offset, length) => ctx.buf.subarray(video.start + offset, video.start + offset + length),
+    }, { base: video.start, out: ctx.out, budget: ctx.budget });
+  }
   return ctx.out;
 }
 
