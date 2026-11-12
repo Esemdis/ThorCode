@@ -13,6 +13,12 @@ model User {
   password_hash              String?
   role                       Role                       @default(USER)
   created_at                 DateTime                   @default(now())
+  // When the password was last reset or changed (or the email changed). Each
+  // login token carries it as its `pwc` stamp, in ms (0 for null), and a token
+  // whose stamp is not the current value is refused, so a change ends every
+  // session signed before it (THO-898, auth/loginRevocation.js). Compared by
+  // value, not with the token's iat.
+  password_changed_at        DateTime?
   settings                   Json?
   oauth                      OAuth[]                    @relation("UserOauth")
   wishlists                  Wishlist?                  @relation("UserWishlists")

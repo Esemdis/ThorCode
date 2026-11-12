@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 import jwt from 'jsonwebtoken';
 import verifyJWT from './verifyJWT.js';
 import { signOAuthState } from '../utils/oauthState.js';
@@ -89,5 +89,143 @@ describe('verifyJWT middleware', () => {
       const hs512 = jwt.sign({ id: 'user-1', role: 'USER' }, 'test-secret', { algorithm: 'HS512' });
       expect(run(hs512).nextCalled).toBe(false);
     });
+  });
+});
+
+describe('verifyJWT after a password change (THO-898)', () => {
+  const loginRevocationChangedAt = new Date('2026-11-11T12:00:00.500Z');
+  const loginRevocationChangedSecond = Math.floor(loginRevocationChangedAt.getTime() / 1000);
+  const loginRevocationStamp = loginRevocationChangedAt.getTime();
+  const loginRevocationRows = new Map();
+  let loginRevocationIdCounter = 0;
+  // Each test gets its own user, because the per-user cache is module-level.
+  const loginRevocationUserId = () => `revoke-user-${++loginRevocationIdCounter}`;
+
+  const loginRevocationToken = (claims) => jwt.sign(claims, 'test-secret');
+
+  // Resolves after the middleware's database read: next() or the 401 has
+  // happened by then.
+  async function runLoginRevocation(token) {
+    const req = { headers: { authorization: `Bearer ${token}` } };
+    const res = mockRes();
+    let nextCalled = false;
+    await verifyJWT(req, res, () => { nextCalled = true; });
+    return { req, res, nextCalled };
+  }
+
+  beforeAll(() => {
+    // The middleware requires the client on first use and reads it from here.
+    process.env.DATABASE_URL ||= 'postgresql://test:test@127.0.0.1:5432/test';
+    globalThis.prisma = {
+      user: {
+        findUnique: vi.fn(async ({ where }) => loginRevocationRows.get(where.id) ?? null),
+      },
+    };
+  });
+
+  beforeEach(() => {
+    globalThis.prisma.user.findUnique.mockImplementation(
+      async ({ where }) => loginRevocationRows.get(where.id) ?? null,
+    );
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  it('refuses a login token signed against the password before the change', async () => {
+    const id = loginRevocationUserId();
+    loginRevocationRows.set(id, { password_changed_at: loginRevocationChangedAt });
+
+    const { res, nextCalled } = await runLoginRevocation(loginRevocationToken({
+      id, role: 'USER', kind: 'login', pwc: 0, iat: loginRevocationChangedSecond - 60,
+    }));
+
+    expect(nextCalled).toBe(false);
+    expect(res.statusCode).toBe(401);
+    expect(res.body).toEqual({ error: 'Your password was changed. Sign in again.' });
+  });
+
+  // The login read the row (and checked the old hash) before the reset
+  // committed, and signed after it, in the same second or later. By iat it
+  // is newer than the change; by the password it carries, it is not.
+  it('refuses a login token issued after the change from a login that read the old password', async () => {
+    const id = loginRevocationUserId();
+    loginRevocationRows.set(id, { password_changed_at: loginRevocationChangedAt });
+
+    const { res, nextCalled } = await runLoginRevocation(loginRevocationToken({
+      id, role: 'USER', kind: 'login', pwc: 0, iat: loginRevocationChangedSecond + 1,
+    }));
+
+    expect(nextCalled).toBe(false);
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('accepts a login token signed against the current password', async () => {
+    const id = loginRevocationUserId();
+    loginRevocationRows.set(id, { password_changed_at: loginRevocationChangedAt });
+
+    const { req, nextCalled } = await runLoginRevocation(loginRevocationToken({
+      id, role: 'USER', kind: 'login', pwc: loginRevocationStamp,
+    }));
+
+    expect(nextCalled).toBe(true);
+    expect(req.user.id).toBe(id);
+  });
+
+  it('accepts a login token for an account whose password never changed', async () => {
+    const id = loginRevocationUserId();
+    loginRevocationRows.set(id, { password_changed_at: null });
+
+    const { nextCalled } = await runLoginRevocation(loginRevocationToken({ id, role: 'ADMIN', kind: 'login', pwc: 0 }));
+
+    expect(nextCalled).toBe(true);
+  });
+
+  // python-crohn's BACKEND_TOKEN, as scripts/generate-service-token.js mints it.
+  it('still accepts a service token issued before the change, without reading the database', async () => {
+    const id = loginRevocationUserId();
+    loginRevocationRows.set(id, { password_changed_at: loginRevocationChangedAt });
+
+    const { nextCalled } = await runLoginRevocation(loginRevocationToken({
+      id, role: 'SYSTEM', service: 'rss-watcher', iat: loginRevocationChangedSecond - 60,
+    }));
+
+    expect(nextCalled).toBe(true);
+    expect(globalThis.prisma.user.findUnique).not.toHaveBeenCalled();
+  });
+
+  // The token a wander user pastes into Settings: role USER, no expiry, and
+  // no `service` claim, so "has no service claim" would have revoked it.
+  it('still accepts a hand-minted long-lived USER token issued before the change', async () => {
+    const id = loginRevocationUserId();
+    loginRevocationRows.set(id, { password_changed_at: loginRevocationChangedAt });
+
+    const { nextCalled } = await runLoginRevocation(loginRevocationToken({
+      id, role: 'USER', iat: loginRevocationChangedSecond - 60,
+    }));
+
+    expect(nextCalled).toBe(true);
+    expect(globalThis.prisma.user.findUnique).not.toHaveBeenCalled();
+  });
+
+  // Owner decision on THO-898: a deleted account's sessions end with it.
+  it('refuses a login token when no account row is found', async () => {
+    const { res, nextCalled } = await runLoginRevocation(loginRevocationToken({
+      id: loginRevocationUserId(), role: 'USER', kind: 'login', pwc: 0,
+    }));
+
+    expect(nextCalled).toBe(false);
+    expect(res.statusCode).toBe(401);
+    expect(res.body).toEqual({ error: 'This account no longer exists.' });
+  });
+
+  // concert-map signs the user out on any 401; a database blip must not.
+  it('answers 500, not 401, when the database cannot be read', async () => {
+    globalThis.prisma.user.findUnique.mockRejectedValue(new Error('connection refused'));
+
+    const { res, nextCalled } = await runLoginRevocation(loginRevocationToken({
+      id: loginRevocationUserId(), role: 'USER', kind: 'login',
+    }));
+
+    expect(nextCalled).toBe(false);
+    expect(res.statusCode).toBe(500);
   });
 });

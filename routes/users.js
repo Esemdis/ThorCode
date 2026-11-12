@@ -14,6 +14,7 @@ const { paginationValidation } = require('../utils/validation/pagination');
 const { rateLimiter } = require('../utils/rateLimiter');
 const prisma = require('../prisma/client');
 const signJWT = require('../auth/signJWT');
+const { forgetPasswordChange, isLoginToken, passwordChangeStamp } = require('../auth/loginRevocation');
 const { sendEmailVerificationCode } = require('../utils/mail');
 // Reached through the module object, not destructured, so a test can replace
 // one sender with vi.spyOn and the route sees the replacement.
@@ -134,9 +135,9 @@ router.post(
         role: existingUser.role || 'USER', // Default to USER if no role is set
       };
 
-      // If you want to be safer, you could insert the token into the DB
-      // and check it on every request, but for simplicity, we will just sign it here and trust the expiry.
-      const token = signJWT({ user });
+      // Signed against the row whose hash was just checked: if a reset
+      // committed in between, this token is already ended (THO-898).
+      const token = signJWT({ user, passwordChangedAt: existingUser.password_changed_at });
 
       // Return the user and token
       res
@@ -271,23 +272,108 @@ router.get(
   },
 );
 
+// --- Proving the current password (THO-810, THO-898) ----------------------
+
+// A write that changes the password state (a change, an email change) reads
+// the row, works for a while (three bcrypt rounds, about 200 ms, on a
+// change) and then writes. Written `where: { id }`, one still in flight from
+// a session a reset had just ended overwrote the reset and came back with a
+// fresh token that passed every check (THO-898 review). So the write is
+// conditional on the state it read (`update` with `password_changed_at` in
+// its where throws P2025 when that moved), and a login token must still
+// carry that state when the work starts.
+const SESSION_ENDED = 'Your password was changed. Sign in again.';
+const STATE_MOVED = 'Your password was changed while this was being saved. Try again.';
+const CODE_GONE = 'That code is no longer valid. Ask for a new one.';
+
+/** Whether a login token was signed against a password state other than this one. */
+const sessionPredates = (req, passwordChangedAt) => isLoginToken(req.user)
+  && req.user.pwc !== passwordChangeStamp(passwordChangedAt);
+
+/**
+ * The answer when the state a request read moved before it wrote: the
+ * session is over for a login token (and concert-map signs out on that 401,
+ * which is right); anything else may simply try again.
+ */
+const stateMovedAnswer = (req, res) => (isLoginToken(req.user)
+  ? response.unauthorized(res, SESSION_ENDED)
+  : response.conflict(res, STATE_MOVED));
+
+const WRONG_CURRENT_PASSWORD = 'Your current password is not right';
+const NO_CURRENT_PASSWORD =
+  'This account has no password yet. Sign out and use "Forgot password?" to set one first.';
+
+// Wrong current passwords, per account, shared by every route that asks for
+// one: a stolen session must not get a separate budget of guesses from each. Per account
+// rather than per IP, because the guesser already holds that account's token
+// and can ask from anywhere.
+const currentPasswordLimit = rateLimiter({
+  message: 'Too many wrong passwords. Please wait a few minutes and try again.',
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => `user:${req.user.id}`,
+  skipSuccessfulRequests: true,
+  // Only a wrong (or missing-on-the-account) current password is a guess, and
+  // both answer 403. Counting every 400 and 500 as one, someone retrying a
+  // stuck deletion, or a new password the rules refuse, was told "Too many
+  // wrong passwords" after giving the right one every time.
+  requestWasSuccessful: (req, res) => res.statusCode !== 403,
+});
+
+/**
+ * Why `given` does not prove the caller knows this account's password, or
+ * null when it does.
+ *
+ * Answered with 403, never 401: concert-map signs the user out on any 401,
+ * and a typo in a settings form must not end the session it was typed in.
+ */
+async function currentPasswordRefusal(user, given) {
+  if (!user.password_hash) return NO_CURRENT_PASSWORD;
+  return (await bcrypt.compare(given, user.password_hash)) ? null : WRONG_CURRENT_PASSWORD;
+}
+
+const readCurrentPassword = (req) => {
+  const value = req.body?.currentPassword;
+  return typeof value === 'string' && value ? value : null;
+};
+
 /**
  * POST /users/email/request-change
  * Initiates email change by sending verification code to new email
  * @body {string} newEmail - New email address
+ * @body {string} currentPassword - THO-898: a session alone is not enough
  * @returns {object} { success: true, message: string }
- * @throws {400} Invalid email format or email already in use
+ * @throws {400} Invalid email format, or no current password
  * @throws {401} Unauthorized
+ * @throws {403} The current password is wrong, or the account has none
  * @throws {409} Email already in use or pending verification
+ * @throws {429} Too many requests, or too many wrong passwords for this account
  * @throws {500} Server error
  */
-router.post('/email/request-change', auth, emailRequestRateLimiter, upload.none(), async (req, res) => {
+// The wrong-password limiter after the request limiter, so a guess still
+// spends one of the three requests a quarter hour.
+router.post('/email/request-change', auth, emailRequestRateLimiter, currentPasswordLimit, upload.none(), async (req, res) => {
   try {
     const userId = req.user.id;
     // Validate email input
     if (!req.body.newEmail || typeof req.body.newEmail !== 'string') {
       return response.badRequest(res, 'New email is required');
     }
+
+    // THO-898. With only a session, a stolen login token could move the
+    // account to the thief's address, and the reset mail that would have
+    // ended the thief's session then went to the thief. Checked before the
+    // address is looked at, so a session alone cannot ask which addresses
+    // have accounts either.
+    const currentPassword = readCurrentPassword(req);
+    if (!currentPassword) return response.badRequest(res, 'Current password is required');
+    const account = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, password_hash: true },
+    });
+    if (!account) return response.notFound(res, 'User not found');
+    const wrong = await currentPasswordRefusal(account, currentPassword);
+    if (wrong) return response.forbidden(res, wrong);
     // Stored and compared as sign-in compares it. See normaliseEmail.
     const newEmail = normaliseEmail(req.body.newEmail);
 
@@ -364,13 +450,20 @@ router.post('/email/request-change', auth, emailRequestRateLimiter, upload.none(
 
 /**
  * POST /users/email/verify-code
- * Verifies email change code and updates user email
+ * Verifies email change code and updates user email.
+ * Ends every login session the account had, this one included, and hands back
+ * a fresh token for the caller to carry on with, as a password change does
+ * (THO-898).
  * @body {string} code - 6-digit verification code
- * @returns {object} { success: true, data: { user: { id, email } }, message: string }
+ * @returns {object} { success: true, data: { user: { id, email }, token }, message: string }
  * @throws {400} Invalid or expired verification code — including one that is
  *   someone else's, which is answered exactly like a wrong guess
- * @throws {401} Unauthorized
- * @throws {409} The new address was taken since the code was sent
+ * @throws {401} Unauthorized; or the password changed while this ran (a reset
+ *   from elsewhere), which ends this login session
+ * @throws {409} The new address was taken since the code was sent; "That code
+ *   is no longer valid. Ask for a new one." when another request-change (a
+ *   second tab) replaced the code; or, for a token that is not a login
+ *   session, the password changed while this ran
  * @throws {500} Server error
  */
 router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.none(), async (req, res) => {
@@ -404,22 +497,50 @@ router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.non
     // Update the email and spend the code together. The address was checked
     // when the code was sent, fifteen minutes ago at most; someone may have
     // registered with it since, and the unique key answering that was a 500.
-    let user;
+    //
+    // It also counts as a password change (owner decision on THO-898): an
+    // address change is how an account is taken over, so it ends the other
+    // login sessions the same way.
+    const current = await prisma.user.findUnique({ where: { id: userId }, select: { password_changed_at: true } });
+    if (!current) return response.notFound(res, 'User not found');
+    const readChangedAt = current.password_changed_at ?? null;
+    if (sessionPredates(req, readChangedAt)) return response.unauthorized(res, SESSION_ENDED);
+
+    const changedAt = new Date();
+    let updated;
     try {
-      [user] = await prisma.$transaction([
+      [updated] = await prisma.$transaction([
         prisma.user.update({
-          where: { id: userId },
-          data: { email: verification.new_email },
-          select: { id: true, email: true },
+          where: { id: userId, password_changed_at: readChangedAt },
+          data: { email: verification.new_email, password_changed_at: changedAt },
+          select: { id: true, email: true, role: true },
         }),
         prisma.emailVerification.delete({ where: { id: verification.id } }),
       ]);
     } catch (error) {
       if (error.code === UNIQUE_VIOLATION) return response.conflict(res, 'Email already in use');
+      if (error.code === RECORD_NOT_FOUND) {
+        // Either write can find nothing: the user row, when a reset moved the
+        // state it read, or the code, when a second request-change (another
+        // tab) replaced it. Only the first ends the session; read again to
+        // tell them apart, rather than sign someone out over a stale code.
+        const now = await prisma.user.findUnique({ where: { id: userId }, select: { password_changed_at: true } });
+        if (now && passwordChangeStamp(now.password_changed_at) === passwordChangeStamp(readChangedAt)) {
+          return response.conflict(res, CODE_GONE);
+        }
+        return stateMovedAnswer(req, res);
+      }
       throw error;
     }
+    forgetPasswordChange(userId);
 
-    return response.success(res, 200, { user }, 'Email updated successfully');
+    // Signed after the change, so the caller's own session survives it.
+    const token = signJWT({
+      user: { id: updated.id, email: updated.email, role: updated.role },
+      passwordChangedAt: changedAt,
+    });
+    const user = { id: updated.id, email: updated.email };
+    return response.success(res, 200, { user, token }, 'Email updated successfully');
   } catch (error) {
     console.error('Error verifying email code:', error);
     return response.serverError(res, 'Internal server error');
@@ -538,7 +659,8 @@ router.post('/password/forgot', forgotIpLimit, upload.none(), forgotAddressLimit
 /**
  * POST /users/password/reset
  * Sets a new password with the token from a reset email, and spends the token.
- * Signs no one in and ends no session: old tokens run to their own expiry.
+ * Signs no one in, and ends every login session the account had (THO-898).
+ * Service and other long-lived tokens keep working: auth/loginRevocation.js.
  * @body {string} token
  * @body {string} password - register's rules
  * @returns {200} "Password changed"
@@ -576,12 +698,17 @@ router.post('/password/reset', resetLimit, upload.none(), passwordValidation, as
     try {
       await prisma.$transaction([
         prisma.passwordReset.delete({ where: { token_hash: tokenHash } }),
-        prisma.user.update({ where: { id: reset.user_id }, data: { password_hash: passwordHash } }),
+        prisma.user.update({
+          where: { id: reset.user_id },
+          // Any new value ends the account's login tokens (THO-898).
+          data: { password_hash: passwordHash, password_changed_at: new Date() },
+        }),
       ]);
     } catch (error) {
       if (error.code === RECORD_NOT_FOUND) return response.badRequest(res, RESET_USED);
       throw error;
     }
+    forgetPasswordChange(reset.user_id);
 
     return response.success(res, 200, {}, 'Password changed');
   } catch (error) {
@@ -592,53 +719,21 @@ router.post('/password/reset', resetLimit, upload.none(), passwordValidation, as
 
 // --- Signed in: change the password, delete the account (THO-810) -----------
 
-const WRONG_CURRENT_PASSWORD = 'Your current password is not right';
-const NO_CURRENT_PASSWORD =
-  'This account has no password yet. Sign out and use "Forgot password?" to set one first.';
-
-// Wrong current passwords, per account, shared by both routes below: a stolen
-// session must not get a separate budget of guesses from each. Per account
-// rather than per IP, because the guesser already holds that account's token
-// and can ask from anywhere.
-const currentPasswordLimit = rateLimiter({
-  message: 'Too many wrong passwords. Please wait a few minutes and try again.',
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  keyGenerator: (req) => `user:${req.user.id}`,
-  skipSuccessfulRequests: true,
-  // Only a wrong (or missing-on-the-account) current password is a guess, and
-  // both answer 403. Counting every 400 and 500 as one, someone retrying a
-  // stuck deletion, or a new password the rules refuse, was told "Too many
-  // wrong passwords" after giving the right one every time.
-  requestWasSuccessful: (req, res) => res.statusCode !== 403,
-});
-
-/**
- * Why `given` does not prove the caller knows this account's password, or
- * null when it does.
- *
- * Answered with 403, never 401: concert-map signs the user out on any 401,
- * and a typo in a settings form must not end the session it was typed in.
- */
-async function currentPasswordRefusal(user, given) {
-  if (!user.password_hash) return NO_CURRENT_PASSWORD;
-  return (await bcrypt.compare(given, user.password_hash)) ? null : WRONG_CURRENT_PASSWORD;
-}
-
-const readCurrentPassword = (req) => {
-  const value = req.body?.currentPassword;
-  return typeof value === 'string' && value ? value : null;
-};
-
 /**
  * PATCH /users/me/password
  * Changes the caller's password, given the current one.
- * Ends no session: old tokens run to their own expiry (owner decision, THO-810).
+ * Ends every login session the account had, this one included, and hands back
+ * a fresh token for the caller to carry on with (THO-898). Service and other
+ * long-lived tokens keep working: auth/loginRevocation.js.
  * @body {string} currentPassword
  * @body {string} newPassword - register's rules
- * @returns {200} "Password changed"
+ * @returns {200} "Password changed", with `data.token`, a new login token
  * @throws {400} A missing current password, a new one the rules refuse, or the same one again
+ * @throws {401} The password changed while this ran (a reset from elsewhere),
+ *   which ends this login session
  * @throws {403} The current password is wrong, or the account has none
+ * @throws {409} For a token that is not a login session: the password changed
+ *   while this ran; try again
  * @throws {429} Too many wrong passwords for this account
  */
 router.patch(
@@ -657,9 +752,11 @@ router.patch(
 
       const user = await prisma.user.findUnique({
         where: { id: req.user.id },
-        select: { id: true, password_hash: true },
+        select: { id: true, email: true, role: true, password_hash: true, password_changed_at: true },
       });
       if (!user) return response.notFound(res, 'User not found');
+      const readChangedAt = user.password_changed_at ?? null;
+      if (sessionPredates(req, readChangedAt)) return response.unauthorized(res, SESSION_ENDED);
 
       const refusal = await currentPasswordRefusal(user, currentPassword);
       if (refusal) return response.forbidden(res, refusal);
@@ -670,14 +767,32 @@ router.patch(
       }
 
       const passwordHash = await bcrypt.hash(newPassword, 10);
+      const changedAt = new Date();
       // A reset link mailed before the change would undo it if used later, so
       // it goes with it.
-      await prisma.$transaction([
-        prisma.user.update({ where: { id: user.id }, data: { password_hash: passwordHash } }),
-        prisma.passwordReset.deleteMany({ where: { user_id: user.id } }),
-      ]);
+      try {
+        await prisma.$transaction([
+          prisma.user.update({
+            where: { id: user.id, password_changed_at: readChangedAt },
+            data: { password_hash: passwordHash, password_changed_at: changedAt },
+          }),
+          prisma.passwordReset.deleteMany({ where: { user_id: user.id } }),
+        ]);
+      } catch (error) {
+        if (error.code === RECORD_NOT_FOUND) return stateMovedAnswer(req, res);
+        throw error;
+      }
+      forgetPasswordChange(user.id);
 
-      return response.success(res, 200, {}, 'Password changed');
+      // Signed after the change, so it is the one session that outlives it.
+      // Without it the caller's own token, issued before the change, would be
+      // refused on their next request and the settings form would sign out
+      // the person who just used it.
+      const token = signJWT({
+        user: { id: user.id, email: user.email, role: user.role },
+        passwordChangedAt: changedAt,
+      });
+      return response.success(res, 200, { token }, 'Password changed');
     } catch (error) {
       console.error('Error changing password:', error);
       return response.serverError(res, 'Internal server error');
@@ -740,6 +855,7 @@ router.delete('/me', auth, currentPasswordLimit, upload.none(), async (req, res)
       // user.delete finds no row. The account is gone, which is what was
       // asked, so that is a success, not a "try again" that then 404s.
       if (error?.code === 'P2025' && !(await prisma.user.findUnique({ where: { id: user.id }, select: { id: true } }))) {
+        forgetPasswordChange(user.id);
         return response.success(res, 200, {}, 'Account deleted');
       }
       console.error('Error deleting account rows after its files were removed:', error);
@@ -748,6 +864,9 @@ router.delete('/me', auth, currentPasswordLimit, upload.none(), async (req, res)
         'Your photos and videos were removed, but your account could not be deleted. Try again to finish.',
       );
     }
+    // Its login tokens are refused from the next request on (THO-898), not
+    // after the minute the cache would otherwise keep the row it read.
+    forgetPasswordChange(user.id);
     await removeDerivedCopies(prisma, media.sha256s);
 
     return response.success(res, 200, {}, 'Account deleted');

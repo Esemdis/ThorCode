@@ -21,7 +21,7 @@ describe('the email change routes', () => {
   it('registers with every middleware the route declares', () => {
     const manifest = routeManifest(router);
 
-    expect(manifest).toContain('POST /email/request-change [4]');
+    expect(manifest).toContain('POST /email/request-change [5]');
     expect(manifest).toContain('POST /email/verify-code [4]');
   });
 
