@@ -636,11 +636,34 @@ router.post(
         // the old concert while the row names the new one would send the
         // files back on the next rebuild, so both go back as they were.
         console.error("[move] could not rewrite a sidecar:", error);
-        await undoRetarget(error.undo ?? []);
-        await prisma.concertAttendance.updateMany({
-          where: { id: attendance.id, concert_id: target.id },
-          data: { concert_id: fromConcertId },
-        });
+        const stuck = await undoRetarget(error.undo ?? []);
+        // Only from the concert this request moved it to: a revert that
+        // matched on the id alone would undo whatever has moved it since.
+        let rowError = null;
+        try {
+          const { count } = await prisma.concertAttendance.updateMany({
+            where: { id: attendance.id, concert_id: target.id },
+            data: { concert_id: fromConcertId },
+          });
+          if (count !== 1) rowError = new Error("the attendance no longer names the concert it was moved to");
+        } catch (revertError) {
+          rowError = revertError;
+        }
+        if (stuck.length || rowError) {
+          // Disk and Postgres may now disagree, which a rebuild turns into
+          // files under the wrong show. One line with everything needed to
+          // put it right by hand, and an answer that does not say "nothing
+          // was changed" when something was.
+          console.error(
+            `[move] RESTORE FAILED for attendance ${attendance.id} (concert ${fromConcertId} -> ${target.id}):`
+              + ` row ${rowError ? "NOT restored" : "restored"};`
+              + ` sidecars not restored: ${stuck.map((s) => s.absDir).join(", ") || "none"}`,
+            [...stuck.map((s) => s.error), ...(rowError ? [rowError] : [])],
+          );
+          return res.status(500).json({
+            error: "Could not update the photo folders, and could not put everything back as it was. Some photos may show under the wrong date until this is fixed.",
+          });
+        }
         return res.status(500).json({ error: "Could not update the photo folders; nothing was changed" });
       }
 

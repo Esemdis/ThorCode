@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  planScrub, applyPatches, crc32, planSource,
+  planScrub, applyPatches, crc32, planSource, FILL_CHUNK,
 } from './mediaScrub.js';
 import { exifCapturedAt } from './exifCapturedAt.js';
 import {
@@ -951,5 +951,42 @@ describe('planScrub on a loose EXIF header (THO-894 review, round 4)', () => {
     const noTiff = Buffer.from(jpeg);
     noTiff.write('Exif\0\0ZZZZ', exifAt, 'latin1');
     await expect(planScrub(noTiff)).rejects.toMatchObject({ code: 'UNSCRUBBABLE' });
+  });
+});
+
+// A zeroed run was one Buffer.alloc of its whole length, so an unknown trailer
+// that was not already blank cost a second copy of itself in the heap: 256 MB
+// more for the largest image allowed. These count the memory the patches hold
+// on to, which is what the plan costs once it is made.
+const heldByPatchesBoundedFill = (patches) => [...new Set(patches.map((p) => p.bytes.buffer))]
+  .reduce((sum, ab) => sum + ab.byteLength, 0);
+
+describe('planScrub keeps a long blanked run from costing its own length (bounded fill)', () => {
+  it('zeroes a large unknown trailer after the last image while holding only a small shared buffer', async () => {
+    const trailerBoundedFill = Buffer.alloc(12 * FILL_CHUNK + 123, 0x41);
+    // A chunk that is already zero in the middle plans nothing for that chunk.
+    trailerBoundedFill.fill(0, 4 * FILL_CHUNK, 5 * FILL_CHUNK);
+    const file = Buffer.concat([minimalJpegTho894, trailerBoundedFill]);
+    const patches = await planScrub(file);
+    expect(heldByPatchesBoundedFill(patches)).toBeLessThanOrEqual(2 * FILL_CHUNK);
+    expect(Math.max(...patches.map((p) => p.bytes.length))).toBeLessThanOrEqual(FILL_CHUNK);
+    const out = applyPatches(file, patches);
+    expect(out.subarray(0, minimalJpegTho894.length).equals(minimalJpegTho894)).toBe(true);
+    expect(out.subarray(minimalJpegTho894.length).equals(Buffer.alloc(trailerBoundedFill.length))).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
+  });
+
+  it('blanks a large unknown Samsung block the same way, with the directory left as it was', async () => {
+    const noteBoundedFill = Buffer.alloc(5 * FILL_CHUNK + 7, 0x42);
+    const { trailer, dataAt } = samsungTrailerTho899([{ type: 0x0b00, name: 'Vendor_Note', data: noteBoundedFill }]);
+    const file = Buffer.concat([minimalJpegTho894, trailer]);
+    const patches = await planScrub(file);
+    expect(heldByPatchesBoundedFill(patches)).toBeLessThanOrEqual(2 * FILL_CHUNK);
+    const out = applyPatches(file, patches);
+    const blankFrom = minimalJpegTho894.length + 8;
+    const blankTo = minimalJpegTho894.length + dataAt[0] + noteBoundedFill.length;
+    expect(out.subarray(blankFrom, blankTo).equals(Buffer.alloc(blankTo - blankFrom))).toBe(true);
+    expect(out.subarray(blankTo).equals(file.subarray(blankTo))).toBe(true);
+    expect(await planScrub(out)).toEqual([]);
   });
 });

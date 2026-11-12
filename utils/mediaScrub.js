@@ -101,15 +101,38 @@ function put(ctx, at, bytes) {
   push(ctx, at, Buffer.from(bytes));
 }
 
-// The same for a run of one byte, checked before the run is allocated: a
-// region that is already blank costs nothing but the look.
+// A long run is planned as patches of at most FILL_CHUNK bytes, each a view of
+// one buffer of the run's byte that every run shares. A run used to be one
+// Buffer.alloc of its whole length, so an unknown trailer after a JPEG's last
+// image (planAfterImage) or a Samsung block (planSamsungTrailer) that was not
+// already blank cost a second copy of itself: up to 256 MB more heap for one
+// image of MAX_IMAGE_BYTES. 256 KiB keeps that worst case at a thousand
+// patches, far inside MAX_PATCHES, and the shared buffers at 256 KiB per byte
+// value. Nothing writes into a patch's bytes (they are copied or written out),
+// which is what makes sharing them safe.
+const FILL_CHUNK = 256 * 1024;
+const fillRuns = new Map();
+
+function fillRun(byte) {
+  let run = fillRuns.get(byte);
+  if (!run) {
+    run = Buffer.alloc(FILL_CHUNK, byte);
+    fillRuns.set(byte, run);
+  }
+  return run;
+}
+
+// The same for a run of one byte, checked before anything is planned: a chunk
+// that is already blank costs nothing but the look.
 function fill(ctx, at, length, byte) {
   if (at < 0 || at + length > ctx.buf.length) throw unscrubbable('patch outside the file');
   charge(ctx, length);
-  let i = at;
-  while (i < at + length && ctx.buf[i] === byte) i += 1;
-  if (i === at + length) return;
-  push(ctx, at, Buffer.alloc(length, byte));
+  for (let start = at; start < at + length; start += FILL_CHUNK) {
+    const end = Math.min(start + FILL_CHUNK, at + length);
+    let i = start;
+    while (i < end && ctx.buf[i] === byte) i += 1;
+    if (i < end) push(ctx, start, fillRun(byte).subarray(0, end - start));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,5 +1044,5 @@ function applyPatches(buf, patches) {
 }
 
 module.exports = {
-  planScrub, planScrubFile, planSource, applyPatches, crc32, XMP_UUID, SCRUB_VERSION,
+  planScrub, planScrubFile, planSource, applyPatches, crc32, XMP_UUID, SCRUB_VERSION, FILL_CHUNK,
 };

@@ -28,6 +28,7 @@ beforeEach(() => {
   const concertCounts = [4000, 7, 19, 210, 40, 31, 3];
   prisma.band.count.mockImplementation(async () => bandCounts.shift() ?? 0);
   prisma.concert.count.mockImplementation(async () => concertCounts.shift() ?? 0);
+  prisma.concert.findMany.mockResolvedValue([]);
 });
 
 describe('GET /health', () => {
@@ -50,18 +51,59 @@ describe('GET /health', () => {
   it('counts rather than listing, so a browser can afford to ask', async () => {
     // The cron feeds this mirrors return every matching row — thousands of
     // them. A panel that asked those would move megabytes to render a number.
-    await request(app).get('/health').set(...authHeader(admin)).expect(200);
+    // The one read of rows is the followed shows still to come (#43), which
+    // the checker reads every five minutes anyway, and it answers counts.
+    const res = await request(app).get('/health').set(...authHeader(admin)).expect(200);
 
-    expect(prisma.concert.findMany).not.toHaveBeenCalled();
     expect(prisma.band.findMany).not.toHaveBeenCalled();
+    expect(prisma.concert.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.concert.findMany.mock.calls[0][0].where).toMatchObject({ follows: { some: {} } });
+    expect(Object.keys(res.body.follow_checks).sort()).toEqual(
+      ['failing', 'followed', 'last_checked_at', 'last_error', 'never_checked', 'stale'],
+    );
+  });
+
+  // concert-map's healthLines has read follow_checks since THO-779 and
+  // nothing sent it, so the checker's line never showed (#43).
+  it('says how the followed-show checker is keeping up, in the shape concert-map reads', async () => {
+    vi.setSystemTime(new Date('2026-10-09T08:10:00Z'));
+    try {
+      prisma.concert.findMany.mockResolvedValueOnce([
+        {
+          id: 1, name: 'Gojira', venue: 'Sentrum', concert_date: new Date('2026-11-01T00:00:00Z'),
+          url: 'https://www.songkick.com/concerts/1-gojira', event_id: null,
+          listing_check: { checked_at: new Date('2026-10-09T08:07:00Z'), attempted_at: null, failures: 0, last_error: null },
+        },
+        {
+          id: 2, name: 'Copenhell 2027', venue: 'Refshaleøen', concert_date: null,
+          url: null, event_id: 'sk_42',
+          listing_check: {
+            checked_at: new Date('2026-10-09T05:00:00Z'), attempted_at: new Date('2026-10-09T08:05:00Z'),
+            failures: 3, last_error: 'no event data on the listing',
+          },
+        },
+      ]);
+      const res = await request(app).get('/health').set(...authHeader(admin)).expect(200);
+      expect(res.body.follow_checks).toEqual({
+        followed: 2,
+        last_checked_at: '2026-10-09T08:07:00.000Z',
+        never_checked: 0,
+        stale: 1,
+        failing: 1,
+        last_error: { show: 'Copenhell 2027', error: 'no event data on the listing' },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('asks in one round trip', async () => {
     // Twelve sequential counts against a remote database is twelve latencies.
+    // Thirteen with the followed shows' read (#43).
     await request(app).get('/health').set(...authHeader(admin)).expect(200);
 
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-    expect(prisma.$transaction.mock.calls[0][0]).toHaveLength(12);
+    expect(prisma.$transaction.mock.calls[0][0]).toHaveLength(13);
   });
 
   it('only counts a setlist gap a run could actually close', async () => {
@@ -71,8 +113,9 @@ describe('GET /health', () => {
     await request(app).get('/health').set(...authHeader(admin)).expect(200);
 
     const queries = prisma.$transaction.mock.calls[0][0];
-    // The queue counts are the last three, in the order the route lists them.
-    const [queue] = queries.slice(-3);
+    // The queue counts are the three before the followed shows' read, in the
+    // order the route lists them.
+    const [queue] = queries.slice(-4, -1);
     expect(prisma.concert.count).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({

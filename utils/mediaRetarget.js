@@ -64,18 +64,33 @@ async function retargetSidecars({ relDirs, concertId, concert }) {
 }
 
 /**
- * Put sidecars back as they were, newest first. Best effort: logged, never
- * thrown, because it runs while the caller is already answering a failure.
+ * Put sidecars back as they were, newest first. Never throws, because it runs
+ * while the caller is already answering a failure, and one folder that will
+ * not go back must not stop the rest from going back.
+ *
+ * Returns the folders it could not restore, each with its error, so the
+ * caller can say so out loud: a sidecar left naming the concert the row no
+ * longer names hands its files to the wrong show on the next rebuild, and a
+ * log line per folder from in here, with nothing in the answer, read as a
+ * clean undo.
  *
  * Only concert_id and the concert block are restored, onto whatever the
  * sidecar holds now: an upload that landed in between keeps its file entry.
+ *
+ * @returns {Promise<Array<{absDir: string, error: Error}>>}
  */
 async function undoRetarget(undo) {
+  const failed = [];
   for (const { absDir, previous } of [...undo].reverse()) {
-    await updateSidecar(absDir, (current) => ({
-      ...(current ?? previous), concert_id: previous.concert_id, concert: previous.concert,
-    })).catch((err) => console.error(`[media] could not restore the sidecar in ${absDir}`, err));
+    try {
+      await updateSidecar(absDir, (current) => ({
+        ...(current ?? previous), concert_id: previous.concert_id, concert: previous.concert,
+      }));
+    } catch (error) {
+      failed.push({ absDir, error });
+    }
   }
+  return failed;
 }
 
 module.exports = { retargetSidecars, undoRetarget };

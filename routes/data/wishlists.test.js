@@ -1607,6 +1607,46 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
     expect(await tho823ReadSidecar('user-1/a')).toEqual(tho823OldSidecar([]));
   });
 
+  // The revert is conditional on the concert this request moved the row to.
+  // Matched on the id alone, it would undo a move that landed in between and
+  // point the row back at a show neither request now means.
+  it('reverts the row only from the concert it moved it to', async () => {
+    await tho823WriteSidecar('user-1/a', { ...tho823OldSidecar([]), version: 99 });
+    prisma.concertMedia.findMany.mockResolvedValue([{ rel_path: 'user-1/a/IMG_1.jpg' }]);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await tho823Move({ concert_id: THO823_RIGHT.id });
+
+    expect(res.status).toBe(500);
+    expect(prisma.concertAttendance.updateMany.mock.calls[1][0]).toEqual({
+      where: { id: 42, concert_id: THO823_RIGHT.id }, data: { concert_id: THO823_FROM },
+    });
+    expect(res.body.error).toBe('Could not update the photo folders; nothing was changed');
+  });
+
+  // A revert that did not take (the row moved meanwhile, or the update threw)
+  // used to be logged as a plain sidecar error and answered "nothing was
+  // changed". Disk and Postgres may disagree then, so it is said out loud.
+  it('says so, and logs one line naming the attendance, when the revert does not take', async () => {
+    await tho823WriteSidecar('user-1/a', tho823OldSidecar([]));
+    await tho823WriteSidecar('user-1/b', { ...tho823OldSidecar([]), version: 99 });
+    prisma.concertMedia.findMany.mockResolvedValue([
+      { rel_path: 'user-1/a/IMG_1.jpg' }, { rel_path: 'user-1/b/IMG_2.jpg' },
+    ]);
+    prisma.concertAttendance.updateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+    const tho823RevertLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await tho823Move({ concert_id: THO823_RIGHT.id });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).not.toMatch(/nothing was changed/);
+    const restoreLines = tho823RevertLog.mock.calls.filter(([line]) => String(line).includes('RESTORE FAILED'));
+    expect(restoreLines).toHaveLength(1);
+    expect(restoreLines[0][0]).toMatch(/attendance 42 \(concert 99 -> 77\): row NOT restored/);
+  });
+
   // The THO-895 guard that refused this is gone: since #50, sharing the
   // show's new night never widens a link spanning two nights
   // (albumLinkForNight), so the move needs no album check of its own.

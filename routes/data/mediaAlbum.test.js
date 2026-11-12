@@ -572,6 +572,24 @@ describe('sharing a night\'s picks', () => {
     }
   });
 
+  // #52: an album thumbnail was cached for an hour without asking, so a file
+  // unpicked from a picks link stayed on that link's page through its cached
+  // thumbnail. Revalidated every time, it is 304 while picked and 404 once not.
+  it('makes a picks link revalidate its thumbnails, so unpicking one takes effect at once', async () => {
+    const pickedRow = await pickedFileTho849(1, true);
+    const picks = (await sharePicksTho849([1]).expect(200)).body.data.token;
+    const thumbRevalidateTho52 = (headers = {}) => request(app())
+      .get(`/data/concerts/album-shares/${picks}/media/1/thumb`).set(headers);
+
+    const first = await thumbRevalidateTho52().expect(200);
+    expect(first.headers['cache-control']).toBe('private, no-cache');
+    expect(first.headers.etag).toBeTruthy();
+    await thumbRevalidateTho52({ 'If-None-Match': first.headers.etag }).expect(304);
+
+    pickedRow.picked = false;
+    await thumbRevalidateTho52({ 'If-None-Match': first.headers.etag }).expect(404);
+  });
+
   it('hands a picked original out without the place it was taken', async () => {
     // Through the same scrubbed copy as the whole night (THO-894), never a
     // path of its own to the original.

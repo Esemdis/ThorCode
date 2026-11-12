@@ -3220,6 +3220,9 @@ describe('GET /media/:id/thumb', () => {
     const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
     const res = await request(app()).get(`/data/concerts/media/1/thumb?t=${t}`).expect(200);
     expect(res.headers['content-type']).toMatch(/image\/webp/);
+    // The owner's thumbnails stay cached for good; only an album link's are
+    // revalidated (#52), because only those can be taken back.
+    expect(res.headers['cache-control']).toBe('private, max-age=31536000, immutable');
   });
 
   it('serves the stored poster for a video, even though it lives under a dot-directory', async () => {

@@ -407,12 +407,16 @@ async function servePublicAlbumMedia(req, res) {
     if (which === 'file') res.attachment(row.filename);
 
     // no-store for the same reason as the single link: it is meant to stop
-    // working. A thumbnail may be kept for an hour — a grid of hundreds
-    // re-fetched over a home connection on every visit is a real cost, and a
-    // thumbnail outliving a revoke by an hour gives away nothing the
-    // recipient has not already seen.
+    // working. A thumbnail is kept but asked about every time (no-cache): a
+    // grid of hundreds re-fetched over a home connection on every visit is a
+    // real cost, and a revalidation that still may see it is a bodiless 304
+    // off the ETag sendFile sets. It used to be kept for an hour without
+    // asking (#52), so a file unpicked from a picks link stayed on that
+    // link's page through its cached thumbnail; asked each time, the answer
+    // is this route's own check above, and an unpicked file is a 404 at
+    // once. The owner's thumbnails keep their immutable cache.
     return await sendMediaBytes(res, row, which, ALBUM_BYTES_CONTEXT, {
-      cacheControl: which === 'thumb' ? 'private, max-age=3600' : 'private, no-store',
+      cacheControl: which === 'thumb' ? 'private, no-cache' : 'private, no-store',
       publicCopy: true,
     });
   } catch (err) {
