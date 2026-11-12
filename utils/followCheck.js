@@ -392,7 +392,64 @@ function errorText(error) {
   return text(typeof error === "string" ? error : "read failed", MAX_ERROR) ?? "read failed";
 }
 
+// A followed show not read for this long is "behind" in the admin's health
+// line. concert-map words it as "not read in 2 h" (src/utils/healthSummary.js);
+// four of STALE_MIN's half hours, so one skipped round or an hour's hold on
+// Songkick after a block is not yet worth a word.
+const SUMMARY_STALE_MIN = 120;
+
+/** What a failing show is called in the admin's health line. */
+const summaryShowName = (concert) => concert.name
+  || [concert.venue, concert.concert_date ? new Date(concert.concert_date).toISOString().slice(0, 10) : null]
+    .filter(Boolean).join(" ")
+  || `show ${concert.id}`;
+
+/**
+ * Whether the checker is keeping up, for GET /data/concerts/health's
+ * `follow_checks` (concert-map's healthLines reads it, #43): how many followed
+ * shows it is reading, when it last read one, how many it never has or is
+ * behind on, and how many it cannot read, with the latest reason.
+ *
+ * Only shows it can read count: still to come, with a Songkick listing. A
+ * followed show with no listing is never read, and counting it would leave
+ * "never read" above zero for good.
+ *
+ * @param {Array<object>} concerts - followed shows, each with `listing_check`
+ * @returns {{followed: number, last_checked_at: string|null, never_checked: number,
+ *            stale: number, failing: number, last_error: {show: string, error: string}|null}}
+ */
+function followCheckSummary(concerts, now = new Date()) {
+  const readable = concerts.filter((concert) => listingUrl(concert) && upcoming(concert, now));
+  const summary = {
+    followed: readable.length, last_checked_at: null, never_checked: 0, stale: 0, failing: 0, last_error: null,
+  };
+  let latestRead = null;
+  let latestErrorAt = null;
+  for (const concert of readable) {
+    const check = concert.listing_check;
+    const checked = at(check?.checked_at);
+    if (checked == null) {
+      summary.never_checked += 1;
+    } else {
+      if (latestRead == null || checked > latestRead) latestRead = checked;
+      if (now.getTime() - checked > SUMMARY_STALE_MIN * MIN) summary.stale += 1;
+    }
+    if ((check?.failures ?? 0) >= FAILING_AFTER) {
+      summary.failing += 1;
+      const attempted = at(check.attempted_at) ?? 0;
+      if (latestErrorAt == null || attempted > latestErrorAt) {
+        latestErrorAt = attempted;
+        summary.last_error = { show: summaryShowName(concert), error: check.last_error || "read failed" };
+      }
+    }
+  }
+  if (latestRead != null) summary.last_checked_at = new Date(latestRead).toISOString();
+  return summary;
+}
+
 module.exports = {
+  SUMMARY_STALE_MIN,
+  followCheckSummary,
   STALE_MIN,
   HOT_MIN,
   HOT_BEFORE_MIN,

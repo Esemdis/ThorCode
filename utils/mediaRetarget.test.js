@@ -101,4 +101,27 @@ describe('retargetSidecars', () => {
     expect(restored.concert).toEqual(retargetOld.concert);
     expect(restored.files.map((f) => f.name)).toEqual(['IMG_1.jpg', 'VID_1.mp4', 'IMG_9.jpg']);
   });
+
+  // It used to log each failure and return nothing, so the caller answered
+  // "nothing was changed" over a sidecar still naming the new concert.
+  it('undo goes on past a folder it cannot restore and returns that folder', async () => {
+    await seed('user-1/a', retargetOld);
+    await seed('user-1/b', retargetOld);
+    const undo = await retargetSidecars({ relDirs: ['user-1/a', 'user-1/b'], concertId: 77, concert: retargetRight });
+    // A sidecar this build cannot read refuses the restore.
+    const stuckRetargetUndo = { ...(await read('user-1/b')), version: 99 };
+    await writeFile(sidecarAt('user-1/b'), JSON.stringify(stuckRetargetUndo));
+
+    const failed = await undoRetarget(undo);
+
+    expect(failed.map((f) => f.absDir)).toEqual([abs('user-1/b')]);
+    expect(failed[0].error).toBeInstanceOf(Error);
+    expect((await read('user-1/a')).concert_id).toBe(99);
+  });
+
+  it('undo returns nothing when every folder went back', async () => {
+    await seed('user-1/a', retargetOld);
+    const undo = await retargetSidecars({ relDirs: ['user-1/a'], concertId: 77, concert: retargetRight });
+    expect(await undoRetarget(undo)).toEqual([]);
+  });
 });

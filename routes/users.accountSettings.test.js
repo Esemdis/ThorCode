@@ -295,6 +295,40 @@ describe('DELETE /users/me (THO-810)', () => {
     expect(prisma.concertMedia.deleteMany).not.toHaveBeenCalled();
   });
 
+  // The re-check after a P2025 is a query too. When it failed, the catch-all
+  // answered "Internal server error" to someone whose photos were already
+  // gone, which reads as if nothing happened and hides that a retry finishes.
+  it('still says the photos are gone when the P2025 re-check itself fails', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique
+      .mockResolvedValueOnce(accountSettingsUser(id))
+      .mockRejectedValueOnce(new Error('connection reset'));
+    prisma.$transaction.mockRejectedValueOnce(Object.assign(new Error('Record not found'), { code: 'P2025' }));
+
+    const res = await deleteAccount(id, { currentPassword: CURRENT });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe(
+      'Your photos and videos were removed, but your account could not be deleted. Try again to finish.',
+    );
+  });
+
+  // The service account's refusal is a 403 like a wrong password's, but it
+  // follows the right password, so it is no guess and must not spend the
+  // budget the next real attempt with the right password needs.
+  it('does not count the service account refusal against the wrong-password budget', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id, { role: 'SYSTEM' }));
+
+    for (let i = 0; i < 11; i++) {
+      expect((await deleteAccount(id, { currentPassword: CURRENT }, 'SYSTEM')).status).toBe(403);
+    }
+    const wrong = await deleteAccount(id, { currentPassword: 'WrongPass1' }, 'SYSTEM');
+
+    expect(wrong.status).toBe(403);
+    expect(wrong.body.error).toBe('Your current password is not right');
+  });
+
   it('refuses the service account', async () => {
     const id = accountSettingsUserId();
     prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id, { role: 'SYSTEM' }));
