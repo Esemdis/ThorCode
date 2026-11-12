@@ -1,9 +1,13 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildApp, authHeader, installFakePrisma } from '../../test/routeApp.js';
+import {
+  jpegWithGpsTho894, minimalJpegTho894, mp4WithLocationTho894,
+  pixelMotionPhotoTho899, samsungMotionPhotoTho899, iptcApp13Tho899,
+} from '../../test/exifFixture.js';
 
 // Sharing a whole night by public link (THO-892). Its own file rather than
 // more of media.test.js: every behaviour here is about one stateful table, and
@@ -88,14 +92,18 @@ const stopNight = (ids, as = ownerTho892) => request(app())
   .delete(`/data/concerts/album-shares?attendance_ids=${ids.join(',')}`).set(...authHeader(as));
 const openAlbum = (token) => request(app()).get(`/data/concerts/album-shares/${token}`);
 
-// A media row with its bytes on disk, the way the archive holds them.
-async function fileInAlbumTho892({ id = 1, attendanceId = 1, userId = 'user-1', bytes = 'master bytes', filename = 'IMG_1.jpg' } = {}) {
+// A media row with its bytes on disk, the way the archive holds them. A real
+// JPEG by default: a public route serves only what it can scrub (THO-894), and
+// text in a .jpg is refused.
+async function fileInAlbumTho892({
+  id = 1, attendanceId = 1, userId = 'user-1', bytes = minimalJpegTho894, filename = 'IMG_1.jpg', kind = 'PHOTO',
+} = {}) {
   const rel = `${userId}/2026-06-12 Oslo - Gojira/${filename}`;
   const dir = join(root, 'archive', userId, '2026-06-12 Oslo - Gojira');
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, filename), bytes);
   const row = {
-    id, attendance_id: attendanceId, band_id: 92, kind: 'PHOTO', filename, rel_path: rel, sha256: `sha-${id}`,
+    id, attendance_id: attendanceId, band_id: 92, kind, filename, rel_path: rel, sha256: `sha${id}`,
     bytes: bytes.length, taken_at: null,
     attendance_rel: { wishlist_rel: { user_id: userId } },
   };
@@ -315,18 +323,112 @@ describe('GET /album-shares/:token', () => {
   });
 });
 
+// The body as a Buffer whatever its type: superagent leaves a video's undefined.
+const rawBytesTho894 = (req) => req.buffer(true).parse((res, done) => {
+  const chunks = [];
+  res.on('data', (c) => chunks.push(c));
+  res.on('end', () => done(null, Buffer.concat(chunks)));
+});
+
 describe('GET /album-shares/:token/media/:id/:which', () => {
   const bytesAt = (token, id, which) => request(app())
     .get(`/data/concerts/album-shares/${token}/media/${id}/${which}`);
 
   it('sends the archive master as a download under its own name', async () => {
-    await fileInAlbumTho892({ id: 1, filename: 'IMG_1.jpg', bytes: 'master bytes' });
+    await fileInAlbumTho892({ id: 1, filename: 'IMG_1.jpg' });
     const { body } = await shareNight([1]).expect(200);
 
     const res = await bytesAt(body.data.token, 1, 'file').expect(200);
     expect(res.headers['content-disposition']).toMatch(/attachment; filename="IMG_1\.jpg"/);
     expect(res.headers['cache-control']).toBe('private, no-store');
-    expect(res.body.toString()).toBe('master bytes');
+    // A master with nothing to strip goes out exactly as it is.
+    expect(Buffer.compare(res.body, minimalJpegTho894)).toBe(0);
+  });
+
+  it('hands a shared night\'s original out without the place it was taken', async () => {
+    // The original keeps it — the owner may want a map of where photographs
+    // were taken — but a stranger holding the link, or anyone it was
+    // forwarded to, could read the owner's home out of it.
+    const { jpeg, tiffAt, at } = jpegWithGpsTho894();
+    await fileInAlbumTho892({ id: 1, bytes: jpeg });
+    const { body } = await shareNight([1]).expect(200);
+
+    const res = await bytesAt(body.data.token, 1, 'file').expect(200);
+    const served = res.body;
+    expect(served.length).toBe(jpeg.length);
+    expect(served.readUInt16LE(tiffAt + at.gpsIfd)).toBe(0);
+    expect(served.subarray(tiffAt + at.serial, tiffAt + at.serial + 14).equals(Buffer.alloc(14))).toBe(true);
+    // The picture itself, from the first scan on, byte for byte.
+    const scan = (b) => b.subarray(b.indexOf(Buffer.from([0xff, 0xda])));
+    expect(scan(served).equals(scan(jpeg))).toBe(true);
+    // Made once, kept in the cache like a thumbnail.
+    expect(await readdir(join(root, 'cache', 'public'))).toEqual(['sha1.jpg', 'sha1.jpg.stamp']);
+  });
+
+  it('strips the location from a shared night\'s video', async () => {
+    const mp4 = mp4WithLocationTho894();
+    await fileInAlbumTho892({ id: 1, bytes: mp4, filename: 'VID_1.mp4', kind: 'VIDEO' });
+    const { body } = await shareNight([1]).expect(200);
+
+    for (const which of ['file', 'view']) {
+      const res = await rawBytesTho894(bytesAt(body.data.token, 1, which)).expect(200);
+      expect(res.body.length).toBe(mp4.length);
+      expect(res.body.includes(Buffer.from('+59.9139+010.7522'))).toBe(false);
+      expect(res.body.includes(Buffer.from('iPhone 15 Pro'))).toBe(false);
+    }
+  });
+
+  it('strips the location from the video inside a shared motion photo, and the IPTC city from a photo', async () => {
+    // THO-899: a Pixel motion photo appends its clip after the JPEG, a Samsung
+    // one keeps it in its SEF trailer beside the mobile country code, and a
+    // Lightroom export keeps the city in APP13. None of them was reached.
+    const { jpeg } = jpegWithGpsTho894();
+    const files = [
+      pixelMotionPhotoTho899().file,
+      samsungMotionPhotoTho899().file,
+      Buffer.concat([jpeg.subarray(0, 2), iptcApp13Tho899(), jpeg.subarray(2)]),
+    ];
+    for (const [i, bytes] of files.entries()) {
+      await fileInAlbumTho892({ id: i + 1, bytes, filename: `PXL_${i + 1}.MP.jpg` });
+    }
+    const { body } = await shareNight([1]).expect(200);
+
+    for (const [i, original] of files.entries()) {
+      const res = await rawBytesTho894(bytesAt(body.data.token, i + 1, 'file')).expect(200);
+      expect(res.body.length).toBe(original.length);
+      for (const gone of ['+59.9139+010.7522', 'iPhone 15 Pro', 'SN-1234567890', 'MCC_Data242', 'IPTC-City']) {
+        expect(res.body.includes(Buffer.from(gone, 'latin1'))).toBe(false);
+      }
+    }
+    // The video is still there, frames and all, for whoever wants to play it.
+    const pixel = await rawBytesTho894(bytesAt(body.data.token, 1, 'file')).expect(200);
+    expect(pixel.body.includes(Buffer.from('frame-data-that-must-never-change'.repeat(4)))).toBe(true);
+  });
+
+  it('answers 404, not the original, for a file it cannot strip', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await fileInAlbumTho892({ id: 1, bytes: 'not a photograph at all' });
+    const { body } = await shareNight([1]).expect(200);
+
+    const res = await bytesAt(body.data.token, 1, 'file').expect(404);
+    expect(res.headers['cache-control']).toBeUndefined();
+    expect(res.headers['content-disposition']).toBeUndefined();
+    expect(warn.mock.calls.flat().join(' ')).toMatch(/media 1/);
+    warn.mockRestore();
+  });
+
+  it('a shared night\'s thumbnail and viewing copy carry no EXIF at all', async () => {
+    const sharp = (await import('sharp')).default;
+    const base = await sharp({ create: { width: 64, height: 48, channels: 3, background: '#334155' } }).jpeg().toBuffer();
+    const { jpeg } = jpegWithGpsTho894(base);
+    expect((await sharp(jpeg).metadata()).exif).toBeDefined();
+    await fileInAlbumTho892({ id: 1, bytes: jpeg });
+    const { body } = await shareNight([1]).expect(200);
+
+    for (const which of ['thumb', 'view']) {
+      const res = await rawBytesTho894(bytesAt(body.data.token, 1, which)).expect(200);
+      expect((await sharp(res.body).metadata()).exif).toBeUndefined();
+    }
   });
 
   it('refuses a file that is not part of the night, exactly as one that does not exist', async () => {
@@ -363,5 +465,150 @@ describe('GET /album-shares/:token/media/:id/:which', () => {
     await stopNight([1]).expect(204);
     await bytesAt(body.data.token, 1, 'file').expect(404);
     await bytesAt('not-a-real-token', 1, 'file').expect(404);
+  });
+});
+
+// A link to the night's picks rather than every file of it (THO-849).
+describe('sharing a night\'s picks', () => {
+  // The fakes above know nothing of either column; these add them, so a query
+  // that forgot to ask for one kind of link, or for picked files, finds rows
+  // the real one would not.
+  const picksMatchTho849 = (l, where) => where.picks_only === undefined || Boolean(l.picks_only) === where.picks_only;
+  beforeEach(() => {
+    prisma.mediaAlbumShareLink.findFirst = vi.fn(async ({ where }) => albumLinks
+      .filter((l) => matchesAlbumWhere(l, where) && picksMatchTho849(l, where))
+      .sort((a, b) => b.created_at - a.created_at)[0] ?? null);
+    // The POST reads every candidate since THO-895, to pick the one that is
+    // still this night's; the kind must filter that read too.
+    prisma.mediaAlbumShareLink.findMany = vi.fn(async ({ where }) => albumLinks
+      .filter((l) => matchesAlbumWhere(l, where) && picksMatchTho849(l, where))
+      .sort((a, b) => b.created_at - a.created_at || b.id - a.id));
+    prisma.mediaAlbumShareLink.updateMany = vi.fn(async ({ where, data }) => {
+      const hit = albumLinks.filter((l) => matchesAlbumWhere(l, where) && picksMatchTho849(l, where));
+      hit.forEach((l) => Object.assign(l, data));
+      return { count: hit.length };
+    });
+    prisma.concertMedia.findMany = vi.fn(async ({ where }) => mediaRows.filter((m) => where.attendance_id.in.includes(m.attendance_id)
+      && (where.picked === undefined || Boolean(m.picked) === where.picked)));
+  });
+
+  const sharePicksTho849 = (ids, body = { picks_only: true }) => request(app())
+    .post('/data/concerts/album-shares').set(...authHeader(ownerTho892)).send({ attendance_ids: ids, ...body });
+  const stopKindTho849 = (ids, kind) => request(app())
+    .delete(`/data/concerts/album-shares?attendance_ids=${ids.join(',')}${kind === undefined ? '' : `&picks_only=${kind}`}`)
+    .set(...authHeader(ownerTho892));
+  const pickedFileTho849 = async (id, picked, over = {}) => {
+    const row = await fileInAlbumTho892({ id, filename: `IMG_${id}.jpg`, ...over });
+    row.picked = picked;
+    return row;
+  };
+
+  it('mints a link of its own beside the whole night\'s, and hands it back when asked again', async () => {
+    const night = await shareNight([1]).expect(200);
+    const picks = await sharePicksTho849([1]).expect(200);
+    expect(picks.body.data.token).not.toBe(night.body.data.token);
+    expect(picks.body.data.picks_only).toBe(true);
+    expect(night.body.data.picks_only).toBe(false);
+    expect((await sharePicksTho849([1]).expect(200)).body.data.token).toBe(picks.body.data.token);
+    expect((await shareNight([1]).expect(200)).body.data.token).toBe(night.body.data.token);
+    expect(albumLinks.map((l) => l.picks_only)).toEqual([false, true]);
+  });
+
+  it('never hands back or widens a picks link for a whole-night request of the same night, nor the reverse', async () => {
+    // Since THO-895 the POST picks among every live candidate for the night.
+    // If the kind dropped out of that read, sharing the whole night would
+    // widen the picks link (or a picks request the whole night's), and a URL
+    // already sent would change what it shows.
+    const picks = await sharePicksTho849([1]).expect(200);
+    const night = await shareNight([1, 2]).expect(200);
+    expect(night.body.data.token).not.toBe(picks.body.data.token);
+    expect(night.body.data.picks_only).toBe(false);
+    expect(prisma.mediaAlbumShareLink.findMany.mock.calls.at(-1)[0].where.picks_only).toBe(false);
+
+    const morePicks = await sharePicksTho849([1, 2, 3]).expect(200);
+    expect(morePicks.body.data.token).toBe(picks.body.data.token);
+    expect(prisma.mediaAlbumShareLink.findMany.mock.calls.at(-1)[0].where.picks_only).toBe(true);
+
+    // Each link widened only by its own kind.
+    expect(albumLinks.map((l) => [l.picks_only, l.attendance_ids])).toEqual([[true, [1, 2, 3]], [false, [1, 2]]]);
+  });
+
+  it('refuses a picks_only it cannot read rather than sharing the whole night', async () => {
+    await sharePicksTho849([1], { picks_only: 'yes' }).expect(400);
+    await sharePicksTho849([1], { picks_only: 1 }).expect(400);
+    expect(albumLinks).toEqual([]);
+  });
+
+  it('lists only what is picked, says so, and follows picking after it was sent', async () => {
+    await pickedFileTho849(1, true);
+    const unpicked = await pickedFileTho849(2, false);
+    const { body } = await sharePicksTho849([1]).expect(200);
+
+    const first = (await openAlbum(body.data.token).expect(200)).body.data;
+    expect(first.picks_only).toBe(true);
+    expect(first.files.map((f) => f.id)).toEqual([1]);
+    expect(first.bands).toEqual([{ id: 92, name: 'Gojira', setlist: null }]);
+    // Whether a file is picked is the owner's business, as on the whole night.
+    expect(Object.keys(first.files[0])).not.toContain('picked');
+
+    unpicked.picked = true;
+    expect((await openAlbum(body.data.token).expect(200)).body.data.files.map((f) => f.id)).toEqual([1, 2]);
+    mediaRows[0].picked = false;
+    expect((await openAlbum(body.data.token).expect(200)).body.data.files.map((f) => f.id)).toEqual([2]);
+  });
+
+  it('opens a picked file\'s bytes and refuses an unpicked one of the same night, as one that does not exist', async () => {
+    // The ids are sequential: the file beside a picked one is a guess away.
+    await pickedFileTho849(1, true);
+    await pickedFileTho849(2, false);
+    const picks = (await sharePicksTho849([1]).expect(200)).body.data.token;
+    const night = (await shareNight([1]).expect(200)).body.data.token;
+    const bytesAt = (token, id, which) => request(app()).get(`/data/concerts/album-shares/${token}/media/${id}/${which}`);
+
+    for (const which of ['thumb', 'view', 'file']) {
+      await bytesAt(picks, 1, which).expect(200);
+      await bytesAt(picks, 2, which).expect(404);
+      await bytesAt(night, 2, which).expect(200);
+    }
+  });
+
+  it('hands a picked original out without the place it was taken', async () => {
+    // Through the same scrubbed copy as the whole night (THO-894), never a
+    // path of its own to the original.
+    const { jpeg, tiffAt, at } = jpegWithGpsTho894();
+    await pickedFileTho849(1, true, { bytes: jpeg });
+    const { body } = await sharePicksTho849([1]).expect(200);
+    const res = await request(app()).get(`/data/concerts/album-shares/${body.data.token}/media/1/file`).expect(200);
+    expect(res.body.readUInt16LE(tiffAt + at.gpsIfd)).toBe(0);
+  });
+
+  it('stops one kind of link or the other, and both when not told which', async () => {
+    const tokens = async () => ({
+      night: (await shareNight([1]).expect(200)).body.data.token,
+      picks: (await sharePicksTho849([1]).expect(200)).body.data.token,
+    });
+
+    let t = await tokens();
+    await stopKindTho849([1], 1).expect(204);
+    await openAlbum(t.picks).expect(404);
+    await openAlbum(t.night).expect(200);
+
+    t = await tokens();
+    await stopKindTho849([1], 0).expect(204);
+    await openAlbum(t.night).expect(404);
+    await openAlbum(t.picks).expect(200);
+
+    // The app from before picks could be shared stops "the night's link":
+    // ending both is the safe reading of that.
+    t = await tokens();
+    await stopKindTho849([1]).expect(204);
+    await openAlbum(t.night).expect(404);
+    await openAlbum(t.picks).expect(404);
+  });
+
+  it('refuses a picks_only on a stop that it cannot read, stopping nothing', async () => {
+    const { body } = await sharePicksTho849([1]).expect(200);
+    await stopKindTho849([1], 'maybe').expect(400);
+    await openAlbum(body.data.token).expect(200);
   });
 });

@@ -25,11 +25,98 @@ $MEDIA_ROOT/
         thumbs/<sha256>.webp        grid thumbnails of photos, 480px wide
         display/<sha256>.webp       lightbox copies of photos, within 2048px
         clips/<link id>.mp4         shared moments cut from videos
+        public/                     what share links hand out, metadata stripped
     incoming/         multer's scratch space during an upload.
 ```
 
 `archive/` is the only one that gets copied offsite. `cache/` is regenerated on
 demand from the originals, and `incoming/` holds bytes that are mid-flight.
+
+`cache/public/` holds the copies the public share links (one file, or a whole
+night's album) hand to someone with no account: the original or rendition with
+its GPS position, camera make, model and serials, and XMP patched out in place,
+so the picture and the video stream are byte for byte the original's (THO-894).
+`<sha256>.<ext>` is a master, `web-<sha256>.mp4` a rendition, `clip-<link id>.mp4`
+a shared moment. Beside each copy, `<name>.stamp` records the scrubber version
+and the size and mtime of the file it was made from; a `<name>.clean` marker
+instead means that file had nothing to strip and the original is served as it
+is, and `<name>.refused` that it could not be stripped, so the share link
+answers 404 at once instead of reading it again. Any of them is ignored, and
+the file looked at again, once the source or the scrubber has changed. A
+master's are stamped with the version and size only: its name is its checksum,
+and two rows with the same bytes would otherwise keep re-making each other's
+copy. That trusts the archive file to still hold the bytes it was uploaded
+with, which every app path keeps true. **Don't edit archive files in place;**
+if you ever must, empty `cache/public/` afterwards, or an edit that keeps the
+size keeps the old verdict. Renditions and moments keep the mtime in their
+stamp because they are made again under the same name, so two rows with the
+same bytes do re-copy each other's rendition when both are opened in turn
+(disk and time, nothing served unchecked). It is keyed by checksum and safe to delete at any time;
+the next request makes the copy again. A file that cannot be read well enough
+to strip (a format it does not know, a damaged header, anything far outside
+what a camera writes) is answered 404 on the share link, with
+`[media] not serving media <id> publicly` in the log — never sent as it is.
+The owner's own downloads are untouched.
+
+When `utils/mediaScrub.js` learns to strip something it used to leave, or
+starts refusing more or fewer files than it did (a limit raised or lowered, a
+parse bug fixed, a box it used to refuse now read), bump `SCRUB_VERSION` at
+its top. That is what makes every copy, `.clean` and `.refused` verdict already
+in `cache/public/` be looked at again; without it they keep the old verdict,
+and a refused file its 404, until someone empties the directory.
+
+Copies go with their row: deleting a file (one at a time, in bulk, or with
+its account) and detaching a show remove its copies, stopping a moment's link
+removes the moment's, and the rendition service sweeps the copy of a moment
+whose link has expired, and any `<name>.<pid>.<uuid>.tmp` more than a day old
+(a copy the API died in the middle of), on each archive pass. A copy whose row
+is still there stays, even when no live link reaches it any more: nothing
+bounds `cache/public` but the rows, so a superseded video master's copy, for
+one, stays until its row goes.
+
+Besides location, camera and serials, the copy loses XMP, IPTC kept inside
+EXIF, the owner's name wherever a format keeps one (EXIF Artist, Copyright,
+XPAuthor; PNG Author, Copyright and Source; QuickTime and 3GPP author and
+copyright), Apple's Live Photo `content.identifier`, and C2PA manifests (JPEG
+APP11, PNG `caBX`, the MP4 uuid box), whose signature the patching breaks
+anyway. Blanking XMP also removes an HDR photo's gain-map description (Ultra
+HDR's `Container:Directory` and `hdrgm:*`, Apple's `HDRGainMap`), so a shared
+Pixel or iPhone HDR JPEG without an ISO 21496-1 APP2 block shows as SDR. The
+pixels are untouched.
+
+What the copy still carries, on purpose or because it is not reached yet:
+the capture time and its offset, Orientation and the colour profile (needed to
+show the picture right); EXIF ImageDescription, UserComment and Software
+(the software version, not the device); a location track recorded inside the
+video stream itself (GoPro GPMF, Apple `mebx`, Android GPS tracks), which lives
+in `mdat` and cannot be reached by a same-length patch; and Samsung's trailer
+`Image_UTC_Data` block, which is the capture time again.
+
+What follows a JPEG's last image (THO-899): a motion photo's video, whether
+appended after the JPEG (Pixel and the phones that copied its format) or in
+Samsung's SEF trailer as `MotionPhoto_Data`, is scrubbed like any MP4 and kept,
+so the clip still plays. Every other Samsung trailer block but
+`Image_UTC_Data` (`MCC_Data`, the
+mobile country code; `DualShot_*` second photographs; the undocumented rest)
+has its data zeroed, and the directory is left so the trailer still reads.
+Anything else after the last image that is not a JPEG, an MP4 or padding is
+zeroed, as are bytes after a PNG's IEND or a WebP's RIFF. A motion photo whose
+video does not parse, or a Samsung trailer whose directory does not, is
+refused (404). Blanking XMP takes away the `GCamera`/`Container` tags that
+point at the clip, so Google Photos shows a shared motion photo as a still;
+a reader of Samsung's trailer, such as exiftool, still finds it. A JPEG's APP13
+(Photoshop's IPTC: city, sub-location, country, by-line) is filled with spaces,
+as XMP is.
+
+A file far outside what a camera writes is refused rather than walked: more
+than 250,000 MP4 boxes and key entries, or a million image chunks, segments
+and EXIF directory entries; an MP4 key name over 1 KB; more than 10,000
+patches; boxes 32 deep. The one slow shape left is a JPEG whose scan is
+hundreds of megabytes of stuffed `FF 00` bytes, under a second to plan; its
+verdict is then cached like any other. At most `MAX_CONCURRENT_SCRUBS` (2,
+in `utils/mediaPublicCopy.js`) files are scrubbed at once; the rest wait their
+turn, and a cached copy or verdict never waits. Two 250 MB images planned
+together still cost up to half a gigabyte of memory.
 
 The thing to understand before touching any of this: **`concert-media.json` is
 the record of truth and Postgres is a disposable index of it.** Every sidecar

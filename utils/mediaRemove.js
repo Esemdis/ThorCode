@@ -21,6 +21,7 @@ const { unlink } = require('node:fs/promises');
 const { resolveArchivePath, posterPath, webRenditionPath } = require('./mediaPaths');
 const { FAILED_SUFFIX } = require('./renditionPlan');
 const { updateSidecar, removeFile } = require('./mediaSidecar');
+const { removePublicCopies } = require('./mediaPublicCopy');
 
 // Already gone is the outcome we wanted. Anything else is not.
 async function unlinkIfThere(absPath) {
@@ -59,7 +60,7 @@ const reason = (what, err) => (err?.code ? `${what} (${err.code})` : what);
  * already gone. The rows themselves are the caller's to delete, and only the
  * ones in `removed`.
  *
- * @param {Array<{id: number, rel_path: string, filename: string, kind: string}>} rows
+ * @param {Array<{id: number, rel_path: string, filename: string, kind: string, sha256?: string}>} rows
  * @param {{ update?: typeof updateSidecar }} [deps] - replaceable so a test can
  *   count the sidecar writes
  * @returns {Promise<{removed: number[], failed: Array<{id: number, error: string}>}>}
@@ -100,6 +101,12 @@ async function removeMediaFiles(rows, { update = updateSidecar } = {}) {
       }
     }
   }
+
+  // The scrubbed copies share links were served (THO-894), as big as the file
+  // and unreachable once its row goes. Here rather than in each caller, so
+  // account deletion (utils/accountDeletion.js) takes them as the two DELETE
+  // routes do. Only for rows removed: a row that stays may still be shared.
+  for (const r of rows) if (!errors.has(r.id)) await removePublicCopies(r);
 
   return {
     removed: rows.filter((r) => !errors.has(r.id)).map((r) => r.id),

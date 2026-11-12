@@ -131,6 +131,25 @@ describe('detachAttendances', () => {
     });
   });
 
+  // THO-894: the scrubbed copies a share link served sit in cache/public under
+  // the row's checksum. Every other path that removes a row takes them; left
+  // here, an account deletion that detached its shows first kept full-size
+  // copies of every shared file for good.
+  it('takes the detached rows\' public share copies out of cache/public, and nobody else\'s', async () => {
+    await mkdir(join(root, 'archive', 'u', 'show'), { recursive: true });
+    const publicDirDetachTho894 = join(root, 'cache', 'public');
+    await mkdir(publicDirDetachTho894, { recursive: true });
+    for (const name of ['ddd444.jpg', 'ddd444.jpg.stamp', 'web-ddd444.mp4', 'eee555.jpg.clean']) {
+      await writeFile(join(publicDirDetachTho894, name), 'copy');
+    }
+    const prisma = fakePrisma([{ attendance_id: 1, rel_path: 'u/show/a.jpg', sha256: 'ddd444' }]);
+
+    await detachAttendances(prisma, [1]);
+
+    expect(await readdir(publicDirDetachTho894)).toEqual(['eee555.jpg.clean']);
+    expect(prisma.concertMedia.findMany.mock.calls[0][0].select).toMatchObject({ sha256: true });
+  });
+
   it('does nothing and touches no rows when there is no media', async () => {
     const prisma = fakePrisma([]);
     expect(await detachAttendances(prisma, [1])).toEqual({ detached: 0, folders: [] });

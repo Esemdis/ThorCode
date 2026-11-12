@@ -43,7 +43,7 @@ const {
 } = require('node:fs/promises');
 
 const {
-  archiveRoot, clipCacheRoot, resolveArchivePath, DETACHED_DIR, WEB_DIR,
+  archiveRoot, clipCacheRoot, publicCacheRoot, resolveArchivePath, DETACHED_DIR, WEB_DIR,
 } = require('../../utils/mediaPaths');
 const { archiveStatus } = require('../../utils/mediaHealth');
 const { readSidecar } = require('../../utils/mediaSidecar');
@@ -52,7 +52,9 @@ const {
   pendingInShow, isAbandonedPart, partNameFor, FAILED_SUFFIX,
 } = require('../../utils/renditionPlan');
 const { playableFor } = require('../../utils/mediaRenditions');
-const { clipFiles, parseClipRequest, planClips } = require('../../utils/mediaClips');
+const {
+  clipFiles, parseClipRequest, planClips, stalePublicTemps,
+} = require('../../utils/mediaClips');
 
 const args = process.argv.slice(2);
 const once = args.includes('--once');
@@ -318,11 +320,19 @@ async function cutClip(job) {
   log(`clip ${job.id} (${job.rel_path} ${range}): cut in ${Math.round((Date.now() - started) / 1000)}s`);
 }
 
-/** Sweep dead clips, then cut any that are waiting. Cheap when there are none. */
-async function clips() {
+/**
+ * Sweep dead clips, then cut any that are waiting. Cheap when there are none.
+ *
+ * `withPublic` also sweeps the scrubbed copies of dead moments out of
+ * cache/public (THO-894). Only on the archive pass, not every few seconds:
+ * that directory holds a copy of every file a share link has served, and
+ * listing it on every clip poll would cost more than the copies do.
+ */
+async function clips({ withPublic = false } = {}) {
   const root = clipCacheRoot();
   const names = await filesIn(root);
-  if (!names.length) return;
+  const publicNames = withPublic ? (await filesIn(publicCacheRoot())).filter((n) => n.startsWith('clip-')) : [];
+  if (!names.length && !publicNames.length) return;
 
   const requests = new Map();
   for (const name of names.filter((n) => /^\d+\.json$/.test(n))) {
@@ -331,21 +341,41 @@ async function clips() {
     const text = await readFile(path.join(root, name), 'utf8').catch(() => null);
     requests.set(name, text == null ? null : parseClipRequest(name, text));
   }
-  const { jobs, sweep } = planClips(names, requests, new Date());
+  const { jobs, sweep, sweepPublic } = planClips(names, requests, new Date(), publicNames);
 
   if (dryRun) {
     for (const job of jobs) log(`would cut clip ${job.id} from ${job.rel_path}`);
     return;
   }
   for (const name of sweep) await unlink(path.join(root, name)).catch(() => {});
+  for (const name of sweepPublic) await unlink(path.join(publicCacheRoot(), name)).catch(() => {});
   for (const job of jobs) {
     if (stopping) return;
     await cutClip(job);
   }
 }
 
+/**
+ * Delete the temp copies in cache/public that a dead API process left
+ * (THO-894; see stalePublicTemps). On the archive pass, like the public clip
+ * sweep, and only the `.tmp` names are stat'ed.
+ */
+async function sweepPublicTemps() {
+  const root = publicCacheRoot();
+  const entries = [];
+  for (const name of (await filesIn(root)).filter((n) => n.endsWith('.tmp'))) {
+    const info = await stat(path.join(root, name)).catch(() => null);
+    if (info) entries.push({ name, mtimeMs: info.mtimeMs });
+  }
+  for (const name of stalePublicTemps(entries)) {
+    if (dryRun) log(`would remove ${name}, an abandoned public copy`);
+    else await unlink(path.join(root, name)).catch(() => {});
+  }
+}
+
 async function pass() {
-  await clips();
+  await clips({ withPublic: true });
+  await sweepPublicTemps();
   const shows = await showDirs();
   let pending = 0;
   let done = 0;

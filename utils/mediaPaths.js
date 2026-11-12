@@ -42,6 +42,27 @@ function clipCacheRoot() {
   return path.join(mediaRoot(), CACHE_DIR, 'clips');
 }
 
+// The copies the public share routes hand out, with location and camera
+// metadata cut out (THO-894). Derived and disposable like the thumbnails.
+function publicCacheRoot() {
+  return path.join(mediaRoot(), CACHE_DIR, 'public');
+}
+
+function publicCachePath(key) {
+  return path.join(publicCacheRoot(), key);
+}
+
+// Every file one public copy can leave in cache/public: the copy, the stamp of
+// the source and scrubber it was made from, the marker that says the file had
+// nothing to strip, and the one that says it could not be stripped. Here
+// rather than in mediaPublicCopy.js because the rendition service sweeps them
+// too, and its image carries only a few utils.
+const PUBLIC_COPY_SUFFIXES = ['', '.stamp', '.clean', '.refused'];
+
+function publicCopyFiles(key, dir = publicCacheRoot()) {
+  return PUBLIC_COPY_SUFFIXES.map((suffix) => path.join(dir, `${key}${suffix}`));
+}
+
 /**
  * One path component, made safe without being made ugly.
  *
@@ -170,7 +191,8 @@ function webRenditionPath(absOriginal) {
 
 module.exports = {
   ARCHIVE_DIR, CACHE_DIR, DETACHED_DIR, MAX_SEGMENT, POSTERS_DIR, WEB_DIR,
-  archiveRoot, thumbCacheRoot, clipCacheRoot, slugSegment, safeExtension, showFolderName,
+  archiveRoot, thumbCacheRoot, clipCacheRoot, publicCacheRoot, publicCachePath, publicCopyFiles,
+  PUBLIC_COPY_SUFFIXES, slugSegment, safeExtension, showFolderName,
   showFolderRelPath, uniqueFilename, resolveArchivePath, thumbPath, posterPath,
   webRenditionPath,
 };

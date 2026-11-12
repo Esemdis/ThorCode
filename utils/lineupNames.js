@@ -14,12 +14,76 @@
 // Clean at the write boundary rather than at render, so what is stored is what
 // matches.
 
-// A follower count welded onto the end of a name: "Counterparts266K Followers",
-// "Heavensgate5.31K Followers", "Someone1,204 followers".
-const FOLLOWER_SUFFIX = /\s*\d[\d.,]*\s*[KMB]?\s*followers?\s*$/i;
+// Why these are hand-written scans and not regexes (THO-971): the patterns
+// they replace were /\s*\d[\d.,]*\s*[KMB]?\s*followers?\s*$/i,
+// /\s+official\s*$/i and /\s*\([^)]*\)\s*$/. Each leads with a run the engine
+// retries from every start position, so a name with a long run of spaces,
+// digits or "(" took time proportional to its length squared: 100,000 spaces
+// took 31.6 s, on the one thread that answers every request. A name like that
+// could be stored as a band, and these run over every stored band on each band
+// add. Anchored at the end, a suffix can be found by reading backwards once.
+// They cut exactly where the regexes did; lineupNames.test.js checks that
+// against the old patterns.
 
-// The Bandsintown profile suffix: "thrown official" is THROWN.
-const PROFILE_SUFFIX = /\s+official\s*$/i;
+// What \s matches is what trimEnd removes, so one test serves both.
+const isSpace = (ch) => ch !== '' && ch.trim() === '';
+const isDigit = (ch) => ch >= '0' && ch <= '9';
+
+// Index just past the last non-space character at or before `end`.
+function trimmedEnd(s, end) {
+  let i = end;
+  while (i > 0 && isSpace(s[i - 1])) i--;
+  return i;
+}
+
+// Index of the first of the spaces that run back from `start`.
+function spacesBefore(s, start) {
+  let i = start;
+  while (i > 0 && isSpace(s[i - 1])) i--;
+  return i;
+}
+
+// Whether s[at..at+word.length) is `word`, ignoring ASCII case only. The
+// regexes' /i (without /u) folded only ASCII here: toLowerCase would also
+// turn the Kelvin sign into "k".
+function asciiWordAt(s, at, word) {
+  if (at < 0) return false;
+  for (let i = 0; i < word.length; i++) {
+    const code = s.charCodeAt(at + i);
+    const lower = code >= 65 && code <= 90 ? code + 32 : code;
+    if (lower !== word.charCodeAt(i)) return false;
+  }
+  return true;
+}
+
+// A follower count welded onto the end of a name: "Counterparts266K Followers",
+// "Heavensgate5.31K Followers", "Someone1,204 followers". Returns where the
+// suffix starts, or s.length when there is none.
+function followerSuffixStart(s) {
+  let i = trimmedEnd(s, s.length);
+  if (asciiWordAt(s, i - 9, 'followers')) i -= 9;
+  else if (asciiWordAt(s, i - 8, 'follower')) i -= 8;
+  else return s.length;
+  i = spacesBefore(s, i);
+  if (i > 0 && 'KMBkmb'.includes(s[i - 1])) i = spacesBefore(s, i - 1);
+  // The count is a run of digits, dots and commas that has to start with a
+  // digit, so it is cut at the run's first digit: "x..5K" keeps "x..".
+  let runStart = i;
+  while (runStart > 0 && (isDigit(s[runStart - 1]) || s[runStart - 1] === '.' || s[runStart - 1] === ',')) runStart--;
+  let firstDigit = runStart;
+  while (firstDigit < i && !isDigit(s[firstDigit])) firstDigit++;
+  if (firstDigit === i) return s.length;
+  return spacesBefore(s, firstDigit);
+}
+
+// The Bandsintown profile suffix: "thrown official" is THROWN. It needs a space
+// before it, so "thrownofficial" is left alone.
+function profileSuffixStart(s) {
+  const end = trimmedEnd(s, s.length);
+  const at = end - 8;
+  if (!asciiWordAt(s, at, 'official') || at === 0 || !isSpace(s[at - 1])) return s.length;
+  return spacesBefore(s, at);
+}
 
 /**
  * Strip scraper and profile noise from one lineup name.
@@ -29,7 +93,8 @@ const PROFILE_SUFFIX = /\s+official\s*$/i;
  */
 function cleanLineupName(name) {
   if (typeof name !== 'string') return '';
-  const cleaned = name.replace(FOLLOWER_SUFFIX, '').replace(PROFILE_SUFFIX, '').trim();
+  const withoutCount = name.slice(0, followerSuffixStart(name));
+  const cleaned = withoutCount.slice(0, profileSuffixStart(withoutCount)).trim();
   // Never clean a name out of existence — a band actually called "Official" is
   // likelier than an entry that was nothing but suffix.
   return cleaned || name.trim();
@@ -86,7 +151,16 @@ function cleanLineupJson(json) {
 // A trailing disambiguator: "Architects (UK)", "Polaris (AUS)", "Psychonaut (be)".
 // Sources disagree about whether to include it, and it is the only difference
 // that regularly separates a lineup name from the band row it belongs to.
-const COUNTRY_SUFFIX = /\s*\([^)]*\)\s*$/;
+// Returns where it starts, or s.length when there is none. The parentheses
+// hold no ")", so the suffix opens at the first "(" after the last ")" before
+// the closing one: "A (b (c))" has no suffix to strip.
+function countrySuffixStart(s) {
+  const end = trimmedEnd(s, s.length);
+  if (s[end - 1] !== ')') return s.length;
+  const open = s.indexOf('(', s.lastIndexOf(')', end - 2) + 1);
+  if (open === -1 || open >= end - 1) return s.length;
+  return spacesBefore(s, open);
+}
 
 /**
  * Reduce a band or lineup name to the form used to decide whether two names are
@@ -105,7 +179,7 @@ const COUNTRY_SUFFIX = /\s*\([^)]*\)\s*$/;
 function canonicalBandName(name) {
   const cleaned = cleanLineupName(name);
   if (!cleaned) return '';
-  const withoutSuffix = cleaned.replace(COUNTRY_SUFFIX, '').trim() || cleaned;
+  const withoutSuffix = cleaned.slice(0, countrySuffixStart(cleaned)).trim() || cleaned;
   // Accents come off Latin letters (ö is o), and then any letter or digit in
   // any script is kept. It used to keep a-z and 0-9 only, which erased every
   // name not written in Latin — "Кино" and "陰陽座" were both '', so neither

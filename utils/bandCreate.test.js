@@ -10,7 +10,7 @@ const require = createRequire(import.meta.url);
 const bandSourceUrls = require('./bandSourceUrls.js');
 const bandBacklink = require('./bandBacklink.js');
 const pythonService = require('./pythonService.js');
-const { createBand, BandExistsError } = require('./bandCreate.js');
+const { createBand, BandExistsError, BandNameTooLongError, BAND_NAME_MAX } = require('./bandCreate.js');
 
 const MBID = '5a7e05a6-a9f5-4f5a-9d0c-6c0d7c7d4c1a';
 const uniqueViolation = () => Object.assign(new Error('Unique constraint failed'), { code: 'P2002' });
@@ -44,6 +44,29 @@ describe('createBand', () => {
       band_name: 'Gojira',
       initial: true,
     }));
+  });
+
+  it('refuses a name over 200 characters before reading a single band (THO-971)', async () => {
+    // The lookup reads every stored band and matches against each, so a huge
+    // name must be refused before it, and never stored to slow later adds.
+    const err = await createBand('a'.repeat(BAND_NAME_MAX + 1)).catch((e) => e);
+
+    expect(err).toBeInstanceOf(BandNameTooLongError);
+    expect(err.message).toBe('name must be at most 200 characters');
+    expect(prisma.band.findMany).not.toHaveBeenCalled();
+    expect(prisma.band.findUnique).not.toHaveBeenCalled();
+    expect(prisma.band.create).not.toHaveBeenCalled();
+    expect(bandSourceUrls.findSourceUrls).not.toHaveBeenCalled();
+  });
+
+  it('accepts a name of exactly 200 characters (THO-971)', async () => {
+    prisma.band.findMany.mockResolvedValue([]);
+    prisma.band.create.mockImplementation(async ({ data }) => ({ id: 9, ...data }));
+
+    const out = await createBand('a'.repeat(BAND_NAME_MAX));
+
+    expect(out.band.name).toHaveLength(200);
+    expect(prisma.band.create).toHaveBeenCalled();
   });
 
   it('refuses a name already stored, before asking MusicBrainz', async () => {

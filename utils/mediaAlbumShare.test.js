@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   ALBUM_TTL_MS, albumExpiry, normaliseAttendanceIds, sameIds, unionIds, albumBase, albumMediaUrls, albumPayload,
-  albumNightKey, albumLinkForNight,
+  parsePicksOnly, albumMediaWhere, albumServesFile, albumNightKey, albumLinkForNight,
 } from './mediaAlbumShare.js';
 
 describe('albumExpiry', () => {
@@ -213,5 +213,96 @@ describe('albumPayload', () => {
     expect(() => albumPayload({
       link: albumLinkTho892, attendances: [{ id: 1, concert_rel: albumConcertTho892() }], media: [], baseUrl: 'api.example.com',
     })).toThrow(/not absolute/);
+  });
+});
+
+// Sharing a night's picks rather than every file of it (THO-849).
+describe('parsePicksOnly', () => {
+  it('reads a JSON boolean and the text a query string carries', () => {
+    expect(parsePicksOnly(true)).toBe(true);
+    expect(parsePicksOnly('1')).toBe(true);
+    expect(parsePicksOnly('true')).toBe(true);
+    expect(parsePicksOnly(false)).toBe(false);
+    expect(parsePicksOnly('0')).toBe(false);
+    expect(parsePicksOnly('false')).toBe(false);
+  });
+
+  it('tells not given apart from given as something it cannot read', () => {
+    // Not given is each route's default; anything else is refused, never
+    // guessed: a typo must not share the whole night when the picks were meant.
+    expect(parsePicksOnly(undefined)).toBeUndefined();
+    for (const bad of [null, 'yes', 'TRUE', 1, 0, '', ['1'], {}]) expect(parsePicksOnly(bad)).toBeNull();
+  });
+});
+
+describe('albumMediaWhere', () => {
+  it('asks for every file of the attendances for a whole-night link', () => {
+    expect(albumMediaWhere({ picks_only: false }, [1, 2])).toEqual({ attendance_id: { in: [1, 2] } });
+    // A row from before the column existed reads as a whole-night link.
+    expect(albumMediaWhere({}, [1])).toEqual({ attendance_id: { in: [1] } });
+  });
+
+  it('asks only for the picked ones for a picks link', () => {
+    expect(albumMediaWhere({ picks_only: true }, [1, 2])).toEqual({ attendance_id: { in: [1, 2] }, picked: true });
+  });
+});
+
+describe('albumServesFile', () => {
+  const picksLinkTho849 = { user_id: 'user-1', attendance_ids: [1, 2], picks_only: true };
+  const rowTho849 = (over = {}) => ({
+    attendance_id: 1, picked: true, attendance_rel: { wishlist_rel: { user_id: 'user-1' } }, ...over,
+  });
+
+  it('opens a picked file of the night for a picks link, and not an unpicked one', () => {
+    // The ids are sequential: an unpicked file is one guess away from a picked
+    // one, so the byte route asks the same question the listing does.
+    expect(albumServesFile(picksLinkTho849, rowTho849())).toBe(true);
+    expect(albumServesFile(picksLinkTho849, rowTho849({ picked: false }))).toBe(false);
+  });
+
+  it('opens every file of the night for a whole-night link', () => {
+    expect(albumServesFile({ ...picksLinkTho849, picks_only: false }, rowTho849({ picked: false }))).toBe(true);
+  });
+
+  it('never opens a file from another night or another account, picked or not', () => {
+    expect(albumServesFile(picksLinkTho849, rowTho849({ attendance_id: 3 }))).toBe(false);
+    expect(albumServesFile(picksLinkTho849, rowTho849({ attendance_rel: { wishlist_rel: { user_id: 'someone-else' } } })))
+      .toBe(false);
+    expect(albumServesFile(picksLinkTho849, null)).toBe(false);
+  });
+});
+
+describe('albumPayload for a picks link', () => {
+  const picksConcertTho849 = {
+    concert_date: new Date('2026-06-12T19:00:00Z'), venue: 'Sentrum Scene', city: 'Oslo', country: 'NO',
+    bands: [{ setlist: { songs: [{ name: 'Stranded' }] }, band_rel: { id: 92, name: 'Gojira' } }],
+  };
+  const buildPicksTho849 = (link, attendance = { id: 1, concert_rel: picksConcertTho849 }) => albumPayload({
+    link: { token: 'tok', expires_at: new Date('2026-11-17T10:00:00Z'), ...link },
+    attendances: [attendance],
+    media: [],
+    baseUrl: 'https://api.example.com',
+  });
+
+  it('says whether it is the picks or the whole night', () => {
+    expect(buildPicksTho849({ picks_only: true }).picks_only).toBe(true);
+    expect(buildPicksTho849({ picks_only: false }).picks_only).toBe(false);
+    expect(buildPicksTho849({}).picks_only).toBe(false);
+  });
+
+  it('keeps the bill and the setlist, and leaves the owner\'s notes and other people out', () => {
+    // An attendance row carries the owner's diary (notes, rating) and the
+    // wishlist it hangs off; none of it is the recipient's to read.
+    const out = buildPicksTho849({ picks_only: true }, {
+      id: 1,
+      notes: 'went with Kari, lost my jacket',
+      rating: 5,
+      wishlist_rel: { user_id: 'user-1', name: 'Mine' },
+      concert_rel: { ...picksConcertTho849, attendances: [{ wishlist_rel: { user_id: 'user-2' } }] },
+    });
+    expect(Object.keys(out).sort()).toEqual(['bands', 'expires_at', 'files', 'night', 'picks_only']);
+    expect(out.bands).toEqual([{ id: 92, name: 'Gojira', setlist: { songs: [{ name: 'Stranded' }] } }]);
+    const text = JSON.stringify(out);
+    for (const secret of ['Kari', 'jacket', 'rating', 'user-1', 'user-2', 'Mine']) expect(text).not.toContain(secret);
   });
 });
