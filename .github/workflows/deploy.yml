@@ -78,8 +78,27 @@ jobs:
 
   build:
     needs: [test, database]
-    # A manual run can be started on any branch; only main may publish :latest,
-    # which Watchtower deploys, migrations and all.
+    # Only main publishes :latest, which Watchtower deploys, migrations and
+    # all. A manual run can be started on any branch and a pull request runs
+    # this file too; this condition keeps both from publishing.
+    #
+    # It guards against the accident, not against intent (THO-987). A pull
+    # request from a branch in this repo, and a manual run on a branch, use
+    # that branch's copy of this file, and anyone who can push a branch, every
+    # pipeline agent included, can delete this line and publish :latest from
+    # an unmerged branch. GITHUB_TOKEN with `packages: write` is handed to
+    # every such run, so nothing in a workflow file can close that. What would
+    # are GitHub settings the owner makes:
+    #   - an Environment restricted to main, holding the token that publishes,
+    #     with this job naming it (`environment:` is left out until that
+    #     Environment exists, or every deploy would stop);
+    #   - the GHCR package's Actions access for this repo set to Read, so
+    #     GITHUB_TOKEN can no longer push it;
+    #   - Watchtower following a tag only that job moves;
+    #   - a branch rule on main requiring code-owner review (.github/CODEOWNERS).
+    # A fork's pull request gets no secrets and a read-only token
+    # (`pull_request`, not `pull_request_target`), so the hole is same-repo
+    # branches only.
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

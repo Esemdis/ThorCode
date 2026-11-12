@@ -13,6 +13,14 @@ this says how to change it without breaking a deploy.
   `vitest run test/integration`). **A red test on `main` blocks every deploy,**
   not just the one that broke it. Check the Actions tab before you assume your
   change is live.
+- The `refs/heads/main` check on `deploy.yml`'s `build` job is all that keeps a
+  branch from publishing `:latest`, and a branch can edit it (THO-987). Don't
+  touch `.github/workflows/` unless the ticket is about it, and never weaken
+  that check or add `packages: write` elsewhere. The real guards (a main-only
+  Environment holding the publish token, the package's Actions access set to
+  Read, Watchtower on a tag only that job moves) are settings only the owner
+  makes; `.github/CODEOWNERS` asks for the owner's review once a branch rule
+  requires it.
 - The container boots with `npx prisma migrate deploy && node index.js`
   (`Dockerfile`), so a merged migration is applied to production the moment the
   image starts. A failed migration stops the API from starting.
