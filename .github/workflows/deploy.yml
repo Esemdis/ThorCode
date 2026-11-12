@@ -84,18 +84,30 @@ jobs:
     #
     # It guards against the accident, not against intent (THO-987). A pull
     # request from a branch in this repo, and a manual run on a branch, use
-    # that branch's copy of this file, and anyone who can push a branch, every
-    # pipeline agent included, can delete this line and publish :latest from
-    # an unmerged branch. GITHUB_TOKEN with `packages: write` is handed to
-    # every such run, so nothing in a workflow file can close that. What would
-    # are GitHub settings the owner makes:
-    #   - an Environment restricted to main, holding the token that publishes,
-    #     with this job naming it (`environment:` is left out until that
-    #     Environment exists, or every deploy would stop);
-    #   - the GHCR package's Actions access for this repo set to Read, so
-    #     GITHUB_TOKEN can no longer push it;
-    #   - Watchtower following a tag only that job moves;
-    #   - a branch rule on main requiring code-owner review (.github/CODEOWNERS).
+    # that branch's copy of this file. A branch's copy can drop this line and
+    # declare `packages: write`, and GitHub grants it, so anyone who can push
+    # a change to this file can publish :latest from an unmerged branch.
+    # Nothing in a workflow file can close that.
+    #
+    # The agent pipeline's credential can push such a change today: a branch
+    # changing this file was accepted. Taking the `workflow` scope, and any
+    # tool that runs a workflow, away from agent credentials is the cheapest
+    # real guard: a branch that cannot edit this file cannot get past this
+    # condition, for pull requests and manual runs alike.
+    #
+    # The rest are GitHub settings the owner makes, in this order, so deploys
+    # never stop:
+    #   1. an Environment restricted to main, holding the publish token;
+    #   2. a change that names that Environment here and logs in with its
+    #      token (`environment:` is left out until the Environment exists, or
+    #      every deploy would stop);
+    #   3. only then, the GHCR package's Actions access for this repo set to
+    #      Read, so GITHUB_TOKEN can no longer push it. Set before 2, it
+    #      refuses main's own push below: no image, no deploy, no migrations;
+    #   4. Watchtower following a tag only that job moves.
+    # A branch rule on main requiring code-owner review (.github/CODEOWNERS)
+    # gates the merge, not the pull request's run, which publishes before
+    # anyone reviews.
     # A fork's pull request gets no secrets and a read-only token
     # (`pull_request`, not `pull_request_target`), so the hole is same-repo
     # branches only.
