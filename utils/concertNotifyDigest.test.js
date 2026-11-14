@@ -7,6 +7,9 @@ const prisma = installFakePrisma({
     findFirst: vi.fn(async () => ({ id: 1, last_run_at: new Date('2026-09-25T08:00:00Z') })),
     create: vi.fn(),
     update: vi.fn(async () => ({})),
+    // The claim on the window (THO-974). Won by default; a test that loses it
+    // says so itself.
+    updateMany: vi.fn(async () => ({ count: 1 })),
   },
   concertBandReference: { findMany: vi.fn() },
   notificationSubscription: { findMany: vi.fn() },
@@ -40,18 +43,25 @@ beforeEach(() => {
 });
 
 describe('runNotificationDigest', () => {
-  it('keeps the window when no digest could be sent at all', async () => {
+  it('gives the window back when no digest could be sent at all', async () => {
     // A bad key or an email outage used to move the window on regardless,
-    // and every concert in it was never mailed to anyone.
+    // and every concert in it was never mailed to anyone. The claim already
+    // moved it (THO-974), so it is put back, but only if it still holds this
+    // run's claim: a later run that took it since must not be undone.
     vi.spyOn(mail, 'sendDigestEmail').mockRejectedValue(new Error('Email service error: invalid key'));
 
     const result = await runNotificationDigest();
 
     expect(result).toMatchObject({ sent: 0, failed: 2 });
     expect(prisma.notificationDigestRun.update).not.toHaveBeenCalled();
+    const since = new Date('2026-09-25T08:00:00Z');
+    const [claim, restore] = prisma.notificationDigestRun.updateMany.mock.calls.map(([arg]) => arg);
+    expect(prisma.notificationDigestRun.updateMany).toHaveBeenCalledTimes(2);
+    const claimedAt = claim.data.last_run_at;
+    expect(restore).toEqual({ where: { id: 1, last_run_at: claimedAt }, data: { last_run_at: since } });
   });
 
-  it('moves the window on once any digest went out', async () => {
+  it('moves the window on once any digest went out, with the claim and nothing after', async () => {
     vi.spyOn(mail, 'sendDigestEmail')
       .mockResolvedValueOnce({ data: { id: 'a' } })
       .mockRejectedValueOnce(new Error('rate limited'));
@@ -59,7 +69,56 @@ describe('runNotificationDigest', () => {
     const result = await runNotificationDigest();
 
     expect(result).toMatchObject({ sent: 1, failed: 1 });
-    expect(prisma.notificationDigestRun.update).toHaveBeenCalledTimes(1);
+    expect(prisma.notificationDigestRun.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.notificationDigestRun.update).not.toHaveBeenCalled();
+  });
+
+  it('sends nothing when another process already claimed the window', async () => {
+    // dev and prd share one database, and both ran this job at 09:00: each
+    // read the same cursor and both sent the same digest (THO-974).
+    prisma.notificationDigestRun.updateMany.mockResolvedValue({ count: 0 });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const send = vi.spyOn(mail, 'sendDigestEmail').mockResolvedValue({ data: { id: 'a' } });
+
+    const result = await runNotificationDigest();
+
+    expect(result).toEqual({ sent: 0, concerts: 0, failed: 0, skipped: true });
+    expect(send).not.toHaveBeenCalled();
+    expect(prisma.concertBandReference.findMany).not.toHaveBeenCalled();
+    expect(prisma.notificationDigestRun.update).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('already taken'));
+  });
+
+  it('claims the window from the cursor it read, before reading or sending anything', async () => {
+    const order = [];
+    prisma.notificationDigestRun.updateMany.mockImplementation(async () => { order.push('claim'); return { count: 1 }; });
+    prisma.concertBandReference.findMany.mockImplementation(async () => { order.push('read'); return [linked(concert(100))]; });
+    vi.spyOn(mail, 'sendDigestEmail').mockImplementation(async () => { order.push('send'); return { data: { id: 'a' } }; });
+
+    await runNotificationDigest();
+
+    expect(order).toEqual(['claim', 'read', 'send', 'send']);
+    const { where, data } = prisma.notificationDigestRun.updateMany.mock.calls[0][0];
+    expect(where).toEqual({ id: 1, last_run_at: new Date('2026-09-25T08:00:00Z') });
+    expect(data.last_run_at).toBeInstanceOf(Date);
+  });
+
+  it('moves the window with the claim alone when nothing is new', async () => {
+    prisma.concertBandReference.findMany.mockResolvedValue([]);
+
+    const result = await runNotificationDigest();
+
+    expect(result).toMatchObject({ sent: 0, concerts: 0 });
+    expect(prisma.notificationDigestRun.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.notificationDigestRun.update).not.toHaveBeenCalled();
+  });
+
+  it('reads the oldest cursor row, so two processes read the same one', async () => {
+    vi.spyOn(mail, 'sendDigestEmail').mockResolvedValue({ data: { id: 'a' } });
+
+    await runNotificationDigest();
+
+    expect(prisma.notificationDigestRun.findFirst).toHaveBeenCalledWith({ orderBy: { id: 'asc' } });
   });
 
   it('mails only shows still to come, not a past one imported today', async () => {
