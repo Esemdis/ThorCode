@@ -23,6 +23,12 @@ describe('sourceUrl', () => {
     expect(sourceUrl('https://songkick.com.evil.test/artists/1-x', SK_THO976)).toBeNull();
   });
 
+  // python-crohn needed a hostname regex for this (urlparse keeps the escape);
+  // WHATWG URL decodes it, finds a "/" in the host and throws.
+  it('refuses a host smuggling a path separator as a percent-escape', () => {
+    expect(sourceUrl('https://evil.com%2f.songkick.com/', SK_THO976)).toBeNull();
+  });
+
   // Reads as songkick.com to a person; the host is evil.test.
   it('refuses userinfo and an explicit port', () => {
     expect(sourceUrl('https://songkick.com@evil.test/', SK_THO976)).toBeNull();
