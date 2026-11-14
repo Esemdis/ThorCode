@@ -1650,3 +1650,44 @@ describe('GET /bands/recommended', () => {
     expect(spotify.getValidToken).not.toHaveBeenCalled();
   });
 });
+
+// THO-976: the stored url is what the scraper is sent to, so the admin edit
+// checks the host, not whether the text mentions the site.
+describe('PATCH /bands/:bandId source urls (THO-976)', () => {
+  const patchBandTho976 = (body) =>
+    request(app).patch('/bands/7').set(...authHeader({ role: 'ADMIN' })).send(body);
+
+  it('refuses a songkick url on another host and writes nothing', async () => {
+    const res = await patchBandTho976({ songkick_url: 'https://attacker.example/songkick.com/x' });
+    expect(res.status).toBe(400);
+    expect(res.body.errors[0].msg).toBe('songkick_url must be an https songkick.com URL');
+    expect(prisma.band.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses a plain-http bandsintown url', async () => {
+    const res = await patchBandTho976({ bandsintown_url: 'http://www.bandsintown.com/a/456-x' });
+    expect(res.status).toBe(400);
+    expect(res.body.errors[0].msg).toBe('bandsintown_url must be an https bandsintown.com URL');
+    expect(prisma.band.update).not.toHaveBeenCalled();
+  });
+
+  it('stores the cleaned https url, without query, hash or trailing slash', async () => {
+    prisma.band.update.mockResolvedValue({ id: 7 });
+    const res = await patchBandTho976({
+      songkick_url: 'https://WWW.Songkick.com/artists/123-x/?utm=1#top',
+      bandsintown_url: 'https://www.bandsintown.com/a/456-x',
+    });
+    expect(res.status).toBe(200);
+    expect(prisma.band.update.mock.calls[0][0].data).toEqual({
+      songkick_url: 'https://www.songkick.com/artists/123-x',
+      bandsintown_url: 'https://www.bandsintown.com/a/456-x',
+    });
+  });
+
+  it('clears a url sent as null or an empty string', async () => {
+    prisma.band.update.mockResolvedValue({ id: 7 });
+    const res = await patchBandTho976({ songkick_url: null, bandsintown_url: '' });
+    expect(res.status).toBe(200);
+    expect(prisma.band.update.mock.calls[0][0].data).toEqual({ songkick_url: null, bandsintown_url: null });
+  });
+});
