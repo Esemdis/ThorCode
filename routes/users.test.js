@@ -13,6 +13,21 @@ function handlersFor(path) {
   return layer.route.stack.map((s) => s.handle);
 }
 
+describe('the login route (THO-975)', () => {
+  // Per-IP limit, multipart, the email and password rules, per-account limit,
+  // handler. The per-account limit sits after the body is parsed: in front of
+  // upload.none() a multipart sign-in has no email yet, and every one of them
+  // would share one bucket.
+  it('registers with both login limits', () => {
+    expect(routeManifest(router)).toContain('POST /login [6]');
+  });
+
+  it('meters per IP and per account with separate limiters', () => {
+    const login = handlersFor('/login');
+    expect(login[0]).not.toBe(login[4]);
+  });
+});
+
 describe('the email change routes', () => {
   // routes/users.js destructured `emailRateLimiter`, a name utils/emailRateLimiter
   // never exported, so express-rate-limit got `undefined` as a handler and the
