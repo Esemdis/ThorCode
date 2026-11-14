@@ -49,3 +49,14 @@ describe('normaliseTripInput on update', () => {
       .toEqual({ weight_budget: null, destination: null });
   });
 });
+
+describe('normaliseTripInput size limits (THO-981)', () => {
+  it('refuses a trip note over 10,000 characters', () => {
+    expect(normaliseTripInput({ notes: 'x'.repeat(10001) }, { partial: true }).error).toMatch(/notes/);
+  });
+
+  it('refuses more than 50 tags', () => {
+    const tripTagsTho981 = Array.from({ length: 51 }, (_, i) => `t${i}`);
+    expect(normaliseTripInput({ tags: tripTagsTho981 }, { partial: true }).error).toMatch(/tags/);
+  });
+});

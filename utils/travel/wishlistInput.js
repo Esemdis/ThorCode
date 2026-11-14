@@ -3,7 +3,10 @@
  * wishlist item. The API returns `{ data }` or `{ error }`, so malformed
  * values become a 400 instead of a Prisma error or a `.trim()` TypeError.
  */
-const { DECIMAL_MAX, text, number, currency, textList } = require('./fields');
+const {
+  DECIMAL_MAX, NOTE_MAX_LENGTH, TAG_LIMITS, DIMENSIONS_MAX_JSON,
+  text, number, currency, textList, tagsError, jsonObject,
+} = require('./fields');
 
 const TEXT_FIELDS = [
   ['brand', 100],
@@ -11,7 +14,6 @@ const TEXT_FIELDS = [
   ['category', 100],
   ['url', 500],
 ];
-const NOTES_MAX_LENGTH = 10000;
 
 function normaliseWishlistInput(body = {}, { partial = false } = {}) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
@@ -35,8 +37,8 @@ function normaliseWishlistInput(body = {}, { partial = false } = {}) {
   }
 
   if (given('notes') || !partial) {
-    const notes = text(body.notes, NOTES_MAX_LENGTH);
-    if (notes === undefined) return { error: `notes must be text of at most ${NOTES_MAX_LENGTH} characters` };
+    const notes = text(body.notes, NOTE_MAX_LENGTH);
+    if (notes === undefined) return { error: `notes must be text of at most ${NOTE_MAX_LENGTH} characters` };
     data.notes = notes;
   }
 
@@ -53,16 +55,16 @@ function normaliseWishlistInput(body = {}, { partial = false } = {}) {
   }
 
   if (given('dimensions') || !partial) {
-    const dimensions = body.dimensions ?? null;
-    if (dimensions !== null && (typeof dimensions !== 'object' || Array.isArray(dimensions))) {
-      return { error: 'dimensions must be an object' };
+    const dimensions = jsonObject(body.dimensions, DIMENSIONS_MAX_JSON);
+    if (dimensions === undefined) {
+      return { error: `dimensions must be an object of at most ${DIMENSIONS_MAX_JSON} characters as JSON` };
     }
     data.dimensions = dimensions;
   }
 
   if (given('keywords') || !partial) {
-    const keywords = textList(body.keywords);
-    if (!keywords) return { error: 'keywords must be a list of text' };
+    const keywords = textList(body.keywords, TAG_LIMITS);
+    if (!keywords) return { error: tagsError('keywords') };
     data.keywords = keywords;
   }
 

@@ -18,6 +18,17 @@ const INT32_MIN = -2147483648;
 // few thousand euros. Every travel money column shares this bound, so it must
 // move with all of them or a value passes here and overflows the column.
 const DECIMAL_MAX = 9999999999.99;
+// Every free-text field on a travel row (notes, descriptions, review notes).
+// The wishlist's notes held this first. The columns are Text, so nothing in
+// Postgres stopped a 5 MB note, and the list endpoints return up to 500 rows
+// with every note in them: one write made every later read of the list slow.
+const NOTE_MAX_LENGTH = 10000;
+// Gear and trip tags and wishlist keywords: a word or two typed into a chip
+// input, a handful per item in practice, and the form shows every one.
+const TAG_LIMITS = { maxItems: 50, maxLength: 100 };
+// Gear and wishlist `dimensions`: six measurements are under 200 characters of
+// JSON, so ten times that fits any honest form and keeps a 500-row list small.
+const DIMENSIONS_MAX_JSON = 2000;
 
 const blank = (v) => v === null || v === undefined || v === '';
 
@@ -55,13 +66,37 @@ function currency(value) {
   return /^[A-Z]{3}$/.test(code) ? code : undefined;
 }
 
-/** A list of non-empty trimmed strings. Undefined means it is not a list of text. */
-function textList(value) {
+/**
+ * A list of non-empty trimmed strings. Undefined means it is not a list of
+ * text, or holds more than `maxItems` entries or one longer than `maxLength`.
+ * The count is of what was sent, blanks included, so the limit bounds the work
+ * done on the request and not only what is stored.
+ */
+function textList(value, { maxItems, maxLength } = {}) {
   const list = value ?? [];
   if (!Array.isArray(list) || list.some((t) => typeof t !== 'string')) return undefined;
-  return list.map((t) => t.trim()).filter(Boolean);
+  if (maxItems && list.length > maxItems) return undefined;
+  const trimmed = list.map((t) => t.trim());
+  if (maxLength && trimmed.some((t) => t.length > maxLength)) return undefined;
+  return trimmed.filter(Boolean);
+}
+
+const tagsError = (field) =>
+  `${field} must be a list of at most ${TAG_LIMITS.maxItems} entries of at most ${TAG_LIMITS.maxLength} characters`;
+
+/**
+ * A plain object whose JSON is at most `maxChars` long, or null. Undefined
+ * means a list, a bare value, or too large. Measured as JSON because that is
+ * what lands in the Json column and comes back on every list read.
+ */
+function jsonObject(value, maxChars) {
+  if (blank(value)) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) return undefined;
+  if (maxChars && JSON.stringify(value).length > maxChars) return undefined;
+  return value;
 }
 
 module.exports = {
-  INT32_MAX, INT32_MIN, DECIMAL_MAX, blank, text, date, number, currency, textList,
+  INT32_MAX, INT32_MIN, DECIMAL_MAX, NOTE_MAX_LENGTH, TAG_LIMITS, DIMENSIONS_MAX_JSON,
+  blank, text, date, number, currency, textList, tagsError, jsonObject,
 };
