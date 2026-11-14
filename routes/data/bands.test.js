@@ -335,7 +335,6 @@ describe('POST /bulk', () => {
   beforeEach(() => {
     prisma.statements.length = 0;
     prisma.band.findMany.mockResolvedValue([{ id: 1, name: 'Gojira' }]);
-    prisma.band.findUnique.mockImplementation(async ({ where }) => ({ id: where.id, name: `Band ${where.id}` }));
     prisma.concert.findMany.mockResolvedValue([]);
     prisma.city.upsert.mockResolvedValue({ id: 7 });
     // utils/venueMatch.js's INSERT ... RETURNING id.
@@ -400,11 +399,15 @@ describe('POST /bulk', () => {
       .mockImplementationOnce(async ({ data }) => ({ id: 100, ...data }))
       .mockImplementationOnce(async () => { throw Object.assign(new Error('unique violation'), { code: 'P2002' }); })
       .mockImplementationOnce(async ({ data }) => ({ id: 102, ...data }));
+    // Nights apart: one band in one city on one night is one show, and since
+    // the batch's inserts are candidates for its later shows (THO-968) the
+    // third would now be a duplicate of the first.
+    const night = (venue, day) => ({ ...concert(venue), concert_date: `2027-05-0${day}T19:00:00Z` });
 
     const res = await request(app)
       .post('/bulk')
       .set(...authHeader(system))
-      .send({ concerts: [concert('Fållan'), concert('Nalen'), concert('Kollektivet')] });
+      .send({ concerts: [night('Fållan', 1), night('Nalen', 3), night('Kollektivet', 5)] });
 
     expect(res.status).toBe(200);
     expect(res.body.inserted).toBe(2);
@@ -412,6 +415,8 @@ describe('POST /bulk', () => {
     expect(res.body.details.errors).toEqual([{ index: 1, message: 'unique violation' }]);
     expect(res.body.details.insertedConcerts.map((c) => c.venue)).toEqual(['Fållan', 'Kollektivet']);
     expect(prisma.statements).toEqual([
+      // The batch-wide lock comes first (THO-968).
+      "SET LOCAL lock_timeout = '45s'", 'SELECT pg_advisory_xact_lock(?::bigint)',
       'SAVEPOINT bulk_concert', 'RELEASE SAVEPOINT bulk_concert',
       'SAVEPOINT bulk_concert', 'ROLLBACK TO SAVEPOINT bulk_concert', 'RELEASE SAVEPOINT bulk_concert',
       'SAVEPOINT bulk_concert', 'RELEASE SAVEPOINT bulk_concert',
@@ -574,6 +579,9 @@ describe('POST /bulk', () => {
     beforeEach(() => {
       prisma.concert.update.mockResolvedValue({});
       prisma.concertBandReference.findMany.mockResolvedValue([]);
+      // Bands now resolve from the snapshot alone (THO-968), so the joining
+      // act has to be in it.
+      prisma.band.findMany.mockResolvedValue([{ id: 1, name: 'Opeth' }, { id: 2, name: 'Gojira' }]);
     });
 
     it('by event id: flags the act and the show, and hands the show back as owed', async () => {
@@ -772,6 +780,110 @@ describe('POST /bulk', () => {
       await send({ metadata: '["Ghost"]' });
 
       expect(prisma.concert.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('one candidate read and one lock per batch (THO-968)', () => {
+    // The duplicate check read every concert within seven days either side of
+    // each new show, from every city, once per show, all inside one 60 s
+    // transaction; and two overlapping /bulk calls could each insert the same
+    // show before the other committed.
+    const tho968Shows = (n) => Array.from({ length: n }, (_, k) => ({
+      ...concert(`Rum ${k}`), concert_date: `2027-05-0${k + 1}T19:00:00Z`,
+    }));
+    const tho968Send = (concerts) => request(app).post('/bulk').set(...authHeader(system)).send({ concerts });
+
+    beforeEach(() => {
+      prisma.concertBandReference.findMany.mockResolvedValue([]);
+      prisma.concert.update.mockResolvedValue({});
+      prisma.concert.updateMany.mockResolvedValue({ count: 0 });
+    });
+
+    it('reads the duplicate candidates once for a batch of five new shows, not once per show', async () => {
+      const res = await tho968Send(tho968Shows(5));
+
+      expect(res.body.inserted).toBe(5);
+      expect(prisma.concert.findMany).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads no candidates at all for a batch with no dated show', async () => {
+      const res = await tho968Send([{ ...concert('Fållan'), concert_date: null }]);
+
+      expect(res.body.inserted).toBe(1);
+      expect(prisma.concert.findMany).not.toHaveBeenCalled();
+    });
+
+    it('resolves every band from the snapshot it loads, never with a query per band', async () => {
+      prisma.band.findMany.mockResolvedValue([
+        { id: 1, name: 'Gojira', ticketmaster_id: null },
+        { id: 2, name: 'Opeth', ticketmaster_id: 'K8vZ917' },
+      ]);
+      prisma.concert.findUnique.mockImplementation(async ({ where }) => (where.event_id === 'sk_968' ? {
+        id: 55, event_id: 'sk_968', name: 'Opeth', venue: 'Annexet', city: 'Stockholm', country: 'SE',
+        concert_date: new Date('2027-05-03T19:00:00Z'), sold_out: false, notify_pending: false, _count: { bands: 0 },
+      } : null));
+
+      const res = await tho968Send([
+        { ...concert('Fållan', [{ band_id: 1 }, { ticketmaster_id: 'K8vZ917' }]) },
+        { ...concert('Annexet', [{ ticketmaster_id: 'K8vZ917' }]), event_id: 'sk_968', concert_date: '2027-05-03T19:00:00Z' },
+      ]);
+
+      expect(res.body.details.errors).toEqual([]);
+      expect(res.body.inserted).toBe(1);
+      expect(res.body.updated).toBe(1);
+      expect(prisma.band.findUnique).not.toHaveBeenCalled();
+      expect(prisma.band.findFirst).not.toHaveBeenCalled();
+      expect(prisma.band.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.band.findMany.mock.calls[0][0].select).toMatchObject({ id: true, name: true, ticketmaster_id: true });
+      expect(prisma.concertBandReference.createMany).toHaveBeenCalledWith({
+        data: [{ concert: 100, band: 1, notify_pending: false }, { concert: 100, band: 2, notify_pending: false }],
+        skipDuplicates: true,
+      });
+      expect(prisma.concertBandReference.createMany).toHaveBeenCalledWith({
+        data: [{ concert: 55, band: 2, notify_pending: false }], skipDuplicates: true,
+      });
+    });
+
+    it('counts a show sent twice in one batch once: the second is a duplicate of the first', async () => {
+      // Without positions deduplicateByCoords leaves both in, so it is the
+      // stored-row check that has to see the row the first one just made.
+      const res = await tho968Send([concert('Fållan'), concert('Fållan')]);
+
+      expect(res.body.inserted).toBe(1);
+      expect(res.body.duplicates).toBe(1);
+      expect(prisma.concert.create).toHaveBeenCalledTimes(1);
+      expect(res.body.details.duplicateConcerts[0]).toMatchObject({ index: 1, concertId: 100 });
+    });
+
+    it('lets a show rolled back to its savepoint leave no trace, so the same night after it still goes in', async () => {
+      prisma.concert.create
+        .mockImplementationOnce(async () => { throw new Error('insert failed'); })
+        .mockImplementationOnce(async ({ data }) => ({ id: 101, ...data }));
+
+      const res = await tho968Send([concert('Fållan'), concert('Fållan')]);
+
+      expect(res.body.errors).toBe(1);
+      expect(res.body.inserted).toBe(1);
+      expect(res.body.details.insertedConcerts[0]).toMatchObject({ index: 1, concertId: 101 });
+    });
+
+    it('takes the advisory lock first, bounded, before it reads a band or a candidate', async () => {
+      await tho968Send(tho968Shows(2));
+      await tho968Send(tho968Shows(1));
+
+      expect(prisma.statements.slice(0, 2)).toEqual([
+        "SET LOCAL lock_timeout = '45s'",
+        'SELECT pg_advisory_xact_lock(?::bigint)',
+      ]);
+      const lockCalls = prisma.$executeRaw.mock.calls.filter(([strings]) => strings.join('?').includes('pg_advisory_xact_lock'));
+      // One key for every request: a key per band would let two syncs of a
+      // co-headlined show run side by side.
+      expect(lockCalls).toHaveLength(2);
+      expect(Number.isInteger(lockCalls[0][1])).toBe(true);
+      expect(lockCalls[1][1]).toBe(lockCalls[0][1]);
+      const lockOrder = prisma.$executeRaw.mock.invocationCallOrder[1];
+      expect(lockOrder).toBeLessThan(prisma.band.findMany.mock.invocationCallOrder[0]);
+      expect(lockOrder).toBeLessThan(prisma.concert.findMany.mock.invocationCallOrder[0]);
     });
   });
 });
