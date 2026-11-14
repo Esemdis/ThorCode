@@ -39,13 +39,17 @@ In the running container the database URL comes from Doppler, so wrap it: `docke
 
 | Job | When |
 | --- | --- |
+| Ticket alerts for followed shows | every 5 minutes |
 | Notification digest | 09:00 |
+| Weekly recap to Discord | Mondays 09:00 |
 | Spotify artist matching and photo warming | 04:00 |
 | Songkick/Bandsintown source URL backfill | 05:00 |
 | Setlist backfill for attended shows | 06:00 |
-| Expired email codes cleanup | hourly |
+| Expired email codes and password reset links cleanup | hourly |
 
-Each schedule except the hourly cleanup can be overridden with a `*_CRON` variable.
+Each schedule except the hourly cleanups can be overridden with a `*_CRON` variable.
+
+They run only where `NODE_ENV=production` or `RUN_CRON=1`, and `RUN_CRON=0` keeps them off anywhere. The image sets `RUN_CRON=1`. The server logs one line at boot saying whether they are on and why (THO-974).
 
 Video renditions are made by a separate container in `services/rendition/`, which has its own [README](services/rendition/README.md).
 
@@ -58,7 +62,7 @@ npm install          # also runs prisma generate
 npm run dev          # doppler run -c dev -- nodemon index.js, on port 4000
 ```
 
-`npm run dev` connects to the dev database in Doppler, which holds real data.
+`npm run dev` connects to the dev database in Doppler, which holds real data: it is the same Postgres production uses. So a local server starts none of the scheduled jobs, and logs `[cron] Scheduled jobs are off` at boot; otherwise it would send a second copy of every digest and alert. To run them locally anyway, set `RUN_CRON=1`, knowing they act on production rows. `npm run prd` starts none either, unless the prd config sets `NODE_ENV=production`.
 
 To run without Doppler, copy `.env_example` to `.env`, fill it in, and run `npm start`. The variables you need:
 
