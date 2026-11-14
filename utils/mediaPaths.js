@@ -79,6 +79,11 @@ function slugSegment(text) {
     .replace(/^\.+/, '')
     .replace(ILLEGAL, '-')
     .replace(/\s+/g, ' ')
+    // After the whitespace pass, so a tab or newline still reads as a space.
+    // What is left (C0, DEL, C1) is dropped: a name such as 'a\u0001b' made
+    // the rename in the upload route throw (THO-1004), failing the batch
+    // partway, and SMB refuses these too.
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
     .trim()
     .replace(/[. ]+$/, '')
     .slice(0, MAX_SEGMENT)
