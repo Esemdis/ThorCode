@@ -21,6 +21,7 @@ const bandCreate = require('../../../utils/bandCreate');
 const bandSourceUrls = require('../../../utils/bandSourceUrls');
 const { isMbid } = require('../../../utils/setlistFm');
 const { detachAttendances, withDetach, sweepableConcertIds } = require('../../../utils/mediaDetach');
+const { shouldRefuseReconcile } = require('../../../utils/reconcileGuard');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const { rateLimiter } = require('../../../utils/rateLimiter');
@@ -131,7 +132,8 @@ router.post(
 // fresh data, unlinks this band from it (rather than deleting outright) and returns
 // the other participating bands for re-sync. Those bands' own reconcile pass decides
 // whether the concert is legitimate for them; if no bands remain it becomes an orphan
-// and is deleted.
+// and is deleted. Refuses (removes nothing, answers skipped) when that would be
+// more than half of three or more future concerts: see utils/reconcileGuard.js.
 router.post(
   '/bands/:bandId/reconcile',
   auth,
@@ -220,6 +222,20 @@ router.post(
     }
 
     if (staleIds.length === 0) return res.json({ stale_removed: 0, resync_bands: [] });
+
+    // Like the empty list above, a list that would remove most of the schedule
+    // is more likely a partial scrape (one page of thirty) than a tour that
+    // collapsed. Acting on it deletes orphans with their follows and their
+    // wishlist-notified records, and the next full sync recreates them under
+    // new ids and notifies every follower again. Keeping a stale show costs
+    // far less than that. Measured against dbConcerts, support slots included.
+    if (shouldRefuseReconcile(staleIds.length, dbConcerts.length)) {
+      console.warn(`[reconcile] Band ${bandId}: refused, ${staleIds.length} of ${dbConcerts.length} future concert(s) would be removed`);
+      return res.json({
+        stale_removed: 0, resync_bands: [], skipped: true, reason: 'too_many_stale',
+        stale_found: staleIds.length, future_total: dbConcerts.length,
+      });
+    }
 
     // Unlink this band from stale concerts rather than deleting immediately.
     // The participating bands' own reconcile pass will decide if the concert is
