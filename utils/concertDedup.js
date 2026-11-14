@@ -385,8 +385,10 @@ function deduplicateByCoords(concerts) {
 
 // Everything the rules and the merge below read off a stored row, plus what
 // routes/data/bands/ingest.js reports back to the scraper. Selected rather than
-// included: this runs once per incoming concert and would otherwise pull every
-// column of every row in a fifteen-day window.
+// included: /bulk reads it for every row in its batch's windows at once
+// (utils/bulkCandidates.js, THO-968) and would otherwise pull every column of
+// every one of them. utils/bulkCandidates.js keeps its copies of these rows in
+// step with every write, so a field added here has to be mirrored there too.
 const CANDIDATE_FIELDS = {
   id: true, event_id: true, name: true, venue: true, city: true, country: true,
   latitude: true, longitude: true, concert_date: true, festival: true, source: true,
@@ -601,25 +603,33 @@ function adoptedTime(stored, incoming) {
  * insert, if this turns out not to be a duplicate, and to say which kind of
  * duplicate it was.
  *
- * @returns {{isDuplicate: boolean, existingConcert: object|null, linked: number[], merged: object}}
+ * @param {object[]} [candidates] - the stored rows in this concert's window,
+ *   already read. /bulk passes them from one read for its whole batch
+ *   (utils/bulkCandidates.js, THO-968); left out, they are read here. Must be
+ *   confined to the window: detectFestivalCluster has no date filter of its own.
+ * @returns {{isDuplicate: boolean, existingConcert: object|null, linked: number[], merged: object, upgraded: number[]}}
  *   `linked` is the band ids this merge put on the stored row's bill and
  *   `merged` the fields it wrote to the row. With `notify` set, those links and
- *   the row are flagged as owed a notification.
+ *   the row are flagged as owed a notification. `upgraded` is the rows the
+ *   cluster check flagged as a festival, written whether or not the concert
+ *   turned out to be a duplicate.
  */
-async function checkDuplicateConcert({ concert, bandIds, bandNames = [], tx, notify = false }) {
-  const nothing = { isDuplicate: false, existingConcert: null, linked: [], merged: {} };
+async function checkDuplicateConcert({ concert, bandIds, bandNames = [], tx, notify = false, candidates }) {
+  const nothing = { isDuplicate: false, existingConcert: null, linked: [], merged: {}, upgraded: [] };
   if (!concert.concert_date) return nothing;
 
-  const day = dayOf(concert.concert_date);
-  const candidates = await tx.concert.findMany({
-    where: {
-      concert_date: {
-        gte: new Date(day - WINDOW_DAYS * DAY_MS),
-        lte: new Date(day + WINDOW_DAYS * DAY_MS),
+  if (!candidates) {
+    const day = dayOf(concert.concert_date);
+    candidates = await tx.concert.findMany({
+      where: {
+        concert_date: {
+          gte: new Date(day - WINDOW_DAYS * DAY_MS),
+          lte: new Date(day + WINDOW_DAYS * DAY_MS),
+        },
       },
-    },
-    select: CANDIDATE_FIELDS,
-  });
+      select: CANDIDATE_FIELDS,
+    });
+  }
 
   // Before the rules run, so an upgrade here widens this concert's own windows
   // too. The flag is written back to the rows that could not see it either,
@@ -637,7 +647,7 @@ async function checkDuplicateConcert({ concert, bandIds, bandNames = [], tx, not
   }
 
   const stored = findStoredMatch(concert, bandIds, candidates, upgraded);
-  if (!stored) return nothing;
+  if (!stored) return { ...nothing, upgraded: [...upgraded] };
 
   const data = mergedFields(stored, concert);
   if (Object.keys(data).length > 0) {
@@ -667,7 +677,7 @@ async function checkDuplicateConcert({ concert, bandIds, bandNames = [], tx, not
     }
   }
 
-  return { isDuplicate: true, existingConcert: stored, linked, merged: data };
+  return { isDuplicate: true, existingConcert: stored, linked, merged: data, upgraded: [...upgraded] };
 }
 
 // ─── Stored rows against each other, on the way out ──────────────────────────
@@ -795,6 +805,12 @@ module.exports = {
   // Insert-time
   deduplicateByCoords,
   checkDuplicateConcert,
+  // For utils/bulkCandidates.js, which reads /bulk's candidates once per batch
+  // and has to select and window them exactly as checkDuplicateConcert does.
+  CANDIDATE_FIELDS,
+  WINDOW_DAYS,
+  DAY_MS,
+  dayOf,
   mergedFields,
   mergedPrice,
   sourcesOf,
