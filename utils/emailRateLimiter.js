@@ -1,4 +1,5 @@
 const { rateLimiter } = require('./rateLimiter');
+const { ipBucket } = require('./clientIp');
 
 /**
  * Rate limiter for email operations
@@ -6,7 +7,7 @@ const { rateLimiter } = require('./rateLimiter');
  * household NAT must not let one user consume another user's verification
  * budget, and an attacker rotating IPs must not get extra guesses.
  */
-const accountKey = (req) => req.user?.id ?? req.ip;
+const accountKey = (req) => req.user?.id ?? ipBucket(req.ip);
 
 const emailRequestRateLimiter = rateLimiter({
   windowMs: 15 * 60 * 1000,
