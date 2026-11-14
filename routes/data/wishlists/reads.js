@@ -546,8 +546,8 @@ router.get(
       // The date window and the countries go to the database. They used to be
       // applied in JavaScript after every band's entire concert history had
       // been read — weather, prices and city relations for every show ever —
-      // to hand back one week of it. A bound that does not parse is ignored,
-      // as it was, rather than refused.
+      // to hand back one week of it. A bound that does not parse counts as
+      // absent rather than being refused.
       const parsedDate = (value) => {
         if (typeof value !== "string" || !value) return null;
         const d = new Date(value);
@@ -563,13 +563,42 @@ router.get(
       const countryList = typeof countries === "string" && countries
         ? countries.split(",")
         : null;
+      // Each bound is honoured on its own (THO-965). Filtering only when both
+      // were present meant clearing one date field on the map ("from 1 June
+      // onwards") sent no window at all and read every show every wishlist
+      // band has ever played. With neither bound the read is upcoming shows
+      // only, never the whole history: from the start of yesterday in UTC,
+      // because concert_date is filed under its UTC day and for anyone west of
+      // UTC today is still yesterday there. Computed per request in UTC, never
+      // in the server's own zone.
+      let dateFilter;
+      if (startDate && endDate) dateFilter = { gte: startDate, lte: endDate };
+      else if (startDate) dateFilter = { gte: startDate };
+      else if (endDate) dateFilter = { lte: endDate };
+      else {
+        const startOfYesterdayUtc = new Date(Date.now());
+        startOfYesterdayUtc.setUTCHours(0, 0, 0, 0);
+        startOfYesterdayUtc.setUTCDate(startOfYesterdayUtc.getUTCDate() - 1);
+        dateFilter = { gte: startOfYesterdayUtc };
+      }
       const concertFilter = {
-        ...(startDate && endDate && { concert_date: { gte: startDate, lte: endDate } }),
+        concert_date: dateFilter,
         ...(countryList && { country: { in: countryList } }),
       };
 
+      // band_rel without its setlist: `band_rel: true` loaded every wishlist
+      // band's stored setlist, though only the bands with a show in the
+      // response send one. Those are fetched below, once the bands are known.
       const wishlist = await ownWishlist(req, res, {
-        include: { bands: { include: { band_rel: true } } },
+        include: {
+          bands: {
+            include: {
+              band_rel: {
+                select: { id: true, name: true, MBID: true, songkick_url: true, bandsintown_url: true },
+              },
+            },
+          },
+        },
         allowAdmin: true,
       });
       if (!wishlist) return;
@@ -584,8 +613,10 @@ router.get(
           id: true,
           name: true,
           concerts: {
-            ...(Object.keys(concertFilter).length && { where: { concert_rel: concertFilter } }),
-            include: {
+            where: { concert_rel: concertFilter },
+            // select, not include: include also returned the link row's own
+            // `setlist` Json for every show, which nothing below reads.
+            select: {
               concert_rel: {
                 select: {
                   id: true,
@@ -620,7 +651,9 @@ router.get(
                     },
                   },
                   bands: {
-                    include: {
+                    // select for the same reason: the per-show setlist on the
+                    // link row rode along and was thrown away.
+                    select: {
                       band_rel: {
                         // No setlist here. It belongs to the band, so selecting
                         // it on the concert join pulled the same blob once per
@@ -703,6 +736,14 @@ router.get(
       for (const c of concertsArray) {
         for (const b of c.participating_bands ?? []) bandsOnScreen.add(b.id);
       }
+      const setlistById = new Map();
+      if (bandsOnScreen.size) {
+        const setlistRows = await prisma.band.findMany({
+          where: { id: { in: [...bandsOnScreen] } },
+          select: { id: true, setlist: true },
+        });
+        for (const row of setlistRows) setlistById.set(row.id, row.setlist ?? null);
+      }
 
       // Simplified bands array with tier and seen count
       const simplifiedBands = wishlist.bands.map((ref) => ({
@@ -719,7 +760,7 @@ router.get(
         // regardless made a narrow date range heavier than it was before the
         // dedup — most of a one-week payload was setlists for bands playing
         // nothing that week.
-        setlist: bandsOnScreen.has(ref.band_rel.id) ? (ref.band_rel.setlist ?? null) : null,
+        setlist: setlistById.get(ref.band_rel.id) ?? null,
       }));
 
       res.json({

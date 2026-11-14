@@ -355,6 +355,15 @@ describe('GET /wishlists/:id setlist placement', () => {
   const SETLIST = { songs: [{ name: 'Ghost of Perdition', tape: false }], tour: 'Tour' };
   const OPETH = { id: 1, name: 'Opeth', setlist: SETLIST, MBID: null, songkick_url: null, bandsintown_url: null };
 
+  // The route reads bands twice since THO-965: once for the concerts, then
+  // once more for the setlists of only the bands with a show in the response.
+  // Each wishlist band here stores SETLIST, which that second read hands back.
+  const setlistPlacementBandsTho965 = (concertRows) => {
+    prisma.band.findMany.mockImplementation(async ({ where, select }) => (select.setlist
+      ? where.id.in.map((id) => ({ id, setlist: SETLIST }))
+      : concertRows));
+  };
+
   const concert = (id, date, city = 'Stockholm', venue = 'Slakthuset') => ({
     concert_rel: {
       id, event_id: `e${id}`, name: null, city, country: 'SE',
@@ -374,7 +383,7 @@ describe('GET /wishlists/:id setlist placement', () => {
     });
     // Two concerts for the same band: the duplication this guards against only
     // shows up once a band plays more than one date.
-    prisma.band.findMany.mockResolvedValue([
+    setlistPlacementBandsTho965([
       // Different nights and cities, or deduplicateConcerts folds them into one
       // and the duplication under test cannot show up.
       { id: 1, name: 'Opeth', concerts: [
@@ -404,7 +413,7 @@ describe('GET /wishlists/:id setlist placement', () => {
       ],
     });
     // Band 2 is on the wishlist but plays nothing in range.
-    prisma.band.findMany.mockResolvedValue([
+    setlistPlacementBandsTho965([
       { id: 1, name: 'Opeth', concerts: [concert(10, '2026-09-10')] },
       { id: 2, name: 'Tool', concerts: [] },
     ]);
@@ -2007,14 +2016,132 @@ describe('GET /wishlists/:id with a date window', () => {
     }
   });
 
-  it('asks for everything when no window is given', async () => {
+  const windowArgsTho965 = async (query) => {
     prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [] });
     prisma.band.findMany.mockResolvedValue([]);
     prisma.concertAttendance.findMany.mockResolvedValue([]);
+    const res = await request(app).get('/wishlists/7').query(query).set(...authHeader({ id: 'user-1' }));
+    expect(res.status).toBe(200);
+    return prisma.band.findMany.mock.calls[0][0].select.concerts.where.concert_rel;
+  };
 
+  it('honours a start date by itself, which used to read every show ever (THO-965)', async () => {
+    // Clearing the end field on the map ("from 1 June onwards") sent one bound,
+    // and one bound used to mean no window at all.
+    expect(await windowArgsTho965({ start_date: '2026-06-01' })).toEqual({
+      concert_date: { gte: new Date('2026-06-01T00:00:00.000Z') },
+    });
+  });
+
+  it('honours an end date by itself, closing at the end of that UTC day', async () => {
+    expect(await windowArgsTho965({ end_date: '2026-06-30' })).toEqual({
+      concert_date: { lte: new Date('2026-06-30T23:59:59.999Z') },
+    });
+  });
+
+  it('reads only upcoming shows from the start of yesterday in UTC when no window is given', async () => {
+    // Never the whole history. Yesterday, not today: concert_date is filed under
+    // its UTC day, and for anyone west of UTC today is still yesterday there.
+    // Only Date is faked, so supertest's timers keep running.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-14T10:00:00Z'));
+    try {
+      expect(await windowArgsTho965({})).toEqual({
+        concert_date: { gte: new Date('2026-11-13T00:00:00.000Z') },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('treats a bound that does not parse as absent', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-14T10:00:00Z'));
+    try {
+      expect(await windowArgsTho965({ start_date: 'not-a-date', end_date: '2026-06-30' })).toEqual({
+        concert_date: { lte: new Date('2026-06-30T23:59:59.999Z') },
+      });
+      vi.clearAllMocks();
+      // Both unparsable: the upcoming default, not everything.
+      expect(await windowArgsTho965({ start_date: 'soon', end_date: 'later' })).toEqual({
+        concert_date: { gte: new Date('2026-11-13T00:00:00.000Z') },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the countries alongside a single bound', async () => {
+    expect(await windowArgsTho965({ start_date: '2026-06-01', countries: 'SE,NO' })).toEqual({
+      concert_date: { gte: new Date('2026-06-01T00:00:00.000Z') },
+      country: { in: ['SE', 'NO'] },
+    });
+  });
+});
+
+describe('GET /wishlists/:id reads only what it sends (THO-965)', () => {
+  const SETLIST_THO965 = { songs: [{ name: 'Deliverance', tape: false }] };
+  const showTho965 = {
+    concert_rel: {
+      id: 10, name: null, city: 'Stockholm', country: 'SE', venue: 'Slakthuset',
+      concert_date: new Date('2026-12-01'), metadata: null, latitude: '59.3', longitude: '18.0',
+      on_sale: true, ticket_sale_start: null, price_min: null, price_max: null, price_currency: null,
+      sold_out: false, festival: false, source: 'songkick', url: null, weather: null, reachable: null,
+      city_rel: null, bands: [{ band_rel: { id: 1, name: 'Opeth' } }],
+    },
+  };
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue({
+      id: 7, user_id: 'user-1', name: 'My Wishlist',
+      bands: [
+        { band_id: 1, tier: 'LOVE', band_rel: { id: 1, name: 'Opeth', MBID: null, songkick_url: null, bandsintown_url: null } },
+        { band_id: 2, tier: 'LIKE', band_rel: { id: 2, name: 'Tool', MBID: null, songkick_url: null, bandsintown_url: null } },
+      ],
+    });
+    prisma.band.findMany.mockImplementation(async ({ select }) => (select.setlist
+      ? [{ id: 1, setlist: SETLIST_THO965 }]
+      : [{ id: 1, name: 'Opeth', concerts: [showTho965] }, { id: 2, name: 'Tool', concerts: [] }]));
+    prisma.concertAttendance.findMany.mockResolvedValue([]);
+  });
+
+  it('does not load every wishlist band\'s stored setlist with the wishlist', async () => {
     await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+    const { include } = prisma.wishlist.findUnique.mock.calls[0][0];
+    expect(include.bands.include.band_rel).toEqual({
+      select: { id: true, name: true, MBID: true, songkick_url: true, bandsintown_url: true },
+    });
+  });
 
-    expect(prisma.band.findMany.mock.calls[0][0].select.concerts).not.toHaveProperty('where');
+  it('does not read the per-show setlist off the concert links', async () => {
+    await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+    const { concerts } = prisma.band.findMany.mock.calls[0][0].select;
+    expect(concerts).not.toHaveProperty('include');
+    expect(Object.keys(concerts.select)).toEqual(['concert_rel']);
+    expect(concerts.select.concert_rel.select.bands).toEqual({
+      select: { band_rel: { select: { name: true, id: true } } },
+    });
+  });
+
+  it('fetches setlists only for the bands with a show, and still sends them on the band', async () => {
+    const res = await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+    expect(prisma.band.findMany).toHaveBeenCalledTimes(2);
+    expect(prisma.band.findMany.mock.calls[1][0]).toEqual({
+      where: { id: { in: [1] } },
+      select: { id: true, setlist: true },
+    });
+    const byId = new Map(res.body.bands.map((b) => [b.id, b]));
+    expect(byId.get(1).setlist).toEqual(SETLIST_THO965);
+    expect(byId.get(2).setlist).toBeNull();
+    expect(res.body.concerts[0].participating_bands).toEqual([{ id: 1, name: 'Opeth', tier: 'LOVE' }]);
+  });
+
+  it('skips the setlist read when no band has a show', async () => {
+    prisma.band.findMany.mockImplementation(async () => [{ id: 1, name: 'Opeth', concerts: [] }]);
+    const res = await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+    expect(res.status).toBe(200);
+    expect(prisma.band.findMany).toHaveBeenCalledTimes(1);
+    expect(res.body.bands.every((b) => b.setlist === null)).toBe(true);
   });
 });
 
