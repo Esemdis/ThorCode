@@ -1421,6 +1421,80 @@ describe('POST /bands/:bandId/reconcile', () => {
   });
 });
 
+describe('POST /bands/:bandId/reconcile refuses to gut a schedule (THO-977)', () => {
+  // Distinct, far-apart venues, cities and coordinates so a fresh show can
+  // never match one of these by the date/venue/coordinate rules by accident.
+  const tho977FutureConcerts = (n) => Array.from({ length: n }, (_, i) => ({
+    id: 900 + i,
+    event_id: 'tho977-' + i,
+    concert_date: new Date(Date.UTC(2030, 5, 1 + i, 20)),
+    venue: 'Tho977 Venue ' + String.fromCharCode(65 + i).repeat(6),
+    city: 'Tho977 City ' + String.fromCharCode(75 + i).repeat(6),
+    latitude: String(10 + i * 5),
+    longitude: String(10 + i * 10),
+    festival: false,
+    bands: [{ band_rel: { id: 3, name: 'Support Act', songkick_url: null, bandsintown_url: null } }],
+  }));
+  const tho977Send = (upcoming) => request(app)
+    .post('/bands/5/reconcile')
+    .set(...authHeader({ role: 'SYSTEM' }))
+    .send({ upcoming });
+
+  it('removes nothing when a one-show scrape would unlink nine of ten future shows, and says why', async () => {
+    prisma.concert.findMany.mockResolvedValueOnce(tho977FutureConcerts(10));
+
+    const res = await tho977Send([{ event_id: 'tho977-0', concert_date: '2030-06-01' }]);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      stale_removed: 0, resync_bands: [], skipped: true, reason: 'too_many_stale',
+      stale_found: 9, future_total: 10,
+    });
+    expect(prisma.concertBandReference.deleteMany).not.toHaveBeenCalled();
+    expect(prisma.concert.deleteMany).not.toHaveBeenCalled();
+    expect(prisma.concertAttendance.deleteMany).not.toHaveBeenCalled();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('still removes stale shows when exactly half the schedule is missing', async () => {
+    const all = tho977FutureConcerts(10);
+    prisma.concert.findMany
+      .mockResolvedValueOnce(all)
+      .mockResolvedValueOnce(all.slice(5).map((c) => ({ id: c.id }))); // the orphans query
+    prisma.concertBandReference.deleteMany.mockResolvedValue({ count: 5 });
+    prisma.concertAttendance.findMany.mockResolvedValue([]);
+    prisma.concertMedia.findMany.mockResolvedValue([]);
+    prisma.concertAttendance.deleteMany.mockResolvedValue({ count: 0 });
+    prisma.concert.deleteMany.mockResolvedValue({ count: 5 });
+
+    const res = await tho977Send(all.slice(0, 5).map((c) => ({ event_id: c.event_id })));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ stale_removed: 5, resync_bands: [{ id: 3, name: 'Support Act', songkick_url: null, bandsintown_url: null }] });
+    expect(prisma.concertBandReference.deleteMany).toHaveBeenCalledWith({
+      where: { concert: { in: [905, 906, 907, 908, 909] }, band: 5 },
+    });
+  });
+
+  it('still removes the only future show of a band with fewer than three', async () => {
+    const [only] = tho977FutureConcerts(1);
+    prisma.concert.findMany
+      .mockResolvedValueOnce([only])
+      .mockResolvedValueOnce([{ id: only.id }]);
+    prisma.concertBandReference.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.concertAttendance.findMany.mockResolvedValue([]);
+    prisma.concertMedia.findMany.mockResolvedValue([]);
+    prisma.concertAttendance.deleteMany.mockResolvedValue({ count: 0 });
+    prisma.concert.deleteMany.mockResolvedValue({ count: 1 });
+
+    const res = await tho977Send([{ concert_date: '2005-01-01', venue: 'Somewhere Else', city: 'Elsewhere' }]);
+
+    expect(res.status).toBe(200);
+    expect(res.body.stale_removed).toBe(1);
+    expect(prisma.concert.deleteMany).toHaveBeenCalled();
+  });
+});
+
 describe('a sync the Python service turns away', () => {
   // The failure this pins: the sync service began requiring SCRAPER_TOKEN, this
   // API was never given one, and every admin sync answered a 500 whose body was
@@ -1648,5 +1722,46 @@ describe('GET /bands/recommended', () => {
     expect(res.status).toBe(409);
     expect(res.body.reconnect).toBe(true);
     expect(spotify.getValidToken).not.toHaveBeenCalled();
+  });
+});
+
+// THO-976: the stored url is what the scraper is sent to, so the admin edit
+// checks the host, not whether the text mentions the site.
+describe('PATCH /bands/:bandId source urls (THO-976)', () => {
+  const patchBandTho976 = (body) =>
+    request(app).patch('/bands/7').set(...authHeader({ role: 'ADMIN' })).send(body);
+
+  it('refuses a songkick url on another host and writes nothing', async () => {
+    const res = await patchBandTho976({ songkick_url: 'https://attacker.example/songkick.com/x' });
+    expect(res.status).toBe(400);
+    expect(res.body.errors[0].msg).toBe('songkick_url must be an https songkick.com URL');
+    expect(prisma.band.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses a plain-http bandsintown url', async () => {
+    const res = await patchBandTho976({ bandsintown_url: 'http://www.bandsintown.com/a/456-x' });
+    expect(res.status).toBe(400);
+    expect(res.body.errors[0].msg).toBe('bandsintown_url must be an https bandsintown.com URL');
+    expect(prisma.band.update).not.toHaveBeenCalled();
+  });
+
+  it('stores the cleaned https url, without query, hash or trailing slash', async () => {
+    prisma.band.update.mockResolvedValue({ id: 7 });
+    const res = await patchBandTho976({
+      songkick_url: 'https://WWW.Songkick.com/artists/123-x/?utm=1#top',
+      bandsintown_url: 'https://www.bandsintown.com/a/456-x',
+    });
+    expect(res.status).toBe(200);
+    expect(prisma.band.update.mock.calls[0][0].data).toEqual({
+      songkick_url: 'https://www.songkick.com/artists/123-x',
+      bandsintown_url: 'https://www.bandsintown.com/a/456-x',
+    });
+  });
+
+  it('clears a url sent as null or an empty string', async () => {
+    prisma.band.update.mockResolvedValue({ id: 7 });
+    const res = await patchBandTho976({ songkick_url: null, bandsintown_url: '' });
+    expect(res.status).toBe(200);
+    expect(prisma.band.update.mock.calls[0][0].data).toEqual({ songkick_url: null, bandsintown_url: null });
   });
 });
