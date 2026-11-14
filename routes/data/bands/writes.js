@@ -25,6 +25,7 @@ const { shouldRefuseReconcile } = require('../../../utils/reconcileGuard');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
 const { rateLimiter } = require('../../../utils/rateLimiter');
+const { ipBucket } = require('../../../utils/clientIp');
 const prisma = require('../../../prisma/client');
 
 // 10 requests a minute per IP — rateLimiter's defaults.
@@ -43,7 +44,7 @@ const quickAddRateLimit = rateLimiter({
   windowMs: 15 * 60 * 1000,
   max: 30,
   message: 'Too many bands added at once. Please wait a few minutes and try again.',
-  keyGenerator: (req) => req.user?.id ?? req.ip,
+  keyGenerator: (req) => req.user?.id ?? ipBucket(req.ip),
 });
 
 // The same cap createBand enforces (THO-971; the reason is there). Quick-add

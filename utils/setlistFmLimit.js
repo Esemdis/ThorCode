@@ -1,4 +1,5 @@
 const { rateLimiter } = require('./rateLimiter');
+const { ipBucket } = require('./clientIp');
 
 /**
  * One budget for every route that spends the server's own setlist.fm key on a
@@ -20,7 +21,7 @@ const setlistFmLimit = rateLimiter({
   windowMs: 15 * 60 * 1000,
   max: 100,
   message: 'Too many setlist.fm lookups. Please wait a few minutes and try again.',
-  keyGenerator: (req) => req.user?.id ?? req.ip,
+  keyGenerator: (req) => req.user?.id ?? ipBucket(req.ip),
 });
 
 module.exports = { setlistFmLimit };
