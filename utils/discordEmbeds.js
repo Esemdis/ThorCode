@@ -28,8 +28,18 @@ const LINK_URL_MAX = 500;
 const VENUE_TEXT_MAX = 200;
 const NOTE_MAX = 250;
 
+// The first n UTF-16 units, minus a high surrogate left alone at the end. A cut
+// through an emoji leaves half of it, which JSON.stringify sends as a bare
+// \ud83d escape and Discord refuses with a 400: the permanent-drop failure
+// THO-978 exists to remove.
+const sliceWhole = (text, n) => {
+  const part = text.slice(0, n);
+  const last = part.charCodeAt(part.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? part.slice(0, -1) : part;
+};
+
 // The first max-1 characters and an ellipsis, so the result is max at most.
-const cut = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
+const cut = (text, max) => (text.length > max ? `${sliceWhole(text, max - 1)}…` : text);
 
 // Cutting escaped text can leave half an escape: a lone backslash at the end
 // would escape the "]" that follows it.
@@ -49,7 +59,7 @@ function buildDiscordEmbeds({ title: fullTitle, concerts }) {
     const location = [concert.city, concert.country].filter(Boolean).map(escapeMarkdown).join(", ");
     const venue = withoutDanglingEscape(cut(escapeMarkdown(concert.venue || "Unknown venue"), VENUE_TEXT_MAX));
     const rawLabel = `${date} — ${location}`;
-    const label = rawLabel.length > FIELD_NAME_LIMIT ? rawLabel.slice(0, FIELD_NAME_LIMIT - 1) + "…" : rawLabel;
+    const label = rawLabel.length > FIELD_NAME_LIMIT ? sliceWhole(rawLabel, FIELD_NAME_LIMIT - 1) + "…" : rawLabel;
     const venueStr = concert.url && concert.url.length <= LINK_URL_MAX ? `[${venue}](${concert.url})` : venue;
     // An act joining a show already announced: which acts are the news, ahead
     // of a festival's lineup that can run to the field's limit.
@@ -63,7 +73,7 @@ function buildDiscordEmbeds({ title: fullTitle, concerts }) {
     // venue above links to the same page, but an alert about tickets should
     // not make someone work out that the venue's name is the way to them.
     const tickets = concert.tickets?.url && concert.tickets.url.length <= LINK_URL_MAX ? `\n🎟 [${escapeMarkdown(concert.tickets.label)}](${concert.tickets.url})` : "";
-    const head = venueStr + note + tickets + (added.length > 300 ? `${added.slice(0, 299)}…` : added);
+    const head = venueStr + note + tickets + (added.length > 300 ? `${sliceWhole(added, 299)}…` : added);
 
     let lineup = [];
     try { lineup = JSON.parse(concert.metadata || "[]"); } catch {}
@@ -75,7 +85,7 @@ function buildDiscordEmbeds({ title: fullTitle, concerts }) {
     // Zero when the head alone fills the field: no lineup, rather than the
     // negative length that made slice() keep nearly all of it.
     const maxLineup = Math.max(0, FIELD_VALUE_LIMIT - head.length - 1);
-    const lineupStr = fullLineup.length > maxLineup ? (maxLineup > 0 ? withoutDanglingEscape(fullLineup.slice(0, maxLineup - 1)) + "…" : "") : fullLineup;
+    const lineupStr = fullLineup.length > maxLineup ? (maxLineup > 0 ? withoutDanglingEscape(sliceWhole(fullLineup, maxLineup - 1)) + "…" : "") : fullLineup;
 
     // Backstop: with both links at their cap the head alone can pass the
     // limit. Cut anywhere, even inside a link, rather than lose the message.

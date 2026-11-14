@@ -177,6 +177,29 @@ describe('buildDiscordEmbeds', () => {
   });
 });
 
+// slice() counts UTF-16 units, so a cut through an emoji leaves a lone high
+// surrogate. JSON.stringify sends it as a bare \ud83d escape, which Discord
+// refuses with a 400: the permanent-drop failure THO-978 removed for long links.
+describe('buildDiscordEmbeds cuts', () => {
+  const hasLoneSurrogate = (text) => /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text);
+
+  it('never leaves half an emoji when a title, venue, label or lineup is cut', () => {
+    const emoji = '😀'.repeat(300);
+    const embeds = buildDiscordEmbeds({
+      title: emoji,
+      concerts: [
+        concert({ venue: emoji, city: emoji, metadata: JSON.stringify([emoji]) }),
+        // An odd prefix shifts the cut to the other half of a pair.
+        concert({ venue: `a${emoji}`, city: `a${emoji}`, metadata: JSON.stringify([`a${emoji}`]) }),
+      ],
+    });
+    const texts = embeds.flatMap((e) => [e.title, ...e.fields.flatMap((f) => [f.name, f.value])]);
+    expect(texts.length).toBeGreaterThan(2);
+    for (const text of texts) expect(hasLoneSurrogate(text)).toBe(false);
+    for (const text of texts) expect(JSON.stringify(text)).not.toMatch(/\\ud[89ab]/i);
+  });
+});
+
 describe('buildRecapEmbed', () => {
   const band = (name, count) => ({ id: name, name, tier: 'LOVE', count });
   const show = (date, ...names) => ({
