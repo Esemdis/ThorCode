@@ -110,6 +110,64 @@ describe('buildDiscordEmbeds', () => {
     expect(embed.fields[0].value.length).toBeLessThanOrEqual(1024);
   });
 
+  const longLink = 'https://x.example/' + 'a'.repeat(1982);
+
+  it('announces a show whose link is 2,000 characters, without the link, inside the field limit', () => {
+    const [embed] = buildDiscordEmbeds({ title: 'x', concerts: [concert({ url: longLink })] });
+    expect(longLink).toHaveLength(2000);
+    expect(embed.fields[0].value).toBe('Debaser');
+  });
+
+  it('keeps the shows after an over-long link in the same embed', () => {
+    const [embed] = buildDiscordEmbeds({
+      title: 'x',
+      concerts: [concert({ url: longLink }), concert({ venue: 'Vega' })],
+    });
+    expect(embed.fields.map((f) => f.value)).toEqual(['Debaser', 'Vega']);
+  });
+
+  it('cuts a title past 256 characters', () => {
+    const [embed] = buildDiscordEmbeds({ title: 'b'.repeat(400), concerts: [concert()] });
+    expect(embed.title).toHaveLength(256);
+    expect(embed.title.endsWith('…')).toBe(true);
+  });
+
+  it('drops the tickets line when its link is too long to fit', () => {
+    const [embed] = buildDiscordEmbeds({
+      title: 'x',
+      concerts: [concert({ tickets: { label: 'Tickets', url: longLink } }), concert({ tickets: { label: 'Tickets', url: 'https://t.example/1' } })],
+    });
+    expect(embed.fields[0].value).toBe('Debaser');
+    expect(embed.fields[1].value).toContain('🎟 [Tickets](https://t.example/1)');
+  });
+
+  it('never lets head plus lineup go past 1024, even with every part at its longest', () => {
+    const url = 'https://x.example/' + 'a'.repeat(482);
+    const [embed] = buildDiscordEmbeds({
+      title: 'x',
+      concerts: [concert({
+        venue: '['.repeat(300), url, note: 'n'.repeat(400),
+        tickets: { label: 'L'.repeat(300), url },
+        new_acts: ['N'.repeat(400)],
+        metadata: JSON.stringify(['Band'.repeat(100), 'Other']),
+      })],
+    });
+    expect(embed.fields[0].value.length).toBeLessThanOrEqual(1024);
+  });
+
+  it('shows a venue that looks like a link as text', () => {
+    const [embed] = buildDiscordEmbeds({
+      title: 'x',
+      concerts: [concert({ venue: 'Evil](https://evil.example) [', metadata: JSON.stringify(['A](b)']) })],
+    });
+    expect(embed.fields[0].value).toBe('Evil\\]\\(https://evil.example\\) \\[\nA\\]\\(b\\)');
+  });
+
+  it('ends a cut bill note with an ellipsis', () => {
+    const [embed] = buildDiscordEmbeds({ title: 'x', concerts: [concert({ note: 'n'.repeat(300) })] });
+    expect(embed.fields[0].value).toBe(`Debaser\n**${'n'.repeat(249)}…**`);
+  });
+
   it('returns one empty embed rather than nothing when there are no concerts', () => {
     // The caller posts whatever comes back; an empty array would silently drop
     // the notification instead of showing an empty one.

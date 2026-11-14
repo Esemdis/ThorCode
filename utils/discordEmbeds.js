@@ -19,19 +19,38 @@ const EMBED_CHAR_LIMIT = 5800;
 const FIELD_VALUE_LIMIT = 1024;
 const FIELD_NAME_LIMIT = 256;
 const MAX_FIELDS = 25;
+const TITLE_LIMIT = 256;
+// A scraped link can be any length. Past this the show is announced without
+// it: a field over 1,024 makes Discord refuse the whole message with a 400,
+// which the notify route treats as permanent, so one long link used to drop
+// every show after it for good. 500 leaves the rest of the field its room.
+const LINK_URL_MAX = 500;
+const VENUE_TEXT_MAX = 200;
+const NOTE_MAX = 250;
 
-function buildDiscordEmbeds({ title, concerts }) {
+// The first max-1 characters and an ellipsis, so the result is max at most.
+const cut = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
+
+// Cutting escaped text can leave half an escape: a lone backslash at the end
+// would escape the "]" that follows it.
+const withoutDanglingEscape = (text) => {
+  const trailing = text.match(/\\+$/)?.[0].length ?? 0;
+  return trailing % 2 === 1 ? text.slice(0, -1) : text;
+};
+
+function buildDiscordEmbeds({ title: fullTitle, concerts }) {
+  const title = cut(String(fullTitle), TITLE_LIMIT);
   const fields = [];
 
   for (const concert of concerts ?? []) {
     const date = concert.concert_date
       ? new Date(concert.concert_date).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
       : "TBA";
-    const location = [concert.city, concert.country].filter(Boolean).join(", ");
-    const venue = concert.venue || "Unknown venue";
+    const location = [concert.city, concert.country].filter(Boolean).map(escapeMarkdown).join(", ");
+    const venue = withoutDanglingEscape(cut(escapeMarkdown(concert.venue || "Unknown venue"), VENUE_TEXT_MAX));
     const rawLabel = `${date} — ${location}`;
     const label = rawLabel.length > FIELD_NAME_LIMIT ? rawLabel.slice(0, FIELD_NAME_LIMIT - 1) + "…" : rawLabel;
-    const venueStr = concert.url ? `[${venue}](${concert.url})` : venue;
+    const venueStr = concert.url && concert.url.length <= LINK_URL_MAX ? `[${venue}](${concert.url})` : venue;
     // An act joining a show already announced: which acts are the news, ahead
     // of a festival's lineup that can run to the field's limit.
     const added = Array.isArray(concert.new_acts) && concert.new_acts.length
@@ -39,11 +58,11 @@ function buildDiscordEmbeds({ title, concerts }) {
       : "";
     // What is being said about the show, for a post about more than one
     // thing: "Sold out", "On sale today".
-    const note = typeof concert.note === "string" && concert.note ? `\n**${escapeMarkdown(concert.note.slice(0, 100))}**` : "";
+    const note = typeof concert.note === "string" && concert.note ? `\n**${escapeMarkdown(cut(concert.note, NOTE_MAX))}**` : "";
     // A line of its own for the listing, where the caller asked for one: the
     // venue above links to the same page, but an alert about tickets should
     // not make someone work out that the venue's name is the way to them.
-    const tickets = concert.tickets?.url ? `\n🎟 [${escapeMarkdown(concert.tickets.label)}](${concert.tickets.url})` : "";
+    const tickets = concert.tickets?.url && concert.tickets.url.length <= LINK_URL_MAX ? `\n🎟 [${escapeMarkdown(concert.tickets.label)}](${concert.tickets.url})` : "";
     const head = venueStr + note + tickets + (added.length > 300 ? `${added.slice(0, 299)}…` : added);
 
     let lineup = [];
@@ -51,12 +70,16 @@ function buildDiscordEmbeds({ title, concerts }) {
     // metadata is free-form text. Anything but a list of names threw on
     // .join, outside the post's own try, and took the whole notify run down.
     if (!Array.isArray(lineup)) lineup = [];
-    lineup = lineup.filter((n) => typeof n === "string");
+    lineup = lineup.filter((n) => typeof n === "string").map(escapeMarkdown);
     const fullLineup = lineup.length ? `\n${lineup.join(", ")}` : "";
-    const maxLineup = FIELD_VALUE_LIMIT - head.length - 1;
-    const lineupStr = fullLineup.length > maxLineup ? fullLineup.slice(0, maxLineup) + "…" : fullLineup;
+    // Zero when the head alone fills the field: no lineup, rather than the
+    // negative length that made slice() keep nearly all of it.
+    const maxLineup = Math.max(0, FIELD_VALUE_LIMIT - head.length - 1);
+    const lineupStr = fullLineup.length > maxLineup ? (maxLineup > 0 ? withoutDanglingEscape(fullLineup.slice(0, maxLineup - 1)) + "…" : "") : fullLineup;
 
-    fields.push({ name: label, value: head + lineupStr, inline: false });
+    // Backstop: with both links at their cap the head alone can pass the
+    // limit. Cut anywhere, even inside a link, rather than lose the message.
+    fields.push({ name: label, value: cut(head + lineupStr, FIELD_VALUE_LIMIT), inline: false });
   }
 
   const footer = `${fields.length} new concert${fields.length !== 1 ? "s" : ""}`;
@@ -95,7 +118,7 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
 // Discord reads band names as markdown: one with an asterisk or an underscore
 // in it would set the rest of the list in italics.
-const escapeMarkdown = (text) => String(text).replace(/([\\*_~`|>])/g, "\\$1");
+const escapeMarkdown = (text) => String(text).replace(/([\\*_~`|>[\]()])/g, "\\$1");
 
 /**
  * As many items as fit in `max` characters, with what did not fit counted at

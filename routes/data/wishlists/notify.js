@@ -129,8 +129,8 @@ const actKey = (concertId, bandId) => `${concertId}:${bandId}`;
  *
  * A show stays pending while any recipient's post of it failed in a way worth
  * retrying, and the retry goes only where there is no delivery on record.
- * Scraper builds older than concert_id send shows this cannot track, which
- * are posted as before and never held.
+ * An entry without a concert_id cannot be tracked, so it is not posted at all:
+ * posted untracked it would go out again on every call.
  */
 async function deliveryLedger(concertIds) {
   const rows = concertIds.length
@@ -204,26 +204,18 @@ router.post(
         },
       });
 
-      // Shows from scraper builds older than concert_id, which cannot be read
-      // back: posted under the band whose scrape found them, as they always were.
-      const legacyFor = (follows) => bands
-        .filter((b) => follows.has(b.band_id))
-        .map((b) => ({ name: b.name, concerts: (b.concerts ?? []).filter((c) => !Number.isInteger(c.concert_id)) }))
-        .filter((b) => b.concerts.length > 0);
-
       // What each wishlist follows that this request has news of.
       const followedNews = (wishlist) => {
         const follows = new Set(wishlist.bands.map((ref) => ref.band_rel.id));
         const items = news
           .map((item) => ({ item, acts: item.acts.filter((a) => follows.has(a.id)) }))
           .filter(({ acts }) => acts.length > 0);
-        return { items, legacy: legacyFor(follows) };
+        return { items };
       };
 
       const noWebhookCount = allWishlists.filter((w) => {
         if (w.discord_webhook) return false;
-        const { items, legacy } = followedNews(w);
-        return items.length > 0 || legacy.length > 0;
+        return followedNews(w).items.length > 0;
       }).length;
       if (noWebhookCount > 0) {
         console.log(`[Discord] ${noWebhookCount} wishlist(s) matched but have no webhook configured — skipping`);
@@ -237,7 +229,7 @@ router.post(
 
       await Promise.all(
         allWishlists.filter((w) => w.discord_webhook).map(async (wishlist) => {
-          const { items, legacy } = followedNews(wishlist);
+          const { items } = followedNews(wishlist);
           const reported = new Set();
           reportedByWishlist.set(wishlist.id, reported);
 
@@ -250,11 +242,10 @@ router.post(
             const unsent = ledger.unsent(wishlist.id, item.concert.id, acts);
             if (unsent.length > 0) concerts.push(entry(item, unsent));
           }
-          for (const band of legacy) concerts.push(...band.concerts);
           if (concerts.length === 0) return;
 
           notified++;
-          const names = [...concerts.flatMap((c) => (c.acts ?? []).map((a) => a.name)), ...legacy.map((b) => b.name)];
+          const names = concerts.flatMap((c) => (c.acts ?? []).map((a) => a.name));
           const e = await ledger.send(wishlist.id, wishlist.discord_webhook, { title: titleFor(names), concerts });
           if (e) {
             console.error(`[Discord] Failed to notify wishlist ${wishlist.id}:`, e.response?.status ?? e.message);
@@ -347,8 +338,8 @@ router.post(
  * @returns {Promise<number>} how many users were posted to
  */
 async function notifySubscribers(news, allWishlists, reportedByWishlist, ledger) {
-  // Scraper builds older than the concert_id field send nothing to match on.
-  // The wishlist pass above still works, so this is a skip, not an error.
+  // Nothing this request named has news to match on (an entry without a
+  // concert_id is not read back). That is a skip, not an error.
   if (news.length === 0) return 0;
 
   const subscriptions = await prisma.notificationSubscription.findMany({
