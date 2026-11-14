@@ -34,6 +34,13 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      # Blocks the deploy on purpose: a high or critical advisory in what ships
+      # fails this job, and build waits on it. Until this existed nothing looked,
+      # and main carried a critical and four highs (THO-973). Production
+      # dependencies only, so a dev tool's advisory never holds back a deploy.
+      # The fix for a red run is a bump (Dependabot opens one), not removing
+      # this step. An unreachable audit endpoint fails it too.
+      - run: npm audit --omit=dev --audit-level=high
       - run: npx vitest run
 
   # The same code against a real Postgres, built from nothing by the
