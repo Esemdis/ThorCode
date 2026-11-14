@@ -21,3 +21,10 @@ describe('normaliseLoadoutInput', () => {
     expect(normaliseLoadoutInput(body, { partial }).error).toMatch(message);
   });
 });
+
+describe('normaliseLoadoutInput size limits (THO-981)', () => {
+  it('refuses a description over 10,000 characters', () => {
+    expect(normaliseLoadoutInput({ description: 'x'.repeat(10001) }, { partial: true }).error)
+      .toMatch(/description/);
+  });
+});

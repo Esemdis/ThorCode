@@ -8,6 +8,7 @@ const ownsTrip = require("../../middlewares/ownsTrip");
 const prisma = require("../../prisma/client");
 const { fail } = require("../../utils/apiResponse");
 const { parseReorder, MAX_ENTRIES } = require("../../utils/travel/reorder");
+const { NOTE_MAX_LENGTH, text } = require("../../utils/travel/fields");
 
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
@@ -34,6 +35,10 @@ function numberProblem({ gear_item_id, sort_order }) {
   return null;
 }
 
+// The column is Text, so only this stopped a megabyte note riding along on
+// every read of the packing list (THO-981).
+const NOTE_PROBLEM = `note must be text of at most ${NOTE_MAX_LENGTH} characters`;
+
 // GET /travel/trips/:tripId/items
 router.get("/", async (req, res) => {
   try {
@@ -59,6 +64,8 @@ router.post("/", body("name").notEmpty().trim(), async (req, res) => {
   }
   const problem = numberProblem({ gear_item_id, sort_order });
   if (problem) return res.status(400).json({ error: problem });
+  const itemNote = text(note, NOTE_MAX_LENGTH);
+  if (itemNote === undefined) return res.status(400).json({ error: NOTE_PROBLEM });
 
   try {
     // Linking to gear reads the gear row anyway — for its worn flag — so the
@@ -79,7 +86,7 @@ router.post("/", body("name").notEmpty().trim(), async (req, res) => {
         name: name.trim(),
         category: category?.trim() || null,
         status: status || "BOUGHT",
-        note: note?.trim() || null,
+        note: itemNote,
         url: url?.trim() || null,
         sort_order: sort_order ?? 0,
         gear_item_id: gear_item_id ? parseInt(gear_item_id, 10) : null,
@@ -158,7 +165,10 @@ router.patch("/:itemId", [
   if (name !== undefined) data.name = name.trim();
   if (category !== undefined) data.category = category?.trim() || null;
   if (status !== undefined) data.status = status;
-  if (note !== undefined) data.note = note?.trim() || null;
+  if (note !== undefined) {
+    data.note = text(note, NOTE_MAX_LENGTH);
+    if (data.note === undefined) return res.status(400).json({ error: NOTE_PROBLEM });
+  }
   if (url !== undefined) data.url = url?.trim() || null;
   if (sort_order !== undefined) data.sort_order = sort_order;
   if (gear_item_id !== undefined) data.gear_item_id = gear_item_id ? parseInt(gear_item_id, 10) : null;
