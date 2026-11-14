@@ -50,7 +50,9 @@ router.post("/sync-weather", roleCheck(["ADMIN"]), async (_req, res) => {
   } catch (err) {
     // Not `fail`: that answers 500 for everything, which reported the sync
     // service's own rejection as a fault in this API.
-    console.error(`[${new Date().toISOString()}] POST sync-weather`, err);
+    // Never the whole error: an axios error carries its request config, and
+    // with it `Authorization: Bearer <SCRAPER_TOKEN>`.
+    console.error(`[${new Date().toISOString()}] POST sync-weather`, err.response?.status ?? err.message);
     const { status, message } = pythonServiceFailure(err);
     sendError(res, status, message);
   }
