@@ -766,16 +766,45 @@ describe('POST /wishlists/notify subscription delivery', () => {
     });
   });
 
-  it('skips the concert read entirely when no concert ids came through', async () => {
-    // Older scraper builds post without them. The wishlist digest still has to
-    // work, and matching subscriptions is impossible without a resolved city.
+  it('posts nothing for an entry with no concert_id', async () => {
+    // Such an entry was once posted as it came, never read back and never
+    // recorded as delivered, so every call announced it again. python-crohn
+    // always sends concert_id, so it is not posted at all.
     const body = payload(9, 'Someone Elses Band');
     delete body.bands[0].concerts[0].concert_id;
 
+    const res = await post(body);
+
+    expect(res.status).toBe(200);
+    expect(prisma.concert.findMany).not.toHaveBeenCalled();
+    expect(received).toHaveLength(0);
+  });
+
+  it('announces a show with a 2,000-character link, and the shows after it', async () => {
+    // Discord answers 400 to the whole message when a field is over 1,024,
+    // and a 400 is settled for good: this show used to take the one after it.
+    const longUrl = 'https://x.example/' + 'a'.repeat(2000);
+    answer = (path, nth) => {
+      const embed = received.at(-1).body.embeds[0];
+      const tooLong = embed.title.length > 256
+        || embed.fields.some((f) => f.value.length > 1024 || f.name.length > 256);
+      return tooLong ? 400 : 204;
+    };
+    prisma.wishlist.findMany.mockResolvedValue([THEIRS()]);
+    prisma.concert.findMany.mockImplementation(async ({ where }) => where.id.in.map((id) => (
+      { ...CONCERT, id, url: id === 100 ? longUrl : null }
+    )));
+    const body = payload(9, 'Someone Elses Band', 100);
+    body.bands[0].concerts = [
+      { ...body.bands[0].concerts[0], concert_id: 100, url: longUrl },
+      { ...body.bands[0].concerts[0], concert_id: 101 },
+    ];
+
     await post(body);
 
-    expect(prisma.concert.findMany).not.toHaveBeenCalled();
-    expect(received.filter((r) => r.path === '/theirs')).toHaveLength(1);
+    const recorded = prisma.concertDelivery.createMany.mock.calls.flatMap(([arg]) => arg.data);
+    expect(recorded.map((d) => d.concert_id).sort()).toEqual([100, 101]);
+    expect(JSON.stringify(received.map((r) => r.body))).not.toContain('a'.repeat(100));
   });
 });
 

@@ -28,6 +28,8 @@ const { rateLimiter } = require('../../../utils/rateLimiter');
 const { clipFiles, isClip, prepareClip } = require('../../../utils/mediaClips');
 const { ensurePublicCopy, masterCopyKey, renditionCopyKey } = require('../../../utils/mediaPublicCopy');
 const { albumServesFile } = require('../../../utils/mediaAlbumShare');
+const { createSlotCounter } = require('../../../utils/openSlots');
+const { ipBucket } = require('../../../utils/clientIp');
 const { withOwner, liveAlbumLink, INT32_MAX } = require('./shared');
 
 const router = express.Router();
@@ -383,10 +385,70 @@ const albumBytesLimiter = rateLimiter({
   max: 5000,
 });
 
+/**
+ * How many full-size downloads may be open at once (THO-1003). The limiter
+ * above counts requests, and a /file is one request that can stream a 2 GB
+ * original over the home uplink the whole archive is served from: a few of
+ * those, looping, fit in 5000 an hour and stall every photo for everyone.
+ *
+ * Four per link: enough for one person saving a night a few files at a time,
+ * or two people on the same link doing so, without one link taking the whole
+ * uplink. A token holder can still occupy all four for everyone else on that
+ * link; the link's owner can revoke it, and the per-client cap stops one
+ * client from doing it to every link at once.
+ *
+ * Three per client (an IPv4 address or an IPv6 /64, as the limiter keys it):
+ * below the per-link cap, so one client alone cannot fill a link, and across
+ * links, so holding several links buys nothing. A browser's download manager
+ * runs them one or two at a time, so a person never meets it.
+ *
+ * Refused with a 429, not queued: see openSlots.js. Only /file counts; a
+ * thumbnail or a viewing copy is small and the page asks for hundreds.
+ */
+const ALBUM_DOWNLOADS_PER_TOKEN = 4;
+const ALBUM_DOWNLOADS_PER_IP = 3;
+const albumDownloadsByToken = createSlotCounter({ max: ALBUM_DOWNLOADS_PER_TOKEN });
+const albumDownloadsByIp = createSlotCounter({ max: ALBUM_DOWNLOADS_PER_IP });
+
+/**
+ * Takes a download slot for this client and this link, held until the
+ * response ends. False, and nothing held, when either is full.
+ *
+ * Released on 'finish' (the last byte handed to the socket) and on 'close'
+ * (the connection went, which is also how a client hanging up mid-download or
+ * before the handler answered shows itself). Every way this handler ends —
+ * a file sent, a 404, a 500 from the catch — goes through one or both, and
+ * the releases are idempotent, so the slot is given back exactly once.
+ */
+function holdAlbumDownloadSlot(req, res) {
+  const releaseIp = albumDownloadsByIp.tryAcquire(ipBucket(req.ip));
+  if (!releaseIp) return false;
+  const releaseToken = albumDownloadsByToken.tryAcquire(String(req.params.token));
+  if (!releaseToken) {
+    releaseIp();
+    return false;
+  }
+  const release = () => {
+    releaseToken();
+    releaseIp();
+  };
+  res.once('finish', release);
+  res.once('close', release);
+  return true;
+}
+
 const ALBUM_BYTES_CONTEXT = 'GET /album-shares/:token/media/:id/:which';
 const ALBUM_COPIES = new Set(['thumb', 'view', 'file']);
 
 async function servePublicAlbumMedia(req, res) {
+  // Taken here, before the first await, and not once the link and row are
+  // known. A client that hangs up while the database is asked would otherwise
+  // have its 'close' fire before a listener existed to release on it, and the
+  // slot would be held for the life of the process. Taken before the link is
+  // checked, an unknown token holds a slot only for as long as its 404 takes.
+  if (req.params.which === 'file' && !holdAlbumDownloadSlot(req, res)) {
+    return res.status(429).json({ error: 'Too many downloads open at once, please wait for one to finish.' });
+  }
   try {
     const { which } = req.params;
     // At most ten digits and inside a 32-bit Int: a longer id reaching Prisma
