@@ -97,6 +97,8 @@ A push to `main` triggers `.github/workflows/deploy.yml`. The workflow runs thre
 
 1. It runs the unit suite.
 2. It builds a Postgres 16 database from the migrations and checks that it matches `schema.prisma` exactly. Then it runs the integration tests against that database.
-3. It builds `ghcr.io/esemdis/thorcode:latest`. This job runs only if both earlier jobs passed.
+3. It builds the image and pushes it as `ghcr.io/esemdis/thorcode:latest` and `ghcr.io/esemdis/thorcode:<commit sha>`. This job runs only if both earlier jobs passed.
+
+When a migration fails at boot and the API will not start, the [deploy runbook](docs/deploy-runbook.md) says how to resolve it and go back to an earlier `:<sha>` image.
 
 The container gets one secret, `DOPPLER_TOKEN`, and fetches the rest from Doppler at boot. The [media runbook](docs/concert-media-runbook.md) covers the Unraid template, the reverse proxy and the offsite backup.
