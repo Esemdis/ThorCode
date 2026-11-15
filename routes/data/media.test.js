@@ -1122,6 +1122,122 @@ describe('the same file uploaded twice', () => {
   });
 });
 
+describe('a batch that fails partway, then is retried (THO-980)', () => {
+  // A poster comes from the uploading browser and cannot be made again
+  // (nothing here decodes video), so the one request that carries it is the
+  // only chance to keep it. A throw in the file loop used to skip the poster
+  // step and sweep every poster temp file, and the retry then skipped the
+  // already-landed videos as duplicates without looking at their posters.
+  const sha = (buf) => createHash('sha256').update(buf).digest('hex');
+  const showDirTho980 = () => join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+  const posterBytesTho980 = async (colour) => (await import('sharp')).default(
+    { create: { width: 64, height: 36, channels: 3, background: colour } }).webp().toBuffer();
+  const videoBytesTho980 = (name) => Buffer.from(`fake mp4 of ${name}`);
+  const postersOfTho980 = async () => (
+    await readdir(join(showDirTho980(), '.posters')).catch(() => [])).sort();
+  const incomingOfTho980 = () => readdir(join(root, 'incoming'));
+
+  // Stateful for this describe only: the rows request 1 writes have to be what
+  // request 2's duplicate check reads back.
+  const statefulRowsTho980 = ({ failOnCreate } = {}) => {
+    const rows = [];
+    let creates = 0;
+    prisma.concertMedia.create = vi.fn(async ({ data }) => {
+      creates += 1;
+      if (creates === failOnCreate) throw new Error('database went away');
+      const row = { id: rows.length + 1, ...data };
+      rows.push(row);
+      return row;
+    });
+    prisma.concertMedia.findMany = vi.fn(async () => rows.map((r) => ({ ...r })));
+    return rows;
+  };
+
+  const uploadVideosTho980 = (names, posterBuf) => {
+    let req = request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', '92');
+    for (const n of names) {
+      req = req.attach('files', videoBytesTho980(n), { filename: n, contentType: 'video/mp4' });
+    }
+    for (const n of names) {
+      req = req.attach('posters', posterBuf, { filename: `${n}.webp`, contentType: 'image/webp' });
+    }
+    return req;
+  };
+
+  it('keeps the posters of the videos that landed when the third of three fails, so a retry ends with all three', async () => {
+    statefulRowsTho980({ failOnCreate: 3 });
+    const names = ['VID_1.mp4', 'VID_2.mp4', 'VID_3.mp4'];
+    const poster = await posterBytesTho980('#333');
+
+    await uploadVideosTho980(names, poster).expect(500);
+    expect(await postersOfTho980()).toEqual(['VID_1.mp4.webp', 'VID_2.mp4.webp']);
+
+    const res = await uploadVideosTho980(names, poster).expect(201);
+    expect(res.body.data.duplicates).toEqual(['VID_1.mp4', 'VID_2.mp4']);
+    expect(await postersOfTho980()).toEqual(['VID_1.mp4.webp', 'VID_2.mp4.webp', 'VID_3.mp4.webp']);
+    expect(await incomingOfTho980()).toEqual([]);
+  });
+
+  it('stores the poster sent with a retried video whose own poster was lost', async () => {
+    // The state a failed batch left behind before the fix: the row and the
+    // video are there, the poster is not.
+    const rows = [{
+      id: 1, filename: 'VID_1.mp4', rel_path: 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4',
+      sha256: sha(videoBytesTho980('VID_1.mp4')),
+    }];
+    prisma.concertMedia.findMany = vi.fn(async () => rows);
+
+    const res = await uploadVideosTho980(['VID_1.mp4'], await posterBytesTho980('#333')).expect(201);
+
+    expect(res.body.data.duplicates).toEqual(['VID_1.mp4']);
+    expect(res.body.data.created).toEqual([]);
+    expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+    expect(await postersOfTho980()).toEqual(['VID_1.mp4.webp']);
+    expect(await incomingOfTho980()).toEqual([]);
+  });
+
+  it('leaves a stored poster alone when a duplicate video arrives with another', async () => {
+    const rows = [{
+      id: 1, filename: 'VID_1.mp4', rel_path: 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4',
+      sha256: sha(videoBytesTho980('VID_1.mp4')),
+    }];
+    prisma.concertMedia.findMany = vi.fn(async () => rows);
+    const stored = await posterBytesTho980('#ff0000');
+    await mkdir(join(showDirTho980(), '.posters'), { recursive: true });
+    await writeFile(join(showDirTho980(), '.posters', 'VID_1.mp4.webp'), stored);
+
+    await uploadVideosTho980(['VID_1.mp4'], await posterBytesTho980('#0000ff')).expect(201);
+
+    expect(await readFile(join(showDirTho980(), '.posters', 'VID_1.mp4.webp'))).toEqual(stored);
+    expect(await incomingOfTho980()).toEqual([]);
+  });
+
+  it('clears every poster temp file when a batch fails partway', async () => {
+    statefulRowsTho980({ failOnCreate: 2 });
+
+    await uploadVideosTho980(['VID_1.mp4', 'VID_2.mp4'], await posterBytesTho980('#333')).expect(500);
+
+    expect(await incomingOfTho980()).toEqual([]);
+  });
+
+  it('still returns 201 when the poster sent with a retried duplicate is not an image', async () => {
+    const rows = [{
+      id: 1, filename: 'VID_1.mp4', rel_path: 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4',
+      sha256: sha(videoBytesTho980('VID_1.mp4')),
+    }];
+    prisma.concertMedia.findMany = vi.fn(async () => rows);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await uploadVideosTho980(['VID_1.mp4'], Buffer.from('not an image at all')).expect(201);
+
+    expect(await postersOfTho980()).toEqual([]);
+    expect(await incomingOfTho980()).toEqual([]);
+  });
+});
+
 describe('which folder a show lands in', () => {
   // A stateful stand-in for the table, because both of these are about what a
   // second upload does with what the first one left behind. The fake object
