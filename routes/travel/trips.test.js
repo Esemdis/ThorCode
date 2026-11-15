@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import request from 'supertest';
+import { inspect } from 'node:util';
 import { buildApp, authHeader, installFakePrisma } from '../../test/routeApp.js';
 
 // Seeded before the router is imported — see installFakePrisma.
@@ -30,6 +31,7 @@ describe('a trip weather sync the Python service turns away', () => {
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     process.env.PYTHON_SERVICE_URL = `http://127.0.0.1:${server.address().port}`;
     delete process.env.PYTHON_SERVICE_FALLBACK_URL;
+    process.env.SCRAPER_TOKEN = 'tho982-scraper-secret';
   });
 
   afterAll(() => new Promise((resolve) => server.close(resolve)));
@@ -40,6 +42,20 @@ describe('a trip weather sync the Python service turns away', () => {
     expect(res.status).toBe(502);
     expect(res.body.error).toMatch(/SCRAPER_TOKEN/);
     expect(res.body.error).not.toMatch(/Request failed with status/);
+  });
+
+  it('logs the upstream status, never the scraper token it sent', async () => {
+    // The whole axios error was logged, and its config carries the request's
+    // `Authorization: Bearer <SCRAPER_TOKEN>` header straight into docker logs.
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await request(app).post('/sync-weather').set(...authHeader({ role: 'ADMIN' }));
+
+    const logged = spy.mock.calls
+      .map((args) => args.map((a) => (typeof a === 'string' ? a : inspect(a))).join(' '))
+      .join('\n');
+    expect(logged).toMatch(/sync-weather/);
+    expect(logged).toMatch(/401/);
+    expect(logged).not.toContain('tho982-scraper-secret');
   });
 });
 
