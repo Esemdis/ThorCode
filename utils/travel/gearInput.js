@@ -16,11 +16,13 @@
  * check, and the route does that.
  */
 const {
-  INT32_MAX, INT32_MIN, DECIMAL_MAX, blank, text, number, currency, textList,
+  INT32_MAX, INT32_MIN, DECIMAL_MAX, NOTE_MAX_LENGTH, TAG_LIMITS, DIMENSIONS_MAX_JSON,
+  text, number, currency, textList, tagsError, jsonObject,
 } = require('./fields');
+const { photoDataUrl, PHOTO_TOO_LARGE, GEAR_PHOTO_MAX_LENGTH } = require('./photo');
 
-// Photos arrive as client-side-compressed data URLs; cap ~300KB of string.
-const PHOTO_MAX_LENGTH = 300000;
+// Kept under its old name: callers and tests import it from here.
+const PHOTO_MAX_LENGTH = GEAR_PHOTO_MAX_LENGTH;
 
 // Column widths, from schema.prisma.
 const TEXT_FIELDS = [['model', 200], ['brand', 100], ['category', 100], ['url', 500]];
@@ -48,35 +50,32 @@ function normaliseGearInput(body = {}, { partial = false } = {}) {
   }
 
   if (given('notes') || !partial) {
-    const notes = text(body.notes);
-    if (notes === undefined) return { error: 'notes must be text' };
+    const notes = text(body.notes, NOTE_MAX_LENGTH);
+    if (notes === undefined) return { error: `notes must be text of at most ${NOTE_MAX_LENGTH} characters` };
     data.notes = notes;
   }
 
   if (given('photo') || !partial) {
-    const { photo } = body;
-    if (blank(photo)) data.photo = null;
-    else if (typeof photo !== 'string' || !photo.startsWith('data:image/')) {
-      return { error: 'Photo must be an image data URL' };
-    } else if (photo.length > PHOTO_MAX_LENGTH) {
-      return { error: 'Photo too large — compress it below ~220KB' };
-    } else data.photo = photo;
+    const photo = photoDataUrl(body.photo, PHOTO_MAX_LENGTH);
+    if (photo === PHOTO_TOO_LARGE) return { error: 'Photo too large — compress it below ~220KB' };
+    if (photo === undefined) return { error: 'Photo must be a JPEG, PNG or WebP image data URL' };
+    data.photo = photo;
   }
 
   // Free-form measurements ({ height, width, weight, … }), read by the app's
   // weight and volume totals. An object or nothing; a list or a bare number
   // would be stored and then silently counted as unmeasured.
   if (given('dimensions') || !partial) {
-    const dimensions = body.dimensions ?? null;
-    if (dimensions !== null && (typeof dimensions !== 'object' || Array.isArray(dimensions))) {
-      return { error: 'dimensions must be an object' };
+    const dimensions = jsonObject(body.dimensions, DIMENSIONS_MAX_JSON);
+    if (dimensions === undefined) {
+      return { error: `dimensions must be an object of at most ${DIMENSIONS_MAX_JSON} characters as JSON` };
     }
     data.dimensions = dimensions;
   }
 
   if (given('tags') || !partial) {
-    const tags = textList(body.tags);
-    if (!tags) return { error: 'tags must be a list of text' };
+    const tags = textList(body.tags, TAG_LIMITS);
+    if (!tags) return { error: tagsError('tags') };
     data.tags = tags;
   }
 

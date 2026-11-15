@@ -12,7 +12,9 @@
  * overwritten with them.
  */
 
-const { INT32_MAX, text, date, number, textList } = require('./fields');
+const {
+  INT32_MAX, NOTE_MAX_LENGTH, TAG_LIMITS, text, date, number, textList, tagsError,
+} = require('./fields');
 
 function normaliseTripInput(body = {}, { partial = false } = {}) {
   const data = {};
@@ -31,8 +33,8 @@ function normaliseTripInput(body = {}, { partial = false } = {}) {
   }
 
   if (given('notes')) {
-    const notes = text(body.notes);
-    if (notes === undefined) return { error: 'notes must be text' };
+    const notes = text(body.notes, NOTE_MAX_LENGTH);
+    if (notes === undefined) return { error: `notes must be text of at most ${NOTE_MAX_LENGTH} characters` };
     data.notes = notes;
   }
 
@@ -53,8 +55,8 @@ function normaliseTripInput(body = {}, { partial = false } = {}) {
   }
 
   if (given('tags') || !partial) {
-    const tags = textList(body.tags);
-    if (!tags) return { error: 'tags must be a list of text' };
+    const tags = textList(body.tags, TAG_LIMITS);
+    if (!tags) return { error: tagsError('tags') };
     data.tags = tags;
   }
 
