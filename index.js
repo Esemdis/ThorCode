@@ -34,18 +34,9 @@ app.use("/travel/reviews", require("./routes/travel/allReviews"));
 app.use("/travel/gear", require("./routes/travel/gear"));
 app.use("/travel/wishlist", require("./routes/travel/wishlist"));
 app.use("/travel/loadouts", require("./routes/travel/loadouts"));
-// Anything that escapes a route. A deliberate 4xx keeps its message — it was
-// written to be read — but a 500 is an internal detail (table names, constraint
-// names, sometimes values), so outside development the client just gets told it
-// broke and the log keeps the rest.
-app.use((err, req, res, _next) => {
-  console.error(`[${new Date().toISOString()}] ${req.method} ${req.path}`, err);
-  const status = err.status ?? 500;
-  const message = status < 500 || process.env.NODE_ENV !== 'production'
-    ? err.message || 'Internal server error'
-    : 'Internal server error';
-  res.status(status).json({ error: message });
-});
+// Anything that escapes a route: utils/errorHandler.js says what it answers
+// and what it may log.
+app.use(require("./utils/errorHandler").errorHandler);
 
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled promise rejection:', reason);

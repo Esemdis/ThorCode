@@ -92,3 +92,42 @@ describe('normaliseGearInput on photos and fill levels', () => {
     expect(level(null)).toBe(null);
   });
 });
+
+describe('normaliseGearInput refusing what it used to store unchecked (THO-981)', () => {
+  const svgPhotoDataUrlTho981 = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>';
+
+  it('refuses an SVG data URL as a gear photo, which runs script when opened on its own', () => {
+    expect(normaliseGearInput({ photo: svgPhotoDataUrlTho981 }, { partial: true }).error).toMatch(/photo/i);
+  });
+
+  it('refuses a data URL whose payload is not base64', () => {
+    // travel-bag's PackModeDeck puts the photo unquoted into CSS url(), so a
+    // `)` in the value could add url()s that fetch outside addresses.
+    const body = { photo: 'data:image/jpeg;base64,x), url(https://a/b)' };
+    expect(normaliseGearInput(body, { partial: true }).error).toMatch(/photo/i);
+  });
+
+  it('refuses a 1 MB note, naming notes', () => {
+    expect(normaliseGearInput({ notes: 'x'.repeat(1000000) }, { partial: true }).error).toMatch(/notes/);
+    expect(normaliseGearInput({ notes: 'x'.repeat(10000) }, { partial: true }).data.notes).toHaveLength(10000);
+  });
+
+  it('refuses more than 50 tags, and a tag over 100 characters', () => {
+    const tagsTho981 = Array.from({ length: 51 }, (_, i) => `t${i}`);
+    expect(normaliseGearInput({ tags: tagsTho981 }, { partial: true }).error).toMatch(/tags/);
+    expect(normaliseGearInput({ tags: ['x'.repeat(101)] }, { partial: true }).error).toMatch(/tags/);
+    expect(normaliseGearInput({ tags: tagsTho981.slice(0, 50) }, { partial: true }).data.tags).toHaveLength(50);
+  });
+
+  it('refuses dimensions whose JSON is over 2,000 characters', () => {
+    expect(normaliseGearInput({ dimensions: { note: 'x'.repeat(2000) } }, { partial: true }).error)
+      .toMatch(/dimensions/);
+  });
+
+  it('still takes what travel-bag sends: a JPEG photo, short tags and the measured dimensions', () => {
+    const photo = `data:image/jpeg;base64,/9j/${'A'.repeat(80000)}`;
+    const dimensions = { height: 20, width: 12, depth: 8, volume: 2, weight: 180, size: 'M' };
+    expect(normaliseGearInput({ photo, tags: ['ultralight'], dimensions }, { partial: true }).data)
+      .toEqual({ photo, tags: ['ultralight'], dimensions });
+  });
+});

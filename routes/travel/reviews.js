@@ -8,6 +8,7 @@ const ownsTrip = require("../../middlewares/ownsTrip");
 const prisma = require("../../prisma/client");
 const { fail } = require("../../utils/apiResponse");
 const { recomputeGearReviewStatus } = require("../../utils/reviewStatus");
+const { NOTE_MAX_LENGTH, text } = require("../../utils/travel/fields");
 
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
@@ -46,7 +47,13 @@ router.post(
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-    const { trip_item_id, usage, rating, verdict, quantity, note, add_to_gear } = req.body;
+    const { trip_item_id, usage, rating, verdict, quantity, add_to_gear } = req.body;
+    // Checked before the item is read, so a refused note writes nothing:
+    // add_to_gear below creates a gear row before the review is saved.
+    const note = text(req.body.note, NOTE_MAX_LENGTH);
+    if (note === undefined) {
+      return res.status(400).json({ error: `note must be text of at most ${NOTE_MAX_LENGTH} characters` });
+    }
     try {
       // The item's own fields are needed below, so this read does double duty as
       // the check that it belongs to this (already-owned) trip.
@@ -79,7 +86,7 @@ router.post(
         rating: rating != null ? parseInt(rating) : null,
         verdict,
         quantity: quantity || null,
-        note: note?.trim() || null,
+        note,
         item_name: item.name,
         gear_item_id: gearItemId,
       };
