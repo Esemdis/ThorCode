@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import jwt from 'jsonwebtoken';
 import verifyJWT from './verifyJWT.js';
+import signJWT from './signJWT.js';
 import { signOAuthState } from '../utils/oauthState.js';
 
 function mockRes() {
@@ -56,6 +57,22 @@ describe('verifyJWT middleware', () => {
     const { req, nextCalled } = run(token);
     expect(nextCalled).toBe(true);
     expect(req.user).toMatchObject({ id: 'user-7', role: 'USER' });
+  });
+
+  it('accepts a token our own signJWT produced, and refuses it once tampered with', () => {
+    // jsonwebtoken's jws and jwa moved a major version underneath it in the
+    // npm-minor-and-patch bump (THO-1015). This is the sign-then-verify path
+    // login and every request take, end to end through both libraries.
+    const token = signJWT({ user: { id: 'user-9', email: 'a@b.com', role: 'ADMIN' } });
+    const ok = run(token);
+    expect(ok.nextCalled).toBe(true);
+    expect(ok.req.user).toMatchObject({ id: 'user-9', role: 'ADMIN' });
+    const [h, p, sig] = token.split('.');
+    const forged = Buffer.from(JSON.stringify({ id: 'user-1', role: 'ADMIN' })).toString('base64url');
+    const bad = run(`${h}.${forged}.${sig}`);
+    expect(bad.nextCalled).toBe(false);
+    expect(bad.res.statusCode).toBe(401);
+    expect(p).not.toBe(forged);
   });
 
   describe('a validly signed token that is not a session', () => {
