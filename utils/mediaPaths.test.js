@@ -28,6 +28,20 @@ describe('slugSegment', () => {
     expect(slugSegment('a\tb')).toBe('a b');
   });
 
+  it('does not let dropping a control character put a leading dot back', () => {
+    // THO-1004 review: control characters were removed after the leading-dot
+    // strip, so '\u0001.IMG_1.jpg' became '.IMG_1.jpg', a hidden file that the
+    // media rebuild skips and reports missing on every run.
+    expect(slugSegment('\u0001.hidden')).toBe('hidden');
+    expect(slugSegment('\u0001.hidden').startsWith('.')).toBe(false);
+    expect(slugSegment('\t.hidden')).toBe('hidden');
+    expect(slugSegment('\u0001 .\u0002.x')).toBe('x');
+  });
+
+  it('leaves no double space where a control character sat between two spaces', () => {
+    expect(slugSegment('a \u0001 b')).toBe('a b');
+  });
+
   it('refuses to produce a name that is only dots', () => {
     // '.' and '..' resolve to directories that already exist, so a show named
     // out of them would write into the parent of the archive.
