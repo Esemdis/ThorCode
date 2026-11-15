@@ -76,9 +76,18 @@ function publicCopyFiles(key, dir = publicCacheRoot()) {
  */
 function slugSegment(text) {
   const cleaned = String(text ?? '')
-    .replace(/^\.+/, '')
     .replace(ILLEGAL, '-')
+    // Control characters are dropped (C0, DEL, C1): a name such as 'a\u0001b'
+    // made the rename in the upload route throw (THO-1004), failing the batch
+    // partway, and SMB refuses these too. Tab, newline, VT, FF and CR are
+    // spared here because the whitespace pass below turns them into a space.
+    // This must run before the leading-dot strip and the whitespace pass:
+    // deleting a character can expose a leading dot ('\u0001.x' -> '.x', a
+    // hidden file the media rebuild skips) or leave two spaces side by side.
+    .replace(/[\u0000-\u0008\u000e-\u001f\u007f-\u009f]/g, '')
     .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\.+/, '')
     .trim()
     .replace(/[. ]+$/, '')
     .slice(0, MAX_SEGMENT)
