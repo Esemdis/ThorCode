@@ -37,6 +37,28 @@ const MAX_ITEMS = 120;
 
 const round = (n) => (n == null ? null : Math.round(n));
 
+// THO-1007. The caps above bound how many lines go into the prompt, not how many
+// characters, and a note had no size limit until THO-981 (it is 10,000 now, and a row
+// written before that keeps whatever it holds): 120 items with 100 KB notes was a 12 MB
+// prompt on the owner's Gemini key for one click. A line is what the model judges an
+// item by, so each part of it is cut to what that needs. A name, a brand or a tag
+// is a few words; a note is a sentence or two.
+const NAME_CHARS = 100;
+const GEAR_CHARS = 60;
+const TAG_CHARS = 30;
+const MAX_TAGS = 5;
+const NOTE_CHARS = 200;
+
+// Cut by code point, never through an emoji: a lone surrogate serialises to an invalid
+// JSON escape the receiver may reject (docs/agent-lessons.md). Whitespace, newlines
+// included, is folded to one space, so a note cannot start a line of its own in a list
+// whose lines are items (`- 2x Rain shell`).
+function clip(text, max) {
+  const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
+  const chars = Array.from(flat);
+  return chars.length > max ? `${chars.slice(0, max - 1).join('')}…` : flat;
+}
+
 // The two date sources in a verdict disagree about type: forecast days come out
 // of a JSON column as strings, while start_date and end_date are @db.Date and
 // arrive as Date objects. `String(new Date())` is "Mon Aug 10 2026 …", so
@@ -87,20 +109,21 @@ function forecastLines(days = []) {
 // tags come along when the item is linked to the closet.
 function describeItem(i) {
   const gear = i.gear_item_rel;
-  const bits = [i.name];
+  const bits = [clip(i.name, NAME_CHARS)];
 
   // The trip item's own category is usually blank for anything added from the
   // closet, where the category lives on the gear row instead.
   const category = i.category || gear?.category;
-  if (category) bits.push(`category: ${category}`);
+  if (category) bits.push(`category: ${clip(category, TAG_CHARS)}`);
 
-  if (gear?.brand || gear?.model) bits.push(`gear: ${[gear.brand, gear.model].filter(Boolean).join(' ')}`);
-  if (gear?.tags?.length) bits.push(`tags: ${gear.tags.join(', ')}`);
+  if (gear?.brand || gear?.model) bits.push(`gear: ${clip([gear.brand, gear.model].filter(Boolean).join(' '), GEAR_CHARS)}`);
+  // The first few: they are free text the traveller wrote, the same few that say what the thing is.
+  if (gear?.tags?.length) bits.push(`tags: ${gear.tags.slice(0, MAX_TAGS).map((t) => clip(t, TAG_CHARS)).join(', ')}`);
   if (i.worn) bits.push('worn, not packed');
   // Status matters to the verdict: an item still in NEED_TO_BUY is not in
   // the bag, however well it answers the forecast.
   if (i.status && i.status !== 'PACKED') bits.push(`status: ${i.status.toLowerCase().replace(/_/g, ' ')}`);
-  if (i.note) bits.push(`note: ${i.note}`);
+  if (i.note) bits.push(`note: ${clip(i.note, NOTE_CHARS)}`);
 
   return bits.join('; ');
 }
@@ -270,6 +293,8 @@ module.exports = {
   groupPacking,
   dateOnly,
   tripLength,
+  clip,
+  NOTE_CHARS,
   MAX_DAYS,
   MAX_ITEMS,
 };

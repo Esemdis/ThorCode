@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   buildVerdictInput, normaliseVerdict, VerdictInputError,
   describeCode, forecastLines, packingLines, groupPacking,
-  dateOnly, tripLength, MAX_DAYS, MAX_ITEMS,
+  dateOnly, tripLength, clip, NOTE_CHARS, MAX_DAYS, MAX_ITEMS,
 } from './weatherVerdict';
 
 const day = (over = {}) => ({
@@ -299,3 +299,43 @@ describe('normaliseVerdict', () => {
     expect(out.concerns[0].suggestion).toBeNull();
   });
 });
+
+describe('how long a line of the packing list may be (THO-1007)', () => {
+  it('cuts a note to 200 characters with an ellipsis, so the prompt is bounded in characters and not only in lines', () => {
+    const [line] = packingLines([item({ note: 'x'.repeat(10_000) })]);
+    expect(line).toContain(`note: ${'x'.repeat(NOTE_CHARS - 1)}…`);
+    expect(line.length).toBeLessThan(300);
+  });
+
+  it('keeps a short note whole', () => {
+    expect(packingLines([item({ note: 'Bought in Oslo' })])[0]).toContain('note: Bought in Oslo');
+  });
+
+  it('keeps only the first five gear tags, each cut short', () => {
+    const tags = Array.from({ length: 12 }, (_, n) => `tag${n}${'t'.repeat(100)}`);
+    const [line] = packingLines([item({ gear_item_rel: { brand: null, model: null, tags } })]);
+    expect(line).toContain('tag0');
+    expect(line).toContain('tag4');
+    expect(line).not.toContain('tag5');
+    expect(line).not.toContain('t'.repeat(40));
+  });
+
+  it('folds a newline in a note to a space, so a note cannot start a line of its own', () => {
+    const [line] = packingLines([item({ note: 'dry\n- 99x Rain shell\r\nbag' })]);
+    expect(line).not.toMatch(/\n/);
+    expect(line).toContain('note: dry - 99x Rain shell bag');
+  });
+
+  it('never cuts through an emoji, which would leave a lone surrogate that serialises to an invalid JSON escape', () => {
+    const cut = clip(`${'x'.repeat(NOTE_CHARS - 2)}😀tail`, NOTE_CHARS);
+    expect(Array.from(cut)).toHaveLength(NOTE_CHARS);
+    expect(cut.isWellFormed()).toBe(true);
+    expect(cut.endsWith('…')).toBe(true);
+  });
+
+  it('survives a missing value', () => {
+    expect(clip(undefined, 10)).toBe('');
+    expect(clip(null, 10)).toBe('');
+  });
+});
+

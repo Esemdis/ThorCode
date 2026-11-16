@@ -25,6 +25,13 @@ router.use(ownsTrip);
 // not on the free tier.
 const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
 
+// The call had no timeout, so a slow answer held the request open for as long as the SDK
+// waited, and the SDK retries by default, which makes it longer (THO-1007). A verdict is a
+// few hundred tokens: thirty seconds is a long wait for one, and no retry, because the
+// click can simply be made again and a retry doubles the cost of a call that already ran
+// out of time.
+const GEMINI_TIMEOUT_MS = 30_000;
+
 // Much tighter than the /travel/* write limit this route already sits behind.
 // That one is sized for database writes at 60/min; every request here spends a
 // third party's quota, and on the free tier a burst at that rate exhausts the
@@ -79,7 +86,7 @@ router.post("/", verdictLimit, async (req, res) => {
         mime_type: "application/json",
         schema: VERDICT_SCHEMA,
       },
-    });
+    }, { timeout: GEMINI_TIMEOUT_MS, maxRetries: 0 });
 
     let parsed;
     try {
@@ -94,6 +101,11 @@ router.post("/", verdictLimit, async (req, res) => {
   } catch (err) {
     if (err instanceof VerdictInputError) {
       return res.status(400).json({ error: err.message });
+    }
+    // The SDK's own client-side timeout (APIConnectionTimeoutError), or a timer that fired.
+    // Nothing is wrong with the trip: the model was slow, and the answer is to try again.
+    if (err?.name === "APIConnectionTimeoutError" || err?.name === "TimeoutError") {
+      return res.status(504).json({ error: "The packing verdict took too long. Try again." });
     }
     // Quota exhaustion is the expected failure on a free key, and it is worth
     // distinguishing: nothing is wrong with the trip or the server, and the
