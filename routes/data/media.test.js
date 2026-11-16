@@ -302,6 +302,28 @@ describe('POST /attendances/:id/media', () => {
     expect(await readdir(join(root, 'incoming')).catch(() => [])).toEqual([]);
   });
 
+  it('writes an ignored poster\'s name to the log without its control or invisible characters (THO-1014)', async () => {
+    // The route logged the raw `originalname`. multer may hand a non-ASCII name over mangled,
+    // so the assertion is on what must never be in the line, not on the exact text.
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await request(app())
+        .post('/data/concerts/attendances/1/media')
+        .set(...authHeader(admin))
+        .field('band_id', '92')
+        .field('meta', JSON.stringify({ 'VID_1.mp4': { width: 1920, height: 1080, duration_ms: 24000 } }))
+        .attach('files', Buffer.from('fake mp4'), { filename: 'VID_1.mp4', contentType: 'video/mp4' })
+        .attach('posters', Buffer.from('not a webp'), { filename: 'ev\u202eil\u200b.webp', contentType: 'image/png' })
+        .expect(201);
+      const line = log.mock.calls.map((c) => c.join(' ')).find((l) => l.includes('[media] poster'));
+      expect(line).toBeDefined();
+      expect(line).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b\u202a-\u202e]/);
+      expect(line).toMatch(/ignored: expected image\/webp/);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it('says which show the files landed in', async () => {
     const res = await request(app())
       .post('/data/concerts/attendances/1/media')
