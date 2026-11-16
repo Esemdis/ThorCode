@@ -38,14 +38,11 @@ app.use("/travel/loadouts", require("./routes/travel/loadouts"));
 // and what it may log.
 app.use(require("./utils/errorHandler").errorHandler);
 
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled promise rejection:', reason);
-});
+// Logged through logFieldsFor, so an axios error's Authorization header never reaches the log (THO-1008).
+const { onUnhandledRejection, onUncaughtException } = require('./utils/processHandlers');
 
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err);
-  process.exit(1);
-});
+process.on('unhandledRejection', onUnhandledRejection);
+process.on('uncaughtException', onUncaughtException);
 
 const server = app.listen(port, async () => {
   console.log(`Example app listening on port ${port}`);
