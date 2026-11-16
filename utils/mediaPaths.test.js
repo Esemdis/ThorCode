@@ -181,6 +181,8 @@ describe('invisible characters in a name (THO-1014)', () => {
     expect(slugSegment('Go\u200bjira')).toBe(slugSegment('Gojira'));
     expect(slugSegment('\ufeffGojira')).toBe('Gojira');
     expect(slugSegment('a\u202Eb\u202Ac\u2066d\u2069e\u200Ef\u200Fg\u2060h')).toBe('abcdefgh');
+    // The Arabic letter mark and the deprecated format characters, which the first version missed.
+    expect(slugSegment('a\u061Cb\u206Ac\u206Fd')).toBe('abcd');
   });
 
   it('does not let dropping one put a leading dot or a double space back', () => {
@@ -204,6 +206,7 @@ describe('invisible characters in a name (THO-1014)', () => {
 describe('printableName (THO-1014)', () => {
   it('turns control and invisible characters into a question mark, so a name cannot forge a log line or read backwards', () => {
     expect(printableName('a\nERROR forged\u0000b\u202Ec')).toBe('a?ERROR forged?b?c');
+    expect(printableName('a\u2028b\u2029c')).toBe('a?b?c');
     // Every invisible one, in a row: a global regex would skip alternate matches here.
     expect(printableName('\u200b\u200b\u200b\u200b')).toBe('????');
   });

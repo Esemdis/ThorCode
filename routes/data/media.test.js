@@ -303,8 +303,10 @@ describe('POST /attendances/:id/media', () => {
   });
 
   it('writes an ignored poster\'s name to the log without its control or invisible characters (THO-1014)', async () => {
-    // The route logged the raw `originalname`. multer may hand a non-ASCII name over mangled,
-    // so the assertion is on what must never be in the line, not on the exact text.
+    // The route logged the raw `originalname`. multer reads a filename as latin1, so a UTF-8 name
+    // (U+202E is e2 80 ae) always arrives as mojibake with C1 control characters in it: that is what
+    // this test sees and guards. The invisible-character cases are in mediaPaths.test.js.
+    // (`defParamCharset: 'utf8'` on the uploader is a separate, older question: see the PR.)
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       await request(app())
