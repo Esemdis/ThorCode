@@ -28,7 +28,7 @@ const {
   fail, badRequest, notFound, forbidden, success, error,
 } = require('../../../utils/apiResponse');
 const {
-  uniqueFilename, resolveArchivePath, slugSegment, posterPath,
+  uniqueFilename, resolveArchivePath, slugSegment, posterPath, printableName,
 } = require('../../../utils/mediaPaths');
 const { showDirForAttendance, lockFolderChoice } = require('../../../utils/mediaShowDir');
 const { capturedAtFor } = require('../../../utils/mediaCapture');
@@ -221,7 +221,7 @@ router.post(
           // Not fatal, and deliberately so: the video is the thing worth
           // keeping. Logged because a tile that silently draws a placeholder
           // is otherwise impossible to explain.
-          console.error(`[media] poster ${poster.originalname} ignored: ${problem}`);
+          console.error(`[media] poster ${printableName(poster.originalname)} ignored: ${problem}`);
           continue;
         }
         posters.set(poster.originalname.replace(/\.webp$/, ''), { source: poster.path });

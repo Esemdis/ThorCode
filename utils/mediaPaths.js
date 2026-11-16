@@ -24,6 +24,18 @@ const MAX_SEGMENT = 80;
 // SMB on Unraid, so the stricter rule is the one that applies.
 const ILLEGAL = /[<>:"/\\|?*]/g;
 
+// Format characters that draw nothing: soft hyphen, the Arabic letter mark, zero-width space, left and
+// right marks, the bidi embeddings and overrides, word joiner, the invisible operators and the
+// deprecated format characters (U+2060 to U+206F, which takes in the bidi isolates), and the
+// byte-order mark (THO-1014). A folder or file name with one reads the same as another and is
+// a different directory, or reads backwards in a file browser (U+202E). The zero-width joiner and
+// non-joiner (U+200C, U+200D) are kept: Persian, Indic scripts and emoji sequences such as the
+// family emoji are spelled with them, and a name without them is a different word.
+const INVISIBLE = /[\u00ad\u061c\u200b\u200e\u200f\u202a-\u202e\u2060-\u206f\u2066-\u2069\ufeff]/g;
+
+// The same set without the `g` flag: `.test` on a global regex remembers where it stopped.
+const INVISIBLE_CHAR = new RegExp(INVISIBLE.source);
+
 function mediaRoot() {
   const root = process.env.MEDIA_ROOT;
   if (!root) throw new Error('MEDIA_ROOT is not set');
@@ -85,6 +97,9 @@ function slugSegment(text) {
     // deleting a character can expose a leading dot ('\u0001.x' -> '.x', a
     // hidden file the media rebuild skips) or leave two spaces side by side.
     .replace(/[\u0000-\u0008\u000e-\u001f\u007f-\u009f]/g, '')
+    // Same place and same reason for the invisible ones: dropped before the dot and space passes
+    // so one cannot hide a leading dot ('\u200b.x') or leave two spaces side by side.
+    .replace(INVISIBLE, '')
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/^\.+/, '')
@@ -111,8 +126,22 @@ function safeExtension(filename) {
   const ext = path.extname(String(filename ?? ''))
     .replace(ILLEGAL, '')
     .replace(/[\s\u0000-\u001f]+/g, '')
+    .replace(INVISIBLE, '')
     .replace(/[. ]+$/, '');
   return /^\.[^.]+$/.test(ext) ? ext.slice(0, 16) : '';
+}
+
+/**
+ * A name from a request, made safe to put in a log line (THO-1014). The upload route logged the raw
+ * `originalname`, so a hostile filename reached the container log unchanged: a control character
+ * could forge a second line, a bidi override could make the line read backwards. Control,
+ * line-separator and invisible characters become `?`, and the name is cut to 120 characters without splitting an emoji.
+ */
+function printableName(name) {
+  return Array.from(String(name ?? ''))
+    .map((c) => (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(c) || INVISIBLE_CHAR.test(c) ? '?' : c))
+    .slice(0, 120)
+    .join('');
 }
 
 function showFolderName({ date, city, headliner }) {
@@ -201,7 +230,7 @@ function webRenditionPath(absOriginal) {
 module.exports = {
   ARCHIVE_DIR, CACHE_DIR, DETACHED_DIR, MAX_SEGMENT, POSTERS_DIR, WEB_DIR,
   archiveRoot, thumbCacheRoot, clipCacheRoot, publicCacheRoot, publicCachePath, publicCopyFiles,
-  PUBLIC_COPY_SUFFIXES, slugSegment, safeExtension, showFolderName,
+  PUBLIC_COPY_SUFFIXES, slugSegment, safeExtension, printableName, showFolderName,
   showFolderRelPath, uniqueFilename, resolveArchivePath, thumbPath, posterPath,
   webRenditionPath,
 };
