@@ -55,6 +55,13 @@ describe('the packing verdict route (THO-1007)', () => {
     expect(res.body.error).toMatch(/took too long/);
   });
 
+  it('answers 504 for the error a timeout mid-response really is: a DOMException named TimeoutError', async () => {
+    // The SDK's own APIConnectionTimeoutError is what a call that never answers throws; a server that
+    // sends headers and then stalls throws the platform's DOMException instead (checked against the real SDK).
+    create.mockRejectedValue(new DOMException('The operation timed out.', 'TimeoutError'));
+    expect((await post()).status).toBe(504);
+  });
+
   it('sends a prompt under a fixed budget for 120 items with 10,000-character notes', async () => {
     items = Array.from({ length: 120 }, (_, n) => ({
       name: `Item ${n} ${'n'.repeat(500)}`, category: 'c'.repeat(500), status: 'NEED_TO_BUY', worn: true,
@@ -64,8 +71,10 @@ describe('the packing verdict route (THO-1007)', () => {
     create.mockResolvedValue({ output_text: JSON.stringify({ verdict: 'ok', summary: 's', concerns: [], suggestions: [] }) });
     await post();
     const { input } = create.mock.calls[0][0];
-    // About 1.2 MB before; each line is now bounded, so the whole input is too.
-    expect(input.length).toBeLessThan(120_000);
+    // About 2.9 MB before; each line is now bounded (about 630 code points at most), so the whole
+    // input is too: about 77,000 code points for this input. Counted in code points because an
+    // emoji is two UTF-16 units and the bound is on what the model is charged for.
+    expect(Array.from(input).length).toBeLessThan(80_000);
     // A note cannot begin a line of its own in a list whose lines are items.
     expect(input).not.toMatch(/^- 99x injected line/m);
   });

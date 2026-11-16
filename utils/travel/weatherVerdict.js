@@ -46,6 +46,7 @@ const round = (n) => (n == null ? null : Math.round(n));
 const NAME_CHARS = 100;
 const GEAR_CHARS = 60;
 const TAG_CHARS = 30;
+const CATEGORY_CHARS = 30;
 const MAX_TAGS = 5;
 const NOTE_CHARS = 200;
 
@@ -114,10 +115,11 @@ function describeItem(i) {
   // The trip item's own category is usually blank for anything added from the
   // closet, where the category lives on the gear row instead.
   const category = i.category || gear?.category;
-  if (category) bits.push(`category: ${clip(category, TAG_CHARS)}`);
+  if (category) bits.push(`category: ${clip(category, CATEGORY_CHARS)}`);
 
   if (gear?.brand || gear?.model) bits.push(`gear: ${clip([gear.brand, gear.model].filter(Boolean).join(' '), GEAR_CHARS)}`);
-  // The first few: they are free text the traveller wrote, the same few that say what the thing is.
+  // The first five the traveller wrote. A tag past them is not seen, and the prompt tells the
+  // model to read a missing tag as unknown, never as a no.
   if (gear?.tags?.length) bits.push(`tags: ${gear.tags.slice(0, MAX_TAGS).map((t) => clip(t, TAG_CHARS)).join(', ')}`);
   if (i.worn) bits.push('worn, not packed');
   // Status matters to the verdict: an item still in NEED_TO_BUY is not in
