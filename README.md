@@ -25,6 +25,7 @@ The API runs as one Node process against Postgres through Prisma. Two other serv
 | Travel | `/travel/*` | `routes/travel/`. Covers trips, todos, gear, loadouts, reviews, a wishlist and a Gemini weather verdict. Places, day plans, budgets and expenses are wander's, which reads the packing list from here. |
 
 Auth is a JWT in `Authorization: Bearer`. Roles are `USER`, `ADMIN` and `SYSTEM`. `SYSTEM` is the role of the machine user the sync service signs in as. `scripts/generate-service-token.js` mints its token.
+With `--wander` it mints the token wander holds instead: a USER token with `scope: 'wander'` that `auth/verifyJWT.js` lets through only on wander's calls (`auth/tokenScopes.js`) and refuses with 403 everywhere else.
 
 Nobody can sign themselves up. To make an account, including the first one on an empty database:
 
