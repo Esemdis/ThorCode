@@ -678,6 +678,8 @@ describe('POST /attendances/:id/media', () => {
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('meta must be a JSON object keyed by file name');
     expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+    // The batch's temp files are removed, as for the invalid-JSON refusal.
+    expect(await readdir(join(root, 'incoming')).catch(() => [])).toEqual([]);
   });
 
   it('keeps the sidecar in step with disk when a later file in the batch fails to insert', async () => {
