@@ -14,5 +14,6 @@ router.use(require('./bands/writes'));
 router.use(require('./bands/detail'));
 router.use(require('./bands/admin'));
 router.use(require('./bands/setlists'));
+router.use(require('./bands/merge'));
 
 module.exports = router;
