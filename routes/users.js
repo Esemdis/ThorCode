@@ -39,15 +39,43 @@ const {
 } = require('../utils/accountDeletion');
 const { REGISTRATION_CLOSED_MESSAGE } = require('../utils/accounts');
 
-// Wrong passwords, per IP: ten per quarter hour. Successful sign-ins do not
-// count. Login and register used to share one limiter at rateLimiter's default
-// of ten a minute — 14,400 guesses a day from one address — under a comment
-// promising five per fifteen minutes.
+const LOGIN_LIMIT_MESSAGE = 'Too many failed sign-ins. Please wait a few minutes and try again.';
+
+// Wrong passwords, per IP (an IPv6 /64, see utils/clientIp.js): ten per
+// quarter hour. Successful sign-ins do not count. Login and register used to
+// share one limiter at rateLimiter's default of ten a minute — 14,400 guesses
+// a day from one address — under a comment promising five per fifteen
+// minutes. routes/users.loginLimit.test.js pins these numbers.
 const loginLimit = rateLimiter({
-  message: 'Too many failed sign-ins. Please wait a few minutes and try again.',
+  message: LOGIN_LIMIT_MESSAGE,
   windowMs: 15 * 60 * 1000,
   max: 10,
   skipSuccessfulRequests: true,
+});
+
+// Wrong passwords, per account, whichever IPs they come from (THO-975): a
+// per-IP budget alone let anyone with a few hundred addresses guess at one
+// account without ever being slowed. Keyed on the address as typed, never on
+// the account found, so a 429 is the same for an address with no account and
+// says nothing about which have one. Only a 401 is a guess: a 400 (a malformed
+// request) or a 500 is not charged. A correct password over budget is refused
+// too, or the 200 among the 429s would tell the guesser which one was right.
+// The cost: anyone who knows an address can keep its owner locked out with ten
+// guesses a quarter hour. Mounted after the body is parsed and normalised,
+// because multipart bodies are empty before upload.none().
+const loginAccountKey = (email) => `login:${normaliseEmail(email)}`;
+const accountLoginLimit = rateLimiter({
+  message: LOGIN_LIMIT_MESSAGE,
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => loginAccountKey(req.body?.email),
+  // Not an address: left to the validation's 400, which is never charged, and
+  // without this every blank email from every IP would share one bucket.
+  skip: (req) => !validateEmail(normaliseEmail(req.body?.email)),
+  skipSuccessfulRequests: true,
+  requestWasSuccessful: (req, res) => res.statusCode !== 401,
+  // The per-IP limiter's budget headers stay the ones the client sees.
+  standardHeaders: false,
 });
 
 // The profile both /me and the admin lookup return.
@@ -104,6 +132,7 @@ router.post(
   loginLimit,
   upload.none(),
   userValidation,
+  accountLoginLimit,
   async (req, res) => {
     try {
       const errors = validationResult(req);
@@ -127,6 +156,10 @@ router.post(
       if (!existingUser?.password_hash || !passwordCompare) {
         return res.status(401).json({ error: 'Invalid credentials' });
       }
+
+      // The owner got in, so the guesses before it were not an attack worth
+      // holding against the next sign-in. Same key string the limiter counts.
+      await accountLoginLimit.resetKey(loginAccountKey(email));
 
       const user = {
         id: existingUser.id,

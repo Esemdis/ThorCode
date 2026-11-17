@@ -228,3 +228,31 @@ describe('PATCH /travel/trips/:tripId/items/bulk (THO-654)', () => {
     expect(prisma.tripItem.updateMany).not.toHaveBeenCalled();
   });
 });
+
+describe('a trip item note of a megabyte (THO-981)', () => {
+  const hugeItemNoteTho981 = 'x'.repeat(1000000);
+
+  it('is refused on create', async () => {
+    prisma.tripItem.create = vi.fn(async ({ data }) => ({ id: 9, ...data }));
+
+    const res = await request(app())
+      .post('/travel/trips/1/items')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ name: 'Rain shell', note: hugeItemNoteTho981 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('note');
+    expect(prisma.tripItem.create).not.toHaveBeenCalled();
+  });
+
+  it('is refused on edit', async () => {
+    const res = await request(app())
+      .patch('/travel/trips/1/items/9')
+      .set(...authHeader({ id: 'user-1' }))
+      .send({ note: hugeItemNoteTho981 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('note');
+    expect(prisma.tripItem.update).not.toHaveBeenCalled();
+  });
+});

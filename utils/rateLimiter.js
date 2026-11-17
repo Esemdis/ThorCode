@@ -1,4 +1,5 @@
 const rateLimit = require('express-rate-limit');
+const { ipBucket } = require('./clientIp');
 
 // Thin wrapper over express-rate-limit so callers only supply the numbers they
 // care about and every limiter answers in the same { error } shape.
@@ -6,13 +7,15 @@ function rateLimiter({
   message = 'Too many requests, please try again later.',
   windowMs = 1 * 60 * 1000, // 1 minute
   max = 10,                 // requests per window, per IP
-  keyGenerator,
+  // Per client by default: an IPv4 address, or an IPv6 /64 (see clientIp.js).
+  keyGenerator = (req) => ipBucket(req.ip),
   // Count only requests that failed. For a login that is the whole point: the
   // budget is for wrong guesses, and a household signing in is not guessing.
   skipSuccessfulRequests = false,
   // With skipSuccessfulRequests, what counts as success. express-rate-limit's
   // default is any status below 400, so a 400 or a 500 would be charged as a
-  // failure; a budget for wrong passwords wants only the 403 they get.
+  // failure; a budget for wrong guesses wants only the status a wrong guess gets
+  // (401 at login, 403 for the current password).
   requestWasSuccessful,
   // A route that must not admit it was limited (THO-808: "forgot password"
   // answers the same whether or not the address has an account) sends its own
@@ -36,7 +39,7 @@ function rateLimiter({
     ...(standardHeaders === false && { legacyHeaders: false }),
     skipSuccessfulRequests,
     ...(requestWasSuccessful && { requestWasSuccessful }),
-    ...(keyGenerator && { keyGenerator }),
+    keyGenerator,
     ...(handler && { handler }),
     ...(skip && { skip }),
   });

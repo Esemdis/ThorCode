@@ -44,6 +44,38 @@ describe('findSourceUrls', () => {
     expect(bandsintown).toBe('https://www.bandsintown.com/a/456-example');
   });
 
+  // MusicBrainz is a wiki anyone can edit, and the stored url is what the
+  // scraper is sent to. A substring test once took this as a Songkick page.
+  it('does not store a songkick link whose host is somewhere else (THO-976)', async () => {
+    const get = vi.fn().mockResolvedValue(
+      relationsResponse([
+        { url: { resource: 'https://attacker.example/songkick.com/x' } },
+        { url: { resource: 'http://10.0.0.5/?ref=bandsintown.com' } },
+      ]),
+    );
+
+    const [songkick, bandsintown] = await findSourceUrls('Example', 'known-mbid', { get });
+
+    expect(songkick).toBeNull();
+    expect(bandsintown).toBeNull();
+  });
+
+  it('still finds the real link when a bad one is listed first', async () => {
+    const get = vi.fn().mockResolvedValue(
+      relationsResponse([
+        { url: { resource: 'https://songkick.com.evil.test/artists/1-x' } },
+        { url: { resource: 'https://notbandsintown.com/a/2-x' } },
+        { url: { resource: 'https://www.songkick.com/artists/123-example' } },
+        { url: { resource: 'https://www.bandsintown.com/a/456-example' } },
+      ]),
+    );
+
+    const [songkick, bandsintown] = await findSourceUrls('Example', 'known-mbid', { get });
+
+    expect(songkick).toBe('https://www.songkick.com/artists/123-example');
+    expect(bandsintown).toBe('https://www.bandsintown.com/a/456-example');
+  });
+
   it('does not trust a search result whose name looks like a different band', async () => {
     const get = vi.fn().mockResolvedValue({
       data: { artists: [{ id: 'wrong-mbid', name: 'A Totally Different Band' }] },

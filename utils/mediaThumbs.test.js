@@ -1,11 +1,15 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import {
+  describe, it, expect, beforeEach, afterEach, vi,
+} from 'vitest';
 import { mkdtemp, writeFile, access, readdir, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import sharp from 'sharp';
 import {
   THUMB_WIDTH, DISPLAY_EDGE, ensureThumb, ensureDisplay, storePoster,
+  MAX_CONCURRENT_RENDERS, MAX_REMEMBERED_FAILURES,
 } from './mediaThumbs.js';
+import { createRequire } from 'node:module';
 import { posterPath } from './mediaPaths.js';
 
 let root;
@@ -233,5 +237,212 @@ describe('ensureDisplay', () => {
       .catch((e) => e);
     expect(err.code).toBe('NO_SOURCE');
     await expect(access(join(root, 'cache', 'display', 'gone.webp'))).rejects.toThrow();
+  });
+});
+
+describe('concurrent renders (THO-979)', () => {
+  // An album share link needs no account, and its limiter bounds the rate of
+  // requests (5000 an hour per IP), not how many run at once. Before THO-979
+  // every request that arrived before the first render finished started its
+  // own full decode of a 12 to 50 MP original, on the same four libuv threads
+  // that serve every file.
+
+  // sharp ships separate CJS and ESM builds, each with its own class, and
+  // mediaThumbs.js requires the CJS one. A spy on the ESM import above would
+  // never see a render.
+  const sharpCjsTho979 = createRequire(import.meta.url)('sharp');
+
+  // A spy left behind by a failing test would wrap the next test's spy.
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  // Counts only renders into the cache: every render writes to a `.tmp` name
+  // first, while the fixtures these tests build write straight to a `.jpg`.
+  // Renders wait behind the gate until it is opened, so a test can look at how
+  // many have started while they are all still running.
+  function gatedRendersTho979({ open = false } = {}) {
+    const realToFile = sharpCjsTho979.prototype.toFile;
+    const gate = {};
+    gate.open = new Promise((resolve) => { gate.release = resolve; });
+    if (open) gate.release();
+    const state = { started: 0, running: 0, most: 0 };
+    vi.spyOn(sharpCjsTho979.prototype, 'toFile').mockImplementation(async function toFileTho979(file, ...rest) {
+      if (!String(file).endsWith('.tmp')) return realToFile.call(this, file, ...rest);
+      state.started += 1;
+      state.running += 1;
+      state.most = Math.max(state.most, state.running);
+      try {
+        await gate.open;
+        return await realToFile.call(this, file, ...rest);
+      } finally {
+        state.running -= 1;
+      }
+    });
+    return { gate, state };
+  }
+
+  const settleTho979 = () => new Promise((resolve) => { setTimeout(resolve, 50); });
+
+  const junkTho979 = async (name = 'junk.jpg') => {
+    const p = join(root, name);
+    await writeFile(p, 'not an image');
+    return p;
+  };
+
+  it('renders an uncached photo once for fifty requests at once', async () => {
+    const absPath = await aPhoto();
+    const { gate, state } = gatedRendersTho979();
+
+    const all = Promise.all(Array.from({ length: 50 }, () => ensureThumb({ absPath, kind: 'PHOTO', sha256: 'fifty' })));
+    await settleTho979();
+    gate.release();
+    const paths = await all;
+
+    expect(state.started).toBe(1);
+    expect(new Set(paths)).toEqual(new Set([join(root, 'cache', 'thumbs', 'fifty.webp')]));
+  });
+
+  it('renders an uncached display copy once for fifty requests at once', async () => {
+    const absPath = await aPhoto();
+    const { gate, state } = gatedRendersTho979();
+
+    const all = Promise.all(Array.from({ length: 50 }, () => ensureDisplay({ absPath, sha256: 'fifty' })));
+    await settleTho979();
+    gate.release();
+    const paths = await all;
+
+    expect(state.started).toBe(1);
+    expect(new Set(paths)).toEqual(new Set([join(root, 'cache', 'display', 'fifty.webp')]));
+  });
+
+  it('runs at most MAX_CONCURRENT_RENDERS at once, and the rest in turn', async () => {
+    const absPath = await aPhoto();
+    const { gate, state } = gatedRendersTho979();
+    const count = MAX_CONCURRENT_RENDERS + 3;
+
+    const all = Promise.all(Array.from({ length: count }, (_, i) => ensureThumb({ absPath, kind: 'PHOTO', sha256: `cap${i}` })));
+    await settleTho979();
+    expect(state.started).toBe(MAX_CONCURRENT_RENDERS);
+
+    gate.release();
+    const paths = await all;
+    expect(state.started).toBe(count);
+    expect(state.most).toBe(MAX_CONCURRENT_RENDERS);
+    for (const p of paths) await expect(access(p)).resolves.toBeUndefined();
+  });
+
+  // A copy already made is a stat; a video poster is a stat; a missing
+  // original is a stat. None of them may queue behind a stranger's cold renders.
+  it('does not make a cached thumbnail, a video poster or a missing original wait for a slot', async () => {
+    const absPath = await aPhoto();
+    const warm = await ensureThumb({ absPath, kind: 'PHOTO', sha256: 'warm' });
+    const rel = 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4';
+    const frame = await sharp({ create: { width: 64, height: 36, channels: 3, background: '#111' } }).jpeg().toBuffer();
+    const poster = await storePoster({ relPath: rel, source: frame });
+
+    const { gate, state } = gatedRendersTho979();
+    const cold = Array.from({ length: MAX_CONCURRENT_RENDERS + 1 }, (_, i) => ensureThumb({ absPath, kind: 'PHOTO', sha256: `cold${i}` }));
+    await settleTho979();
+    expect(state.started).toBe(MAX_CONCURRENT_RENDERS);
+
+    expect(await ensureThumb({ absPath, kind: 'PHOTO', sha256: 'warm' })).toBe(warm);
+    expect(await ensureThumb({ kind: 'VIDEO', relPath: rel })).toBe(poster);
+    const gone = await ensureThumb({ absPath: join(root, 'gone.jpg'), kind: 'PHOTO', sha256: 'gone' }).catch((e) => e);
+    expect(gone.code).toBe('NO_SOURCE');
+
+    gate.release();
+    await Promise.all(cold);
+  });
+
+  it('shares one failure among callers who joined it, and does not leave it in flight', async () => {
+    const absPath = await junkTho979();
+    const { gate, state } = gatedRendersTho979();
+
+    const all = Array.from({ length: 10 }, () => ensureThumb({ absPath, kind: 'PHOTO', sha256: 'junk' }).catch((e) => e));
+    await settleTho979();
+    gate.release();
+    const errors = await Promise.all(all);
+
+    expect(state.started).toBe(1);
+    expect(errors[0]).toBeInstanceOf(Error);
+    for (const e of errors) expect(e).toBe(errors[0]);
+    // Nothing waits forever on a settled flight: the slot it held is free.
+    const ok = await ensureThumb({ absPath: await aPhoto(), kind: 'PHOTO', sha256: 'after' });
+    await expect(access(ok)).resolves.toBeUndefined();
+  });
+
+  it('remembers an undecodable original for a while, then tries it again', async () => {
+    // Before THO-979 each request for a photo sharp cannot read decoded it
+    // again and answered 500, so one broken file was a free decode per request.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-14T12:00:00Z'));
+    const absPath = await junkTho979();
+    const { state } = gatedRendersTho979({ open: true });
+
+    const first = await ensureDisplay({ absPath, sha256: 'bad' }).catch((e) => e);
+    expect(state.started).toBe(1);
+
+    vi.setSystemTime(new Date('2026-11-14T12:09:00Z'));
+    const again = await ensureDisplay({ absPath, sha256: 'bad' }).catch((e) => e);
+    // The same error, so the route still answers it as it always has (500).
+    expect(again).toBe(first);
+    expect(state.started).toBe(1);
+
+    // Past the ten minutes the file is tried again: it may have been replaced.
+    vi.setSystemTime(new Date('2026-11-14T12:10:01Z'));
+    await expect(ensureDisplay({ absPath, sha256: 'bad' })).rejects.toThrow();
+    expect(state.started).toBe(2);
+  });
+
+  it('does not remember a missing original', async () => {
+    // Archive drift is answered with a 404 and is cheap to check; a file that
+    // turns up a moment later (a restore, a slow sync) must render at once.
+    const absPath = join(root, 'late.jpg');
+    const err = await ensureThumb({ absPath, kind: 'PHOTO', sha256: 'late' }).catch((e) => e);
+    expect(err.code).toBe('NO_SOURCE');
+
+    await aPhoto('late.jpg');
+    const out = await ensureThumb({ absPath, kind: 'PHOTO', sha256: 'late' });
+    await expect(access(out)).resolves.toBeUndefined();
+  });
+
+  it('does not remember a failure that was not the decode', async () => {
+    // A full disk or a permissions slip is the server's fault, not the file's,
+    // and must not hide a good photo for ten minutes. Forced here by putting a
+    // file where the thumbnail folder goes, so creating it fails.
+    const absPath = await aPhoto();
+    const folder = join(root, 'cache', 'thumbs');
+    await mkdir(dirname(folder), { recursive: true });
+    await writeFile(folder, '');
+
+    await expect(ensureThumb({ absPath, kind: 'PHOTO', sha256: 'blocked' })).rejects.toThrow();
+    await (await import('node:fs/promises')).unlink(folder);
+    const out = await ensureThumb({ absPath, kind: 'PHOTO', sha256: 'blocked' });
+    await expect(access(out)).resolves.toBeUndefined();
+  });
+
+  it('keeps remembered failures bounded, forgetting the oldest first', async () => {
+    const absPath = await junkTho979();
+    const { state } = gatedRendersTho979({ open: true });
+
+    for (let i = 0; i <= MAX_REMEMBERED_FAILURES; i++) {
+      await ensureThumb({ absPath, kind: 'PHOTO', sha256: `many${i}` }).catch(() => {});
+    }
+    const filled = state.started;
+    expect(filled).toBe(MAX_REMEMBERED_FAILURES + 1);
+
+    // The newest is still remembered, the oldest has been pushed out.
+    await ensureThumb({ absPath, kind: 'PHOTO', sha256: `many${MAX_REMEMBERED_FAILURES}` }).catch(() => {});
+    expect(state.started).toBe(filled);
+    await ensureThumb({ absPath, kind: 'PHOTO', sha256: 'many0' }).catch(() => {});
+    expect(state.started).toBe(filled + 1);
+  });
+
+  it('gives every render a time limit, so a hung decode cannot hold a slot forever', async () => {
+    const timeout = vi.spyOn(sharpCjsTho979.prototype, 'timeout');
+    await ensureThumb({ absPath: await aPhoto(), kind: 'PHOTO', sha256: 'timed' });
+    expect(timeout).toHaveBeenCalledWith({ seconds: 60 });
   });
 });
