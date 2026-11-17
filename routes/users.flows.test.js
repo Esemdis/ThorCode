@@ -144,6 +144,7 @@ describe('POST /users/register, now that sign-up is closed', () => {
 
 describe('the email change codes', () => {
   it('draws again when six digits collide with another account\'s pending code', async () => {
+    prisma.user.findUnique.mockResolvedValue({ id: 'user-1', password_hash: await bcrypt.hash('Password1', 4) });
     prisma.user.findFirst.mockResolvedValue(null);
     prisma.emailVerification.findFirst.mockResolvedValue(null);
     prisma.emailVerification.create
@@ -154,7 +155,7 @@ describe('the email change codes', () => {
     await request(app)
       .post('/users/email/request-change')
       .set(...authHeader({ id: 'user-1' }))
-      .send({ newEmail: 'new@example.test' });
+      .send({ newEmail: 'new@example.test', currentPassword: 'Password1' });
 
     expect(prisma.emailVerification.create).toHaveBeenCalledTimes(2);
     const codes = prisma.emailVerification.create.mock.calls.map(([{ data }]) => data.code);
@@ -165,6 +166,7 @@ describe('the email change codes', () => {
     // The pending check found the caller's own request and refused it, so
     // "Back" and asking again for the same address was a 409 — and so was
     // every address anyone had asked for and abandoned, until the hourly sweep.
+    prisma.user.findUnique.mockResolvedValue({ id: 'user-1', password_hash: await bcrypt.hash('Password1', 4) });
     prisma.user.findFirst.mockResolvedValue(null);
     prisma.emailVerification.findFirst.mockResolvedValue(null);
     prisma.emailVerification.create.mockImplementation(async ({ data }) => ({ id: 1, ...data }));
@@ -172,7 +174,7 @@ describe('the email change codes', () => {
     await request(app)
       .post('/users/email/request-change')
       .set(...authHeader({ id: 'user-1' }))
-      .send({ newEmail: ' New@Example.test' });
+      .send({ newEmail: ' New@Example.test', currentPassword: 'Password1' });
 
     // Stored as it will be compared: lowercased.
     expect(prisma.emailVerification.create.mock.calls[0][0].data.new_email).toBe('new@example.test');
@@ -199,6 +201,7 @@ describe('the email change codes', () => {
     prisma.emailVerification.findFirst.mockResolvedValue({
       id: 4, user_id: 'user-1', new_email: 'taken@example.test', code: '123456', expires_at: new Date(Date.now() + 60_000),
     });
+    prisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'old@example.test' });
     prisma.user.update.mockRejectedValue(Object.assign(new Error('unique'), { code: 'P2002' }));
     prisma.emailVerification.delete.mockResolvedValue({});
 

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcrypt';
 import { authHeader, installFakePrisma } from '../test/routeApp.js';
 
 // The hole THO-972 closes, end to end: the token wander holds to read a packing
@@ -80,10 +81,13 @@ describe('a wander-scoped token (THO-972)', () => {
 
 describe('a token without a scope (THO-972)', () => {
   it('still reaches the email change, as every login and python-crohn token does', async () => {
+    // The change now takes the current password too (THO-835), so the right
+    // one is given: this test is about the scope check, not the password.
+    prisma.user.findUnique.mockResolvedValue({ id: 'user-1', password_hash: await bcrypt.hash('Password1', 4) });
     const res = await request(app)
       .post('/users/email/request-change')
       .set(...authHeader({ id: 'user-1' }))
-      .send({ newEmail: 'new@example.test' });
+      .send({ newEmail: 'new@example.test', currentPassword: 'Password1' });
 
     expect(res.status).not.toBe(403);
     expect(prisma.user.findFirst).toHaveBeenCalled();

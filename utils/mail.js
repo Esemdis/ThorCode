@@ -232,6 +232,58 @@ async function sendPasswordResetEmail({ to, link }) {
   return result;
 }
 
+const EMAIL_CHANGED_SUBJECT = "Your Concert Map email address was changed";
+
+/**
+ * The new address as the old one is told it (THO-835): the first character
+ * and the domain. Enough for the owner to recognise their own change, or to
+ * tell the admin where the account went; not the whole address of whoever
+ * moved it, in an inbox that may no longer be the account holder's alone.
+ * The mask is a fixed width, so it says nothing about the length.
+ */
+function maskAddressForNotice(address) {
+  const at = typeof address === "string" ? address.lastIndexOf("@") : -1;
+  if (at < 1) return "\u2022\u2022\u2022";
+  return `${address[0]}\u2022\u2022\u2022${address.slice(at)}`;
+}
+
+/**
+ * The notice to the address an account has just left (THO-835). Without it a
+ * stolen session could move the account and then reset its password at the
+ * new address, and the owner would hear of it only when sign-in failed.
+ */
+function buildEmailChangedNoticeHtml({ newEmail }) {
+  const card = actionCard({
+    lines: [
+      `The email address on your Concert Map account was changed to ${maskAddressForNotice(newEmail)}.`,
+      "If you made this change, there is nothing more to do.",
+      "If you did not, someone else may be signed in to your account. Tell the Concert Map admin straight away: "
+        + "this address can no longer be used to sign in or to reset the password.",
+    ],
+  });
+  return emailShell({
+    heading: EMAIL_CHANGED_SUBJECT,
+    preheader: "If you did not make this change, tell the Concert Map admin.",
+    cards: [card],
+    footnote: "You're getting this because this address was on the account until now.",
+  });
+}
+
+/** Send that notice. Throws when it was not sent, as the other senders do. */
+async function sendEmailChangedNotice({ to, newEmail }) {
+  if (!to || !newEmail) throw new Error("Email and new address are required");
+  const result = await getResend().emails.send({
+    from: process.env.NOTIFICATIONS_FROM_EMAIL,
+    to,
+    subject: EMAIL_CHANGED_SUBJECT,
+    html: buildEmailChangedNoticeHtml({ newEmail }),
+  });
+  if (result?.error) {
+    throw new Error(`Email service error: ${result.error.message ?? result.error.name ?? "unknown"}`);
+  }
+  return result;
+}
+
 module.exports = {
   sendDigestEmail,
   sendEmailVerificationCode,
@@ -240,4 +292,7 @@ module.exports = {
   buildTicketAlertHtml,
   sendPasswordResetEmail,
   buildPasswordResetHtml,
+  sendEmailChangedNotice,
+  buildEmailChangedNoticeHtml,
+  maskAddressForNotice,
 };
