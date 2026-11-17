@@ -3181,7 +3181,7 @@ describe('GET /media/:id/file', () => {
     // content-disposition 2.x (Express 5.3) sends a token filename bare and
     // 1.x quoted it. Both are valid RFC 6266, so accept either; the test below
     // pins the names where quoting is not optional.
-    expect(res.headers['content-disposition']).toMatch(/^attachment; filename="?IMG_1\.jpg"?$/);
+    expect(res.headers['content-disposition']).toMatch(/^attachment; filename=(IMG_1\.jpg|"IMG_1\.jpg")$/);
     expect(res.headers['content-type']).toMatch(/image\/jpeg/);
   });
 

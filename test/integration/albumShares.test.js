@@ -146,7 +146,7 @@ describe.skipIf(!url)('album share links', () => {
     // The bytes: the night's own files as downloads, nobody else's.
     const bytesAt = (id) => request(app).get(`/data/concerts/album-shares/${token}/media/${id}/file`);
     const sent = await bytesAt(f2.id).expect(200);
-    expect(sent.headers['content-disposition']).toMatch(/attachment; filename="IMG_2\.jpg"/);
+    expect(sent.headers['content-disposition']).toMatch(/^attachment; filename=(IMG_2\.jpg|"IMG_2\.jpg")$/);
     await bytesAt(f3.id).expect(404);
     await bytesAt(2147483647).expect(404);
 

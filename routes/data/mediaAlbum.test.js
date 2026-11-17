@@ -339,7 +339,7 @@ describe('GET /album-shares/:token/media/:id/:which', () => {
     const { body } = await shareNight([1]).expect(200);
 
     const res = await bytesAt(body.data.token, 1, 'file').expect(200);
-    expect(res.headers['content-disposition']).toMatch(/attachment; filename="?IMG_1\.jpg"?(;|$)/);
+    expect(res.headers['content-disposition']).toMatch(/attachment; filename=(IMG_1\.jpg|"IMG_1\.jpg")(;|$)/);
     expect(res.headers['cache-control']).toBe('private, no-store');
     // A master with nothing to strip goes out exactly as it is.
     expect(Buffer.compare(res.body, minimalJpegTho894)).toBe(0);

@@ -67,12 +67,11 @@ describe('verifyJWT middleware', () => {
     const ok = run(token);
     expect(ok.nextCalled).toBe(true);
     expect(ok.req.user).toMatchObject({ id: 'user-9', role: 'ADMIN' });
-    const [h, p, sig] = token.split('.');
+    const [h, , sig] = token.split('.');
     const forged = Buffer.from(JSON.stringify({ id: 'user-1', role: 'ADMIN' })).toString('base64url');
     const bad = run(`${h}.${forged}.${sig}`);
     expect(bad.nextCalled).toBe(false);
     expect(bad.res.statusCode).toBe(401);
-    expect(p).not.toBe(forged);
   });
 
   describe('a validly signed token that is not a session', () => {
