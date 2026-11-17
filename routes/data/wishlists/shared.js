@@ -48,7 +48,32 @@ async function ownWishlist(req, res, { select, include, allowAdmin = false } = {
   return wishlist;
 }
 
+/**
+ * A wishlist row as the app may see it (THO-966).
+ *
+ * The answers were the raw row, which sent discord_webhook (anyone holding it
+ * can post to that channel as the bot) and calendar_token (it reads the feed
+ * without signing in) to concert-map on every load, though it reads neither.
+ * A whitelist rather than spreading the row and deleting the two: a column
+ * added later stays out until someone decides it belongs here. The calendar
+ * token is handed out by calendar.js alone; the webhook only as a yes or no.
+ *
+ * @param {object} row a wishlist, with its bands included
+ * @returns {object}
+ */
+function toWishlistAnswer(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    user_id: row.user_id,
+    last_active_at: row.last_active_at,
+    calendar_token_at: row.calendar_token_at,
+    bands: row.bands,
+    has_discord_webhook: Boolean(row.discord_webhook),
+  };
+}
+
 // Lives in utils/activityLog.js, which the scraper's ingest writes through too.
 const { logActivity, ACTIVITY_KEPT } = require("../../../utils/activityLog");
 
-module.exports = { rateLimit, ownWishlist, logActivity, ACTIVITY_KEPT };
+module.exports = { rateLimit, ownWishlist, toWishlistAnswer, logActivity, ACTIVITY_KEPT };
