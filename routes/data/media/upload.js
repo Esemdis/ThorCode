@@ -45,6 +45,30 @@ const {
   dateOnly, headlinerOf, INT32_MAX, sidecarSeed, ownAttendance, billCandidates,
 } = require('./shared');
 
+// Whether a row's archived original is gone (THO-1006). Only a clean ENOENT
+// counts: a permissions error or a flaky mount says nothing about the file, and
+// writing over bytes that may be there would turn a repair into data loss. That
+// is deliberately stricter than the poster backfill, which treats any failure
+// to look as missing because overwriting a poster costs nothing. An empty or
+// refused rel_path is "not missing" too, so nothing is ever written outside the
+// archive and the upload falls back to being a duplicate.
+async function originalMissingTho1006(relPath) {
+  if (!relPath) return false;
+  let abs;
+  try {
+    abs = resolveArchivePath(relPath);
+  } catch (err) {
+    console.error(`[media] not repairing ${relPath}`, err);
+    return false;
+  }
+  try {
+    await stat(abs);
+    return false;
+  } catch (err) {
+    return err?.code === 'ENOENT';
+  }
+}
+
 const router = express.Router();
 
 // Disk storage, not memory: a 500 MB video buffered in the heap is a container
@@ -360,6 +384,19 @@ router.post(
       const existingByHash = new Map(
         existing.filter((e) => e.sha256).map((e) => [e.sha256, e]),
       );
+      // Every row per checksum, oldest first, for the repair below. A show can
+      // hold several rows with one checksum from before duplicates were refused.
+      const existingRowsByHash = new Map();
+      for (const e of existing) {
+        if (!e.sha256) continue;
+        const list = existingRowsByHash.get(e.sha256) ?? [];
+        list.push(e);
+        existingRowsByHash.set(e.sha256, list);
+      }
+      const repaired = [];
+      // Checksums already repaired in this request, so the same lost bytes
+      // sent twice put one file back and the second is a plain duplicate.
+      const repairedHashes = new Set();
       try {
         for (const file of incoming) {
           const kind = kindForMime(file.mimetype);
@@ -387,6 +424,32 @@ router.post(
           // into the archive by the time it is recognised as one.
           const sha256 = await sha256File(file.path);
           if (knownHashes.has(sha256)) {
+            // The row exists, but its original may not (THO-1006): discarding
+            // these bytes would leave a lost file unrepairable by the one thing
+            // the owner can do, upload it again. Put them back at the row's own
+            // path; no new row, because the row is already there.
+            let lostRow = null;
+            if (!repairedHashes.has(sha256)) {
+              for (const candidate of existingRowsByHash.get(sha256) ?? []) {
+                if (await originalMissingTho1006(candidate.rel_path)) { lostRow = candidate; break; }
+              }
+            }
+            if (lostRow) {
+              const lostAbs = resolveArchivePath(lostRow.rel_path);
+              await mkdir(path.dirname(lostAbs), { recursive: true });
+              // multer's temp file is on the archive's filesystem, so this is
+              // an atomic rename, not a copy.
+              await rename(file.path, lostAbs);
+              repairedHashes.add(sha256);
+              repaired.push(file.originalname);
+              const lostPoster = kind === 'VIDEO' ? posters.get(file.originalname) : null;
+              if (lostPoster) {
+                backfillPosters.push({
+                  relPath: lostRow.rel_path, filename: lostRow.filename, source: lostPoster.source,
+                });
+              }
+              continue;
+            }
             // Named, not dropped quietly. And the temp file goes with it: a
             // skipped upload that still left bytes anywhere would surface in
             // the next rebuild as a file no sidecar mentions, which is drift
@@ -491,7 +554,9 @@ router.post(
 
       // attendance_id says where the files landed, which is not the show in
       // the URL when the band sent with them played another stage that day.
-      success(res, 201, { created, duplicates, attendance_id: attendanceId });
+      // `repaired` is additive: a client that only reads `duplicates` and
+      // `created` keeps working, and a repaired file is neither.
+      success(res, 201, { created, duplicates, repaired, attendance_id: attendanceId });
 
       // Photo thumbnails after the response, best effort. Twenty files should
       // not leave the browser waiting on image processing, and a missing photo
