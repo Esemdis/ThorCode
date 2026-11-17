@@ -15,7 +15,7 @@ const bandCreate = require("../../../utils/bandCreate");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
-const { rateLimit, ownWishlist } = require("./shared");
+const { rateLimit, ownWishlist, toWishlistAnswer } = require("./shared");
 const { RECORD_NOT_FOUND } = require("../../../utils/apiResponse");
 
 const VALID_TIERS = ["LOVE", "LIKE", "FOLLOW"];
@@ -132,7 +132,7 @@ router.post(
       // Return existing wishlist if user already has one
       const findExisting = () => prisma.wishlist.findUnique({ where: { user_id: req.user.id }, include: { bands: true } });
       const existing = await findExisting();
-      if (existing) return res.status(200).json(existing);
+      if (existing) return res.status(200).json(toWishlistAnswer(existing));
 
       const { name, discord_webhook } = req.body;
 
@@ -145,7 +145,7 @@ router.post(
           },
           include: { bands: true },
         });
-        return res.status(201).json(newWishlist);
+        return res.status(201).json(toWishlistAnswer(newWishlist));
       } catch (error) {
         // Two creates that overlap both pass the read above, and user_id is
         // unique, so the second insert fails. It was answered as a 500 on a
@@ -153,7 +153,7 @@ router.post(
         if (error.code !== "P2002") throw error;
         const winner = await findExisting();
         if (!winner) throw error;
-        return res.status(200).json(winner);
+        return res.status(200).json(toWishlistAnswer(winner));
       }
     } catch (error) {
       console.error("Error creating wishlist:", error);
@@ -194,7 +194,7 @@ router.put(
         include: { bands: true },
       });
 
-      res.json(updatedWishlist);
+      res.json(toWishlistAnswer(updatedWishlist));
     } catch (error) {
       console.error("Error updating wishlist:", error);
       return res.status(500).json(SERVER_ERROR);
