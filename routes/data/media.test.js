@@ -663,6 +663,25 @@ describe('POST /attendances/:id/media', () => {
     expect(prisma.concertMedia.create).not.toHaveBeenCalled();
   });
 
+  // THO-1005: `null` parses, and the per-file read of `meta[name]` then threw a
+  // TypeError that answered 500. The other JSON values did not throw: they gave
+  // `undefined` per file and the upload went ahead with no metadata, which hid
+  // a client that was sending the wrong thing.
+  it.each(['null', '[]', '5', '"x"', 'true'])('refuses a meta field that is %s, not an object of per-file metadata', async (meta) => {
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', '92')
+      .field('meta', meta)
+      .attach('files', jpeg(), 'IMG_1.jpg');
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('meta must be a JSON object keyed by file name');
+    expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+    // The batch's temp files are removed, as for the invalid-JSON refusal.
+    expect(await readdir(join(root, 'incoming')).catch(() => [])).toEqual([]);
+  });
+
   it('keeps the sidecar in step with disk when a later file in the batch fails to insert', async () => {
     // Probed directly: forcing the second file's insert to throw used to leave
     // its bytes renamed into the show folder and the first file's row in
@@ -1080,6 +1099,11 @@ describe('the same file uploaded twice', () => {
     prisma.concertMedia.findMany = vi.fn(async () => [
       { filename: 'IMG_first.jpg', rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_first.jpg', sha256: sha(jpeg()) },
     ]);
+    // The original is on disk: a row whose file is gone is a repair, not a
+    // duplicate (THO-1006).
+    const firstDir = join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+    await mkdir(firstDir, { recursive: true });
+    await writeFile(join(firstDir, 'IMG_first.jpg'), jpeg());
 
     const res = await request(app())
       .post('/data/concerts/attendances/1/media')
@@ -1099,6 +1123,9 @@ describe('the same file uploaded twice', () => {
     prisma.concertMedia.findMany = vi.fn(async () => [
       { filename: 'IMG_first.jpg', rel_path: 'x', sha256: sha(jpeg()) },
     ]);
+    // The original is on disk (THO-1006): without it this would be a repair.
+    await mkdir(join(root, 'archive'), { recursive: true });
+    await writeFile(join(root, 'archive', 'x'), jpeg());
 
     await request(app())
       .post('/data/concerts/attendances/1/media')
@@ -1213,6 +1240,9 @@ describe('a batch that fails partway, then is retried (THO-980)', () => {
       sha256: sha(videoBytesTho980('VID_1.mp4')),
     }];
     prisma.concertMedia.findMany = vi.fn(async () => rows);
+    // The original is on disk (THO-1006): without it this would be a repair.
+    await mkdir(showDirTho980(), { recursive: true });
+    await writeFile(join(showDirTho980(), 'VID_1.mp4'), videoBytesTho980('VID_1.mp4'));
 
     const res = await uploadVideosTho980(['VID_1.mp4'], await posterBytesTho980('#333')).expect(201);
 
@@ -1231,6 +1261,7 @@ describe('a batch that fails partway, then is retried (THO-980)', () => {
     prisma.concertMedia.findMany = vi.fn(async () => rows);
     const stored = await posterBytesTho980('#ff0000');
     await mkdir(join(showDirTho980(), '.posters'), { recursive: true });
+    await writeFile(join(showDirTho980(), 'VID_1.mp4'), videoBytesTho980('VID_1.mp4'));
     await writeFile(join(showDirTho980(), '.posters', 'VID_1.mp4.webp'), stored);
 
     await uploadVideosTho980(['VID_1.mp4'], await posterBytesTho980('#0000ff')).expect(201);
@@ -1253,12 +1284,131 @@ describe('a batch that fails partway, then is retried (THO-980)', () => {
       sha256: sha(videoBytesTho980('VID_1.mp4')),
     }];
     prisma.concertMedia.findMany = vi.fn(async () => rows);
+    await mkdir(showDirTho980(), { recursive: true });
+    await writeFile(join(showDirTho980(), 'VID_1.mp4'), videoBytesTho980('VID_1.mp4'));
     vi.spyOn(console, 'error').mockImplementation(() => {});
 
     await uploadVideosTho980(['VID_1.mp4'], Buffer.from('not an image at all')).expect(201);
 
     expect(await postersOfTho980()).toEqual([]);
     expect(await incomingOfTho980()).toEqual([]);
+  });
+});
+
+describe('a re-upload of a file whose original is gone (THO-1006)', () => {
+  // A row can outlive its file (a deleted original, a restored database). The
+  // duplicate check used to discard the bytes anyway, so the one way to
+  // repair the archive, uploading the file again, threw the repair away.
+  const sha = (buf) => createHash('sha256').update(buf).digest('hex');
+  const showDirTho1006 = () => join(root, 'archive', 'user-1', '2026-06-12 Oslo - Gojira');
+  const videoBytesTho1006 = (name) => Buffer.from(`fake mp4 of ${name}`);
+  const seedRowTho1006 = (overrides = {}) => {
+    const rows = [{
+      id: 1, filename: 'IMG_first.jpg', rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_first.jpg',
+      sha256: sha(jpeg()), ...overrides,
+    }];
+    prisma.concertMedia.findMany = vi.fn(async () => rows);
+    return rows;
+  };
+  const uploadTho1006 = (...files) => {
+    let req = request(app()).post('/data/concerts/attendances/1/media').set(...authHeader(admin));
+    for (const [buf, name] of files) req = req.attach('files', buf, name);
+    return req;
+  };
+  const incomingOfTho1006 = () => readdir(join(root, 'incoming')).catch(() => []);
+
+  it('puts the bytes back at the row\'s path when its original is gone, without a new row', async () => {
+    seedRowTho1006();
+
+    const res = await uploadTho1006([jpeg(), 'IMG_again.jpg']).expect(201);
+
+    expect(res.body.data.created).toEqual([]);
+    expect(res.body.data.duplicates).toEqual([]);
+    expect(res.body.data.repaired).toEqual(['IMG_again.jpg']);
+    expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+    expect(await readFile(join(showDirTho1006(), 'IMG_first.jpg'))).toEqual(jpeg());
+    expect(await readdir(showDirTho1006())).not.toContain('IMG_again.jpg');
+    expect(await incomingOfTho1006()).toEqual([]);
+  });
+
+  it('recreates the show folder when it is gone too', async () => {
+    seedRowTho1006();
+    expect(await readdir(showDirTho1006()).catch(() => null)).toBeNull();
+
+    await uploadTho1006([jpeg(), 'IMG_again.jpg']).expect(201);
+
+    expect(await readdir(showDirTho1006())).toContain('IMG_first.jpg');
+  });
+
+  it('leaves a present original untouched and reports the upload as a duplicate', async () => {
+    seedRowTho1006();
+    await mkdir(showDirTho1006(), { recursive: true });
+    await writeFile(join(showDirTho1006(), 'IMG_first.jpg'), 'the original');
+
+    const res = await uploadTho1006([jpeg(), 'IMG_again.jpg']).expect(201);
+
+    expect(res.body.data.duplicates).toEqual(['IMG_again.jpg']);
+    expect(res.body.data.repaired).toEqual([]);
+    expect(await readFile(join(showDirTho1006(), 'IMG_first.jpg'), 'utf8')).toBe('the original');
+    expect(await incomingOfTho1006()).toEqual([]);
+  });
+
+  it('repairs once when the same lost bytes arrive twice in a batch, and calls the second a duplicate', async () => {
+    seedRowTho1006();
+
+    const res = await uploadTho1006([jpeg(), 'IMG_again.jpg'], [jpeg(), 'IMG_again_copy.jpg']).expect(201);
+
+    expect(res.body.data.repaired).toEqual(['IMG_again.jpg']);
+    expect(res.body.data.duplicates).toEqual(['IMG_again_copy.jpg']);
+    expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+    expect(await incomingOfTho1006()).toEqual([]);
+  });
+
+  it('stores the poster sent with a repaired video', async () => {
+    const bytes = videoBytesTho1006('VID_1.mp4');
+    seedRowTho1006({
+      filename: 'VID_1.mp4', rel_path: 'user-1/2026-06-12 Oslo - Gojira/VID_1.mp4', sha256: sha(bytes),
+    });
+    const poster = await (await import('sharp')).default(
+      { create: { width: 64, height: 36, channels: 3, background: '#333' } }).webp().toBuffer();
+
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .attach('files', bytes, { filename: 'VID_1.mp4', contentType: 'video/mp4' })
+      .attach('posters', poster, { filename: 'VID_1.mp4.webp', contentType: 'image/webp' })
+      .expect(201);
+
+    expect(res.body.data.repaired).toEqual(['VID_1.mp4']);
+    expect(await readFile(join(showDirTho1006(), 'VID_1.mp4'))).toEqual(bytes);
+    expect(await readdir(join(showDirTho1006(), '.posters'))).toEqual(['VID_1.mp4.webp']);
+    expect(await incomingOfTho1006()).toEqual([]);
+  });
+
+  it('writes nothing outside the archive for a row whose path escapes it, and calls the upload a duplicate', async () => {
+    // Second row: the first row's path picks the show folder before the
+    // duplicate check runs, and a path that escapes already fails there.
+    const rows = seedRowTho1006({ sha256: 'some-other-file' });
+    rows.push({ id: 2, filename: 'escape.jpg', rel_path: '../../escape.jpg', sha256: sha(jpeg()) });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await uploadTho1006([jpeg(), 'IMG_again.jpg']).expect(201);
+
+    expect(res.body.data.duplicates).toEqual(['IMG_again.jpg']);
+    expect(res.body.data.repaired).toEqual([]);
+    expect(await readdir(root)).not.toContain('escape.jpg');
+    expect(await readdir(dirname(root)).then((n) => n.includes('escape.jpg'))).toBe(false);
+    expect(await incomingOfTho1006()).toEqual([]);
+  });
+
+  it('treats a row with an empty path as a duplicate', async () => {
+    seedRowTho1006({ rel_path: '' });
+
+    const res = await uploadTho1006([jpeg(), 'IMG_again.jpg']).expect(201);
+
+    expect(res.body.data.duplicates).toEqual(['IMG_again.jpg']);
+    expect(res.body.data.repaired).toEqual([]);
+    expect(await incomingOfTho1006()).toEqual([]);
   });
 });
 
