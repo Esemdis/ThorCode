@@ -225,6 +225,14 @@ router.post(
         await cleanup();
         return badRequest(res, 'meta is not valid JSON');
       }
+      // Valid JSON is not enough (THO-1005): `null` parsed and then threw on the
+      // first `meta[name]`, a 500 for what is a bad request, and an array or a
+      // primitive was read as "no metadata for any file", so a client sending
+      // the wrong shape was never told. concert-map always sends an object.
+      if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) {
+        await cleanup();
+        return badRequest(res, 'meta must be a JSON object keyed by file name');
+      }
 
       // The bill of the show the files land in, which by now has the band.
       const onBill = new Map(row.concert_rel.bands.map((b) => [b.band_rel.id, b.band_rel.name]));

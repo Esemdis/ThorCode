@@ -663,6 +663,23 @@ describe('POST /attendances/:id/media', () => {
     expect(prisma.concertMedia.create).not.toHaveBeenCalled();
   });
 
+  // THO-1005: `null` parses, and the per-file read of `meta[name]` then threw a
+  // TypeError that answered 500. The other JSON values did not throw: they gave
+  // `undefined` per file and the upload went ahead with no metadata, which hid
+  // a client that was sending the wrong thing.
+  it.each(['null', '[]', '5', '"x"', 'true'])('refuses a meta field that is %s, not an object of per-file metadata', async (meta) => {
+    const res = await request(app())
+      .post('/data/concerts/attendances/1/media')
+      .set(...authHeader(admin))
+      .field('band_id', '92')
+      .field('meta', meta)
+      .attach('files', jpeg(), 'IMG_1.jpg');
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('meta must be a JSON object keyed by file name');
+    expect(prisma.concertMedia.create).not.toHaveBeenCalled();
+  });
+
   it('keeps the sidecar in step with disk when a later file in the batch fails to insert', async () => {
     // Probed directly: forcing the second file's insert to throw used to leave
     // its bytes renamed into the show folder and the first file's row in
