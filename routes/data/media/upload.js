@@ -18,7 +18,7 @@ const multer = require('multer');
 const crypto = require('node:crypto');
 const path = require('node:path');
 const { createReadStream } = require('node:fs');
-const { mkdir, readdir, rename, unlink, stat } = require('node:fs/promises');
+const { mkdir, readdir, rename, unlink, stat, access } = require('node:fs/promises');
 const { param, body, validationResult } = require('express-validator');
 
 const auth = require('../../../auth/verifyJWT');
@@ -28,7 +28,7 @@ const {
   fail, badRequest, notFound, forbidden, success, error,
 } = require('../../../utils/apiResponse');
 const {
-  uniqueFilename, resolveArchivePath, slugSegment,
+  uniqueFilename, resolveArchivePath, slugSegment, posterPath, printableName,
 } = require('../../../utils/mediaPaths');
 const { showDirForAttendance, lockFolderChoice } = require('../../../utils/mediaShowDir');
 const { capturedAtFor } = require('../../../utils/mediaCapture');
@@ -44,6 +44,30 @@ const { festivalSibling } = require('../../../utils/mediaRehome');
 const {
   dateOnly, headlinerOf, INT32_MAX, sidecarSeed, ownAttendance, billCandidates,
 } = require('./shared');
+
+// Whether a row's archived original is gone (THO-1006). Only a clean ENOENT
+// counts: a permissions error or a flaky mount says nothing about the file, and
+// writing over bytes that may be there would turn a repair into data loss. That
+// is deliberately stricter than the poster backfill, which treats any failure
+// to look as missing because overwriting a poster costs nothing. An empty or
+// refused rel_path is "not missing" too, so nothing is ever written outside the
+// archive and the upload falls back to being a duplicate.
+async function originalMissingTho1006(relPath) {
+  if (!relPath) return false;
+  let abs;
+  try {
+    abs = resolveArchivePath(relPath);
+  } catch (err) {
+    console.error(`[media] not repairing ${relPath}`, err);
+    return false;
+  }
+  try {
+    await stat(abs);
+    return false;
+  } catch (err) {
+    return err?.code === 'ENOENT';
+  }
+}
 
 const router = express.Router();
 
@@ -179,11 +203,14 @@ router.post(
       const incoming = req.files?.files ?? [];
       if (!incoming.length) { await cleanup(); return badRequest(res, 'No files uploaded'); }
 
-      // The whole batch is validated before the first rename or insert. A
-      // batch is all-or-nothing: if the third of four files is unsupported,
-      // the first two must never have moved into the archive or gained a
-      // Postgres row, or a retry re-uploads them as "(2)" duplicates of
-      // themselves. See task-9-report.md for the probe that found otherwise.
+      // The whole batch is validated before the first rename or insert.
+      // Validation is all-or-nothing: if the third of four files is
+      // unsupported, the first two must never have moved into the archive or
+      // gained a Postgres row, or a retry re-uploads them as "(2)" duplicates
+      // of themselves. See task-9-report.md for the probe that found
+      // otherwise. Past validation a later failure (the share hiccups, the
+      // database errors) is not rolled back: the files that landed are kept,
+      // with their sidecar entries and their posters (THO-980).
       for (const file of incoming) {
         if (!kindForMime(file.mimetype)) {
           await cleanup();
@@ -197,6 +224,14 @@ router.post(
       } catch {
         await cleanup();
         return badRequest(res, 'meta is not valid JSON');
+      }
+      // Valid JSON is not enough (THO-1005): `null` parsed and then threw on the
+      // first `meta[name]`, a 500 for what is a bad request, and an array or a
+      // primitive was read as "no metadata for any file", so a client sending
+      // the wrong shape was never told. concert-map always sends an object.
+      if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) {
+        await cleanup();
+        return badRequest(res, 'meta must be a JSON object keyed by file name');
       }
 
       // The bill of the show the files land in, which by now has the band.
@@ -218,7 +253,7 @@ router.post(
           // Not fatal, and deliberately so: the video is the thing worth
           // keeping. Logged because a tile that silently draws a placeholder
           // is otherwise impossible to explain.
-          console.error(`[media] poster ${poster.originalname} ignored: ${problem}`);
+          console.error(`[media] poster ${printableName(poster.originalname)} ignored: ${problem}`);
           continue;
         }
         posters.set(poster.originalname.replace(/\.webp$/, ''), { source: poster.path });
@@ -314,6 +349,9 @@ router.post(
       const added = [];
       const duplicates = [];
       const pairedPosters = [];
+      // Posters that arrived with a retried duplicate video, for a poster the
+      // first attempt lost. Stored in the same place as pairedPosters.
+      const backfillPosters = [];
 
       // The checksums this show already holds. Every upload has always
       // computed one and stored it, but nothing ever compared them, so a
@@ -325,7 +363,48 @@ router.post(
       // honestly belong to two nights, and a global check would refuse a file
       // on the grounds that it exists somewhere the caller may not even be
       // able to see.
+      async function storePostersOfBatch() {
+        for (const [m, poster] of pairedPosters) {
+          if (!poster) continue;
+          try {
+            await storePoster({ relPath: m.rel_path, source: poster.source });
+          } catch (err) {
+            // A bad frame is not worth failing the upload the video already
+            // survived. The grid draws a placeholder for a video with no poster.
+            console.error(`[media] poster for ${m.filename} rejected`, err);
+          }
+        }
+        for (const b of backfillPosters) {
+          try {
+            // Never over a poster that is there: it came from the first upload
+            // of this very video. Any failure to look counts as missing.
+            const present = await access(posterPath(b.relPath)).then(() => true, () => false);
+            if (!present) await storePoster({ relPath: b.relPath, source: b.source });
+          } catch (err) {
+            console.error(`[media] poster for ${b.filename} rejected`, err);
+          }
+        }
+      }
+
       const knownHashes = new Set(existing.map((e) => e.sha256).filter(Boolean));
+      // Only rows that existed before this request: a duplicate of a file
+      // landed earlier in the same request has its own poster in pairedPosters.
+      const existingByHash = new Map(
+        existing.filter((e) => e.sha256).map((e) => [e.sha256, e]),
+      );
+      // Every row per checksum, oldest first, for the repair below. A show can
+      // hold several rows with one checksum from before duplicates were refused.
+      const existingRowsByHash = new Map();
+      for (const e of existing) {
+        if (!e.sha256) continue;
+        const list = existingRowsByHash.get(e.sha256) ?? [];
+        list.push(e);
+        existingRowsByHash.set(e.sha256, list);
+      }
+      const repaired = [];
+      // Checksums already repaired in this request, so the same lost bytes
+      // sent twice put one file back and the second is a plain duplicate.
+      const repairedHashes = new Set();
       try {
         for (const file of incoming) {
           const kind = kindForMime(file.mimetype);
@@ -353,12 +432,48 @@ router.post(
           // into the archive by the time it is recognised as one.
           const sha256 = await sha256File(file.path);
           if (knownHashes.has(sha256)) {
+            // The row exists, but its original may not (THO-1006): discarding
+            // these bytes would leave a lost file unrepairable by the one thing
+            // the owner can do, upload it again. Put them back at the row's own
+            // path; no new row, because the row is already there.
+            let lostRow = null;
+            if (!repairedHashes.has(sha256)) {
+              for (const candidate of existingRowsByHash.get(sha256) ?? []) {
+                if (await originalMissingTho1006(candidate.rel_path)) { lostRow = candidate; break; }
+              }
+            }
+            if (lostRow) {
+              const lostAbs = resolveArchivePath(lostRow.rel_path);
+              await mkdir(path.dirname(lostAbs), { recursive: true });
+              // multer's temp file is on the archive's filesystem, so this is
+              // an atomic rename, not a copy.
+              await rename(file.path, lostAbs);
+              repairedHashes.add(sha256);
+              repaired.push(file.originalname);
+              const lostPoster = kind === 'VIDEO' ? posters.get(file.originalname) : null;
+              if (lostPoster) {
+                backfillPosters.push({
+                  relPath: lostRow.rel_path, filename: lostRow.filename, source: lostPoster.source,
+                });
+              }
+              continue;
+            }
             // Named, not dropped quietly. And the temp file goes with it: a
             // skipped upload that still left bytes anywhere would surface in
             // the next rebuild as a file no sidecar mentions, which is drift
             // manufactured by the check meant to prevent it.
             await unlink(file.path).catch(() => {});
             duplicates.push(file.originalname);
+            // A duplicate video may still carry the poster its first upload
+            // lost (THO-980). Only queued here: every poster write happens in
+            // the loop's `finally`, in one place.
+            const existingRow = kind === 'VIDEO' ? existingByHash.get(sha256) : null;
+            const retryPoster = existingRow ? posters.get(file.originalname) : null;
+            if (retryPoster) {
+              backfillPosters.push({
+                relPath: existingRow.rel_path, filename: existingRow.filename, source: retryPoster.source,
+              });
+            }
             continue;
           }
           // Added before the row is written, so the same bytes arriving twice
@@ -420,40 +535,36 @@ router.post(
         // Written for whatever actually landed, even when the loop above threw
         // partway through: disk, Postgres and the sidecar must agree at every
         // exit, not only the one where every file made it.
-        if (added.length) {
-          await updateSidecar(absDir, (current) => {
-            let next = current ?? emptySidecar(seed);
-            for (const e of added) next = upsertFile(next, e);
-            return next;
-          });
-        }
-      }
-
-      // Posters are written before the response, not after: they arrived with
-      // the request and cannot be recreated later, so losing one to a crash in
-      // a background task would lose it for good.
-      try {
-        for (const [m, poster] of pairedPosters) {
-          if (!poster) continue;
-          try {
-            await storePoster({ relPath: m.rel_path, source: poster.source });
-          } catch (err) {
-            // A bad frame is not worth failing the upload the video already
-            // survived. The grid draws a placeholder for a video with no poster.
-            console.error(`[media] poster for ${m.filename} rejected`, err);
+        //
+        // The posters are stored here too, not after the loop (THO-980). A
+        // throw used to skip them and the outer catch swept their temp files,
+        // and a poster is the one thing a retry cannot rebuild: the retry sees
+        // the landed video as a duplicate and nothing here can decode video.
+        // They are written before the response, not after: they arrived with
+        // the request, and a crash in a background task would lose them.
+        try {
+          if (added.length) {
+            await updateSidecar(absDir, (current) => {
+              let next = current ?? emptySidecar(seed);
+              for (const e of added) next = upsertFile(next, e);
+              return next;
+            });
           }
+        } finally {
+          await storePostersOfBatch();
         }
-      } finally {
-        // Every poster, not just the paired ones: an ignored or unmatched
-        // poster is still a temp file, and now that the bytes are no longer
-        // read at parse time this sweep is the only thing removing them.
-        await Promise.all((req.files?.posters ?? [])
-          .map((f) => unlink(f.path).catch(() => {})));
       }
+      // Every poster, not just the paired ones: an ignored or unmatched
+      // poster is still a temp file, and now that the bytes are no longer
+      // read at parse time this sweep is the only thing removing them.
+      await Promise.all((req.files?.posters ?? [])
+        .map((f) => unlink(f.path).catch(() => {})));
 
       // attendance_id says where the files landed, which is not the show in
       // the URL when the band sent with them played another stage that day.
-      success(res, 201, { created, duplicates, attendance_id: attendanceId });
+      // `repaired` is additive: a client that only reads `duplicates` and
+      // `created` keeps working, and a repaired file is neither.
+      success(res, 201, { created, duplicates, repaired, attendance_id: attendanceId });
 
       // Photo thumbnails after the response, best effort. Twenty files should
       // not leave the browser waiting on image processing, and a missing photo

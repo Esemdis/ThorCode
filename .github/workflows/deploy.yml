@@ -14,6 +14,23 @@ on:
 permissions:
   contents: read
 
+# Without this, two quick merges ran side by side and whichever build finished
+# last became :latest, so an older commit could end up deployed (THO-983).
+# Workflow level, not on `build` alone: with only `build` serialised, the newer
+# run's tests could finish first and the older run's build would still
+# overwrite :latest after it.
+#
+# Only non-PR runs on main share the group, a manual run on main included;
+# pull requests and other branches get a group of their own so they never
+# queue behind a deploy. GitHub keeps one pending run per group: when three
+# pushes land fast, the newest replaces the waiting middle one, so that middle
+# commit gets no :<sha> tag. The newest commit always wins. A run whose tests
+# fail publishes nothing, so it gets no tag either. `cancel-in-progress: false`
+# so a run that is already publishing is never cut off halfway.
+concurrency:
+  group: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && 'deploy-main' || format('ci-{0}', github.run_id) }}
+  cancel-in-progress: false
+
 jobs:
   # Runs before the image is built, and the build waits on it. Until this
   # existed, a push to main built and pushed :latest unconditionally and
@@ -153,7 +170,12 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/esemdis/thorcode:latest
+          # :latest is what Watchtower deploys. :<full sha> stays behind as the
+          # image to go back to when a migration fails at boot
+          # (docs/deploy-runbook.md, THO-983).
+          tags: |
+            ghcr.io/esemdis/thorcode:latest
+            ghcr.io/esemdis/thorcode:${{ github.sha }}
           # The commit this image was built from, so munin-dashboard can say
           # which merge is live (THO-711).
           labels: |

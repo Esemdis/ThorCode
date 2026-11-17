@@ -21,6 +21,7 @@ const { relevantArtists } = require('../../../utils/artistSearch');
 const { resolveArtistImages } = require('../../../utils/bandImages');
 const { matchBandToSpotify } = require('../../../utils/bandSpotifyMatch');
 const { findSourceUrls } = require('../../../utils/bandSourceUrls');
+const { sourceUrl, SOURCE_SITES } = require('../../../utils/sourceUrl');
 const { detachAttendances, withDetach, sweepableConcertIds } = require('../../../utils/mediaDetach');
 const { untagBandInSidecars } = require('../../../utils/mediaUntag');
 const auth = require('../../../auth/verifyJWT');
@@ -231,16 +232,14 @@ router.patch(
     .optional({ nullable: true })
     .custom((val) => {
       if (val === null || val === '') return true;
-      try { new URL(val); } catch { throw new Error('songkick_url must be a valid URL'); }
-      if (!val.includes('songkick.com')) throw new Error('songkick_url must be a songkick.com URL');
+      if (!sourceUrl(val, SOURCE_SITES.songkick)) throw new Error('songkick_url must be an https songkick.com URL');
       return true;
     }),
   body('bandsintown_url')
     .optional({ nullable: true })
     .custom((val) => {
       if (val === null || val === '') return true;
-      try { new URL(val); } catch { throw new Error('bandsintown_url must be a valid URL'); }
-      if (!val.includes('bandsintown.com')) throw new Error('bandsintown_url must be a bandsintown.com URL');
+      if (!sourceUrl(val, SOURCE_SITES.bandsintown)) throw new Error('bandsintown_url must be an https bandsintown.com URL');
       return true;
     }),
   async (req, res) => {
@@ -259,8 +258,8 @@ router.patch(
         console.warn(`[PATCH /bands/${bandId}] WARNING: only one source URL provided — ${missing} is missing`);
       }
       const data = {};
-      if (songkick_url !== undefined)    data.songkick_url    = songkick_url    ? songkick_url.split('?')[0]    || null : null;
-      if (bandsintown_url !== undefined) data.bandsintown_url = bandsintown_url ? bandsintown_url.split('?')[0] || null : null;
+      if (songkick_url !== undefined)    data.songkick_url    = songkick_url    ? sourceUrl(songkick_url, SOURCE_SITES.songkick)       : null;
+      if (bandsintown_url !== undefined) data.bandsintown_url = bandsintown_url ? sourceUrl(bandsintown_url, SOURCE_SITES.bandsintown) : null;
       const updated = await prisma.band.update({
         where: { id: bandId },
         data,

@@ -12,6 +12,7 @@
 const axios = require('axios');
 const { stringSimilarity } = require('./concertDedup');
 const { canonicalBandName } = require('./lineupNames');
+const { sourceUrl, SOURCE_SITES } = require('./sourceUrl');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -158,8 +159,10 @@ async function findSourceUrls(bandName, mbid = null, client = axios) {
   for (const rel of relations) {
     const url = rel.url?.resource;
     if (!url) continue;
-    if (!songkickUrl && url.includes('songkick.com')) songkickUrl = url.split('?')[0].replace(/\/$/, '');
-    if (!bandsintownUrl && url.includes('bandsintown.com')) bandsintownUrl = url.split('?')[0].replace(/\/$/, '');
+    // A rejected link leaves the slot empty, so a bad one listed first does
+    // not shut out a real one after it (THO-976).
+    if (!songkickUrl) songkickUrl = sourceUrl(url, SOURCE_SITES.songkick);
+    if (!bandsintownUrl) bandsintownUrl = sourceUrl(url, SOURCE_SITES.bandsintown);
   }
   console.log(`[findSourceUrls] ${bandName} → songkick: ${songkickUrl}, bandsintown: ${bandsintownUrl}`);
   return [songkickUrl, bandsintownUrl, resolvedMbid];

@@ -4,7 +4,7 @@
  * and a name that was not text threw on .trim() — both 500s. Same `{ data }`
  * or `{ error }` shape as tripInput.js.
  */
-const { INT32_MAX, text, number } = require('./fields');
+const { INT32_MAX, NOTE_MAX_LENGTH, text, number } = require('./fields');
 
 function normaliseLoadoutInput(body = {}, { partial = false } = {}) {
   const data = {};
@@ -17,8 +17,10 @@ function normaliseLoadoutInput(body = {}, { partial = false } = {}) {
   }
 
   if (given('description') || !partial) {
-    const description = text(body.description);
-    if (description === undefined) return { error: 'description must be text' };
+    const description = text(body.description, NOTE_MAX_LENGTH);
+    if (description === undefined) {
+      return { error: `description must be text of at most ${NOTE_MAX_LENGTH} characters` };
+    }
     data.description = description;
   }
 

@@ -90,4 +90,48 @@ describe('verifyJWT middleware', () => {
       expect(run(hs512).nextCalled).toBe(false);
     });
   });
+
+  describe('scoped and long-lived tokens (THO-972)', () => {
+    // run() sets no method or URL, and the scope check reads both.
+    function runScoped972(token, method, url) {
+      const req = { method, originalUrl: url, headers: { authorization: `Bearer ${token}` } };
+      const res = mockRes();
+      let nextCalled = false;
+      verifyJWT(req, res, () => { nextCalled = true; });
+      return { req, res, nextCalled };
+    }
+
+    // scripts/generate-service-token.js signs without expiresIn, and both
+    // python-crohn and wander hold such a token. Pinned so a change here that
+    // starts requiring `exp` cannot cut them off in silence.
+    it('accepts a token minted without exp, which python-crohn and wander hold', () => {
+      const token = jwt.sign({ id: 'sys-1', role: 'SYSTEM' }, 'test-secret');
+      expect(jwt.decode(token).exp).toBeUndefined();
+      const { req, nextCalled } = runScoped972(token, 'GET', '/travel/trips/weather-pending');
+      expect(nextCalled).toBe(true);
+      expect(req.user).toMatchObject({ id: 'sys-1', role: 'SYSTEM' });
+    });
+
+    it('answers 403 to a wander-scoped token outside its routes', () => {
+      const token = jwt.sign({ id: 'user-1', role: 'USER', scope: 'wander' }, 'test-secret');
+      const { req, res, nextCalled } = runScoped972(token, 'POST', '/users/email/request-change');
+      expect(nextCalled).toBe(false);
+      expect(res.statusCode).toBe(403);
+      expect(req.user).toBeUndefined();
+    });
+
+    it('lets a wander-scoped token read a trip', () => {
+      const token = jwt.sign({ id: 'user-1', role: 'USER', scope: 'wander' }, 'test-secret');
+      const { req, nextCalled } = runScoped972(token, 'GET', '/travel/trips/12/items');
+      expect(nextCalled).toBe(true);
+      expect(req.user).toMatchObject({ id: 'user-1', scope: 'wander' });
+    });
+
+    it('refuses a scope it does not know', () => {
+      const token = jwt.sign({ id: 'user-1', role: 'USER', scope: 'everything' }, 'test-secret');
+      const { res, nextCalled } = runScoped972(token, 'GET', '/travel/trips');
+      expect(nextCalled).toBe(false);
+      expect(res.statusCode).toBe(401);
+    });
+  });
 });

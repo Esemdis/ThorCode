@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   slugSegment, showFolderName, showFolderRelPath, uniqueFilename,
-  resolveArchivePath, thumbPath, archiveRoot, posterPath, safeExtension,
+  resolveArchivePath, thumbPath, archiveRoot, posterPath, safeExtension, printableName,
 } from './mediaPaths.js';
 
 beforeEach(() => { process.env.MEDIA_ROOT = '/media'; });
@@ -17,6 +17,29 @@ describe('slugSegment', () => {
     // The share is mounted over SMB on Unraid, where these are illegal even
     // though ext4 would accept most of them.
     expect(slugSegment('AC/DC: Live? <loud>')).toBe('AC-DC- Live- -loud-');
+  });
+
+  it('drops control characters from C0, DEL and C1 instead of passing them to the filesystem', () => {
+    // THO-1004: a U+0001 in an uploaded filename survived the slug and made the
+    // rename throw, failing the whole upload batch partway.
+    const slugControlCharName = 'Live\u0001 Set\u007f\u0085\u009f \u0000One';
+    expect(slugSegment(slugControlCharName)).toBe('Live Set One');
+    expect(slugSegment('\u0001\u0002')).toBe('-');
+    expect(slugSegment('a\tb')).toBe('a b');
+  });
+
+  it('does not let dropping a control character put a leading dot back', () => {
+    // THO-1004 review: control characters were removed after the leading-dot
+    // strip, so '\u0001.IMG_1.jpg' became '.IMG_1.jpg', a hidden file that the
+    // media rebuild skips and reports missing on every run.
+    expect(slugSegment('\u0001.hidden')).toBe('hidden');
+    expect(slugSegment('\u0001.hidden').startsWith('.')).toBe(false);
+    expect(slugSegment('\t.hidden')).toBe('hidden');
+    expect(slugSegment('\u0001 .\u0002.x')).toBe('x');
+  });
+
+  it('leaves no double space where a control character sat between two spaces', () => {
+    expect(slugSegment('a \u0001 b')).toBe('a b');
   });
 
   it('refuses to produce a name that is only dots', () => {
@@ -147,5 +170,52 @@ describe('safeExtension', () => {
     expect(safeExtension('clip.mp4.')).toBe('');
     expect(safeExtension('.jpg')).toBe('');
     expect(safeExtension('a.:?')).toBe('');
+  });
+});
+
+// THO-1014: invisible format characters survived the slug, so two names that look the same were
+// two folders, and a bidi override made a name read backwards in a file browser.
+describe('invisible characters in a name (THO-1014)', () => {
+  it('drops zero-width space, the bidi marks and overrides, word joiner and the byte-order mark', () => {
+    expect(slugSegment('Gojira\u200b')).toBe('Gojira');
+    expect(slugSegment('Go\u200bjira')).toBe(slugSegment('Gojira'));
+    expect(slugSegment('\ufeffGojira')).toBe('Gojira');
+    expect(slugSegment('a\u202Eb\u202Ac\u2066d\u2069e\u200Ef\u200Fg\u2060h')).toBe('abcdefgh');
+    // The Arabic letter mark and the deprecated format characters, which the first version missed.
+    expect(slugSegment('a\u061Cb\u206Ac\u206Fd')).toBe('abcd');
+  });
+
+  it('does not let dropping one put a leading dot or a double space back', () => {
+    // Same reason as the control characters above: it has to run before the dot and space passes.
+    expect(slugSegment('\u200b.hidden')).toBe('hidden');
+    expect(slugSegment('a \u200b b')).toBe('a b');
+    expect(slugSegment('\u202e\u200b')).toBe('-');
+  });
+
+  it('keeps the zero-width joiner and non-joiner, which Persian, Indic scripts and emoji are spelled with', () => {
+    expect(slugSegment('می‌خواهم')).toBe('می‌خواهم');
+    expect(slugSegment('👨‍👩‍👧 Live')).toBe('👨‍👩‍👧 Live');
+  });
+
+  it('drops them from an extension too, so a file is not saved as .jp<ZWSP>g', () => {
+    expect(safeExtension('photo.jp\u200bg')).toBe('.jpg');
+    expect(safeExtension('photo.\u202ejpg')).toBe('.jpg');
+  });
+});
+
+describe('printableName (THO-1014)', () => {
+  it('turns control and invisible characters into a question mark, so a name cannot forge a log line or read backwards', () => {
+    expect(printableName('a\nERROR forged\u0000b\u202Ec')).toBe('a?ERROR forged?b?c');
+    expect(printableName('a\u2028b\u2029c')).toBe('a?b?c');
+    // Every invisible one, in a row: a global regex would skip alternate matches here.
+    expect(printableName('\u200b\u200b\u200b\u200b')).toBe('????');
+  });
+
+  it('cuts to 120 characters without splitting an emoji, and survives a missing name', () => {
+    const cut = printableName(`${'x'.repeat(119)}😀tail`);
+    expect(Array.from(cut)).toHaveLength(120);
+    expect(cut.endsWith('😀')).toBe(true);
+    expect(printableName(undefined)).toBe('');
+    expect(printableName('Live Set — Köln.jpg')).toBe('Live Set — Köln.jpg');
   });
 });

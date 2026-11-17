@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const { tokenScopeVerdict } = require('./tokenScopes');
 
 const ROLES = new Set(['USER', 'ADMIN', 'SYSTEM']);
 
@@ -20,6 +21,10 @@ module.exports = function (req, res, next) {
     if (typeof decoded?.id !== 'string' || !decoded.id || !ROLES.has(decoded.role)) {
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
+    // A scoped token reaches only its own calls (auth/tokenScopes.js, THO-972).
+    const scope = tokenScopeVerdict(decoded, req.method, req.originalUrl);
+    if (scope === 'unknown') return res.status(401).json({ error: 'Invalid or expired token' });
+    if (scope === 'forbidden') return res.status(403).json({ error: 'Forbidden: this token can only read travel-bag trips for wander' });
     req.user = decoded; // Attach the decoded user information to the request object
     next();
   } catch (err) {
