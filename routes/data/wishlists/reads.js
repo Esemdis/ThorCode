@@ -14,7 +14,7 @@ const { groupConcertsByBand } = require("../../../utils/concertUpdateGroups");
 const auth = require("../../../auth/verifyJWT");
 const roleCheck = require("../../../middlewares/roleCheck");
 const prisma = require("../../../prisma/client");
-const { ownWishlist, logActivity, ACTIVITY_KEPT } = require("./shared");
+const { ownWishlist, toWishlistAnswer, logActivity, ACTIVITY_KEPT } = require("./shared");
 
 // The id checks below are declared on each route but were never read, so
 // "/wishlists/abc/…" reached Prisma as NaN and came back a 500.
@@ -95,7 +95,7 @@ router.get(
         where: { user_id: req.user.id },
         include: { bands: true },
       });
-      res.json(wishlists);
+      res.json(wishlists.map(toWishlistAnswer));
     } catch (error) {
       console.error("Error fetching wishlists:", error);
       return res.status(500).json({ error: "Internal server error" });
@@ -766,8 +766,8 @@ router.get(
       res.json({
         id: wishlist.id,
         name: wishlist.name,
-        user_id: wishlist.user_id,
-        discord_webhook: wishlist.discord_webhook,
+        // No user_id or discord_webhook (THO-966): an admin can read anyone's
+        // map, and the map needs neither. See toWishlistAnswer in ./shared.
         bands: simplifiedBands,
         concerts: concertsArray,
       });
