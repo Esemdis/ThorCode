@@ -3352,8 +3352,32 @@ describe('GET /media/:id/file', () => {
     await uploadOne();
     const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
     const res = await request(app()).get(`/data/concerts/media/1/file?t=${t}&download=1`).expect(200);
-    expect(res.headers['content-disposition']).toBe('attachment; filename="IMG_1.jpg"');
+    // content-disposition 2.x (Express 5.3) sends a token filename bare and
+    // 1.x quoted it. Both are valid RFC 6266, so accept either; the test below
+    // pins the names where quoting is not optional.
+    expect(res.headers['content-disposition']).toMatch(/^attachment; filename=(IMG_1\.jpg|"IMG_1\.jpg")$/);
     expect(res.headers['content-type']).toMatch(/image\/jpeg/);
+  });
+
+  it('still quotes a download name with a space and encodes a non-ASCII one', async () => {
+    // A bare value is only legal for a token. A space must be quoted, and a
+    // name outside ASCII needs the RFC 5987 filename* form, or the browser
+    // saves it under a mangled name.
+    await uploadOne();
+    const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
+    const named = (filename) => {
+      prisma.concertMedia.findUnique = vi.fn(async () => ({
+        id: 1, kind: 'PHOTO', sha256: 'h1', filename,
+        rel_path: 'user-1/2026-06-12 Oslo - Gojira/IMG_1.jpg',
+        attendance_rel: { wishlist_rel: { user_id: 'user-1' } },
+      }));
+    };
+    named('Oslo night 1.jpg');
+    const spaced = await request(app()).get(`/data/concerts/media/1/file?t=${t}&download=1`).expect(200);
+    expect(spaced.headers['content-disposition']).toBe('attachment; filename="Oslo night 1.jpg"');
+    named('Tromsø café.jpg');
+    const accented = await request(app()).get(`/data/concerts/media/1/file?t=${t}&download=1`).expect(200);
+    expect(accented.headers['content-disposition']).toContain("filename*=UTF-8''Troms%C3%B8%20caf%C3%A9.jpg");
   });
 
   it('serves the file inline otherwise', async () => {
