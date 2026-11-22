@@ -65,6 +65,8 @@ const EXPECTED_ROUTES = [
   'POST /wishlists/:id/calendar-token [4]',
   'DELETE /wishlists/:id/calendar-token [4]',
   'GET /wishlists/:id/attendance [4]',
+  // THO-967: one card's setlists, read when it is opened.
+  'GET /wishlists/:id/attendance/setlists [4]',
   'POST /wishlists/:id/attendance [6]',
   'DELETE /wishlists/:id/attendance/:concertId [5]',
   'PUT /wishlists/:id/attendance/missed [8]',
@@ -133,6 +135,7 @@ describe('a wishlist that is someone else\'s', () => {
     ['get', '/wishlists/7/recent-concerts', user],
     ['get', '/wishlists/7/activity', user],
     ['get', '/wishlists/7/attendance', user],
+    ['get', '/wishlists/7/attendance/setlists?concert_ids=1', user],
     ['post', '/wishlists/7/attendance', user, { concert_id: 1 }],
     ['delete', '/wishlists/7/attendance/1', user],
     ['put', '/wishlists/7/attendance/missed', user, { attendance_ids: [1], band_id: 1, missed: true }],
@@ -935,6 +938,109 @@ describe('GET /wishlists/:id/attendance', () => {
         missed_bands: { none: { band_id: 5 } },
       }),
     }));
+  });
+});
+
+describe('GET /wishlists/:id/attendance without the songs (THO-967)', () => {
+  const setlistTho967 = {
+    url: 'https://www.setlist.fm/setlist/gojira/2026/vega-63de4613.html',
+    songs: [{ name: 'Intro', tape: true }, { name: 'Stranded' }, { name: 'Amazonia', tape: false }],
+  };
+  const attendanceWithSetlistTho967 = () => ({
+    id: 1,
+    created_at: new Date('2026-01-01'),
+    missed_bands: [],
+    concert_rel: {
+      id: 10, event_id: 'e1', name: null, venue: 'Vega', city: 'Copenhagen', country: 'DK',
+      concert_date: new Date('2026-01-01'), url: null, festival: false, metadata: null,
+      source: 'songkick', latitude: null, longitude: null, on_sale: false, sold_out: false,
+      ticket_sale_start: null, price_min: null, price_max: null, price_currency: null, weather: null,
+      bands: [
+        { setlist: setlistTho967, band_rel: { id: 1, name: 'Gojira' } },
+        { setlist: null, band_rel: { id: 2, name: 'Mastodon' } },
+      ],
+    },
+  });
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [{ band_id: 1, tier: 'LOVE' }, { band_id: 2, tier: 'LIKE' }] });
+    prisma.concertMedia.groupBy.mockResolvedValue([]);
+  });
+
+  it('leaves each band\'s setlist songs out of the full list and says how many there are', async () => {
+    // The app reads this list on every load, and it carried every song of
+    // every set in the history for cards whose setlists start closed.
+    prisma.concertAttendance.findMany.mockResolvedValue([attendanceWithSetlistTho967()]);
+
+    const res = await request(app).get('/wishlists/7/attendance').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    const [gojira, mastodon] = res.body.attendance[0].concert.participating_bands;
+    expect(gojira).not.toHaveProperty('setlist');
+    // Tape is not a song the band played: two, not three.
+    expect(gojira).toMatchObject({ id: 1, setlist_songs: 2, setlist_url: setlistTho967.url });
+    expect(mastodon).not.toHaveProperty('setlist');
+    expect(mastodon).toMatchObject({ id: 2, setlist_songs: 0, setlist_url: null });
+  });
+
+  it('keeps full setlists on one band\'s list', async () => {
+    // ?band_id= is the band page's own short list, which draws the songs open.
+    prisma.concertAttendance.findMany.mockResolvedValue([attendanceWithSetlistTho967()]);
+
+    const res = await request(app).get('/wishlists/7/attendance?band_id=1').set(...authHeader({ id: 'user-1' }));
+
+    const [gojira] = res.body.attendance[0].concert.participating_bands;
+    expect(gojira.setlist).toEqual(setlistTho967);
+    expect(gojira.setlist_songs).toBe(2);
+  });
+});
+
+describe('GET /wishlists/:id/attendance/setlists (THO-967)', () => {
+  const user = authHeader({ id: 'user-1' });
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [{ band_id: 1 }, { band_id: 2 }] });
+  });
+
+  it('answers a card\'s setlists only for shows on this wishlist', async () => {
+    const songsTho967 = { songs: [{ name: 'Stranded' }] };
+    prisma.concertBandReference.findMany.mockResolvedValue([
+      { concert: 10, band: 1, setlist: songsTho967 },
+      { concert: 11, band: 2, setlist: null },
+    ]);
+
+    const res = await request(app).get('/wishlists/7/attendance/setlists?concert_ids=10,11').set(...user);
+
+    expect(res.status).toBe(200);
+    // The fake does not filter, so the filter is read off the query: the
+    // shows asked for, only where this wishlist went, only its own bands.
+    expect(prisma.concertBandReference.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        concert: { in: [10, 11] },
+        band: { in: [1, 2] },
+        concert_rel: { attendances: { some: { wishlist_id: 7 } } },
+      },
+    }));
+    expect(res.body).toEqual({ setlists: [{ concert_id: 10, band_id: 1, setlist: songsTho967 }] });
+  });
+
+  it('refuses more than fifty concert ids', async () => {
+    const fiftyOneTho967 = Array.from({ length: 51 }, (_, i) => i + 1).join(',');
+
+    const res = await request(app).get(`/wishlists/7/attendance/setlists?concert_ids=${fiftyOneTho967}`).set(...user);
+
+    expect(res.status).toBe(400);
+    expect(prisma.concertBandReference.findMany).not.toHaveBeenCalled();
+  });
+
+  it('refuses a concert id that is not a whole number', async () => {
+    for (const ids of ['1,2.5', '1,abc', '', '1,,2', '-3']) {
+      const res = await request(app).get(`/wishlists/7/attendance/setlists?concert_ids=${ids}`).set(...user);
+      expect([ids, res.status]).toEqual([ids, 400]);
+    }
+    const missing = await request(app).get('/wishlists/7/attendance/setlists').set(...user);
+    expect(missing.status).toBe(400);
+    expect(prisma.concertBandReference.findMany).not.toHaveBeenCalled();
   });
 });
 
