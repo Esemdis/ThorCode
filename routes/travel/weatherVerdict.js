@@ -75,7 +75,9 @@ router.post("/", verdictLimit, async (req, res) => {
     // 400 rather than a failed generation — no request is made at all.
     const input = buildVerdictInput(trip, items);
 
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    // v1beta named outright: @google/genai 3.0 changed its default to v1, and this is the
+    // Interactions API, whose path carries the version. 2.x called /v1beta/interactions.
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY, apiVersion: "v1beta" });
 
     const interaction = await ai.interactions.create({
       model: MODEL,
