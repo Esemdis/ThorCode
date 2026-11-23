@@ -36,6 +36,7 @@ describe('the email change routes', () => {
   it('registers with every middleware the route declares', () => {
     const manifest = routeManifest(router);
 
+    // auth, the mail limit, the wrong-password limit, multipart, handler.
     expect(manifest).toContain('POST /email/request-change [5]');
     expect(manifest).toContain('POST /email/verify-code [4]');
   });
@@ -94,5 +95,14 @@ describe('changing the password and deleting the account (THO-810)', () => {
     const remove = accountSettingsHandlers('delete', '/me');
 
     expect(change[1]).toBe(remove[1]);
+  });
+
+  // THO-835: asking to move the address takes the current password too, and
+  // a stolen session must not get a third budget of guesses through it.
+  it('gives the email change the same wrong-password limit', () => {
+    const change = accountSettingsHandlers('patch', '/me/password');
+    const emailChange = accountSettingsHandlers('post', '/email/request-change');
+
+    expect(emailChange[2]).toBe(change[1]);
   });
 });

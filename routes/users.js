@@ -15,7 +15,6 @@ const { rateLimiter } = require('../utils/rateLimiter');
 const prisma = require('../prisma/client');
 const signJWT = require('../auth/signJWT');
 const { forgetPasswordChange, isLoginToken, passwordChangeStamp } = require('../auth/loginRevocation');
-const { sendEmailVerificationCode } = require('../utils/mail');
 // Reached through the module object, not destructured, so a test can replace
 // one sender with vi.spyOn and the route sees the replacement.
 const mail = require('../utils/mail');
@@ -305,7 +304,7 @@ router.get(
   },
 );
 
-// --- Proving the current password (THO-810, THO-898) ----------------------
+// --- Proving the current password (THO-810, THO-835, THO-898) ----
 
 // A write that changes the password state (a change, an email change) reads
 // the row, works for a while (three bcrypt rounds, about 200 ms, on a
@@ -382,7 +381,7 @@ const readCurrentPassword = (req) => {
  * POST /users/email/request-change
  * Initiates email change by sending verification code to new email
  * @body {string} newEmail - New email address
- * @body {string} currentPassword - THO-898: a session alone is not enough
+ * @body {string} currentPassword - THO-835: a session alone is not enough
  * @returns {object} { success: true, message: string }
  * @throws {400} Invalid email format, or no current password
  * @throws {401} Unauthorized
@@ -401,11 +400,17 @@ router.post('/email/request-change', auth, emailRequestRateLimiter, currentPassw
       return response.badRequest(res, 'New email is required');
     }
 
-    // THO-898. With only a session, a stolen login token could move the
-    // account to the thief's address, and the reset mail that would have
-    // ended the thief's session then went to the thief. Checked before the
-    // address is looked at, so a session alone cannot ask which addresses
-    // have accounts either.
+    // Stored and compared as sign-in compares it. See normaliseEmail.
+    const newEmail = normaliseEmail(req.body.newEmail);
+
+    if (!validateEmail(newEmail)) {
+      return response.badRequest(res, 'Invalid email format');
+    }
+
+    // A session alone moved the account to any address, and once a password
+    // reset existed a stolen token was a takeover: move the email, then reset
+    // the password at it (THO-835, THO-898). Checked before the address is looked up,
+    // so a session without the password cannot ask which addresses are taken.
     const currentPassword = readCurrentPassword(req);
     if (!currentPassword) return response.badRequest(res, 'Current password is required');
     const account = await prisma.user.findUnique({
@@ -415,12 +420,7 @@ router.post('/email/request-change', auth, emailRequestRateLimiter, currentPassw
     if (!account) return response.notFound(res, 'User not found');
     const wrong = await currentPasswordRefusal(account, currentPassword);
     if (wrong) return response.forbidden(res, wrong);
-    // Stored and compared as sign-in compares it. See normaliseEmail.
-    const newEmail = normaliseEmail(req.body.newEmail);
-
-    if (!validateEmail(newEmail)) {
-      return response.badRequest(res, 'Invalid email format');
-    }
+    acceptCurrentPassword(res);
 
     // Check if email is already in use by another user, in any case
     const existingUser = await prisma.user.findFirst({
@@ -472,7 +472,7 @@ router.post('/email/request-change', auth, emailRequestRateLimiter, currentPassw
 
     // Send verification code to the new email
     try {
-      await sendEmailVerificationCode({ to: newEmail, code });
+      await mail.sendEmailVerificationCode({ to: newEmail, code });
     } catch (emailError) {
       // Cleanup on email send failure
       await prisma.emailVerification.delete({
@@ -542,7 +542,8 @@ router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.non
     // It also counts as a password change (owner decision on THO-898): an
     // address change is how an account is taken over, so it ends the other
     // login sessions the same way.
-    const current = await prisma.user.findUnique({ where: { id: userId }, select: { password_changed_at: true } });
+    // The email is read here for the notice below: afterwards the row only knows the new address.
+    const current = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, password_changed_at: true } });
     if (!current) return response.notFound(res, 'User not found');
     const readChangedAt = current.password_changed_at ?? null;
     if (sessionPredates(req, readChangedAt)) return response.unauthorized(res, SESSION_ENDED);
@@ -574,6 +575,18 @@ router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.non
       throw error;
     }
     forgetPasswordChange(userId);
+
+    // Tell the address the account just left (THO-835), so a change the
+    // owner did not make is heard of now, not at the next failed sign-in.
+    // The change is saved by now: a notice that fails is logged, never a 500
+    // that would read as "not changed" while the code is already spent.
+    if (current.email && current.email !== updated.email) {
+      try {
+        await mail.sendEmailChangedNotice({ to: current.email, newEmail: updated.email });
+      } catch (noticeError) {
+        console.error('Email changed, but the notice to the old address failed:', noticeError);
+      }
+    }
 
     // Signed after the change, so the caller's own session survives it.
     const token = signJWT({
