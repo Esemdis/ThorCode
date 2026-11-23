@@ -152,7 +152,7 @@ async function mergeBands(tx, sourceId, targetId, { force = false } = {}) {
 
   // Alert watches have no unique key, but a user watching both names in one
   // city would get every alert twice, so the same watch is kept once.
-  const watchKey = (s) => [s.user_id, s.city_id, s.tour_query, s.venue_query].join('|');
+  const watchKey = (s) => JSON.stringify([s.user_id, s.city_id, s.tour_query, s.venue_query]);
   const watchFields = { id: true, user_id: true, city_id: true, tour_query: true, venue_query: true };
   const ourWatches = new Set((await tx.notificationSubscription.findMany({
     where: { band_id: targetId }, select: watchFields,

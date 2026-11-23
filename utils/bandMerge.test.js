@@ -211,6 +211,23 @@ describe('mergeBands', () => {
     expect(tx.calls).toContainEqual(['sub.updateMany', { where: { band_id: 1 }, data: { band_id: 2 } }]);
   });
 
+  // watchKey joined the fields with "|", which writes null and "" the same and
+  // lets a "|" typed into a query shift the fields: a watch of the source's
+  // that differs from the survivor's was dropped as a copy of it.
+  it('keeps a watch that differs from the survivor\'s only by an empty query versus none', async () => {
+    const tx = makeBandMergeTx({
+      bands: [tho999Source, tho999Target],
+      subs: [
+        { id: 70, user_id: 'u1', band_id: 1, city_id: null, tour_query: '', venue_query: null },
+        { id: 71, user_id: 'u1', band_id: 1, city_id: null, tour_query: 'a|b', venue_query: null },
+        { id: 80, user_id: 'u1', band_id: 2, city_id: null, tour_query: null, venue_query: null },
+        { id: 81, user_id: 'u1', band_id: 2, city_id: null, tour_query: 'a', venue_query: 'b' },
+      ],
+    });
+    await mergeBands(tx, 1, 2);
+    expect(tx.calls.some(([name]) => name === 'sub.deleteMany')).toBe(false);
+  });
+
   it('retags media onto the survivor and hands back the files whose sidecars need it', async () => {
     const tx = makeBandMergeTx({
       bands: [tho999Source, tho999Target],
