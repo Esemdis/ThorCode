@@ -971,6 +971,7 @@ const EXPECTED_ROUTES = [
   // auth + setlistFmLimit + handler: both spend the server's setlist.fm key.
   'GET /bands/:bandId/setlist-history [3]',
   'GET /setlist-lookup [3]',
+  'POST /bands/:bandId/merge-into/:targetId [3]',
 ];
 
 describe('the setlist.fm routes', () => {
