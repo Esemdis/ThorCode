@@ -16,7 +16,7 @@ The API runs as one Node process against Postgres through Prisma. Two other serv
 | --- | --- | --- |
 | Accounts | `/users` | `routes/users.js`. Covers login, settings, email change, changing the password while signed in and deleting the account (`utils/accountDeletion.js`, which also clears the account's Travel Bag data and archive folder). Sign-up is closed: `POST /users/register` always answers 403, and accounts are made with `scripts/create-user.js` (below). Email verification goes through Resend. |
 | Bands and concerts | `/data/concerts` | `routes/data/bands/`. Covers ingest from the scraper, search, band pages, setlists and admin. |
-| Wishlists and attendance | `/data/concerts` | `routes/data/wishlists/`. Covers wishlists, the shows you went to and the ones you missed, and the ICS calendar feed. `GET /data/concerts/nearby` (`routes/data/concertsNearby.js`) lists the caller's wishlist shows within a radius of a point on some dates, for wander's trip page (THO-667). |
+| Wishlists and attendance | `/data/concerts` | `routes/data/wishlists/`. Covers wishlists, the shows you went to and the ones you missed, and the ICS calendar feed. The attendance list gives each band's setlist as a song count and a link; a card's songs come from `GET /wishlists/:id/attendance/setlists?concert_ids=…` when it is opened (THO-967). `GET /data/concerts/nearby` (`routes/data/concertsNearby.js`) lists the caller's wishlist shows within a radius of a point on some dates, for wander's trip page (THO-667). |
 | Notifications | `/data/concerts` | `routes/data/notifications.js` handles subscriptions to a band, a city or a festival. New shows go to the wishlist's Discord webhook as the scraper reports them, and a daily email digest goes out by cron. |
 | Photo and video archive | `/data/concerts` | `routes/data/media/`. Covers upload, tagging, 12-hour share links to one file, 7-day share links to a whole night or to its picks (`/album-shares`) and byte serving. See [docs/concert-media-runbook.md](docs/concert-media-runbook.md). |
 | Setlist playlists | `/data/concerts`, `/oauth/spotify`, `/oauth/tidal` | `routes/data/playlists.js` builds a Spotify or Tidal playlist from a night's setlists, on whichever the user chose in Settings. |
@@ -25,6 +25,7 @@ The API runs as one Node process against Postgres through Prisma. Two other serv
 | Travel | `/travel/*` | `routes/travel/`. Covers trips, todos, gear, loadouts, reviews, a wishlist and a Gemini weather verdict. Places, day plans, budgets and expenses are wander's, which reads the packing list from here. |
 
 Auth is a JWT in `Authorization: Bearer`. Roles are `USER`, `ADMIN` and `SYSTEM`. `SYSTEM` is the role of the machine user the sync service signs in as. `scripts/generate-service-token.js` mints its token. A password reset or change ends the account's login tokens (the ones `/users/login` hands out) but leaves service and other long-lived tokens working; `auth/loginRevocation.js` says why.
+With `--wander` it mints the token wander holds instead: a USER token with `scope: 'wander'` that `auth/verifyJWT.js` lets through only on wander's calls (`auth/tokenScopes.js`) and refuses with 403 everywhere else.
 
 Nobody can sign themselves up. To make an account, including the first one on an empty database:
 
@@ -39,13 +40,17 @@ In the running container the database URL comes from Doppler, so wrap it: `docke
 
 | Job | When |
 | --- | --- |
+| Ticket alerts for followed shows | every 5 minutes |
 | Notification digest | 09:00 |
+| Weekly recap to Discord | Mondays 09:00 |
 | Spotify artist matching and photo warming | 04:00 |
 | Songkick/Bandsintown source URL backfill | 05:00 |
 | Setlist backfill for attended shows | 06:00 |
-| Expired email codes cleanup | hourly |
+| Expired email codes and password reset links cleanup | hourly |
 
-Each schedule except the hourly cleanup can be overridden with a `*_CRON` variable.
+Each schedule except the hourly cleanups can be overridden with a `*_CRON` variable.
+
+They run only where `NODE_ENV=production` or `RUN_CRON=1`, and `RUN_CRON=0` keeps them off anywhere. The image sets `RUN_CRON=1`. The server logs one line at boot saying whether they are on and why (THO-974).
 
 Video renditions are made by a separate container in `services/rendition/`, which has its own [README](services/rendition/README.md).
 
@@ -58,7 +63,7 @@ npm install          # also runs prisma generate
 npm run dev          # doppler run -c dev -- nodemon index.js, on port 4000
 ```
 
-`npm run dev` connects to the dev database in Doppler, which holds real data.
+`npm run dev` connects to the dev database in Doppler, which holds real data: it is the same Postgres production uses. So a local server starts none of the scheduled jobs, and logs `[cron] Scheduled jobs are off` at boot; otherwise it would send a second copy of every digest and alert. To run them locally anyway, set `RUN_CRON=1`, knowing they act on production rows. `npm run prd` starts none either, unless the prd config sets `NODE_ENV=production`.
 
 To run without Doppler, copy `.env_example` to `.env`, fill it in, and run `npm start`. The variables you need:
 
@@ -93,6 +98,8 @@ A push to `main` triggers `.github/workflows/deploy.yml`. The workflow runs thre
 
 1. It runs the unit suite.
 2. It builds a Postgres 16 database from the migrations and checks that it matches `schema.prisma` exactly. Then it runs the integration tests against that database.
-3. It builds `ghcr.io/esemdis/thorcode:latest`. This job runs only if both earlier jobs passed.
+3. It builds the image and pushes it as `ghcr.io/esemdis/thorcode:latest` and `ghcr.io/esemdis/thorcode:<commit sha>`. This job runs only if both earlier jobs passed.
+
+When a migration fails at boot and the API will not start, the [deploy runbook](docs/deploy-runbook.md) says how to resolve it and go back to an earlier `:<sha>` image.
 
 The container gets one secret, `DOPPLER_TOKEN`, and fetches the rest from Doppler at boot. The [media runbook](docs/concert-media-runbook.md) covers the Unraid template, the reverse proxy and the offsite backup.

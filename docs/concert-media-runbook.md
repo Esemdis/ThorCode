@@ -129,7 +129,10 @@ of `name`, `start_ms`, `end_ms`; absent means none). `scripts/rebuild-media-inde
 database from those files alone. That is what lets you treat the share as the
 thing being protected and the application as replaceable.
 
-A folder's name is chosen by its first upload and never read back. Correcting
+A folder's name is chosen by its first upload and never read back, so a change
+to how names are cleaned (`slugSegment`, most recently to drop invisible format
+characters, THO-1014) never renames a folder that exists; the rebuild compares
+names through the same function on both sides. Correcting
 the date of a show you went to (THO-823, `POST
 /wishlists/:id/attendance/:concertId/move`) rewrites `concert_id` and the
 `concert` block in each of its sidecars and leaves the folder where it is, so a

@@ -40,9 +40,11 @@ const { TYPE_BYTES, readHeader } = require('./exifCapturedAt');
  * fixed, `cmov` accepted — because refusals are cached too. Without that, every
  * file a share link had already served would keep its old verdict, and every
  * refused one its 404, until someone emptied cache/public by hand. 2: what
- * follows a JPEG's last image, and IPTC in APP13 (THO-899).
+ * follows a JPEG's last image, and IPTC in APP13 (THO-899). 3: long blanked
+ * runs planned in FILL_CHUNK patches, each counted against MAX_PATCHES, so
+ * the files refused for too many patches changed (the bytes out did not).
  */
-const SCRUB_VERSION = 2;
+const SCRUB_VERSION = 3;
 
 function unscrubbable(reason) {
   const err = new Error(`cannot scrub: ${reason}`);
@@ -101,15 +103,43 @@ function put(ctx, at, bytes) {
   push(ctx, at, Buffer.from(bytes));
 }
 
-// The same for a run of one byte, checked before the run is allocated: a
-// region that is already blank costs nothing but the look.
+// A long run is planned as patches of at most FILL_CHUNK bytes, each a view of
+// one buffer of the run's byte that every run shares. A run used to be one
+// Buffer.alloc of its whole length, so an unknown trailer after a JPEG's last
+// image (planAfterImage) or a Samsung block (planSamsungTrailer) that was not
+// already blank cost a second copy of itself: up to 256 MB more heap for one
+// image of MAX_IMAGE_BYTES. 256 KiB keeps that worst case at a thousand
+// patches, far inside MAX_PATCHES, and the shared buffers at 256 KiB per byte
+// value. Nothing writes into a patch's bytes (they are copied or written out),
+// which is what makes sharing them safe.
+const FILL_CHUNK = 256 * 1024;
+const fillRuns = new Map();
+
+function fillRun(byte) {
+  let run = fillRuns.get(byte);
+  if (!run) {
+    run = Buffer.alloc(FILL_CHUNK, byte);
+    fillRuns.set(byte, run);
+  }
+  return run;
+}
+
+// The same for a run of one byte, checked before anything is planned: a chunk
+// that is already blank costs nothing but the look.
 function fill(ctx, at, length, byte) {
+  // Checked as a whole number first: a negative length planned nothing, and a
+  // NaN one passed every comparison below and charged NaN, which switched the
+  // byte budget off for the rest of the file. One Buffer.alloc refused both;
+  // the chunk loop does not.
+  if (!Number.isSafeInteger(length) || length < 0) throw unscrubbable('patch of no real length');
   if (at < 0 || at + length > ctx.buf.length) throw unscrubbable('patch outside the file');
   charge(ctx, length);
-  let i = at;
-  while (i < at + length && ctx.buf[i] === byte) i += 1;
-  if (i === at + length) return;
-  push(ctx, at, Buffer.alloc(length, byte));
+  for (let start = at; start < at + length; start += FILL_CHUNK) {
+    const end = Math.min(start + FILL_CHUNK, at + length);
+    let i = start;
+    while (i < end && ctx.buf[i] === byte) i += 1;
+    if (i < end) push(ctx, start, fillRun(byte).subarray(0, end - start));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,5 +1051,8 @@ function applyPatches(buf, patches) {
 }
 
 module.exports = {
-  planScrub, planScrubFile, planSource, applyPatches, crc32, XMP_UUID, SCRUB_VERSION,
+  planScrub, planScrubFile, planSource, applyPatches, crc32, XMP_UUID, SCRUB_VERSION, FILL_CHUNK,
+  // Exported for its own guard's test: no file this parses can hand it a
+  // length that is not a whole number today, and the guard is for the day one can.
+  fill,
 };

@@ -5,12 +5,33 @@ const auth = require('../../auth/verifyJWT');
 const roleCheck = require('../../middlewares/roleCheck');
 const { RECORD_NOT_FOUND } = require('../../utils/apiResponse');
 
+// Its own copy rather than bands.js's: a router importing another router's
+// internals would tie two unrelated files together over three lines.
+const CITY_WEATHER_BULK_CHUNK = 25;
+const cityWeatherChunks = (list, size) =>
+  Array.from({ length: Math.ceil(list.length / size) }, (_, i) => list.slice(i * size, (i + 1) * size));
+
 // GET /data/cities — list all cities with concert count
+//
+// Named columns, not an include (THO-967). An include sent every column, and
+// weather_monthly is a year of averages per city that the app downloaded on
+// every load and never drew. What is left is what someone reads:
+// python-crohn's sync_city_weather picks stale cities by latitude, longitude
+// and weather_updated_at, and concert-map's CityAdminList edits airport_iata
+// and reachable and shows the concert count.
 router.get('/', auth, async (req, res, next) => {
   try {
     const cities = await prisma.city.findMany({
       orderBy: [{ country: 'asc' }, { name: 'asc' }],
-      include: {
+      select: {
+        id: true,
+        name: true,
+        country: true,
+        latitude: true,
+        longitude: true,
+        reachable: true,
+        airport_iata: true,
+        weather_updated_at: true,
         _count: { select: { concerts: true } },
       },
     });
@@ -22,33 +43,38 @@ router.get('/', auth, async (req, res, next) => {
 
 // PATCH /data/cities/weather/bulk — update weather_monthly for multiple cities
 // Body: [{id, weather_monthly, weather_updated_at}]
-router.patch('/weather/bulk', auth, roleCheck(['SYSTEM']), async (req, res, next) => {
-  try {
-    const updates = req.body;
-    if (!Array.isArray(updates) || updates.length === 0) {
-      return res.status(400).json({ error: 'Body must be a non-empty array' });
-    }
-    // A string id reached Prisma and failed the request partway through.
-    if (!updates.every((item) => item && (item.id == null || Number.isInteger(item.id)))) {
-      return res.status(400).json({ error: 'Every entry needs an integer id' });
-    }
+router.patch('/weather/bulk', auth, roleCheck(['SYSTEM']), async (req, res) => {
+  if (!Array.isArray(req.body) || req.body.length === 0) {
+    return res.status(400).json({ error: 'Body must be a non-empty array' });
+  }
+  // A string id reached Prisma and failed the request partway through.
+  if (!req.body.every((item) => item && (item.id == null || Number.isInteger(item.id)))) {
+    return res.status(400).json({ error: 'Every entry needs an integer id' });
+  }
 
-    let updated = 0;
-    for (const item of updates) {
-      if (!item.id) continue;
-      await prisma.city.update({
+  // In chunks, each its own transaction of updateMany — the shape the concert
+  // and trip weather bulks already have (THO-967). One update per city in
+  // turn threw P2025 on a city merged away since the sync read the list, and
+  // the request answered 500 after every city before it had been written, so
+  // the sync could not tell what had landed. updateMany counts a missing row
+  // as nothing, and `updated` is what was really written.
+  const updates = req.body.filter((item) => item.id);
+  let updated = 0;
+  try {
+    for (const chunk of cityWeatherChunks(updates, CITY_WEATHER_BULK_CHUNK)) {
+      const results = await prisma.$transaction(chunk.map((item) => prisma.city.updateMany({
         where: { id: item.id },
         data: {
           weather_monthly:    item.weather_monthly    ?? undefined,
           weather_updated_at: item.weather_updated_at ? new Date(item.weather_updated_at) : undefined,
         },
-      });
-      updated++;
+      })));
+      updated += results.reduce((sum, r) => sum + (r?.count ?? 0), 0);
     }
-
     res.json({ updated });
-  } catch (err) {
-    next(err);
+  } catch (error) {
+    console.error(`Error storing city weather after ${updated}/${updates.length}:`, error);
+    return res.status(500).json({ error: 'Internal server error', updated });
   }
 });
 

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   listingUrl, isHot, checkDue, dueChecks, checkView, checkable, sanitizeVendors, checkedFields, readTime,
+  followCheckSummary,
 } from './followCheck.js';
 
 const NOW_THO779 = new Date('2026-11-11T09:00:00Z');
@@ -417,5 +418,60 @@ describe('when a read happened', () => {
     // now; a slow one is a wrong clock, not a slow tick, and is held at 15 min.
     expect(readTime('2026-11-11T09:20:00Z', postedAtTho907)).toEqual(postedAtTho907);
     expect(readTime('2026-11-11T07:00:00Z', postedAtTho907)).toEqual(new Date('2026-11-11T08:55:00Z'));
+  });
+});
+
+// #43: concert-map's admin line reads these from GET /data/concerts/health.
+describe('the checker summary for the admin health line', () => {
+  const summaryShowTho43 = (id, check, over = {}) => ({
+    id, name: `Show ${id}`, venue: 'Fållan', concert_date: new Date('2026-12-01T00:00:00Z'),
+    url: `https://www.songkick.com/concerts/${id}-x`, event_id: null, listing_check: check, ...over,
+  });
+
+  it('counts the shows it reads, when it last read one, and what it never has or is behind on', () => {
+    const summary = followCheckSummary([
+      summaryShowTho43(1, { checked_at: minutesAgoTho779(3), failures: 0 }),
+      summaryShowTho43(2, { checked_at: minutesAgoTho779(121), failures: 0 }),
+      summaryShowTho43(3, null),
+      summaryShowTho43(4, { checked_at: null, attempted_at: minutesAgoTho779(1), failures: 1 }),
+    ], NOW_THO779);
+    expect(summary).toEqual({
+      followed: 4,
+      last_checked_at: minutesAgoTho779(3).toISOString(),
+      never_checked: 2,
+      stale: 1,
+      failing: 0,
+      last_error: null,
+    });
+  });
+
+  it('names the most recently failing show with its reason, and counts one failure as no failure yet', () => {
+    const summary = followCheckSummary([
+      summaryShowTho43(1, { checked_at: null, attempted_at: minutesAgoTho779(30), failures: 2, last_error: 'timeout' }),
+      summaryShowTho43(2, {
+        checked_at: null, attempted_at: minutesAgoTho779(5), failures: 4, last_error: 'blocked: 403',
+      }, { name: null, venue: 'Sentrum' }),
+      summaryShowTho43(3, { checked_at: null, attempted_at: minutesAgoTho779(1), failures: 1, last_error: 'one-off' }),
+    ], NOW_THO779);
+    expect(summary.failing).toBe(2);
+    expect(summary.last_error).toEqual({ show: 'Sentrum 2026-12-01', error: 'blocked: 403' });
+  });
+
+  // A show with no listing is never read; counted, it would be "never read"
+  // for good. A past one is no longer read either.
+  it('leaves out followed shows it has no listing to read, and shows already past', () => {
+    const summary = followCheckSummary([
+      summaryShowTho43(1, null, { url: 'https://www.bandsintown.com/e/1' }),
+      summaryShowTho43(2, null, { concert_date: new Date('2026-11-01T00:00:00Z') }),
+      summaryShowTho43(3, null, { url: null, event_id: 'sk_42' }),
+    ], NOW_THO779);
+    expect(summary.followed).toBe(1);
+    expect(summary.never_checked).toBe(1);
+  });
+
+  it('reads as nothing followed when nobody follows anything', () => {
+    expect(followCheckSummary([], NOW_THO779)).toEqual({
+      followed: 0, last_checked_at: null, never_checked: 0, stale: 0, failing: 0, last_error: null,
+    });
   });
 });

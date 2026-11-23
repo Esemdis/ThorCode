@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const { isLoginToken, loginTokenRefusal } = require('./loginRevocation');
+const { tokenScopeVerdict } = require('./tokenScopes');
 
 const ROLES = new Set(['USER', 'ADMIN', 'SYSTEM']);
 
@@ -25,6 +26,10 @@ module.exports = function (req, res, next) {
   if (typeof decoded?.id !== 'string' || !decoded.id || !ROLES.has(decoded.role)) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
+  // A scoped token reaches only its own calls (auth/tokenScopes.js, THO-972).
+  const scope = tokenScopeVerdict(decoded, req.method, req.originalUrl);
+  if (scope === 'unknown') return res.status(401).json({ error: 'Invalid or expired token' });
+  if (scope === 'forbidden') return res.status(403).json({ error: 'Forbidden: this token can only read travel-bag trips for wander' });
 
   // Service and other long-lived tokens never reach the database here, so
   // python-crohn and wander keep working whatever happens to the password

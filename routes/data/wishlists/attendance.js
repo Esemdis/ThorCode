@@ -17,6 +17,7 @@ const { storesRealInstant } = require("../../../utils/ics");
 const { conflict } = require("../../../utils/apiResponse");
 const { countMediaForAttendances } = require("../../../utils/mediaDetach");
 const { enrichConcertBands } = require("../../../utils/setlistEnrich");
+const { setlistSummary } = require("../../../utils/setlistSummary");
 const { upsertSetlistConcert } = require("../../../utils/setlistConcert");
 const { retargetSidecars, undoRetarget } = require("../../../utils/mediaRetarget");
 const { acquire } = require("../../../utils/serialQueue");
@@ -146,7 +147,14 @@ router.get(
               id: b.band_rel.id,
               name: b.band_rel.name,
               tier: bandTierMap.get(b.band_rel.id) ?? null,
-              setlist: b.setlist ?? null,
+              // The whole history is read on every app load, and its cards
+              // open with the setlist closed, so it says how many songs there
+              // are and where the set is on setlist.fm, and a card fetches the
+              // songs from /attendance/setlists when it is opened (THO-967).
+              // One band's list (?band_id=) is short and draws the songs, so
+              // it keeps them.
+              ...setlistSummary(b.setlist),
+              ...(filterBandId ? { setlist: b.setlist ?? null } : {}),
               // On the bill and still listed, but not seen: every count of
               // who you have seen leaves it out.
               missed: missed.has(b.band_rel.id),
@@ -158,6 +166,58 @@ router.get(
       res.json({ attendance: result });
     } catch (error) {
       console.error("Error fetching attendance:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// The most concert ids one setlists read takes. A card is one show, or a
+// festival's days folded into one card; fifty is far past any real festival
+// and keeps a crafted request from asking for the whole history at once.
+const SETLISTS_MAX_CONCERTS = 50;
+
+// GET /wishlists/:id/attendance/setlists?concert_ids=1,2 — one card's setlists
+//
+// What the attendance list no longer carries (THO-967): the songs, for the
+// card being opened. Only shows this wishlist went to and bands on it, the
+// same bill entries the list itself shows; a band with no setlist is left out.
+router.get(
+  "/wishlists/:id/attendance/setlists",
+  [auth, roleCheck(["ADMIN", "USER"]), param("id").isInt().withMessage("Wishlist ID must be an integer")],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: "Validation failed", details: errors.array() });
+
+      const raw = typeof req.query.concert_ids === "string" ? req.query.concert_ids.split(",") : [];
+      // Digits only: parseInt would read "2.5" as 2 and "3abc" as 3, and
+      // answer for a show nobody asked about.
+      const concertIds = raw.every((id) => /^\d+$/.test(id)) ? [...new Set(raw.map(Number))] : [];
+      if (concertIds.length === 0 || concertIds.length > SETLISTS_MAX_CONCERTS || !concertIds.every(Number.isSafeInteger)) {
+        return res.status(400).json({ error: `concert_ids must be 1 to ${SETLISTS_MAX_CONCERTS} whole numbers, comma-separated` });
+      }
+
+      const wishlist = await ownWishlist(req, res, {
+        include: { bands: { select: { band_id: true } } },
+      });
+      if (!wishlist) return;
+
+      const refs = await prisma.concertBandReference.findMany({
+        where: {
+          concert: { in: concertIds },
+          band: { in: wishlist.bands.map((b) => b.band_id) },
+          concert_rel: { attendances: { some: { wishlist_id: wishlist.id } } },
+        },
+        select: { concert: true, band: true, setlist: true },
+      });
+
+      res.json({
+        setlists: refs
+          .filter((r) => r.setlist != null)
+          .map((r) => ({ concert_id: r.concert, band_id: r.band, setlist: r.setlist })),
+      });
+    } catch (error) {
+      console.error("Error fetching attendance setlists:", error);
       return res.status(500).json({ error: "Internal server error" });
     }
   }
@@ -636,11 +696,34 @@ router.post(
         // the old concert while the row names the new one would send the
         // files back on the next rebuild, so both go back as they were.
         console.error("[move] could not rewrite a sidecar:", error);
-        await undoRetarget(error.undo ?? []);
-        await prisma.concertAttendance.updateMany({
-          where: { id: attendance.id, concert_id: target.id },
-          data: { concert_id: fromConcertId },
-        });
+        const stuck = await undoRetarget(error.undo ?? []);
+        // Only from the concert this request moved it to: a revert that
+        // matched on the id alone would undo whatever has moved it since.
+        let rowError = null;
+        try {
+          const { count } = await prisma.concertAttendance.updateMany({
+            where: { id: attendance.id, concert_id: target.id },
+            data: { concert_id: fromConcertId },
+          });
+          if (count !== 1) rowError = new Error("the attendance no longer names the concert it was moved to");
+        } catch (revertError) {
+          rowError = revertError;
+        }
+        if (stuck.length || rowError) {
+          // Disk and Postgres may now disagree, which a rebuild turns into
+          // files under the wrong show. One line with everything needed to
+          // put it right by hand, and an answer that does not say "nothing
+          // was changed" when something was.
+          console.error(
+            `[move] RESTORE FAILED for attendance ${attendance.id} (concert ${fromConcertId} -> ${target.id}):`
+              + ` row ${rowError ? "NOT restored" : "restored"};`
+              + ` sidecars not restored: ${stuck.map((s) => s.absDir).join(", ") || "none"}`,
+            [...stuck.map((s) => s.error), ...(rowError ? [rowError] : [])],
+          );
+          return res.status(500).json({
+            error: "Could not update the photo folders, and could not put everything back as it was. Some photos may show under the wrong date until this is fixed.",
+          });
+        }
         return res.status(500).json({ error: "Could not update the photo folders; nothing was changed" });
       }
 

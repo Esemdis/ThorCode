@@ -40,15 +40,43 @@ const {
 } = require('../utils/accountDeletion');
 const { REGISTRATION_CLOSED_MESSAGE } = require('../utils/accounts');
 
-// Wrong passwords, per IP: ten per quarter hour. Successful sign-ins do not
-// count. Login and register used to share one limiter at rateLimiter's default
-// of ten a minute — 14,400 guesses a day from one address — under a comment
-// promising five per fifteen minutes.
+const LOGIN_LIMIT_MESSAGE = 'Too many failed sign-ins. Please wait a few minutes and try again.';
+
+// Wrong passwords, per IP (an IPv6 /64, see utils/clientIp.js): ten per
+// quarter hour. Successful sign-ins do not count. Login and register used to
+// share one limiter at rateLimiter's default of ten a minute — 14,400 guesses
+// a day from one address — under a comment promising five per fifteen
+// minutes. routes/users.loginLimit.test.js pins these numbers.
 const loginLimit = rateLimiter({
-  message: 'Too many failed sign-ins. Please wait a few minutes and try again.',
+  message: LOGIN_LIMIT_MESSAGE,
   windowMs: 15 * 60 * 1000,
   max: 10,
   skipSuccessfulRequests: true,
+});
+
+// Wrong passwords, per account, whichever IPs they come from (THO-975): a
+// per-IP budget alone let anyone with a few hundred addresses guess at one
+// account without ever being slowed. Keyed on the address as typed, never on
+// the account found, so a 429 is the same for an address with no account and
+// says nothing about which have one. Only a 401 is a guess: a 400 (a malformed
+// request) or a 500 is not charged. A correct password over budget is refused
+// too, or the 200 among the 429s would tell the guesser which one was right.
+// The cost: anyone who knows an address can keep its owner locked out with ten
+// guesses a quarter hour. Mounted after the body is parsed and normalised,
+// because multipart bodies are empty before upload.none().
+const loginAccountKey = (email) => `login:${normaliseEmail(email)}`;
+const accountLoginLimit = rateLimiter({
+  message: LOGIN_LIMIT_MESSAGE,
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => loginAccountKey(req.body?.email),
+  // Not an address: left to the validation's 400, which is never charged, and
+  // without this every blank email from every IP would share one bucket.
+  skip: (req) => !validateEmail(normaliseEmail(req.body?.email)),
+  skipSuccessfulRequests: true,
+  requestWasSuccessful: (req, res) => res.statusCode !== 401,
+  // The per-IP limiter's budget headers stay the ones the client sees.
+  standardHeaders: false,
 });
 
 // The profile both /me and the admin lookup return.
@@ -105,6 +133,7 @@ router.post(
   loginLimit,
   upload.none(),
   userValidation,
+  accountLoginLimit,
   async (req, res) => {
     try {
       const errors = validationResult(req);
@@ -128,6 +157,10 @@ router.post(
       if (!existingUser?.password_hash || !passwordCompare) {
         return res.status(401).json({ error: 'Invalid credentials' });
       }
+
+      // The owner got in, so the guesses before it were not an attack worth
+      // holding against the next sign-in. Same key string the limiter counts.
+      await accountLoginLimit.resetKey(loginAccountKey(email));
 
       const user = {
         id: existingUser.id,
@@ -304,7 +337,8 @@ const NO_CURRENT_PASSWORD =
   'This account has no password yet. Sign out and use "Forgot password?" to set one first.';
 
 // Wrong current passwords, per account, shared by every route that asks for
-// one: a stolen session must not get a separate budget of guesses from each. Per account
+// one (the email change, the password change, deleting the account): a stolen
+// session must not get a separate budget of guesses from each. Per account
 // rather than per IP, because the guesser already holds that account's token
 // and can ask from anywhere.
 const currentPasswordLimit = rateLimiter({
@@ -316,9 +350,16 @@ const currentPasswordLimit = rateLimiter({
   // Only a wrong (or missing-on-the-account) current password is a guess, and
   // both answer 403. Counting every 400 and 500 as one, someone retrying a
   // stuck deletion, or a new password the rules refuse, was told "Too many
-  // wrong passwords" after giving the right one every time.
-  requestWasSuccessful: (req, res) => res.statusCode !== 403,
+  // wrong passwords" after giving the right one every time. The service
+  // account's refusal to be deleted is a 403 too, but it comes after the
+  // password was accepted, so it is no guess either: a route marks the
+  // password accepted (acceptCurrentPassword) before any later 403.
+  requestWasSuccessful: (req, res) => res.statusCode !== 403 || res.locals.currentPasswordAccepted === true,
 });
+
+const acceptCurrentPassword = (res) => {
+  res.locals.currentPasswordAccepted = true;
+};
 
 /**
  * Why `given` does not prove the caller knows this account's password, or
@@ -760,6 +801,7 @@ router.patch(
 
       const refusal = await currentPasswordRefusal(user, currentPassword);
       if (refusal) return response.forbidden(res, refusal);
+      acceptCurrentPassword(res);
       // Someone rotating a leaked password who types the old one again would
       // otherwise be told it changed when nothing did.
       if (await bcrypt.compare(newPassword, user.password_hash)) {
@@ -801,6 +843,21 @@ router.patch(
 );
 
 /**
+ * Whether the account is gone, asked after a deletion's rows failed with
+ * P2025. Only a clear "no row" counts: if the question itself fails, the
+ * person must still hear that their photos went and a retry finishes it,
+ * not the catch-all's "Internal server error" that reads as nothing done.
+ */
+async function accountGoneAfterDeletion(userId) {
+  try {
+    return !(await prisma.user.findUnique({ where: { id: userId }, select: { id: true } }));
+  } catch (error) {
+    console.error('Error checking whether a deleted account is gone:', error);
+    return false;
+  }
+}
+
+/**
  * DELETE /users/me
  * Deletes the caller's account and everything it owns: concerts (wishlist,
  * attendance, follows, subscriptions, reviews, share links), the photos and
@@ -828,6 +885,7 @@ router.delete('/me', auth, currentPasswordLimit, upload.none(), async (req, res)
 
     const wrong = await currentPasswordRefusal(user, currentPassword);
     if (wrong) return response.forbidden(res, wrong);
+    acceptCurrentPassword(res);
 
     const adminCount = user.role === 'ADMIN' ? await prisma.user.count({ where: { role: 'ADMIN' } }) : 0;
     const refusal = accountDeletionRefusal(user, adminCount);
@@ -854,7 +912,7 @@ router.delete('/me', auth, currentPasswordLimit, upload.none(), async (req, res)
       // both pass the read above, the first commits, and the second's
       // user.delete finds no row. The account is gone, which is what was
       // asked, so that is a success, not a "try again" that then 404s.
-      if (error?.code === 'P2025' && !(await prisma.user.findUnique({ where: { id: user.id }, select: { id: true } }))) {
+      if (error?.code === 'P2025' && (await accountGoneAfterDeletion(user.id))) {
         forgetPasswordChange(user.id);
         return response.success(res, 200, {}, 'Account deleted');
       }

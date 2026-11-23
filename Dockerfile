@@ -56,6 +56,14 @@ RUN mkdir -p /doppler
 # still installs exactly what the lock says.
 ENV NODE_ENV=production
 
+# Turns the scheduled jobs in utils/cron.js on (THO-974). They no longer start
+# in every process, because dev and prd share one database and a workstation
+# was sending a second copy of every digest. NODE_ENV above would do it, but
+# the CMD runs under `doppler run`, which overwrites a variable that already
+# exists: a prd config that set NODE_ENV to anything else would silently stop
+# every job. Doppler holds no RUN_CRON, so this one reaches the process as set.
+ENV RUN_CRON=1
+
 EXPOSE 4000
 
 # Apply any pending migrations, then start.

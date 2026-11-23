@@ -65,6 +65,8 @@ const EXPECTED_ROUTES = [
   'POST /wishlists/:id/calendar-token [4]',
   'DELETE /wishlists/:id/calendar-token [4]',
   'GET /wishlists/:id/attendance [4]',
+  // THO-967: one card's setlists, read when it is opened.
+  'GET /wishlists/:id/attendance/setlists [4]',
   'POST /wishlists/:id/attendance [6]',
   'DELETE /wishlists/:id/attendance/:concertId [5]',
   'PUT /wishlists/:id/attendance/missed [8]',
@@ -133,6 +135,7 @@ describe('a wishlist that is someone else\'s', () => {
     ['get', '/wishlists/7/recent-concerts', user],
     ['get', '/wishlists/7/activity', user],
     ['get', '/wishlists/7/attendance', user],
+    ['get', '/wishlists/7/attendance/setlists?concert_ids=1', user],
     ['post', '/wishlists/7/attendance', user, { concert_id: 1 }],
     ['delete', '/wishlists/7/attendance/1', user],
     ['put', '/wishlists/7/attendance/missed', user, { attendance_ids: [1], band_id: 1, missed: true }],
@@ -355,6 +358,15 @@ describe('GET /wishlists/:id setlist placement', () => {
   const SETLIST = { songs: [{ name: 'Ghost of Perdition', tape: false }], tour: 'Tour' };
   const OPETH = { id: 1, name: 'Opeth', setlist: SETLIST, MBID: null, songkick_url: null, bandsintown_url: null };
 
+  // The route reads bands twice since THO-965: once for the concerts, then
+  // once more for the setlists of only the bands with a show in the response.
+  // Each wishlist band here stores SETLIST, which that second read hands back.
+  const setlistPlacementBandsTho965 = (concertRows) => {
+    prisma.band.findMany.mockImplementation(async ({ where, select }) => (select.setlist
+      ? where.id.in.map((id) => ({ id, setlist: SETLIST }))
+      : concertRows));
+  };
+
   const concert = (id, date, city = 'Stockholm', venue = 'Slakthuset') => ({
     concert_rel: {
       id, event_id: `e${id}`, name: null, city, country: 'SE',
@@ -374,7 +386,7 @@ describe('GET /wishlists/:id setlist placement', () => {
     });
     // Two concerts for the same band: the duplication this guards against only
     // shows up once a band plays more than one date.
-    prisma.band.findMany.mockResolvedValue([
+    setlistPlacementBandsTho965([
       // Different nights and cities, or deduplicateConcerts folds them into one
       // and the duplication under test cannot show up.
       { id: 1, name: 'Opeth', concerts: [
@@ -404,7 +416,7 @@ describe('GET /wishlists/:id setlist placement', () => {
       ],
     });
     // Band 2 is on the wishlist but plays nothing in range.
-    prisma.band.findMany.mockResolvedValue([
+    setlistPlacementBandsTho965([
       { id: 1, name: 'Opeth', concerts: [concert(10, '2026-09-10')] },
       { id: 2, name: 'Tool', concerts: [] },
     ]);
@@ -766,16 +778,45 @@ describe('POST /wishlists/notify subscription delivery', () => {
     });
   });
 
-  it('skips the concert read entirely when no concert ids came through', async () => {
-    // Older scraper builds post without them. The wishlist digest still has to
-    // work, and matching subscriptions is impossible without a resolved city.
+  it('posts nothing for an entry with no concert_id', async () => {
+    // Such an entry was once posted as it came, never read back and never
+    // recorded as delivered, so every call announced it again. python-crohn
+    // always sends concert_id, so it is not posted at all.
     const body = payload(9, 'Someone Elses Band');
     delete body.bands[0].concerts[0].concert_id;
 
+    const res = await post(body);
+
+    expect(res.status).toBe(200);
+    expect(prisma.concert.findMany).not.toHaveBeenCalled();
+    expect(received).toHaveLength(0);
+  });
+
+  it('announces a show with a 2,000-character link, and the shows after it', async () => {
+    // Discord answers 400 to the whole message when a field is over 1,024,
+    // and a 400 is settled for good: this show used to take the one after it.
+    const longUrl = 'https://x.example/' + 'a'.repeat(2000);
+    answer = (path, nth) => {
+      const embed = received.at(-1).body.embeds[0];
+      const tooLong = embed.title.length > 256
+        || embed.fields.some((f) => f.value.length > 1024 || f.name.length > 256);
+      return tooLong ? 400 : 204;
+    };
+    prisma.wishlist.findMany.mockResolvedValue([THEIRS()]);
+    prisma.concert.findMany.mockImplementation(async ({ where }) => where.id.in.map((id) => (
+      { ...CONCERT, id, url: id === 100 ? longUrl : null }
+    )));
+    const body = payload(9, 'Someone Elses Band', 100);
+    body.bands[0].concerts = [
+      { ...body.bands[0].concerts[0], concert_id: 100, url: longUrl },
+      { ...body.bands[0].concerts[0], concert_id: 101 },
+    ];
+
     await post(body);
 
-    expect(prisma.concert.findMany).not.toHaveBeenCalled();
-    expect(received.filter((r) => r.path === '/theirs')).toHaveLength(1);
+    const recorded = prisma.concertDelivery.createMany.mock.calls.flatMap(([arg]) => arg.data);
+    expect(recorded.map((d) => d.concert_id).sort()).toEqual([100, 101]);
+    expect(JSON.stringify(received.map((r) => r.body))).not.toContain('a'.repeat(100));
   });
 });
 
@@ -897,6 +938,109 @@ describe('GET /wishlists/:id/attendance', () => {
         missed_bands: { none: { band_id: 5 } },
       }),
     }));
+  });
+});
+
+describe('GET /wishlists/:id/attendance without the songs (THO-967)', () => {
+  const setlistTho967 = {
+    url: 'https://www.setlist.fm/setlist/gojira/2026/vega-63de4613.html',
+    songs: [{ name: 'Intro', tape: true }, { name: 'Stranded' }, { name: 'Amazonia', tape: false }],
+  };
+  const attendanceWithSetlistTho967 = () => ({
+    id: 1,
+    created_at: new Date('2026-01-01'),
+    missed_bands: [],
+    concert_rel: {
+      id: 10, event_id: 'e1', name: null, venue: 'Vega', city: 'Copenhagen', country: 'DK',
+      concert_date: new Date('2026-01-01'), url: null, festival: false, metadata: null,
+      source: 'songkick', latitude: null, longitude: null, on_sale: false, sold_out: false,
+      ticket_sale_start: null, price_min: null, price_max: null, price_currency: null, weather: null,
+      bands: [
+        { setlist: setlistTho967, band_rel: { id: 1, name: 'Gojira' } },
+        { setlist: null, band_rel: { id: 2, name: 'Mastodon' } },
+      ],
+    },
+  });
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [{ band_id: 1, tier: 'LOVE' }, { band_id: 2, tier: 'LIKE' }] });
+    prisma.concertMedia.groupBy.mockResolvedValue([]);
+  });
+
+  it('leaves each band\'s setlist songs out of the full list and says how many there are', async () => {
+    // The app reads this list on every load, and it carried every song of
+    // every set in the history for cards whose setlists start closed.
+    prisma.concertAttendance.findMany.mockResolvedValue([attendanceWithSetlistTho967()]);
+
+    const res = await request(app).get('/wishlists/7/attendance').set(...authHeader({ id: 'user-1' }));
+
+    expect(res.status).toBe(200);
+    const [gojira, mastodon] = res.body.attendance[0].concert.participating_bands;
+    expect(gojira).not.toHaveProperty('setlist');
+    // Tape is not a song the band played: two, not three.
+    expect(gojira).toMatchObject({ id: 1, setlist_songs: 2, setlist_url: setlistTho967.url });
+    expect(mastodon).not.toHaveProperty('setlist');
+    expect(mastodon).toMatchObject({ id: 2, setlist_songs: 0, setlist_url: null });
+  });
+
+  it('keeps full setlists on one band\'s list', async () => {
+    // ?band_id= is the band page's own short list, which draws the songs open.
+    prisma.concertAttendance.findMany.mockResolvedValue([attendanceWithSetlistTho967()]);
+
+    const res = await request(app).get('/wishlists/7/attendance?band_id=1').set(...authHeader({ id: 'user-1' }));
+
+    const [gojira] = res.body.attendance[0].concert.participating_bands;
+    expect(gojira.setlist).toEqual(setlistTho967);
+    expect(gojira.setlist_songs).toBe(2);
+  });
+});
+
+describe('GET /wishlists/:id/attendance/setlists (THO-967)', () => {
+  const user = authHeader({ id: 'user-1' });
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [{ band_id: 1 }, { band_id: 2 }] });
+  });
+
+  it('answers a card\'s setlists only for shows on this wishlist', async () => {
+    const songsTho967 = { songs: [{ name: 'Stranded' }] };
+    prisma.concertBandReference.findMany.mockResolvedValue([
+      { concert: 10, band: 1, setlist: songsTho967 },
+      { concert: 11, band: 2, setlist: null },
+    ]);
+
+    const res = await request(app).get('/wishlists/7/attendance/setlists?concert_ids=10,11').set(...user);
+
+    expect(res.status).toBe(200);
+    // The fake does not filter, so the filter is read off the query: the
+    // shows asked for, only where this wishlist went, only its own bands.
+    expect(prisma.concertBandReference.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        concert: { in: [10, 11] },
+        band: { in: [1, 2] },
+        concert_rel: { attendances: { some: { wishlist_id: 7 } } },
+      },
+    }));
+    expect(res.body).toEqual({ setlists: [{ concert_id: 10, band_id: 1, setlist: songsTho967 }] });
+  });
+
+  it('refuses more than fifty concert ids', async () => {
+    const fiftyOneTho967 = Array.from({ length: 51 }, (_, i) => i + 1).join(',');
+
+    const res = await request(app).get(`/wishlists/7/attendance/setlists?concert_ids=${fiftyOneTho967}`).set(...user);
+
+    expect(res.status).toBe(400);
+    expect(prisma.concertBandReference.findMany).not.toHaveBeenCalled();
+  });
+
+  it('refuses a concert id that is not a whole number', async () => {
+    for (const ids of ['1,2.5', '1,abc', '', '1,,2', '-3']) {
+      const res = await request(app).get(`/wishlists/7/attendance/setlists?concert_ids=${ids}`).set(...user);
+      expect([ids, res.status]).toEqual([ids, 400]);
+    }
+    const missing = await request(app).get('/wishlists/7/attendance/setlists').set(...user);
+    expect(missing.status).toBe(400);
+    expect(prisma.concertBandReference.findMany).not.toHaveBeenCalled();
   });
 });
 
@@ -1420,6 +1564,7 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
   const setlistFm = createRequire(import.meta.url)('../../utils/setlistFm.js');
   const axios = createRequire(import.meta.url)('axios');
   const { readFile, writeFile, mkdir, mkdtemp } = createRequire(import.meta.url)('node:fs/promises');
+  const { readFileSync, writeFileSync } = createRequire(import.meta.url)('node:fs');
   const { tmpdir } = createRequire(import.meta.url)('node:os');
   const { join } = createRequire(import.meta.url)('node:path');
 
@@ -1605,6 +1750,75 @@ describe('POST /wishlists/:id/attendance/:concertId/move (THO-823)', () => {
       { concert_id: THO823_RIGHT.id }, { concert_id: THO823_FROM },
     ]);
     expect(await tho823ReadSidecar('user-1/a')).toEqual(tho823OldSidecar([]));
+  });
+
+  // The revert is conditional on the concert this request moved the row to.
+  // Matched on the id alone, it would undo a move that landed in between and
+  // point the row back at a show neither request now means.
+  it('reverts the row only from the concert it moved it to', async () => {
+    await tho823WriteSidecar('user-1/a', { ...tho823OldSidecar([]), version: 99 });
+    prisma.concertMedia.findMany.mockResolvedValue([{ rel_path: 'user-1/a/IMG_1.jpg' }]);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await tho823Move({ concert_id: THO823_RIGHT.id });
+
+    expect(res.status).toBe(500);
+    expect(prisma.concertAttendance.updateMany.mock.calls[1][0]).toEqual({
+      where: { id: 42, concert_id: THO823_RIGHT.id }, data: { concert_id: THO823_FROM },
+    });
+    expect(res.body.error).toBe('Could not update the photo folders; nothing was changed');
+  });
+
+  // A revert that did not take (the row moved meanwhile, or the update threw)
+  // used to be logged as a plain sidecar error and answered "nothing was
+  // changed". Disk and Postgres may disagree then, so it is said out loud.
+  it('says so, and logs one line naming the attendance, when the revert does not take', async () => {
+    await tho823WriteSidecar('user-1/a', tho823OldSidecar([]));
+    await tho823WriteSidecar('user-1/b', { ...tho823OldSidecar([]), version: 99 });
+    prisma.concertMedia.findMany.mockResolvedValue([
+      { rel_path: 'user-1/a/IMG_1.jpg' }, { rel_path: 'user-1/b/IMG_2.jpg' },
+    ]);
+    prisma.concertAttendance.updateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+    const tho823RevertLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await tho823Move({ concert_id: THO823_RIGHT.id });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).not.toMatch(/nothing was changed/);
+    const restoreLines = tho823RevertLog.mock.calls.filter(([line]) => String(line).includes('RESTORE FAILED'));
+    expect(restoreLines).toHaveLength(1);
+    expect(restoreLines[0][0]).toMatch(/attendance 42 \(concert 99 -> 77\): row NOT restored/);
+  });
+
+  // The row going back is not enough: a photo folder whose sidecar still
+  // names the new concert hands its files to it on the next rebuild, so that
+  // answer must not say "nothing was changed" either.
+  it('says so when a photo folder will not go back even though the row did', async () => {
+    await tho823WriteSidecar('user-1/a', tho823OldSidecar([]));
+    await tho823WriteSidecar('user-1/b', { ...tho823OldSidecar([]), version: 99 });
+    prisma.concertMedia.findMany.mockResolvedValue([
+      { rel_path: 'user-1/a/IMG_1.jpg' }, { rel_path: 'user-1/b/IMG_2.jpg' },
+    ]);
+    // Once folder a has been rewritten and b has refused, a is made
+    // unreadable too, so its restore fails while the row's revert matches.
+    // Done synchronously inside the log of the rewrite failing, which the
+    // route writes just before it starts the undo.
+    const tho823StuckFolder = join(tho823Root, 'archive', 'user-1/a', 'concert-media.json');
+    const tho823RevertLog = vi.spyOn(console, 'error').mockImplementation((line) => {
+      if (String(line).includes('could not rewrite a sidecar')) {
+        const rewritten = JSON.parse(readFileSync(tho823StuckFolder, 'utf8'));
+        writeFileSync(tho823StuckFolder, JSON.stringify({ ...rewritten, version: 99 }));
+      }
+    });
+
+    const res = await tho823Move({ concert_id: THO823_RIGHT.id });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).not.toMatch(/nothing was changed/);
+    const restoreLine = tho823RevertLog.mock.calls.find(([line]) => String(line).includes('RESTORE FAILED'));
+    expect(restoreLine[0]).toMatch(/row restored; sidecars not restored: .*user-1\/a/);
   });
 
   // The THO-895 guard that refused this is gone: since #50, sharing the
@@ -1937,14 +2151,132 @@ describe('GET /wishlists/:id with a date window', () => {
     }
   });
 
-  it('asks for everything when no window is given', async () => {
+  const windowArgsTho965 = async (query) => {
     prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', bands: [] });
     prisma.band.findMany.mockResolvedValue([]);
     prisma.concertAttendance.findMany.mockResolvedValue([]);
+    const res = await request(app).get('/wishlists/7').query(query).set(...authHeader({ id: 'user-1' }));
+    expect(res.status).toBe(200);
+    return prisma.band.findMany.mock.calls[0][0].select.concerts.where.concert_rel;
+  };
 
+  it('honours a start date by itself, which used to read every show ever (THO-965)', async () => {
+    // Clearing the end field on the map ("from 1 June onwards") sent one bound,
+    // and one bound used to mean no window at all.
+    expect(await windowArgsTho965({ start_date: '2026-06-01' })).toEqual({
+      concert_date: { gte: new Date('2026-06-01T00:00:00.000Z') },
+    });
+  });
+
+  it('honours an end date by itself, closing at the end of that UTC day', async () => {
+    expect(await windowArgsTho965({ end_date: '2026-06-30' })).toEqual({
+      concert_date: { lte: new Date('2026-06-30T23:59:59.999Z') },
+    });
+  });
+
+  it('reads only upcoming shows from the start of yesterday in UTC when no window is given', async () => {
+    // Never the whole history. Yesterday, not today: concert_date is filed under
+    // its UTC day, and for anyone west of UTC today is still yesterday there.
+    // Only Date is faked, so supertest's timers keep running.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-14T10:00:00Z'));
+    try {
+      expect(await windowArgsTho965({})).toEqual({
+        concert_date: { gte: new Date('2026-11-13T00:00:00.000Z') },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('treats a bound that does not parse as absent', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-14T10:00:00Z'));
+    try {
+      expect(await windowArgsTho965({ start_date: 'not-a-date', end_date: '2026-06-30' })).toEqual({
+        concert_date: { lte: new Date('2026-06-30T23:59:59.999Z') },
+      });
+      vi.clearAllMocks();
+      // Both unparsable: the upcoming default, not everything.
+      expect(await windowArgsTho965({ start_date: 'soon', end_date: 'later' })).toEqual({
+        concert_date: { gte: new Date('2026-11-13T00:00:00.000Z') },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the countries alongside a single bound', async () => {
+    expect(await windowArgsTho965({ start_date: '2026-06-01', countries: 'SE,NO' })).toEqual({
+      concert_date: { gte: new Date('2026-06-01T00:00:00.000Z') },
+      country: { in: ['SE', 'NO'] },
+    });
+  });
+});
+
+describe('GET /wishlists/:id reads only what it sends (THO-965)', () => {
+  const SETLIST_THO965 = { songs: [{ name: 'Deliverance', tape: false }] };
+  const showTho965 = {
+    concert_rel: {
+      id: 10, name: null, city: 'Stockholm', country: 'SE', venue: 'Slakthuset',
+      concert_date: new Date('2026-12-01'), metadata: null, latitude: '59.3', longitude: '18.0',
+      on_sale: true, ticket_sale_start: null, price_min: null, price_max: null, price_currency: null,
+      sold_out: false, festival: false, source: 'songkick', url: null, weather: null, reachable: null,
+      city_rel: null, bands: [{ band_rel: { id: 1, name: 'Opeth' } }],
+    },
+  };
+
+  beforeEach(() => {
+    prisma.wishlist.findUnique.mockResolvedValue({
+      id: 7, user_id: 'user-1', name: 'My Wishlist',
+      bands: [
+        { band_id: 1, tier: 'LOVE', band_rel: { id: 1, name: 'Opeth', MBID: null, songkick_url: null, bandsintown_url: null } },
+        { band_id: 2, tier: 'LIKE', band_rel: { id: 2, name: 'Tool', MBID: null, songkick_url: null, bandsintown_url: null } },
+      ],
+    });
+    prisma.band.findMany.mockImplementation(async ({ select }) => (select.setlist
+      ? [{ id: 1, setlist: SETLIST_THO965 }]
+      : [{ id: 1, name: 'Opeth', concerts: [showTho965] }, { id: 2, name: 'Tool', concerts: [] }]));
+    prisma.concertAttendance.findMany.mockResolvedValue([]);
+  });
+
+  it('does not load every wishlist band\'s stored setlist with the wishlist', async () => {
     await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+    const { include } = prisma.wishlist.findUnique.mock.calls[0][0];
+    expect(include.bands.include.band_rel).toEqual({
+      select: { id: true, name: true, MBID: true, songkick_url: true, bandsintown_url: true },
+    });
+  });
 
-    expect(prisma.band.findMany.mock.calls[0][0].select.concerts).not.toHaveProperty('where');
+  it('does not read the per-show setlist off the concert links', async () => {
+    await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+    const { concerts } = prisma.band.findMany.mock.calls[0][0].select;
+    expect(concerts).not.toHaveProperty('include');
+    expect(Object.keys(concerts.select)).toEqual(['concert_rel']);
+    expect(concerts.select.concert_rel.select.bands).toEqual({
+      select: { band_rel: { select: { name: true, id: true } } },
+    });
+  });
+
+  it('fetches setlists only for the bands with a show, and still sends them on the band', async () => {
+    const res = await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+    expect(prisma.band.findMany).toHaveBeenCalledTimes(2);
+    expect(prisma.band.findMany.mock.calls[1][0]).toEqual({
+      where: { id: { in: [1] } },
+      select: { id: true, setlist: true },
+    });
+    const byId = new Map(res.body.bands.map((b) => [b.id, b]));
+    expect(byId.get(1).setlist).toEqual(SETLIST_THO965);
+    expect(byId.get(2).setlist).toBeNull();
+    expect(res.body.concerts[0].participating_bands).toEqual([{ id: 1, name: 'Opeth', tier: 'LOVE' }]);
+  });
+
+  it('skips the setlist read when no band has a show', async () => {
+    prisma.band.findMany.mockImplementation(async () => [{ id: 1, name: 'Opeth', concerts: [] }]);
+    const res = await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1' }));
+    expect(res.status).toBe(200);
+    expect(prisma.band.findMany).toHaveBeenCalledTimes(1);
+    expect(res.body.bands.every((b) => b.setlist === null)).toBe(true);
   });
 });
 
@@ -2507,5 +2839,117 @@ describe('POST /wishlists/:id/calendar-token', () => {
       where: { id: 7, calendar_token: null },
     }));
     expect(res.body.token).toBe('the-one-that-won');
+  });
+});
+
+describe('wishlist answers carry no credentials (THO-966)', () => {
+  // Every one of these answers used to be the raw row, so the Discord webhook
+  // (a URL anyone can post to as the bot) and the calendar token (which reads
+  // the feed without signing in) went to concert-map on each load, though it
+  // reads neither. The token is handed out only by the calendar-token routes.
+  const WEBHOOK_THO966 = 'https://discord.com/api/webhooks/1/secret-tho966';
+  const CAL_TOKEN_THO966 = 'cal-tho966';
+  const wishlistRowTho966 = (over = {}) => ({
+    id: 7, name: 'My Wishlist', user_id: 'user-1',
+    discord_webhook: WEBHOOK_THO966, calendar_token: CAL_TOKEN_THO966,
+    last_active_at: null, calendar_token_at: null, bands: [],
+    ...over,
+  });
+  const expectNoCredentialsTho966 = (body) => {
+    expect(body).not.toHaveProperty('discord_webhook');
+    expect(body).not.toHaveProperty('calendar_token');
+    expect(JSON.stringify(body)).not.toContain('secret-tho966');
+    expect(JSON.stringify(body)).not.toContain(CAL_TOKEN_THO966);
+  };
+
+  // POST and PUT spend the shared write limiter; see the sweep near the top.
+  // Reset before as well as after: the describes above this one spend it
+  // without handing it back, and these four writes came back 429.
+  const resetWriteLimitTho966 = async () => {
+    const { rateLimit } = createRequire(import.meta.url)('./wishlists/shared.js');
+    for (const ip of ['::ffff:127.0.0.1', '127.0.0.1', '::1']) await rateLimit.resetKey(ip);
+  };
+  beforeAll(resetWriteLimitTho966);
+  afterAll(resetWriteLimitTho966);
+
+  it('GET /wishlists says whether a webhook is set without sending it', async () => {
+    prisma.wishlist.findMany.mockResolvedValue([wishlistRowTho966()]);
+    const res = await request(app).get('/wishlists').set(...authHeader({ id: 'user-1' }));
+    expect(res.status).toBe(200);
+    expectNoCredentialsTho966(res.body[0]);
+    expect(res.body[0]).toMatchObject({ id: 7, name: 'My Wishlist', user_id: 'user-1', has_discord_webhook: true, bands: [] });
+    expect(res.body[0]).toHaveProperty('last_active_at');
+    expect(res.body[0]).toHaveProperty('calendar_token_at');
+  });
+
+  it('GET /wishlists reports no webhook as false', async () => {
+    prisma.wishlist.findMany.mockResolvedValue([wishlistRowTho966({ discord_webhook: null })]);
+    const res = await request(app).get('/wishlists').set(...authHeader({ id: 'user-1' }));
+    expect(res.body[0].has_discord_webhook).toBe(false);
+  });
+
+  it('GET /wishlists/:id does not hand an admin another user\'s webhook or id', async () => {
+    // An admin may read anyone's map (allowAdmin), which made this the one
+    // route that sent a webhook to someone who is not its owner.
+    prisma.wishlist.findUnique.mockResolvedValue(wishlistRowTho966({ user_id: 'user-2' }));
+    prisma.band.findMany.mockResolvedValue([]);
+    prisma.concertAttendance.findMany.mockResolvedValue([]);
+    const res = await request(app).get('/wishlists/7').set(...authHeader({ id: 'user-1', role: 'ADMIN' }));
+    expect(res.status).toBe(200);
+    expectNoCredentialsTho966(res.body);
+    expect(res.body).not.toHaveProperty('user_id');
+    expect(res.body).toMatchObject({ id: 7, name: 'My Wishlist', bands: [] });
+    expect(res.body).toHaveProperty('concerts');
+  });
+
+  const createTho966 = () => request(app).post('/wishlists').set(...authHeader({ id: 'user-1' }))
+    .send({ name: 'My Wishlist', discord_webhook: WEBHOOK_THO966 });
+
+  it('POST /wishlists does not echo the webhook of a new wishlist', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue(null);
+    prisma.wishlist.create.mockResolvedValue(wishlistRowTho966());
+    const res = await createTho966();
+    expect(res.status).toBe(201);
+    expectNoCredentialsTho966(res.body);
+    expect(res.body).toMatchObject({ id: 7, has_discord_webhook: true });
+  });
+
+  it('POST /wishlists does not send the webhook of the wishlist you already have', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue(wishlistRowTho966());
+    const res = await createTho966();
+    expect(res.status).toBe(200);
+    expectNoCredentialsTho966(res.body);
+    expect(res.body).toMatchObject({ id: 7, has_discord_webhook: true });
+  });
+
+  it('POST /wishlists does not send the winner\'s webhook to the loser of a race', async () => {
+    prisma.wishlist.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(wishlistRowTho966());
+    prisma.wishlist.create.mockRejectedValue(Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }));
+    const res = await createTho966();
+    expect(res.status).toBe(200);
+    expectNoCredentialsTho966(res.body);
+    expect(res.body).toMatchObject({ id: 7, has_discord_webhook: true });
+  });
+
+  it('PUT /wishlists/:id does not echo the webhook it just stored', async () => {
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1' });
+    prisma.wishlist.update.mockResolvedValue(wishlistRowTho966());
+    const res = await request(app).put('/wishlists/7').set(...authHeader({ id: 'user-1', role: 'ADMIN' }))
+      .send({ name: 'My Wishlist', discord_webhook: WEBHOOK_THO966 });
+    expect(res.status).toBe(200);
+    expectNoCredentialsTho966(res.body);
+    expect(res.body).toMatchObject({ id: 7, name: 'My Wishlist', user_id: 'user-1', has_discord_webhook: true, bands: [] });
+  });
+
+  it('still hands the owner the calendar token from its own route', async () => {
+    // The one place the token is meant to reach the client; pinned so the
+    // whitelist above is not copied onto it.
+    prisma.wishlist.findUnique.mockResolvedValue({ id: 7, user_id: 'user-1', calendar_token: CAL_TOKEN_THO966, calendar_token_at: null });
+    process.env.CALLBACK_URL = 'https://api.example.test';
+    const res = await request(app).get('/wishlists/7/calendar-token').set(...authHeader({ id: 'user-1' }));
+    expect(res.status).toBe(200);
+    expect(res.body.token).toBe(CAL_TOKEN_THO966);
   });
 });

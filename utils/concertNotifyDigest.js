@@ -21,9 +21,27 @@ const { billForConcert } = require("./concertBill");
 async function runNotificationDigest() {
   const now = new Date();
 
-  let run = await prisma.notificationDigestRun.findFirst();
+  // Oldest row first, so every process reads the same cursor even if a race
+  // on an empty table ever left two.
+  let run = await prisma.notificationDigestRun.findFirst({ orderBy: { id: "asc" } });
   if (!run) run = await prisma.notificationDigestRun.create({ data: { last_run_at: new Date(0) } });
   const since = run.last_run_at;
+
+  // Claim the window before reading or sending anything (THO-974). dev and prd
+  // share one database, and a workstation running this job at 09:00 beside the
+  // container meant both read the same cursor and both sent the same digest.
+  // The write only lands if the cursor still says what this run read, so of
+  // two runs exactly one gets count 1 and the other stops here. A crash after
+  // the claim loses this window's digests rather than sending them twice: the
+  // same trade the partial-failure rule below already makes.
+  const claim = await prisma.notificationDigestRun.updateMany({
+    where: { id: run.id, last_run_at: since },
+    data: { last_run_at: now },
+  });
+  if (claim.count === 0) {
+    console.log(`[notifyDigest] The window from ${since.toISOString()} was already taken by another run; sending nothing.`);
+    return { sent: 0, concerts: 0, failed: 0, skipped: true };
+  }
 
   // Created in the window is not the same as announced in it: a show imported
   // from setlist.fm history is created today with a date years back, and it
@@ -72,10 +90,8 @@ async function runNotificationDigest() {
   }
   const concerts = [...byConcert.values()];
 
-  if (concerts.length === 0) {
-    await prisma.notificationDigestRun.update({ where: { id: run.id }, data: { last_run_at: now } });
-    return { sent: 0, concerts: 0 };
-  }
+  // Nothing new: the claim has already moved the window on.
+  if (concerts.length === 0) return { sent: 0, concerts: 0 };
 
   const subscriptions = await prisma.notificationSubscription.findMany({
     include: { user_rel: { select: { id: true, email: true } } },
@@ -130,16 +146,20 @@ async function runNotificationDigest() {
   }
 
   // When nothing went out at all — a bad key, an unverified sender, the
-  // email service down — the window stays where it was, so the next run sends
-  // these concerts instead of skipping past them. A partial failure still
-  // moves on: those that did send must not be sent again, and there is no
-  // record of who is owed what.
+  // email service down — the window goes back to where it was, so the next run
+  // sends these concerts instead of skipping past them. Only while the cursor
+  // still holds this run's claim: a run that took the window since must not be
+  // undone. A partial failure keeps the claim and moves on: those that did
+  // send must not be sent again, and there is no record of who is owed what.
   if (attempted > 0 && sent === 0) {
+    await prisma.notificationDigestRun.updateMany({
+      where: { id: run.id, last_run_at: now },
+      data: { last_run_at: since },
+    });
     console.error(`[notifyDigest] No digest could be sent (${attempted} tried); keeping the window from ${since.toISOString()} for the next run.`);
     return { sent, concerts: concerts.length, failed: attempted };
   }
 
-  await prisma.notificationDigestRun.update({ where: { id: run.id }, data: { last_run_at: now } });
   return { sent, concerts: concerts.length, failed: attempted - sent };
 }
 

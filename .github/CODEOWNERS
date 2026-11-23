@@ -1,0 +1,9 @@
+# The workflows decide what reaches production: deploy.yml publishes :latest,
+# Watchtower pulls it, and the container migrates the production database as
+# it starts. A branch's pull request runs that branch's own copy of the file,
+# so a change to it is a change to who can deploy (THO-987). This only asks
+# for the owner's review once a branch rule on main requires code-owner
+# review; that rule is a GitHub setting, not a file here.
+/.github/workflows/ @Esemdis
+# And this file, so the line above cannot be dropped without the same review.
+/.github/CODEOWNERS @Esemdis

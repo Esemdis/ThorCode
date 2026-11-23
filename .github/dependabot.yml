@@ -1,0 +1,26 @@
+# Keeps the dependencies and the Actions current, so the audit step in
+# deploy.yml's test job (THO-973) has a bump waiting when it goes red. Minor and
+# patch npm updates come as one grouped PR, a major on its own; nothing is
+# merged automatically.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"

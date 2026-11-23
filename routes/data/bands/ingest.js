@@ -9,7 +9,7 @@
 const express = require('express');
 const router = express.Router();
 const { validationResult, body } = require('express-validator');
-const { checkDuplicateConcert, deduplicateByCoords, mergedFields, haversineKm, sourcesOf } = require('../../../utils/concertDedup');
+const { checkDuplicateConcert, deduplicateByCoords, mergedFields, haversineKm, sourcesOf, CANDIDATE_FIELDS } = require('../../../utils/concertDedup');
 const { cleanLineupJson, canonicalBandName } = require('../../../utils/lineupNames');
 const auth = require('../../../auth/verifyJWT');
 const roleCheck = require('../../../middlewares/roleCheck');
@@ -17,12 +17,20 @@ const prisma = require('../../../prisma/client');
 const { logActivity } = require('../../../utils/activityLog');
 const { storedCity } = require('../../../utils/cityMatch');
 const { venueId } = require('../../../utils/venueMatch');
+const { loadBulkCandidates } = require('../../../utils/bulkCandidates');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Two positions further apart than this are two places, not one venue under
 // two names. Bandsintown files a festival's acts under the grounds and under
 // each stage, all at one spot.
 const VENUE_MOVE_KM = 1;
+
+// The advisory lock every /bulk transaction takes before it reads anything
+// (THO-968). One key for all of them, not one per band: python-crohn syncs
+// bands two at a time, and two bands sharing a bill would each hold their own
+// lock and insert the same show side by side. Any other advisory lock in this
+// codebase must use another number.
+const BULK_INGEST_LOCK_KEY = 968_000_001;
 
 /**
  * What changed about a show the scrapers already sent, when it has moved.
@@ -90,6 +98,20 @@ router.post(
       const deduplicatedConcerts = deduplicateByCoords(concerts);
 
       const result = await prisma.$transaction(async (tx) => {
+        // First, before the band snapshot and the candidate read (THO-968).
+        // Two overlapping /bulk calls each checked for duplicates before the
+        // other had committed, so both inserted the same show: adding a band
+        // starts its sync while the scheduled one may be running. The second
+        // now waits for the first to commit or roll back, which releases the
+        // lock, and then reads what the first wrote. It waits rather than being
+        // turned away, but no longer than lock_timeout, kept under the 60 s
+        // transaction limit below so a stuck wait ends in this transaction's
+        // own error and a 500, as a timeout already did. SET LOCAL ends with
+        // the transaction. $executeRaw because pg_advisory_xact_lock returns
+        // void, which $queryRaw cannot deserialize.
+        await tx.$executeRaw`SET LOCAL lock_timeout = '45s'`;
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${BULK_INGEST_LOCK_KEY}::bigint)`;
+
         const insertedConcerts = [];
         const updatedConcerts = [];
         const duplicateConcerts = [];
@@ -103,11 +125,20 @@ router.post(
         // bands, so one snapshot holds for the whole request.
         // Oldest first: where production holds two rows for one canonical name,
         // the first-seen one below must always be the same one.
-        const allBands = await tx.band.findMany({ select: { id: true, name: true }, orderBy: { id: 'asc' } });
+        // The same snapshot resolves each show's band_id and ticketmaster_id,
+        // which were one findUnique or findFirst per band per show (THO-968).
+        const allBands = await tx.band.findMany({
+          select: { id: true, name: true, ticketmaster_id: true },
+          orderBy: { id: 'asc' },
+        });
         const bandsByCanonical = new Map();
+        const bandsById = new Map();
+        const bandsByTicketmaster = new Map();
         for (const band of allBands) {
           const key = canonicalBandName(band.name);
           if (key && !bandsByCanonical.has(key)) bandsByCanonical.set(key, band.id);
+          bandsById.set(band.id, band);
+          if (band.ticketmaster_id) bandsByTicketmaster.set(band.ticketmaster_id, band);
         }
         const lineupBandIds = (json) => {
           try {
@@ -121,11 +152,22 @@ router.post(
           }
         };
 
+        // Every stored row any show below could be a duplicate of, read once
+        // (THO-968): see utils/bulkCandidates.js. Only shows that pass the
+        // loop's own checks reach the duplicate check, so only their windows
+        // are read.
+        const candidates = await loadBulkCandidates(
+          tx,
+          deduplicatedConcerts.filter((c) => c.country && c.venue && c.city && Array.isArray(c.bands) && c.bands.length > 0),
+          { bandName: (id) => bandsById.get(id)?.name ?? null },
+        );
+
         // One concert's worth of work. Returns what happened to it rather than
         // recording it, so the loop below can record it only once the concert's
         // savepoint has been released — a result pushed before a later
-        // statement failed would report a row that was rolled back.
-        const ingestOne = async (concert, i) => {
+        // statement failed would report a row that was rolled back. Its writes
+        // to the candidate rows go to `stage` for the same reason.
+        const ingestOne = async (concert, i, stage) => {
           // Scraped lineup names carry follower counts and profile suffixes
           // that stop them matching band.name. Clean once here so the two
           // auto-link lookups below and the row we store all see the same
@@ -141,13 +183,11 @@ router.post(
 
             if (existingByEventId) {
               // Resolve bands by band_id or ticketmaster_id
-              const dbBands = await Promise.all(
-                concert.bands.map((b) => {
-                  if (b.band_id) return tx.band.findUnique({ where: { id: b.band_id } });
-                  if (b.ticketmaster_id) return tx.band.findFirst({ where: { ticketmaster_id: b.ticketmaster_id } });
-                  return null;
-                }),
-              );
+              const dbBands = concert.bands.map((b) => {
+                if (b.band_id) return bandsById.get(b.band_id) ?? null;
+                if (b.ticketmaster_id) return bandsByTicketmaster.get(b.ticketmaster_id) ?? null;
+                return null;
+              });
               // Deduplicated: the same band can arrive twice — once by id, once
               // by Ticketmaster id — and a repeated (concert, band) pair is a
               // unique violation that used to abort the whole transaction.
@@ -207,6 +247,19 @@ router.post(
                     data: concertFieldUpdate,
                   }),
                 ].filter(Boolean));
+
+                // Mirrored into the candidates, which a later show in this
+                // batch is checked against. A row the read did not load but
+                // which has just moved into its windows is read back whole,
+                // bill and all, since a later show's own read would have
+                // found it there.
+                if (candidates.has(existingByEventId.id)) {
+                  stage.merge(existingByEventId.id, concertFieldUpdate);
+                  stage.link(existingByEventId.id, toLink);
+                } else if (concertFieldUpdate.concert_date && candidates.covers(concertFieldUpdate.concert_date)) {
+                  const row = await tx.concert.findUnique({ where: { id: existingByEventId.id }, select: CANDIDATE_FIELDS });
+                  if (row) stage.add(row);
+                }
                 return {
                   updated: {
                     index: i,
@@ -247,19 +300,26 @@ router.post(
           if (concert.bands.some((b) => !b.ticketmaster_id && !b.band_id)) {
             throw new Error(`Invalid band data at index ${i}: ticketmaster_id or band_id required`);
           }
-          const dbBands = await Promise.all(
-            concert.bands.map((b) => {
-              if (b.band_id) return tx.band.findUnique({ where: { id: b.band_id } });
-              return tx.band.findFirst({ where: { ticketmaster_id: b.ticketmaster_id } });
-            }),
-          );
+          const dbBands = concert.bands.map((b) => (b.band_id
+            ? bandsById.get(b.band_id)
+            : bandsByTicketmaster.get(b.ticketmaster_id)) ?? null);
           // Deduplicated for the same reason as above: one band listed twice is
           // one link, not a unique violation.
           const resolved = [...new Map(dbBands.filter(Boolean).map((b) => [b.id, b])).values()];
           const bandIds = resolved.map((b) => b.id);
           const bandNames = resolved.map((b) => b.name);
 
-          const { isDuplicate, existingConcert, linked, merged } = await checkDuplicateConcert({ concert, bandIds, bandNames, tx, notify });
+          const { isDuplicate, existingConcert, linked, merged, upgraded } = await checkDuplicateConcert({
+            concert, bandIds, bandNames, tx, notify, candidates: candidates.forShow(concert),
+          });
+          // Every write the check made, mirrored for the shows after this one.
+          // The festival flags are written whether or not this was a duplicate.
+          stage.markFestival(upgraded);
+          if (isDuplicate) {
+            stage.merge(existingConcert.id, merged);
+            stage.link(existingConcert.id, linked);
+            if (notify && linked.length > 0) stage.merge(existingConcert.id, { notify_pending: true });
+          }
 
           if (isDuplicate) {
             return {
@@ -383,6 +443,10 @@ router.post(
             });
           }
 
+          // A later show in this batch is checked against this one, as its own
+          // read used to find it.
+          stage.add(newConcert, [...bandIds, ...extraIds]);
+
           return {
             inserted: {
               index: i,
@@ -398,7 +462,8 @@ router.post(
           };
         };
 
-        // Must be sequential — each insert affects subsequent duplicate checks within the tx
+        // Must be sequential: each show's writes change what the next one is
+        // checked against, now in `candidates` rather than in a read per show.
         for (const [i, concert] of deduplicatedConcerts.entries()) {
           if (!concert.country || !concert.venue || !concert.city) {
             errors.push({ index: i, message: 'Concert must have country, venue, and city fields' });
@@ -420,9 +485,10 @@ router.post(
           // ROLLBACK TO keeps the savepoint, and a batch with many bad rows
           // would otherwise stack one open subtransaction per failure.
           await tx.$executeRaw`SAVEPOINT bulk_concert`;
+          const stage = candidates.stage();
           let outcome;
           try {
-            outcome = await ingestOne(concert, i);
+            outcome = await ingestOne(concert, i, stage);
             await tx.$executeRaw`RELEASE SAVEPOINT bulk_concert`;
           } catch (error) {
             await tx.$executeRaw`ROLLBACK TO SAVEPOINT bulk_concert`;
@@ -430,6 +496,9 @@ router.post(
             errors.push({ index: i, message: error.message });
             continue;
           }
+          // Only now that its rows are kept: a show rolled back above leaves
+          // its staged writes behind with it.
+          candidates.commit(stage);
 
           if (outcome.inserted) insertedConcerts.push(outcome.inserted);
           if (outcome.updated) updatedConcerts.push(outcome.updated);

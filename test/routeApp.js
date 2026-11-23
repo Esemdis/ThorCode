@@ -21,7 +21,10 @@ process.env.DATABASE_URL ||= 'postgresql://test:test@127.0.0.1:5432/test';
  */
 export function buildApp(router, mount = '/') {
   const app = express();
-  app.use(express.json());
+  // index.js's limit, not Express's 100 KB default: below it a route's own
+  // size checks (a 700,000-character trip photo, THO-981) were never reached,
+  // and the harness answered 413 where production answers the route's 400.
+  app.use(express.json({ limit: '10mb' }));
   app.use(mount, router);
   app.use((err, req, res, _next) => {
     const status = err.status ?? 500;

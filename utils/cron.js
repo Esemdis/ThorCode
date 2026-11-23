@@ -80,11 +80,50 @@ async function cleanupExpiredPasswordResets() {
   }
 }
 
-function startCronJobs() {
+/**
+ * Whether this process runs the scheduled jobs (THO-974).
+ *
+ * The dev and prd Doppler configs share one DATABASE_URL (see
+ * docs/concert-media-runbook.md), so a `npm run dev` left running on a
+ * workstation was a second copy of every job working on production rows: two
+ * 09:00 digests, two Monday recaps, ticket alerts twice. So the jobs run only
+ * in production, or where someone asked for them with RUN_CRON=1; RUN_CRON=0
+ * turns them off anywhere. Exact strings on purpose: a near-miss must not
+ * start them against the shared database.
+ *
+ * NODE_ENV alone is not trusted to mean production: the container starts
+ * under `doppler run`, which overwrites variables that already exist, so a prd
+ * config that set NODE_ENV to anything else would quietly stop every job. The
+ * Dockerfile sets RUN_CRON=1 for that reason.
+ */
+function cronEnabled(env = process.env) {
+  const nodeEnv = env.NODE_ENV ? env.NODE_ENV : "unset";
+  if (env.RUN_CRON === "1") return { on: true, reason: "RUN_CRON=1" };
+  if (env.RUN_CRON === "0") return { on: false, reason: `NODE_ENV=${nodeEnv}, RUN_CRON=0` };
+  if (env.NODE_ENV === "production") return { on: true, reason: "NODE_ENV=production" };
+  return { on: false, reason: `NODE_ENV=${nodeEnv}, RUN_CRON unset` };
+}
+
+// `env` and `schedule` are parameters so a test can start this without
+// touching process.env or node-cron's own export; index.js passes nothing.
+function startCronJobs({ env = process.env, schedule = (...args) => cron.schedule(...args) } = {}) {
+  const { on, reason } = cronEnabled(env);
+  if (!on) {
+    console.log(`[cron] Scheduled jobs are off (${reason}). Set RUN_CRON=1 to run them in this process.`);
+    return;
+  }
+  console.log(`[cron] Scheduled jobs are on (${reason}). Set RUN_CRON=0 to keep them off in this process.`);
+
   // Notification digest
-  cron.schedule(NOTIFICATION_DIGEST_CRON, async () => {
+  schedule(NOTIFICATION_DIGEST_CRON, async () => {
     try {
       const result = await runNotificationDigest();
+      // Another process claimed this window first (THO-974): not a failure,
+      // and nothing was sent or scanned here.
+      if (result.skipped) {
+        console.log("[cron] Notification digest: skipped, another process took this window.");
+        return;
+      }
       console.log(`[cron] Notification digest: sent to ${result.sent} user(s), ${result.failed ?? 0} failed, ${result.concerts} new concert(s) scanned.`);
     } catch (err) {
       console.error("[cron] Notification digest failed:", err);
@@ -92,7 +131,7 @@ function startCronJobs() {
   });
 
   // Ticket alerts for followed shows
-  cron.schedule(TICKET_ALERT_CRON, async () => {
+  schedule(TICKET_ALERT_CRON, async () => {
     try {
       const result = await runTicketAlerts();
       if (result.alerted || result.failed) {
@@ -104,13 +143,13 @@ function startCronJobs() {
   }, { noOverlap: true });
 
   // Cleanup expired email verifications - runs every hour
-  cron.schedule("0 * * * *", cleanupExpiredEmailVerifications);
-  cron.schedule("0 * * * *", cleanupExpiredPasswordResets);
+  schedule("0 * * * *", cleanupExpiredEmailVerifications);
+  schedule("0 * * * *", cleanupExpiredPasswordResets);
 
   // Give newly added bands their Spotify artist id, so the band overview has a
   // photo before anyone has opened them. Silent when there is nothing to do —
   // once the queue is empty this is a single count query.
-  cron.schedule(SPOTIFY_BACKFILL_CRON, async () => {
+  schedule(SPOTIFY_BACKFILL_CRON, async () => {
     try {
       const { searched, matched, remaining } = await backfillSpotifyIds({ limit: SPOTIFY_BACKFILL_LIMIT });
       if (searched > 0) {
@@ -131,7 +170,7 @@ function startCronJobs() {
   // are added by volunteers, not the band, so a miss at creation time is not
   // permanent — this is what actually closes those gaps without an admin
   // manually clicking refresh on every band that came up empty.
-  cron.schedule(SOURCE_URL_BACKFILL_CRON, async () => {
+  schedule(SOURCE_URL_BACKFILL_CRON, async () => {
     try {
       const { checked, updated } = await backfillSourceUrls({ limit: SOURCE_URL_BACKFILL_LIMIT });
       if (checked > 0) {
@@ -142,7 +181,7 @@ function startCronJobs() {
     }
   });
 
-  cron.schedule(WEEKLY_RECAP_CRON, async () => {
+  schedule(WEEKLY_RECAP_CRON, async () => {
     try {
       const { sent, failed, quiet } = await sendWeeklyRecaps();
       console.log(`[cron] Weekly recap: posted ${sent}, ${failed} failed, ${quiet} with nothing new.`);
@@ -151,7 +190,7 @@ function startCronJobs() {
     }
   });
 
-  cron.schedule(SETLIST_BACKFILL_CRON, async () => {
+  schedule(SETLIST_BACKFILL_CRON, async () => {
     try {
       const { checked, updated } = await backfillSetlists({ limit: SETLIST_BACKFILL_LIMIT });
       if (checked > 0) {
@@ -163,5 +202,5 @@ function startCronJobs() {
   });
 }
 
-module.exports = { startCronJobs, cleanupExpiredPasswordResets };
+module.exports = { startCronJobs, cronEnabled, cleanupExpiredPasswordResets };
 
