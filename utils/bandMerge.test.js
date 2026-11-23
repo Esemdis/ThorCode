@@ -219,9 +219,9 @@ describe('mergeBands', () => {
       bands: [tho999Source, tho999Target],
       subs: [
         { id: 70, user_id: 'u1', band_id: 1, city_id: null, tour_query: '', venue_query: null },
-        { id: 71, user_id: 'u1', band_id: 1, city_id: null, tour_query: 'a|b', venue_query: null },
+        { id: 71, user_id: 'u1', band_id: 1, city_id: null, tour_query: 'a|b', venue_query: 'c' },
         { id: 80, user_id: 'u1', band_id: 2, city_id: null, tour_query: null, venue_query: null },
-        { id: 81, user_id: 'u1', band_id: 2, city_id: null, tour_query: 'a', venue_query: 'b' },
+        { id: 81, user_id: 'u1', band_id: 2, city_id: null, tour_query: 'a', venue_query: 'b|c' },
       ],
     });
     await mergeBands(tx, 1, 2);
