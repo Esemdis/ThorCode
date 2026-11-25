@@ -29,6 +29,7 @@ model User {
   venue_reviews              VenueReview[]              @relation("UserVenueReviews")
   media_album_share_links    MediaAlbumShareLink[]      @relation("UserMediaAlbumShareLinks")
   password_reset             PasswordReset?             @relation("UserPasswordResets")
+  service_tokens             ServiceToken[]             @relation("UserServiceTokens")
 }
 
 model OAuth {
@@ -584,6 +585,23 @@ model PasswordReset {
   user_rel   User     @relation("UserPasswordResets", fields: [user_id], references: [id], onDelete: Cascade)
 
   @@index([expires_at])
+}
+
+// A token minted by scripts/generate-service-token.js (THO-1016). Its id is the
+// token's `jti`, so verifyJWT can refuse one withdrawn by
+// scripts/service-tokens.js without changing JWT_SECRET. The token itself is
+// never stored: it is signed after this row is written.
+model ServiceToken {
+  id           String    @id @default(uuid())
+  user_id      String
+  // The token's `scope` claim (`wander`), or null for a full session.
+  scope        String?
+  expires_at   DateTime
+  withdrawn_at DateTime?
+  created_at   DateTime  @default(now())
+  user_rel     User      @relation("UserServiceTokens", fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
 }
 
 enum Role {
