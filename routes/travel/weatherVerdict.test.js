@@ -7,6 +7,7 @@ import { buildApp, authHeader, installFakePrisma } from '../../test/routeApp.js'
 // timeout. The model is faked; what these tests read is what the route sends it.
 
 const create = vi.hoisted(() => vi.fn());
+const clientOptionsTho1060 = vi.hoisted(() => vi.fn());
 
 // The route is CommonJS and `require`s the SDK outside the graph vitest can intercept (as
 // installFakePrisma explains for the Prisma client), so the stand-in goes into `require.cache`
@@ -16,7 +17,7 @@ nodeRequire.cache[nodeRequire.resolve('@google/genai')] = {
   id: nodeRequire.resolve('@google/genai'),
   filename: nodeRequire.resolve('@google/genai'),
   loaded: true,
-  exports: { GoogleGenAI: class { constructor() { this.interactions = { create }; } } },
+  exports: { GoogleGenAI: class { constructor(options) { clientOptionsTho1060(options); this.interactions = { create }; } } },
 };
 
 let items = [];
@@ -38,6 +39,17 @@ const post = () => request(app).post('/travel/trips/1/weather-verdict').set(...a
 beforeEach(() => {
   process.env.GEMINI_API_KEY = 'test-key';
   items = [{ name: 'Rain shell', category: 'Clothing', status: 'PACKED', note: null, worn: false, gear_item_rel: null }];
+});
+
+describe('the packing verdict route and the SDK’s default API version', () => {
+  // @google/genai 3.0 moved the default from v1beta to v1 (the bump in #63), and the
+  // Interactions request path carries that version. 2.x called /v1beta/interactions, so the
+  // route names it rather than inheriting whichever default the SDK ships next.
+  it('asks for v1beta explicitly, as the 2.x SDK did by default', async () => {
+    create.mockResolvedValue({ output_text: JSON.stringify({ verdict: 'ok', summary: 's', concerns: [], suggestions: [] }) });
+    await post();
+    expect(clientOptionsTho1060).toHaveBeenCalledWith(expect.objectContaining({ apiKey: 'test-key', apiVersion: 'v1beta' }));
+  });
 });
 
 describe('the packing verdict route (THO-1007)', () => {

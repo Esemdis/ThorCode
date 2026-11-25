@@ -74,7 +74,7 @@ async function main() {
   rule(`calling ${MODEL}`);
   const started = Date.now();
 
-  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY, apiVersion: "v1beta" });
   const interaction = await ai.interactions.create({
     model: MODEL,
     system_instruction: SYSTEM_PROMPT,

@@ -14,7 +14,6 @@ const { paginationValidation } = require('../utils/validation/pagination');
 const { rateLimiter } = require('../utils/rateLimiter');
 const prisma = require('../prisma/client');
 const signJWT = require('../auth/signJWT');
-const { sendEmailVerificationCode } = require('../utils/mail');
 // Reached through the module object, not destructured, so a test can replace
 // one sender with vi.spyOn and the route sees the replacement.
 const mail = require('../utils/mail');
@@ -304,17 +303,68 @@ router.get(
   },
 );
 
+// --- Proving the current password (THO-810, THO-835) -----------------------
+
+const WRONG_CURRENT_PASSWORD = 'Your current password is not right';
+const NO_CURRENT_PASSWORD =
+  'This account has no password yet. Sign out and use "Forgot password?" to set one first.';
+
+// Wrong current passwords, per account, shared by every route that asks for
+// one (the email change, the password change, deleting the account): a stolen
+// session must not get a separate budget of guesses from each. Per account
+// rather than per IP, because the guesser already holds that account's token
+// and can ask from anywhere.
+const currentPasswordLimit = rateLimiter({
+  message: 'Too many wrong passwords. Please wait a few minutes and try again.',
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => `user:${req.user.id}`,
+  skipSuccessfulRequests: true,
+  // Only a wrong (or missing-on-the-account) current password is a guess, and
+  // both answer 403. Counting every 400 and 500 as one, someone retrying a
+  // stuck deletion, or a new password the rules refuse, was told "Too many
+  // wrong passwords" after giving the right one every time. The service
+  // account's refusal to be deleted is a 403 too, but it comes after the
+  // password was accepted, so it is no guess either: a route marks the
+  // password accepted (acceptCurrentPassword) before any later 403.
+  requestWasSuccessful: (req, res) => res.statusCode !== 403 || res.locals.currentPasswordAccepted === true,
+});
+
+const acceptCurrentPassword = (res) => {
+  res.locals.currentPasswordAccepted = true;
+};
+
+/**
+ * Why `given` does not prove the caller knows this account's password, or
+ * null when it does.
+ *
+ * Answered with 403, never 401: concert-map signs the user out on any 401,
+ * and a typo in a settings form must not end the session it was typed in.
+ */
+async function currentPasswordRefusal(user, given) {
+  if (!user.password_hash) return NO_CURRENT_PASSWORD;
+  return (await bcrypt.compare(given, user.password_hash)) ? null : WRONG_CURRENT_PASSWORD;
+}
+
+const readCurrentPassword = (req) => {
+  const value = req.body?.currentPassword;
+  return typeof value === 'string' && value ? value : null;
+};
+
 /**
  * POST /users/email/request-change
  * Initiates email change by sending verification code to new email
  * @body {string} newEmail - New email address
+ * @body {string} currentPassword - THO-835: a session alone is not enough
  * @returns {object} { success: true, message: string }
- * @throws {400} Invalid email format or email already in use
+ * @throws {400} Invalid email format, or no current password
  * @throws {401} Unauthorized
+ * @throws {403} The current password is wrong, or the account has none
+ * @throws {429} Too many requests, or too many wrong passwords
  * @throws {409} Email already in use or pending verification
  * @throws {500} Server error
  */
-router.post('/email/request-change', auth, emailRequestRateLimiter, upload.none(), async (req, res) => {
+router.post('/email/request-change', auth, emailRequestRateLimiter, currentPasswordLimit, upload.none(), async (req, res) => {
   try {
     const userId = req.user.id;
     // Validate email input
@@ -327,6 +377,21 @@ router.post('/email/request-change', auth, emailRequestRateLimiter, upload.none(
     if (!validateEmail(newEmail)) {
       return response.badRequest(res, 'Invalid email format');
     }
+
+    // A session alone moved the account to any address, and once a password
+    // reset existed a stolen token was a takeover: move the email, then reset
+    // the password at it (THO-835). Checked before the address is looked up,
+    // so a session without the password cannot ask which addresses are taken.
+    const currentPassword = readCurrentPassword(req);
+    if (!currentPassword) return response.badRequest(res, 'Current password is required');
+    const account = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, password_hash: true },
+    });
+    if (!account) return response.notFound(res, 'User not found');
+    const wrong = await currentPasswordRefusal(account, currentPassword);
+    if (wrong) return response.forbidden(res, wrong);
+    acceptCurrentPassword(res);
 
     // Check if email is already in use by another user, in any case
     const existingUser = await prisma.user.findFirst({
@@ -378,7 +443,7 @@ router.post('/email/request-change', auth, emailRequestRateLimiter, upload.none(
 
     // Send verification code to the new email
     try {
-      await sendEmailVerificationCode({ to: newEmail, code });
+      await mail.sendEmailVerificationCode({ to: newEmail, code });
     } catch (emailError) {
       // Cleanup on email send failure
       await prisma.emailVerification.delete({
@@ -434,6 +499,11 @@ router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.non
       return response.badRequest(res, 'Verification code has expired');
     }
 
+    // Read before the write, for the notice below: afterwards the row only
+    // knows the new address.
+    const before = await prisma.user.findUnique({ where: { id: userId }, select: { email: true } });
+    if (!before) return response.notFound(res, 'User not found');
+
     // Update the email and spend the code together. The address was checked
     // when the code was sent, fifteen minutes ago at most; someone may have
     // registered with it since, and the unique key answering that was a 500.
@@ -450,6 +520,18 @@ router.post('/email/verify-code', auth, emailVerificationRateLimiter, upload.non
     } catch (error) {
       if (error.code === UNIQUE_VIOLATION) return response.conflict(res, 'Email already in use');
       throw error;
+    }
+
+    // Tell the address the account just left (THO-835), so a change the
+    // owner did not make is heard of now, not at the next failed sign-in.
+    // The change is saved by now: a notice that fails is logged, never a 500
+    // that would read as "not changed" while the code is already spent.
+    if (before.email && before.email !== user.email) {
+      try {
+        await mail.sendEmailChangedNotice({ to: before.email, newEmail: user.email });
+      } catch (noticeError) {
+        console.error('Email changed, but the notice to the old address failed:', noticeError);
+      }
     }
 
     return response.success(res, 200, { user }, 'Email updated successfully');
@@ -624,51 +706,6 @@ router.post('/password/reset', resetLimit, upload.none(), passwordValidation, as
 });
 
 // --- Signed in: change the password, delete the account (THO-810) -----------
-
-const WRONG_CURRENT_PASSWORD = 'Your current password is not right';
-const NO_CURRENT_PASSWORD =
-  'This account has no password yet. Sign out and use "Forgot password?" to set one first.';
-
-// Wrong current passwords, per account, shared by both routes below: a stolen
-// session must not get a separate budget of guesses from each. Per account
-// rather than per IP, because the guesser already holds that account's token
-// and can ask from anywhere.
-const currentPasswordLimit = rateLimiter({
-  message: 'Too many wrong passwords. Please wait a few minutes and try again.',
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  keyGenerator: (req) => `user:${req.user.id}`,
-  skipSuccessfulRequests: true,
-  // Only a wrong (or missing-on-the-account) current password is a guess, and
-  // both answer 403. Counting every 400 and 500 as one, someone retrying a
-  // stuck deletion, or a new password the rules refuse, was told "Too many
-  // wrong passwords" after giving the right one every time. The service
-  // account's refusal to be deleted is a 403 too, but it comes after the
-  // password was accepted, so it is no guess either: a route marks the
-  // password accepted (acceptCurrentPassword) before any later 403.
-  requestWasSuccessful: (req, res) => res.statusCode !== 403 || res.locals.currentPasswordAccepted === true,
-});
-
-const acceptCurrentPassword = (res) => {
-  res.locals.currentPasswordAccepted = true;
-};
-
-/**
- * Why `given` does not prove the caller knows this account's password, or
- * null when it does.
- *
- * Answered with 403, never 401: concert-map signs the user out on any 401,
- * and a typo in a settings form must not end the session it was typed in.
- */
-async function currentPasswordRefusal(user, given) {
-  if (!user.password_hash) return NO_CURRENT_PASSWORD;
-  return (await bcrypt.compare(given, user.password_hash)) ? null : WRONG_CURRENT_PASSWORD;
-}
-
-const readCurrentPassword = (req) => {
-  const value = req.body?.currentPassword;
-  return typeof value === 'string' && value ? value : null;
-};
 
 /**
  * PATCH /users/me/password
