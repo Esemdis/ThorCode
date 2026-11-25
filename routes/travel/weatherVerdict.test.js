@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import { beforeEach, describe, it, expect, vi } from 'vitest';
+import express from 'express';
 import request from 'supertest';
 import { buildApp, authHeader, installFakePrisma } from '../../test/routeApp.js';
 
@@ -89,5 +90,49 @@ describe('the packing verdict route (THO-1007)', () => {
     expect(Array.from(input).length).toBeLessThan(80_000);
     // A note cannot begin a line of its own in a list whose lines are items.
     expect(input).not.toMatch(/^- 99x injected line/m);
+  });
+});
+
+describe('the packing verdict route (THO-1053)', () => {
+  // The route allows 6 calls a minute per IP and this block makes more than that from one test
+  // client, so each call comes from its own address (the app trusts X-Forwarded-For, as index.js does).
+  const appTho1053 = express();
+  appTho1053.set('trust proxy', true);
+  appTho1053.use(express.json());
+  appTho1053.use('/travel/trips/:tripId/weather-verdict', router);
+  let ipTho1053 = 0;
+  const postTho1053 = () => request(appTho1053).post('/travel/trips/1/weather-verdict')
+    .set(...authHeader()).set('X-Forwarded-For', `198.18.53.${++ipTho1053}`).send({});
+
+  // JSON that parses but is not an object is the provider's fault, not the caller's: a 400 would
+  // tell the person to fix a request that was fine. An array used to pass through to a 200 with an
+  // invented verdict, because normaliseVerdict reads fields off whatever it is given.
+  it.each(['null', '"x"', '3', '[]'])('answers 502, not a 400 or a 200, when the model returns %s', async (output) => {
+    create.mockResolvedValue({ output_text: output });
+    const res = await postTho1053();
+    expect(res.status).toBe(502);
+    expect(res.body.error).toBe('The packing verdict came back unreadable. Try again.');
+  });
+
+  it('still answers 400 when nothing is packed, because there is nothing to judge', async () => {
+    items = [];
+    const res = await postTho1053();
+    expect(res.status).toBe(400);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  // SDK 3.x continues an interrupted answer on its own; running out of that budget throws this,
+  // and it is a slow model like any other, not a server fault.
+  it('answers 504 when automatic continuation runs out', async () => {
+    create.mockRejectedValue(Object.assign(new Error('Automatic continuation was interrupted'), { name: 'ContinuationInterruptedError' }));
+    const res = await postTho1053();
+    expect(res.status).toBe(504);
+    expect(res.body.error).toMatch(/took too long/);
+  });
+
+  it('turns automatic continuation off for the model call', async () => {
+    create.mockResolvedValue({ output_text: JSON.stringify({ verdict: 'ok', summary: 's', concerns: [], suggestions: [] }) });
+    await postTho1053();
+    expect(create.mock.calls[0][0].automatic_continuation).toBe(false);
   });
 });
