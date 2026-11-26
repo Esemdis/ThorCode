@@ -100,6 +100,16 @@ describe('POST /travel/loadouts/:id/apply/:tripId', () => {
     expect(res.body.data.skipped).toBe(0);
   });
 
+  // travel-bag appends these rows as they come; without the gear a medicine
+  // container's fill list (THO-1062) stayed blank until a reload.
+  it('returns each new item with its gear, as the trip itself does', async () => {
+    await apply().expect(200);
+
+    for (const [args] of prisma.tripItem.create.mock.calls) {
+      expect(args.include).toEqual({ gear_item_rel: true });
+    }
+  });
+
   it('carries the entry\'s own worn flag and bag through', async () => {
     const res = await apply().expect(200);
 

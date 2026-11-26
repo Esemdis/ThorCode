@@ -33,6 +33,30 @@ const FLAGS = ['worn', 'essential', 'retired', 'price_irrelevant'];
 const CREATE_FLAGS = ['worn', 'price_irrelevant'];
 // Same ceiling as a trip item's per_day, which this is copied onto.
 const PER_DAY_MAX = 1000;
+// A medicine container's list (THO-1063): at most this many medicines, each
+// taken at most every this many days.
+const CONTENTS_MAX = 30;
+const EVERY_DAYS_MAX = 365;
+
+/**
+ * What a medicine container holds, as `[{ name, amount, every_days }]`, or
+ * undefined when it does not parse. Nothing sent means an empty list: Prisma
+ * refuses a plain null for a Json column, and [] reads the same to the app.
+ */
+function gearContents(value) {
+  if (value == null) return [];
+  if (!Array.isArray(value) || value.length > CONTENTS_MAX) return undefined;
+  const out = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') return undefined;
+    const name = text(entry.name, 100);
+    const amount = number(entry.amount, { min: 1, max: PER_DAY_MAX, integer: true });
+    const everyDays = entry.every_days == null ? 1 : number(entry.every_days, { min: 1, max: EVERY_DAYS_MAX, integer: true });
+    if (!name || amount == null || everyDays == null) return undefined;
+    out.push({ name, amount, every_days: everyDays });
+  }
+  return out;
+}
 
 function normaliseGearInput(body = {}, { partial = false } = {}) {
   const data = {};
@@ -112,6 +136,15 @@ function normaliseGearInput(body = {}, { partial = false } = {}) {
     const perDay = number(body.per_day, { min: 1, max: PER_DAY_MAX, integer: true });
     if (perDay === undefined) return { error: `per_day must be a whole number from 1 to ${PER_DAY_MAX}, or null` };
     data.per_day = perDay;
+  }
+
+  // Only set when sent, as per_day: a create without it leaves the column empty.
+  if (given('contents')) {
+    const contents = gearContents(body.contents);
+    if (contents === undefined) {
+      return { error: `contents must be a list of at most ${CONTENTS_MAX} medicines, each with a name, an amount from 1 to ${PER_DAY_MAX} and every_days from 1 to ${EVERY_DAYS_MAX}` };
+    }
+    data.contents = contents;
   }
 
   if (given('sort_order')) {
