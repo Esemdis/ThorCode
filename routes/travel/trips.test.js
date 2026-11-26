@@ -84,7 +84,7 @@ describe('POST /travel/trips/:id/duplicate', () => {
   it('copies the trip and its items in one write, bags included', async () => {
     prisma.trip.findFirst.mockResolvedValue({
       id: 5, name: 'Lisbon', destination: 'Lisbon', notes: null, tags: ['city'],
-      items: [{ name: 'Tent', category: 'Shelter', status: 'PACKED', note: null, url: null, sort_order: 0, gear_item_id: 3, bag_id: 4, worn: false }],
+      items: [{ name: 'Tent', category: 'Shelter', status: 'PACKED', note: null, url: null, sort_order: 0, gear_item_id: 3, bag_id: 4, worn: false, per_day: 2 }],
     });
 
     const res = await request(app).post('/5/duplicate').set(...authHeader({ id: 'user-1' }));
@@ -93,7 +93,7 @@ describe('POST /travel/trips/:id/duplicate', () => {
     expect(prisma.trip.create).toHaveBeenCalledTimes(1);
     const { data } = prisma.trip.create.mock.calls[0][0];
     expect(data.name).toBe('Copy of Lisbon');
-    expect(data.items.create).toEqual([expect.objectContaining({ gear_item_id: 3, bag_id: 4 })]);
+    expect(data.items.create).toEqual([expect.objectContaining({ gear_item_id: 3, bag_id: 4, per_day: 2 })]);
   });
 });
 

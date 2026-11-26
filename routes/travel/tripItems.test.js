@@ -256,3 +256,36 @@ describe('a trip item note of a megabyte (THO-981)', () => {
     expect(prisma.tripItem.update).not.toHaveBeenCalled();
   });
 });
+
+describe('a trip item\'s count per day (THO-1056)', () => {
+  const sendPerDayTho1056 = (method, path, body) => request(app())[method](path)
+    .set(...authHeader({ id: 'user-1' }))
+    .send(body);
+
+  it('saves a whole number on create and on edit', async () => {
+    prisma.tripItem.create = vi.fn(async ({ data }) => ({ id: 9, ...data }));
+
+    const created = await sendPerDayTho1056('post', '/travel/trips/1/items', { name: 'Pills', per_day: 2 });
+    expect(created.status).toBe(201);
+    expect(prisma.tripItem.create.mock.calls[0][0].data.per_day).toBe(2);
+
+    const edited = await sendPerDayTho1056('patch', '/travel/trips/1/items/9', { per_day: 3 });
+    expect(edited.status).toBe(200);
+    expect(prisma.tripItem.update.mock.calls[0][0].data.per_day).toBe(3);
+  });
+
+  it('clears with null, and leaves it alone on an edit that does not mention it', async () => {
+    await sendPerDayTho1056('patch', '/travel/trips/1/items/9', { per_day: null });
+    expect(prisma.tripItem.update.mock.calls[0][0].data).toEqual({ per_day: null });
+
+    await sendPerDayTho1056('patch', '/travel/trips/1/items/9', { name: 'Vitamins' });
+    expect(prisma.tripItem.update.mock.calls[1][0].data).not.toHaveProperty('per_day');
+  });
+
+  it.each([0, -1, 1.5, '2', 1001, true])('refuses %j with a 400', async (per_day) => {
+    const res = await sendPerDayTho1056('patch', '/travel/trips/1/items/9', { per_day });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('per_day');
+    expect(prisma.tripItem.update).not.toHaveBeenCalled();
+  });
+});

@@ -279,6 +279,7 @@ router.post("/:id/duplicate", param("id").isInt(), async (req, res) => {
             gear_item_id: item.gear_item_id,
             bag_id: item.bag_id,
             worn: item.worn,
+            per_day: item.per_day,
           })),
         },
       },

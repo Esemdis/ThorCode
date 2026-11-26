@@ -1,5 +1,7 @@
-import { describe, it, expect } from 'vitest';
-import { tokenScopeVerdict, serviceTokenClaims, WANDER_TOKEN_SCOPE } from './tokenScopes.js';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import {
+  tokenScopeVerdict, serviceTokenClaims, parseMintArgs, serviceTokenExpiry, WANDER_TOKEN_SCOPE,
+} from './tokenScopes.js';
 
 const wander972 = { id: 'user-1', role: 'USER', scope: WANDER_TOKEN_SCOPE };
 
@@ -61,18 +63,73 @@ describe('tokenScopeVerdict (THO-972)', () => {
 
 describe('serviceTokenClaims (THO-972)', () => {
   const userFor972 = (role) => ({ id: 'u-1', email: 'a@example.com', role });
+  // Every minted token carries these since THO-1016.
+  const lifetime1016 = { jti: '3f2b8c1e-9d4a-4e6b-8a7c-1b2c3d4e5f60', expiresAt: new Date('2027-11-25T12:00:00.750Z') };
+  const lifetimeClaims1016 = { jti: lifetime1016.jti, exp: Math.floor(Date.UTC(2027, 10, 25, 12) / 1000) };
 
   it('mints a wander token as a USER with the wander scope', () => {
-    expect(serviceTokenClaims(userFor972('USER'), { wander: true }))
-      .toEqual({ id: 'u-1', email: 'a@example.com', role: 'USER', scope: 'wander' });
+    expect(serviceTokenClaims(userFor972('USER'), { wander: true, ...lifetime1016 }))
+      .toEqual({ id: 'u-1', email: 'a@example.com', role: 'USER', scope: 'wander', ...lifetimeClaims1016 });
   });
 
   it('refuses a wander token for an ADMIN or SYSTEM account, whose role would outlive a demotion', () => {
-    expect(() => serviceTokenClaims(userFor972('ADMIN'), { wander: true })).toThrow(/USER/);
-    expect(() => serviceTokenClaims(userFor972('SYSTEM'), { wander: true })).toThrow(/USER/);
+    expect(() => serviceTokenClaims(userFor972('ADMIN'), { wander: true, ...lifetime1016 })).toThrow(/USER/);
+    expect(() => serviceTokenClaims(userFor972('SYSTEM'), { wander: true, ...lifetime1016 })).toThrow(/USER/);
   });
 
   it('mints an unflagged token with the account\'s role and no dead service claim', () => {
-    expect(serviceTokenClaims(userFor972('SYSTEM'))).toEqual({ id: 'u-1', email: 'a@example.com', role: 'SYSTEM' });
+    expect(serviceTokenClaims(userFor972('SYSTEM'), lifetime1016))
+      .toEqual({ id: 'u-1', email: 'a@example.com', role: 'SYSTEM', ...lifetimeClaims1016 });
+  });
+
+  // THO-1016: verifyJWT refuses a token with neither, so signing one would
+  // hand out a token that never works.
+  it('refuses to make claims without a jti or an expiry', () => {
+    expect(() => serviceTokenClaims(userFor972('SYSTEM'))).toThrow(/ServiceToken/);
+    expect(() => serviceTokenClaims(userFor972('SYSTEM'), { jti: lifetime1016.jti })).toThrow(/expiry/);
+    expect(() => serviceTokenClaims(userFor972('SYSTEM'), { jti: lifetime1016.jti, expiresAt: new Date('nope') })).toThrow(/expiry/);
+  });
+
+  it('puts exp in whole seconds, never after the row\'s expiry', () => {
+    const { exp } = serviceTokenClaims(userFor972('SYSTEM'), lifetime1016);
+    expect(Number.isInteger(exp)).toBe(true);
+    expect(exp * 1000).toBeLessThanOrEqual(lifetime1016.expiresAt.getTime());
+  });
+});
+
+describe('parseMintArgs (THO-1016)', () => {
+  it('defaults to a 365-day full-session token', () => {
+    expect(parseMintArgs(['Sync@Example.test'])).toEqual({ wander: false, days: 365, email: 'sync@example.test' });
+  });
+
+  it('reads --wander and --days in any order, in both spellings', () => {
+    expect(parseMintArgs(['--days', '90', '--wander', 'me@example.test'])).toEqual({ wander: true, days: 90, email: 'me@example.test' });
+    expect(parseMintArgs(['me@example.test', '--days=30'])).toEqual({ wander: false, days: 30, email: 'me@example.test' });
+  });
+
+  it.each([['0'], ['-3'], ['1.5'], ['abc'], ['1e3'], ['3651'], ['']])('refuses --days %s', (value) => {
+    expect(parseMintArgs(['--days', value, 'me@example.test']).error).toMatch(/--days/);
+  });
+
+  it('refuses --days with no value, rather than taking the email for one', () => {
+    expect(parseMintArgs(['me@example.test', '--days']).error).toMatch(/--days/);
+    expect(parseMintArgs(['--days', 'me@example.test']).error).toMatch(/--days/);
+  });
+
+  it('refuses no email, two emails and an unknown option', () => {
+    expect(parseMintArgs([]).error).toBeTruthy();
+    expect(parseMintArgs(['a@example.test', 'b@example.test']).error).toBeTruthy();
+    expect(parseMintArgs(['--forever', 'a@example.test']).error).toMatch(/--forever/);
+  });
+});
+
+describe('serviceTokenExpiry (THO-1016)', () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('is the given number of days from now', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-25T12:00:00Z'));
+    expect(serviceTokenExpiry(365).toISOString()).toBe('2027-11-25T12:00:00.000Z');
+    expect(serviceTokenExpiry(1).toISOString()).toBe('2026-11-26T12:00:00.000Z');
   });
 });

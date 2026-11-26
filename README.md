@@ -26,6 +26,7 @@ The API runs as one Node process against Postgres through Prisma. Two other serv
 
 Auth is a JWT in `Authorization: Bearer`. Roles are `USER`, `ADMIN` and `SYSTEM`. `SYSTEM` is the role of the machine user the sync service signs in as. `scripts/generate-service-token.js` mints its token. A password reset or change ends the account's login tokens (the ones `/users/login` hands out) but leaves service and other long-lived tokens working; `auth/loginRevocation.js` says why.
 With `--wander` it mints the token wander holds instead: a USER token with `scope: 'wander'` that `auth/verifyJWT.js` lets through only on wander's calls (`auth/tokenScopes.js`) and refuses with 403 everywhere else.
+Every minted token lasts 365 days (`--days N` for another length) and has a `ServiceToken` row whose id is the token's `jti`. `node scripts/service-tokens.js list [--all]` lists them, and `withdraw <jti>` ends one within a minute without changing `JWT_SECRET` or touching any other session (`auth/serviceTokens.js`). A token with neither `jti` nor `exp`, which is what the script minted before THO-1016, is refused: mint a new one.
 
 Nobody can sign themselves up. To make an account, including the first one on an empty database:
 

@@ -26,9 +26,12 @@ app.use(express.json());
 app.use('/users', usersRouter);
 app.use('/travel/trips', tripsRouter);
 
+// With an expiry and no `jti`, so verifyJWT neither refuses it (THO-1016) nor
+// looks it up: what is under test here is the scope, not the row.
 const wanderToken972 = jwt.sign(
   { id: 'user-1', email: 'me@example.test', role: 'USER', scope: 'wander' },
   process.env.JWT_SECRET,
+  { expiresIn: '1h' },
 );
 const wanderHeader972 = ['Authorization', `Bearer ${wanderToken972}`];
 

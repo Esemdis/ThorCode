@@ -33,9 +33,13 @@ export function buildApp(router, mount = '/') {
   return app;
 }
 
-/** A bearer header for a user with the given id and role. */
+/**
+ * A bearer header for a user with the given id and role. It expires, like a
+ * login token, because verifyJWT refuses a token with neither `exp` nor `jti`
+ * (THO-1016) and one with a `jti` would need a ServiceToken row.
+ */
 export function authHeader(user = {}) {
-  const token = jwt.sign({ id: 'user-1', role: 'USER', ...user }, process.env.JWT_SECRET);
+  const token = jwt.sign({ id: 'user-1', role: 'USER', ...user }, process.env.JWT_SECRET, { expiresIn: '1h' });
   return ['Authorization', `Bearer ${token}`];
 }
 
