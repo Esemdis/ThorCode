@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import { buildApp, authHeader, installFakePrisma } from '../../test/routeApp.js';
 
@@ -10,6 +10,8 @@ const prisma = installFakePrisma({
   loadout: { create: vi.fn(), update: vi.fn() },
   tripTodo: { create: vi.fn(), update: vi.fn() },
   trip: { findFirst: vi.fn() },
+  loadoutEntry: { deleteMany: vi.fn(), updateMany: vi.fn() },
+  tripItem: { deleteMany: vi.fn(), updateMany: vi.fn() },
   $transaction: vi.fn(async (ops) => Promise.all(ops)),
 });
 
@@ -68,6 +70,46 @@ describe('PATCH /travel/gear/:id', () => {
       where: { id: 3, user_id: 'user-1' }, data: { fill_level: 30 },
     });
     expect(prisma.gearItem.updateMany).not.toHaveBeenCalled();
+  });
+
+  describe('an upgrade (THO-1060)', () => {
+    const upgradeTentReplacement = { id: 9, name: 'Lighter tent', category: 'Shelter' };
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-26T15:00:00Z'));
+      prisma.gearItem.findFirst.mockResolvedValueOnce(upgradeTentReplacement);
+    });
+    afterEach(() => vi.useRealTimers());
+
+    it('swaps the replacement into loadouts and trips still ahead, with the retirement', async () => {
+      await request(gear).patch('/3').set(...user).send({ retired: true, replaced_by_id: 9 }).expect(200);
+
+      const mine = { user_id: 'user-1' };
+      // Today's trip is not "ahead": you are already leaving with the old one.
+      const ahead = { ...mine, OR: [{ start_date: null }, { start_date: { gt: new Date('2026-11-26T00:00:00Z') } }] };
+      expect(prisma.loadoutEntry.deleteMany).toHaveBeenCalledWith({
+        where: { gear_item_id: 3, loadout_rel: { ...mine, entries: { some: { gear_item_id: 9 } } } },
+      });
+      expect(prisma.loadoutEntry.updateMany).toHaveBeenCalledWith({ where: { gear_item_id: 3, loadout_rel: mine }, data: { gear_item_id: 9 } });
+      expect(prisma.loadoutEntry.updateMany).toHaveBeenCalledWith({ where: { bag_id: 3, loadout_rel: mine }, data: { bag_id: 9 } });
+      expect(prisma.tripItem.deleteMany).toHaveBeenCalledWith({
+        where: { gear_item_id: 3, trip_rel: { ...ahead, items: { some: { gear_item_id: 9 } } } },
+      });
+      expect(prisma.tripItem.updateMany).toHaveBeenCalledWith({
+        where: { gear_item_id: 3, trip_rel: ahead },
+        data: { gear_item_id: 9, name: 'Lighter tent', category: 'Shelter' },
+      });
+      expect(prisma.tripItem.updateMany).toHaveBeenCalledWith({ where: { bag_id: 3, trip_rel: ahead }, data: { bag_id: 9 } });
+      // One transaction: the retirement and all six carry-over writes.
+      expect(prisma.$transaction.mock.calls.at(-1)[0]).toHaveLength(7);
+    });
+
+    it('leaves loadouts and trips alone when the link is set without retiring', async () => {
+      await request(gear).patch('/3').set(...user).send({ replaced_by_id: 9 }).expect(200);
+
+      expect(prisma.loadoutEntry.updateMany).not.toHaveBeenCalled();
+      expect(prisma.tripItem.updateMany).not.toHaveBeenCalled();
+    });
   });
 
   it('answers a name that is not text with 400; .trim() on it was a 500', async () => {

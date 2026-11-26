@@ -8,6 +8,7 @@ const prisma = require("../../prisma/client");
 const { fail, paginate, sendList } = require("../../utils/apiResponse");
 const { recomputeGearReviewStatus } = require("../../utils/reviewStatus");
 const { normaliseGearInput } = require("../../utils/travel/gearInput");
+const { upgradeCarryOverOps } = require("../../utils/travel/upgradeCarryOver");
 
 router.use(auth);
 router.use(roleCheck(["USER", "ADMIN"]));
@@ -131,6 +132,7 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
   const { data, error } = normaliseGearInput(req.body, { partial: true });
   if (error) return res.status(400).json({ error });
   const { replaced_by_id } = req.body;
+  let replacement = null;
 
   try {
     if (replaced_by_id !== undefined) {
@@ -148,14 +150,20 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
         }
         // Must belong to the same user — otherwise this becomes a link an
         // attacker controls, and reads of their own gear leak the target's name/brand/model.
-        const replacement = await prisma.gearItem.findFirst({
+        replacement = await prisma.gearItem.findFirst({
           where: { id: replacedById, user_id: req.user.id },
-          select: { id: true },
+          select: { id: true, name: true, category: true },
         });
         if (!replacement) return res.status(400).json({ error: "replaced_by_id must reference your own gear item" });
         data.replaced_by_id = replacedById;
       }
     }
+
+    // An upgrade (retired, with its replacement) swaps the replacement into
+    // loadouts and trips still ahead, in the same transaction as the retirement.
+    const carryOver = replacement && data.retired === true
+      ? upgradeCarryOverOps(prisma, { userId: req.user.id, oldId: parseInt(req.params.id, 10), replacement, now: new Date() })
+      : [];
 
     const syncData = {};
     for (const f of SYNCED_FIELDS) if (f in data) syncData[f] = data[f];
@@ -177,13 +185,18 @@ router.patch("/:id", param("id").isInt(), async (req, res) => {
           where: { user_id: req.user.id, id: { not: existing.id }, name: existing.name, brand: existing.brand, model: existing.model },
           data: syncData,
         }),
+        ...carryOver,
       ]);
       item = updated;
     } else {
-      item = await prisma.gearItem.update({
-        where: { id: parseInt(req.params.id, 10), user_id: req.user.id },
-        data,
-      });
+      // Not this user's item: the update throws and the carry-over rolls back.
+      [item] = await prisma.$transaction([
+        prisma.gearItem.update({
+          where: { id: parseInt(req.params.id, 10), user_id: req.user.id },
+          data,
+        }),
+        ...carryOver,
+      ]);
     }
     if ("essential" in data) item = await recomputeGearReviewStatus(item.id);
     res.json({ data: item });
