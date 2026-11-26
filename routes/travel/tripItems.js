@@ -77,13 +77,16 @@ router.post("/", body("name").notEmpty().trim(), async (req, res) => {
     // Linking to gear reads the gear row anyway — for its worn flag — so the
     // ownership filter rides along on a query that has to happen regardless.
     let resolvedWorn = worn !== undefined ? Boolean(worn) : false;
+    let resolvedPerDay = per_day ?? null;
     if (gear_item_id) {
       const gear = await prisma.gearItem.findFirst({
         where: { id: parseInt(gear_item_id, 10), user_id: req.user.id },
-        select: { worn: true },
+        select: { worn: true, per_day: true },
       });
       if (!gear) return res.status(404).json({ error: "Gear item not found" });
       if (worn === undefined) resolvedWorn = gear.worn;
+      // A medicine's dose comes with it, as a loadout apply carries it.
+      if (per_day === undefined) resolvedPerDay = gear.per_day ?? null;
     }
 
     const item = await prisma.tripItem.create({
@@ -97,7 +100,7 @@ router.post("/", body("name").notEmpty().trim(), async (req, res) => {
         sort_order: sort_order ?? 0,
         gear_item_id: gear_item_id ? parseInt(gear_item_id, 10) : null,
         worn: resolvedWorn,
-        per_day: per_day ?? null,
+        per_day: resolvedPerDay,
       },
       include: { gear_item_rel: true },
     });

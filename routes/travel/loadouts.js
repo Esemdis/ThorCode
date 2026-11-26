@@ -28,7 +28,7 @@ router.get("/", async (req, res) => {
         entries: {
           include: {
             gear_item_rel: {
-              select: { id: true, name: true, brand: true, model: true, category: true, dimensions: true, photo: true },
+              select: { id: true, name: true, brand: true, model: true, category: true, dimensions: true, photo: true, per_day: true },
             },
           },
           orderBy: { created_at: "asc" },
@@ -233,6 +233,7 @@ router.post("/:id/apply/:tripId", [param("id").isInt(), param("tripId").isInt()]
           status: "BOUGHT",
           worn: entry.worn || false,
           bag_id: entry.bag_id || null,
+          per_day: entry.gear_item_rel.per_day ?? null,
         }));
 
       return {
@@ -277,7 +278,7 @@ router.post("/:id/duplicate", param("id").isInt(), async (req, res) => {
         entries: {
           include: {
             gear_item_rel: {
-              select: { id: true, name: true, brand: true, model: true, category: true, dimensions: true, photo: true },
+              select: { id: true, name: true, brand: true, model: true, category: true, dimensions: true, photo: true, per_day: true },
             },
           },
           orderBy: { created_at: "asc" },
