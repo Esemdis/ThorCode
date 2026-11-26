@@ -25,12 +25,18 @@ const INT32_MAX = 2147483647;
 const isId = (v) => (typeof v === "number" || (typeof v === "string" && /^\d+$/.test(v)))
   && Number.isInteger(Number(v)) && Number(v) >= 1 && Number(v) <= INT32_MAX;
 
-function numberProblem({ gear_item_id, sort_order }) {
+// A day's count is a small whole number; null clears it (THO-1056).
+const PER_DAY_MAX = 1000;
+
+function numberProblem({ gear_item_id, sort_order, per_day }) {
   if (gear_item_id && !isId(gear_item_id)) {
     return "gear_item_id must be a gear item id";
   }
   if (sort_order != null && !Number.isInteger(sort_order)) {
     return "sort_order must be a whole number";
+  }
+  if (per_day != null && !(Number.isInteger(per_day) && per_day >= 1 && per_day <= PER_DAY_MAX)) {
+    return `per_day must be a whole number from 1 to ${PER_DAY_MAX}, or null`;
   }
   return null;
 }
@@ -58,11 +64,11 @@ router.post("/", body("name").notEmpty().trim(), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-  const { name, category, status, note, url, sort_order, gear_item_id, worn } = req.body;
+  const { name, category, status, note, url, sort_order, gear_item_id, worn, per_day } = req.body;
   if (status && !VALID_STATUSES.includes(status)) {
     return res.status(400).json({ error: "Invalid status" });
   }
-  const problem = numberProblem({ gear_item_id, sort_order });
+  const problem = numberProblem({ gear_item_id, sort_order, per_day });
   if (problem) return res.status(400).json({ error: problem });
   const itemNote = text(note, NOTE_MAX_LENGTH);
   if (itemNote === undefined) return res.status(400).json({ error: NOTE_PROBLEM });
@@ -91,6 +97,7 @@ router.post("/", body("name").notEmpty().trim(), async (req, res) => {
         sort_order: sort_order ?? 0,
         gear_item_id: gear_item_id ? parseInt(gear_item_id, 10) : null,
         worn: resolvedWorn,
+        per_day: per_day ?? null,
       },
       include: { gear_item_rel: true },
     });
@@ -154,11 +161,11 @@ router.patch("/:itemId", [
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-  const { name, category, status, note, url, sort_order, gear_item_id, worn } = req.body;
+  const { name, category, status, note, url, sort_order, gear_item_id, worn, per_day } = req.body;
   if (status && !VALID_STATUSES.includes(status)) {
     return res.status(400).json({ error: "Invalid status" });
   }
-  const problem = numberProblem({ gear_item_id, sort_order });
+  const problem = numberProblem({ gear_item_id, sort_order, per_day });
   if (problem) return res.status(400).json({ error: problem });
 
   const data = {};
@@ -173,6 +180,7 @@ router.patch("/:itemId", [
   if (sort_order !== undefined) data.sort_order = sort_order;
   if (gear_item_id !== undefined) data.gear_item_id = gear_item_id ? parseInt(gear_item_id, 10) : null;
   if (worn !== undefined) data.worn = Boolean(worn);
+  if (per_day !== undefined) data.per_day = per_day;
 
   try {
     // The same ownership check POST does seventy lines above, which this had
