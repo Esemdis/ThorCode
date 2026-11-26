@@ -143,3 +143,47 @@ describe('normaliseGearInput and a daily dose', () => {
     expect(normaliseGearInput({ per_day }, { partial: true }).error).toMatch(/per_day/);
   });
 });
+
+describe('normaliseGearInput with a medicine container\'s contents (THO-1063)', () => {
+  const pillBoxContents1063 = [
+    { name: ' Ibuprofen ', amount: 2 },
+    { name: 'Iron', amount: '1', every_days: 2 },
+  ];
+
+  it('stores each medicine trimmed, with every day as the default', () => {
+    expect(normaliseGearInput({ contents: pillBoxContents1063 }, { partial: true }).data).toEqual({
+      contents: [
+        { name: 'Ibuprofen', amount: 2, every_days: 1 },
+        { name: 'Iron', amount: 1, every_days: 2 },
+      ],
+    });
+  });
+
+  // Prisma refuses a plain null for a Json column, so clearing stores [].
+  it('stores a cleared list as an empty one', () => {
+    expect(normaliseGearInput({ contents: null }, { partial: true }).data).toEqual({ contents: [] });
+  });
+
+  it('leaves the column alone when contents is not sent, on a create too', () => {
+    expect(normaliseGearInput({ name: 'Socks' }).data).not.toHaveProperty('contents');
+  });
+
+  it('refuses a medicine without a name, a whole amount or a sane interval', () => {
+    for (const bad of [
+      { amount: 1 },
+      { name: 'Iron', amount: 0 },
+      { name: 'Iron', amount: 1.5 },
+      { name: 'Iron', amount: 1, every_days: 0 },
+      { name: 'Iron', amount: 1, every_days: 366 },
+      'Iron',
+    ]) {
+      expect(normaliseGearInput({ contents: [bad] }, { partial: true }).error).toMatch(/contents must be/);
+    }
+  });
+
+  it('refuses something that is not a list, or a list over 30', () => {
+    expect(normaliseGearInput({ contents: { name: 'Iron' } }, { partial: true }).error).toMatch(/contents must be/);
+    const tooMany = Array.from({ length: 31 }, (_, i) => ({ name: `Pill ${i}`, amount: 1 }));
+    expect(normaliseGearInput({ contents: tooMany }, { partial: true }).error).toMatch(/contents must be/);
+  });
+});

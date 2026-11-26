@@ -749,6 +749,8 @@ model GearItem {
   currency         String         @default("SEK") @db.VarChar(3)
   fill_level       Int?
   per_day          Int?
+  // A medicine container's list: [{ name, amount, every_days }] (THO-1063).
+  contents         Json?
   price_irrelevant Boolean        @default(false)
   user_rel         User           @relation("UserGearItems", fields: [user_id], references: [id])
   trip_items       TripItem[]     @relation("GearItemTripItems")
