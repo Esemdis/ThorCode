@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const { isLoginToken, loginTokenRefusal } = require('./loginRevocation');
 const { tokenLifetimeVerdict, serviceTokenCheck } = require('./serviceTokens');
 const { tokenScopeVerdict } = require('./tokenScopes');
 
@@ -37,24 +38,27 @@ module.exports = function (req, res, next) {
   if (scope === 'unknown') return res.status(401).json({ error: 'Invalid or expired token' });
   if (scope === 'forbidden') return res.status(403).json({ error: 'Forbidden: this token can only read travel-bag trips for wander' });
 
-  // Login tokens never reach the database here: `exp` already ends them.
-  if (lifetime !== 'lookup') {
+  // Minted tokens (`jti`) are checked against their row (auth/serviceTokens.js),
+  // with the same answer for every refusal so a caller cannot tell a withdrawn
+  // token from one that never existed. Login tokens are checked against the
+  // account's password state (auth/loginRevocation.js), and say why.
+  const minted = lifetime === 'lookup';
+  if (!minted && !isLoginToken(decoded)) {
     req.user = decoded; // Attach the decoded user information to the request object
     return next();
   }
 
-  return serviceTokenCheck(decoded).then(
+  return (minted ? serviceTokenCheck(decoded) : loginTokenRefusal(decoded)).then(
     (refusal) => {
-      // The same answer for every refusal, so a caller cannot tell a
-      // withdrawn token from one that never existed.
-      if (refusal) return res.status(401).json({ error: 'Invalid or expired token' });
+      if (refusal) return res.status(401).json({ error: minted ? 'Invalid or expired token' : refusal });
       req.user = decoded;
       return next();
     },
     (err) => {
-      // A 500, not a 401: the token may be fine, and a 401 says it is dead,
-      // so a database blip must not look like a withdrawal.
-      console.error('Error checking a minted token against its row:', err);
+      // A 500, not a 401: the token may be fine, and a 401 says it is dead
+      // (concert-map signs the user out on one), so a database blip must not
+      // end a session or look like a withdrawal.
+      console.error('Error checking a token against the database:', err);
       return res.status(500).json({ error: 'Internal server error' });
     },
   );

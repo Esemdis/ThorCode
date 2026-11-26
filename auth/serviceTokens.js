@@ -15,8 +15,8 @@
  *
  * Three kinds of token reach verifyJWT, told apart by these two claims:
  *  - `jti`: a minted token. Looked up.
- *  - `exp` and no `jti`: a login token from signJWT (8 hours). Never looked up,
- *    so signing in costs no read.
+ *  - `exp` and no `jti`: a login token from signJWT (8 hours). No ServiceToken
+ *    row; its password state is checked instead (auth/loginRevocation.js).
  *  - neither: a token minted before this change. Refused (owner decision on
  *    THO-1016, 1B): accepting them would leave exactly the tokens this ticket
  *    is about, the ones that cannot be withdrawn, working for good. Everyone

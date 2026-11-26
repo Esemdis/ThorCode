@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createRequire } from 'node:module';
 import request from 'supertest';
 import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
 import { buildApp, installFakePrisma, authHeader } from '../test/routeApp.js';
 
 // Every model the account deletion clears, as a deleteMany that returns its
@@ -87,15 +88,112 @@ describe('PATCH /users/me/password (THO-810)', () => {
     const res = await changePassword(id, { currentPassword: CURRENT, newPassword: 'NewPass123' });
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ success: true, data: {}, message: 'Password changed' });
+    expect(res.body).toEqual({ success: true, data: { token: expect.any(String) }, message: 'Password changed' });
     const { where, data } = prisma.user.update.mock.calls[0][0];
-    expect(where).toEqual({ id });
+    // Conditional on the state it read: a reset that lands during the bcrypt
+    // work makes this write fail instead of undoing the reset.
+    expect(where).toEqual({ id, password_changed_at: null });
 
     // Sign in against what was stored.
     prisma.user.findMany.mockResolvedValue([accountSettingsUser(id, { password_hash: data.password_hash })]);
     const login = (password) => request(app).post('/users/login').send({ email: `${id}@example.test`, password });
     expect((await login('NewPass123')).status).toBe(200);
     expect((await login(CURRENT)).status).toBe(401);
+  });
+
+  // THO-898: the change ends every login session the account had, the one it
+  // was made from included, and hands that one a fresh token to carry on with.
+  it('ends the login sessions issued before it and hands back one that outlives it', async () => {
+    const id = accountSettingsUserId();
+    let sessionEndChangedAt = null;
+    // Read both by verifyJWT (password_changed_at) and by the route itself.
+    prisma.user.findUnique.mockImplementation(async () =>
+      accountSettingsUser(id, { password_changed_at: sessionEndChangedAt }));
+    prisma.user.update.mockImplementation(({ data }) => {
+      sessionEndChangedAt = data.password_changed_at;
+      return 'user.update';
+    });
+    const sessionEndOldLogin = authHeader({ id, kind: 'login', pwc: 0 });
+
+    const res = await request(app).patch('/users/me/password').set(...sessionEndOldLogin)
+      .send({ currentPassword: CURRENT, newPassword: 'NewPass123' });
+
+    expect(res.status).toBe(200);
+    expect(sessionEndChangedAt).toBeInstanceOf(Date);
+    const fresh = jwt.verify(res.body.data.token, process.env.JWT_SECRET);
+    expect(fresh).toMatchObject({
+      id, email: `${id}@example.test`, role: 'USER', kind: 'login', pwc: sessionEndChangedAt.getTime(),
+    });
+
+    // Any signed-in route will do: an empty body gets past auth to a 400.
+    const withOld = await request(app).patch('/users/me/password').set(...sessionEndOldLogin).send({});
+    expect(withOld.status).toBe(401);
+    const withFresh = await request(app).patch('/users/me/password')
+      .set('Authorization', `Bearer ${res.body.data.token}`).send({});
+    expect(withFresh.status).toBe(400);
+  });
+
+  // The review's reproduction: a login that read the row, and checked the old
+  // hash, before a change committed, signing its token after it. A scripted
+  // login every half second always has one in the change's own second. By
+  // iat it is newer than the change; it still carries the old password.
+  it('ends a login that checked the old password and signed after the change', async () => {
+    const id = accountSettingsUserId();
+    const raceChangedAt = new Date();
+    prisma.user.findMany.mockResolvedValue([accountSettingsUser(id, { password_changed_at: null })]);
+    prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id, { password_changed_at: raceChangedAt }));
+
+    const login = await request(app).post('/users/login').send({ email: `${id}@example.test`, password: CURRENT });
+    expect(login.status).toBe(200);
+
+    const used = await request(app).patch('/users/me/password')
+      .set('Authorization', `Bearer ${login.body.token}`).send({});
+    expect(used.status).toBe(401);
+  });
+
+  // THO-898 review: a change still in flight from a session a reset has just
+  // ended wrote `where: { id }` after its bcrypt work, undid the reset and got
+  // a fresh token back. The write is now conditional on the state it read.
+  it('does not undo a reset that lands while the change is being worked out, and ends that session', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id, { password_changed_at: null }));
+    prisma.$transaction.mockRejectedValueOnce(Object.assign(new Error('Record to update not found.'), { code: 'P2025' }));
+
+    const res = await request(app).patch('/users/me/password').set(...authHeader({ id, kind: 'login', pwc: 0 }))
+      .send({ currentPassword: CURRENT, newPassword: 'NewPass123' });
+
+    expect(res.status).toBe(401);
+    expect(res.body.data?.token).toBeUndefined();
+    expect(prisma.user.update.mock.calls[0][0].where).toEqual({ id, password_changed_at: null });
+  });
+
+  // The route's own check, not verifyJWT's: a reset that commits after the
+  // token was checked but before the route reads the row. Without it the
+  // change went ahead on a session the reset had just ended.
+  it('refuses a login token signed against another password state before doing any work', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique
+      // verifyJWT's read: the token still matches what it sees.
+      .mockResolvedValueOnce(accountSettingsUser(id, { password_changed_at: null }))
+      // The route's own read, after a reset committed in between.
+      .mockResolvedValueOnce(accountSettingsUser(id, { password_changed_at: new Date('2026-11-11T20:00:00Z') }));
+
+    const res = await request(app).patch('/users/me/password').set(...authHeader({ id, kind: 'login', pwc: 0 }))
+      .send({ currentPassword: CURRENT, newPassword: 'NewPass123' });
+
+    expect(res.status).toBe(401);
+    expect(res.body.data?.token).toBeUndefined();
+    expect(prisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('asks a token that is not a session to try again when the state moved under it', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id));
+    prisma.$transaction.mockRejectedValueOnce(Object.assign(new Error('Record to update not found.'), { code: 'P2025' }));
+
+    const res = await changePassword(id, { currentPassword: CURRENT, newPassword: 'NewPass123' });
+
+    expect(res.status).toBe(409);
   });
 
   // A link mailed before the change would put the old state back if used.
@@ -233,6 +331,23 @@ describe('DELETE /users/me (THO-810)', () => {
       'itemReview.deleteMany', 'tripReview.deleteMany', 'travelWishlistItem.deleteMany',
     ]));
     expect(prisma.user.delete).toHaveBeenCalledWith({ where: { id } });
+  });
+
+  // THO-898, owner decision: a deleted account's sessions end with it. The
+  // deleting request read the row into the per-user cache, so the delete
+  // must clear it or the token would still work for a minute.
+  it('ends the account\'s login sessions, the one it was deleted from included', async () => {
+    const id = accountSettingsUserId();
+    prisma.user.findUnique.mockResolvedValue(accountSettingsUser(id, { password_changed_at: null }));
+    const deletedLogin = authHeader({ id, kind: 'login', pwc: 0 });
+
+    const res = await request(app).delete('/users/me').set(...deletedLogin).send({ currentPassword: CURRENT });
+    expect(res.status).toBe(200);
+
+    prisma.user.findUnique.mockResolvedValue(null);
+    const after = await request(app).patch('/users/me/password').set(...deletedLogin).send({});
+    expect(after.status).toBe(401);
+    expect(after.body).toEqual({ error: 'This account no longer exists.' });
   });
 
   // The files are gone for good by the time the transaction runs. If it then

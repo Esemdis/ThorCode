@@ -29,8 +29,9 @@ describe.skipIf(!url)('merging one artist\'s two band rows', () => {
     // The sidecar retag runs after commit; an empty archive makes it a no-op.
     process.env.MEDIA_ROOT = await mkdtemp(join(tmpdir(), 'band-merge-'));
     prisma = require('../../prisma/client.js');
-    const signJWT = require('../../auth/signJWT.js');
-    adminToken = signJWT({ user: { id: `${RUN}-admin`, role: 'ADMIN' } });
+    // The admin has no account row, so not a login token (THO-898, which
+    // refuses one for a missing account); an `exp` so THO-1016 accepts it.
+    adminToken = require('jsonwebtoken').sign({ id: `${RUN}-admin`, role: 'ADMIN' }, process.env.JWT_SECRET, { expiresIn: '1h' });
     app = express().use(express.json()).use('/data/concerts', require('../../routes/data/bands.js'));
   });
 
