@@ -37,6 +37,15 @@ describe('normaliseAttendanceIds', () => {
     expect(normaliseAttendanceIds(many)).toBeNull();
     expect(normaliseAttendanceIds(many.slice(0, 50))).toHaveLength(50);
   });
+
+  it('takes a larger cap when one is given, and keeps 50 by default', () => {
+    const manyTho917 = Array.from({ length: 201 }, (_, i) => i + 1);
+    expect(normaliseAttendanceIds(manyTho917.slice(0, 51))).toBeNull();
+    expect(normaliseAttendanceIds(manyTho917.slice(0, 200), 200)).toHaveLength(200);
+    expect(normaliseAttendanceIds(manyTho917, 200)).toBeNull();
+    // The cap counts distinct ids: the same attendance named twice is one.
+    expect(normaliseAttendanceIds([...manyTho917.slice(0, 200), 1, 2], 200)).toHaveLength(200);
+  });
 });
 
 describe('sameIds', () => {
