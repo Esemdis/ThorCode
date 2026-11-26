@@ -237,7 +237,10 @@ router.post("/:id/apply/:tripId", [param("id").isInt(), param("tripId").isInt()]
         }));
 
       return {
-        created: await prisma.$transaction(toAdd.map((item) => prisma.tripItem.create({ data: item }))),
+        // With the gear, as a trip's own items come: the app appends these
+        // rows as they are, and a medicine container's fill list (THO-1062),
+        // brand and weight are read off gear_item_rel.
+        created: await prisma.$transaction(toAdd.map((item) => prisma.tripItem.create({ data: item, include: { gear_item_rel: true } }))),
         skipped: loadout.entries.length - toAdd.length,
       };
     });
