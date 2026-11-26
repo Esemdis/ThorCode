@@ -33,10 +33,13 @@ function albumExpiry(now = new Date()) {
  * Accepts the JSON array a POST carries and the comma-separated string a
  * DELETE's query does.
  *
+ * @param {number} [max] - How many distinct ids to take. The album's fifty
+ *   unless a caller has a reason to name more (the year recap's batch read,
+ *   THO-917).
  * @returns {number[]|null} null when the list is empty, too long, or holds
  *   anything that is not an id.
  */
-function normaliseAttendanceIds(raw) {
+function normaliseAttendanceIds(raw, max = MAX_ALBUM_ATTENDANCES) {
   const parts = typeof raw === 'string' ? raw.split(',') : raw;
   if (!Array.isArray(parts) || parts.length === 0) return null;
   const ids = new Set();
@@ -49,7 +52,7 @@ function normaliseAttendanceIds(raw) {
     if (id > 2147483647) return null;
     ids.add(id);
   }
-  if (ids.size > MAX_ALBUM_ATTENDANCES) return null;
+  if (ids.size > max) return null;
   return [...ids].sort((a, b) => a - b);
 }
 
