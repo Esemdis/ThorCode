@@ -1,6 +1,7 @@
 /**
- * Reading the archive: one night's files with its bill, and one band's files
- * across every show of theirs the caller saw.
+ * Reading the archive: one night's files with its bill, many nights' files at
+ * once for the year recap, and one band's files across every show of theirs
+ * the caller saw.
  *
  * Split out of routes/data/media.js, which had grown to 1715 lines and
  * fourteen endpoints. media.js mounts this and its siblings in their
@@ -19,6 +20,7 @@ const {
 const { signMediaToken, mediaUrls } = require('../../../utils/mediaTokens');
 const { bandMediaOverview } = require('../../../utils/mediaOverview');
 const { billForConcert } = require('../../../utils/concertBill');
+const { normaliseAttendanceIds } = require('../../../utils/mediaAlbumShare');
 const { dateOnly, ownAttendance } = require('./shared');
 
 const router = express.Router();
@@ -179,6 +181,66 @@ router.get(
       });
     } catch (err) {
       return fail(res, err, { context: 'GET /attendances/:attendanceId/media' });
+    }
+  },
+);
+
+// How many attendances one batch read may name (THO-917). The year recap asks
+// for every night of a year in one request, and a festival day is one
+// attendance per stage, so a year of festivals passes the album's fifty
+// (MAX_ALBUM_ATTENDANCES, which is sized for one night). Two hundred is past
+// any real year and still a URL of about 1.5 KB; the client splits above it.
+const MAX_BATCH_ATTENDANCES = 200;
+
+router.get(
+  '/attendances/media',
+  [auth, roleCheck(['ADMIN', 'USER'])],
+  async (req, res) => {
+    try {
+      const ids = normaliseAttendanceIds(req.query.ids, MAX_BATCH_ATTENDANCES);
+      if (!ids) return badRequest(res, 'Validation failed');
+
+      // Owned the way ownAttendance owns one: the attendance's wishlist is the
+      // caller's, with no exemption for an admin. Asked in the query rather
+      // than read and compared, so somebody else's attendance and one that
+      // does not exist come back the same — absent — and the answer cannot be
+      // used to probe which ids are real. Neither has its media read.
+      const owned = (await prisma.concertAttendance.findMany({
+        where: { id: { in: ids }, wishlist_rel: { user_id: req.user.id } },
+        select: { id: true },
+      })).map((a) => a.id);
+      const ownedSet = new Set(owned);
+
+      const rows = owned.length
+        ? await prisma.concertMedia.findMany({
+            where: { attendance_id: { in: owned } },
+            include: { clips: clipsInclude },
+            // The same order as one night's listing above, and for its reasons.
+            // Grouping below keeps it, so each night's files are in it too.
+            orderBy: [
+              { taken_at: { sort: 'asc', nulls: 'last' } },
+              { id: 'asc' },
+            ],
+          })
+        : [];
+
+      const shared = await sharedUntil(rows.map((m) => m.id));
+      const mint = urlMinter(req.user.id);
+
+      // Every owned attendance is present, files or none: a night with
+      // nothing uploaded is an empty night, not one that failed to load.
+      const attendances = {};
+      for (const id of owned) attendances[id] = { files: [] };
+      for (const m of rows) {
+        attendances[m.attendance_id].files.push({ ...m, ...mint(m.id), shared_until: shared.get(m.id) ?? null });
+      }
+
+      return success(res, 200, {
+        attendances,
+        missing: ids.filter((id) => !ownedSet.has(id)),
+      });
+    } catch (err) {
+      return fail(res, err, { context: 'GET /attendances/media' });
     }
   },
 );

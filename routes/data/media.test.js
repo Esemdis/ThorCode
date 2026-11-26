@@ -8,7 +8,7 @@ import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { buildApp, authHeader, installFakePrisma, routeManifest } from '../../test/routeApp.js';
-import { signMediaToken } from '../../utils/mediaTokens.js';
+import { signMediaToken, verifyMediaToken as verifyMediaTokenTho917 } from '../../utils/mediaTokens.js';
 import {
   buildExif, jpegWithExif, jpegWithGpsTho894, mp4WithLocationTho894,
 } from '../../test/exifFixture.js';
@@ -161,6 +161,7 @@ describe('POST /attendances/:id/media', () => {
     expect(routeManifest(router)).toEqual([
       'POST /attendances/:attendanceId/media [7]',
       'GET /attendances/:attendanceId/media [4]',
+      'GET /attendances/media [3]',
       'GET /bands/:bandId/media [4]',
       'POST /attendances/:attendanceId/lineup [5]',
       'PATCH /media [11]',
@@ -1868,6 +1869,138 @@ describe('GET /attendances/:id/media', () => {
       .expect(200);
 
     expect(prisma.mediaShareLink.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /attendances/media (THO-917)', () => {
+  // The caller's attendances 1 and 2, as the ownership query would answer
+  // them: it is asked with the caller in its `where`, so it only ever returns
+  // ids the caller owns. Anything else it was asked about is simply absent.
+  const ownedOnlyTho917 = (ownedIds) => vi.fn(async ({ where }) => (
+    where.id.in.filter((id) => ownedIds.includes(id)).map((id) => ({ id }))
+  ));
+  const photoTho917 = (id, attendanceId, extra = {}) => ({
+    id, attendance_id: attendanceId, band_id: null, filename: `${id}.jpg`, kind: 'PHOTO', sha256: `h${id}`, ...extra,
+  });
+
+  it('answers every owned night\'s files in one response, grouped by attendance', async () => {
+    prisma.concertAttendance.findMany = ownedOnlyTho917([1, 2, 3]);
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      photoTho917(10, 1), photoTho917(11, 2), photoTho917(12, 1),
+    ]);
+
+    const res = await request(app())
+      .get('/data/concerts/attendances/media?ids=1,2,3')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(prisma.concertMedia.findMany).toHaveBeenCalledTimes(1);
+    expect(Object.keys(res.body.data.attendances).sort()).toEqual(['1', '2', '3']);
+    expect(res.body.data.attendances['1'].files.map((f) => f.id)).toEqual([10, 12]);
+    expect(res.body.data.attendances['2'].files.map((f) => f.id)).toEqual([11]);
+    // An owned night with nothing uploaded is present and empty, not missing:
+    // the recap would otherwise count a quiet night as one it failed to load.
+    expect(res.body.data.attendances['3']).toEqual({ files: [] });
+    expect(res.body.data.missing).toEqual([]);
+    // Each file carries what the per-night listing gives it.
+    expect(res.body.data.attendances['1'].files[0]).toMatchObject({ shared_until: null, kind: 'PHOTO' });
+  });
+
+  it('reports somebody else\'s attendance and an unknown one alike as missing, and never reads their media', async () => {
+    // 7 is somebody else's and 999 does not exist. The ownership query cannot
+    // tell them apart, by design, so neither can the answer.
+    prisma.concertAttendance.findMany = ownedOnlyTho917([1]);
+    prisma.concertMedia.findMany = vi.fn(async () => [photoTho917(10, 1)]);
+
+    const res = await request(app())
+      .get('/data/concerts/attendances/media?ids=999,1,7')
+      .set(...authHeader({ id: 'user-1', role: 'ADMIN' }))
+      .expect(200);
+
+    // Ownership is the caller's wishlist, admin or not, as in ownAttendance.
+    expect(prisma.concertAttendance.findMany.mock.calls[0][0].where).toEqual({
+      id: { in: [1, 7, 999] }, wishlist_rel: { user_id: 'user-1' },
+    });
+    expect(prisma.concertMedia.findMany.mock.calls[0][0].where).toEqual({ attendance_id: { in: [1] } });
+    expect(res.body.data.missing).toEqual([7, 999]);
+    expect(Object.keys(res.body.data.attendances)).toEqual(['1']);
+  });
+
+  it('does not read any media when none of the attendances is the caller\'s', async () => {
+    prisma.concertAttendance.findMany = ownedOnlyTho917([]);
+
+    const res = await request(app())
+      .get('/data/concerts/attendances/media?ids=7')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(prisma.concertMedia.findMany).not.toHaveBeenCalled();
+    expect(prisma.mediaShareLink.findMany).not.toHaveBeenCalled();
+    expect(res.body.data).toEqual({ attendances: {}, missing: [7] });
+  });
+
+  it('refuses a list over the cap or not of ids without reaching the database', async () => {
+    const user = authHeader({ id: 'user-1' });
+    const overCapTho917 = Array.from({ length: 201 }, (_, i) => i + 1).join(',');
+    for (const query of [`?ids=${overCapTho917}`, '?ids=abc', '?ids=1,abc', '?ids=', '']) {
+      await request(app()).get(`/data/concerts/attendances/media${query}`).set(...user).expect(400);
+    }
+    expect(prisma.concertAttendance.findMany).not.toHaveBeenCalled();
+    expect(prisma.concertMedia.findMany).not.toHaveBeenCalled();
+  });
+
+  it('collapses an id named twice before counting it against the cap', async () => {
+    prisma.concertAttendance.findMany = ownedOnlyTho917([1]);
+    const twoHundredAndOneTho917 = [...Array.from({ length: 200 }, (_, i) => i + 1), 1].join(',');
+
+    await request(app())
+      .get(`/data/concerts/attendances/media?ids=${twoHundredAndOneTho917}`)
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(prisma.concertAttendance.findMany.mock.calls[0][0].where.id.in).toHaveLength(200);
+  });
+
+  it('rejects an unauthenticated request', async () => {
+    await request(app()).get('/data/concerts/attendances/media?ids=1').expect(401);
+    expect(prisma.concertAttendance.findMany).not.toHaveBeenCalled();
+  });
+
+  it('signs each file\'s URLs for the caller', async () => {
+    prisma.concertAttendance.findMany = ownedOnlyTho917([1]);
+    prisma.concertMedia.findMany = vi.fn(async () => [photoTho917(10, 1)]);
+
+    const res = await request(app())
+      .get('/data/concerts/attendances/media?ids=1')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    const { thumb } = res.body.data.attendances['1'].files[0];
+    expect(thumb).toMatch(/^https:\/\/api\.example\.com\/data\/concerts\/media\/10\/thumb\?t=/);
+    const token = new URL(thumb).searchParams.get('t');
+    expect(verifyMediaTokenTho917(token, { mediaId: 10 })).toEqual({ ok: true, userId: 'user-1' });
+  });
+
+  it('orders files by taken-at, nulls last, and keeps that order within each night', async () => {
+    prisma.concertAttendance.findMany = ownedOnlyTho917([1, 2]);
+    // As Postgres would hand them back under the orderBy asserted below.
+    prisma.concertMedia.findMany = vi.fn(async () => [
+      photoTho917(20, 2, { taken_at: '2026-06-12T19:00:00.000Z' }),
+      photoTho917(11, 1, { taken_at: '2026-06-12T20:00:00.000Z' }),
+      photoTho917(10, 1, { taken_at: null }),
+      photoTho917(12, 1, { taken_at: null }),
+    ]);
+
+    const res = await request(app())
+      .get('/data/concerts/attendances/media?ids=1,2')
+      .set(...authHeader({ id: 'user-1' }))
+      .expect(200);
+
+    expect(prisma.concertMedia.findMany.mock.calls[0][0].orderBy).toEqual([
+      { taken_at: { sort: 'asc', nulls: 'last' } },
+      { id: 'asc' },
+    ]);
+    expect(res.body.data.attendances['1'].files.map((f) => f.id)).toEqual([11, 10, 12]);
   });
 });
 

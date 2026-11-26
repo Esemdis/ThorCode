@@ -676,6 +676,8 @@ model TripItem {
   created_at    DateTime      @default(now())
   updated_at    DateTime      @updatedAt
   bag_id        Int?
+  // How many a day (pills, lenses); travel-bag multiplies by the trip's days.
+  per_day       Int?
   trip_rel      Trip          @relation(fields: [trip_id], references: [id], onDelete: Cascade)
   gear_item_rel GearItem?     @relation("GearItemTripItems", fields: [gear_item_id], references: [id], onDelete: SetNull)
   bag_rel       GearItem?     @relation("TripItemBag", fields: [bag_id], references: [id], onDelete: SetNull)

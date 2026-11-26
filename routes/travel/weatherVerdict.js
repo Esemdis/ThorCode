@@ -88,6 +88,11 @@ router.post("/", verdictLimit, async (req, res) => {
         mime_type: "application/json",
         schema: VERDICT_SCHEMA,
       },
+      // @google/genai 3.x continues an interrupted answer on its own by default, and then the
+      // timeout below becomes a budget for the whole call, with each hop billing the input again.
+      // A verdict fits in one hop, so a cut-off answer is a failure to report, not to extend
+      // (THO-1007, THO-1053).
+      automatic_continuation: false,
     }, { timeout: GEMINI_TIMEOUT_MS, maxRetries: 0 });
 
     let parsed;
@@ -99,14 +104,24 @@ router.post("/", verdictLimit, async (req, res) => {
       return res.status(502).json({ error: "The packing verdict came back unreadable. Try again." });
     }
 
+    // JSON that parses but is not an object (null, "x", 3, []) is the provider's fault, so it is a
+    // "try again" 502 like the truncated case above. normaliseVerdict would throw VerdictInputError
+    // for the first three, which means "nothing to judge" and answers 400 and blames the caller;
+    // an array it would accept and turn into an invented verdict. Not logged, to match the 502 above.
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return res.status(502).json({ error: "The packing verdict came back unreadable. Try again." });
+    }
+
     res.json({ data: normaliseVerdict(parsed), meta: { model: MODEL } });
   } catch (err) {
     if (err instanceof VerdictInputError) {
       return res.status(400).json({ error: err.message });
     }
-    // The SDK's own client-side timeout (APIConnectionTimeoutError), or a timer that fired.
+    // The SDK's own client-side timeout (APIConnectionTimeoutError), a timer that fired, or a
+    // continuation that ran out of its budget (ContinuationInterruptedError).
     // Nothing is wrong with the trip: the model was slow, and the answer is to try again.
-    if (err?.name === "APIConnectionTimeoutError" || err?.name === "TimeoutError") {
+    if (err?.name === "APIConnectionTimeoutError" || err?.name === "TimeoutError"
+      || err?.name === "ContinuationInterruptedError") {
       return res.status(504).json({ error: "The packing verdict took too long. Try again." });
     }
     // Quota exhaustion is the expected failure on a free key, and it is worth
