@@ -131,3 +131,15 @@ describe('normaliseGearInput refusing what it used to store unchecked (THO-981)'
       .toEqual({ photo, tags: ['ultralight'], dimensions });
   });
 });
+
+describe('normaliseGearInput and a daily dose', () => {
+  it('stores a whole number, clears with null, and leaves it out when not sent', () => {
+    expect(normaliseGearInput({ per_day: 2 }, { partial: true }).data).toEqual({ per_day: 2 });
+    expect(normaliseGearInput({ per_day: null }, { partial: true }).data).toEqual({ per_day: null });
+    expect(normaliseGearInput({ name: 'Socks' }).data).not.toHaveProperty('per_day');
+  });
+
+  it.each([0, -1, 1.5, 1001, 'two'])('refuses %j', (per_day) => {
+    expect(normaliseGearInput({ per_day }, { partial: true }).error).toMatch(/per_day/);
+  });
+});

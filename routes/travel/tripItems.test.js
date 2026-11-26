@@ -289,3 +289,25 @@ describe('a trip item\'s count per day (THO-1056)', () => {
     expect(prisma.tripItem.update).not.toHaveBeenCalled();
   });
 });
+
+describe('a gear item\'s daily dose on a trip item', () => {
+  const addGearDoseItem = (body) => request(app()).post('/travel/trips/1/items')
+    .set(...authHeader({ id: 'user-1' }))
+    .send({ name: 'Ibuprofen', gear_item_id: 77, ...body });
+
+  beforeEach(() => {
+    prisma.tripItem.create = vi.fn(async ({ data }) => ({ id: 9, ...data }));
+    prisma.gearItem.findFirst = vi.fn(async () => ({ worn: false, per_day: 2 }));
+  });
+
+  it('takes the gear\'s dose when the request names none', async () => {
+    await addGearDoseItem({}).expect(201);
+    expect(prisma.tripItem.create.mock.calls[0][0].data.per_day).toBe(2);
+  });
+
+  it('keeps a dose the request sends, null included', async () => {
+    await addGearDoseItem({ per_day: 3 }).expect(201);
+    await addGearDoseItem({ per_day: null }).expect(201);
+    expect(prisma.tripItem.create.mock.calls.map((call) => call[0].data.per_day)).toEqual([3, null]);
+  });
+});

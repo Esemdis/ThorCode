@@ -110,6 +110,17 @@ describe('POST /travel/loadouts/:id/apply/:tripId', () => {
     ]);
   });
 
+  it('carries a medicine\'s daily dose onto the trip, and none for other gear', async () => {
+    prisma.loadout.findFirst = vi.fn(async () => ({ id: 1, user_id: 'user-1', entries: [
+      ENTRIES[0],
+      { gear_item_id: 44, worn: false, bag_id: null, gear_item_rel: { name: 'Ibuprofen', category: 'Medication', per_day: 2 } },
+    ] }));
+
+    const res = await apply().expect(200);
+
+    expect(res.body.data.items.map((item) => item.per_day)).toEqual([null, 2]);
+  });
+
   it('serialises two applies of one trip rather than packing it twice', async () => {
     // Both requests are held at the ownership check, which sits in front of the
     // queue, so each is certainly in the handler before either reads the

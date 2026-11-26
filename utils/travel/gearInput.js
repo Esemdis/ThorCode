@@ -31,6 +31,8 @@ const FLAGS = ['worn', 'essential', 'retired', 'price_irrelevant'];
 // Absent on a create means false, as the columns' own defaults say. Only these
 // two were ever written on a create; essential and retired start at theirs.
 const CREATE_FLAGS = ['worn', 'price_irrelevant'];
+// Same ceiling as a trip item's per_day, which this is copied onto.
+const PER_DAY_MAX = 1000;
 
 function normaliseGearInput(body = {}, { partial = false } = {}) {
   const data = {};
@@ -101,6 +103,15 @@ function normaliseGearInput(body = {}, { partial = false } = {}) {
     const level = number(body.fill_level, { min: -Infinity });
     if (level === undefined) return { error: 'fill_level must be a percentage' };
     data.fill_level = level === null ? null : Math.max(0, Math.min(100, Math.trunc(level)));
+  }
+
+  // The daily dose a medicine is packed for, copied onto the trip item when the
+  // gear lands on a trip. Only set when sent: most gear has none, and the form
+  // only shows the field for medicine, so a create leaves it to the column.
+  if (given('per_day')) {
+    const perDay = number(body.per_day, { min: 1, max: PER_DAY_MAX, integer: true });
+    if (perDay === undefined) return { error: `per_day must be a whole number from 1 to ${PER_DAY_MAX}, or null` };
+    data.per_day = perDay;
   }
 
   if (given('sort_order')) {
