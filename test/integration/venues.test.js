@@ -55,9 +55,9 @@ describe.skipIf(!url)('one building, one Venue', () => {
 
     const res = await request(app)
       .post('/data/concerts/bulk')
-      // A service token, as scripts/generate-service-token.js mints it: no
-      // `kind`, so it needs no account row (THO-898).
-      .set('Authorization', `Bearer ${jwt.sign({ id: `${RUN}-scraper`, role: 'SYSTEM', service: 'integration' }, process.env.JWT_SECRET)}`)
+      // Not a login token (no `kind`), so it needs no account row (THO-898), and
+      // it has an `exp`: one with neither `exp` nor `jti` is refused (THO-1016).
+      .set('Authorization', `Bearer ${jwt.sign({ id: `${RUN}-scraper`, role: 'SYSTEM', service: 'integration' }, process.env.JWT_SECRET, { expiresIn: '1h' })}`)
       .send({
         concerts: [
           show('Helsinki', 'Tavastia', '01', '60.1693', '24.9312'),

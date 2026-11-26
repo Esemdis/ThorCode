@@ -24,7 +24,6 @@ const require = createRequire(import.meta.url);
 
 describe.skipIf(!url)('two /bulk calls at once (THO-968)', () => {
   let prisma;
-  let signJWT;
   const RUN = `bi${Date.now()}`;
   // A country of its own, so the trigger slows no other test's inserts and no
   // other test's rows are in reach.
@@ -35,7 +34,6 @@ describe.skipIf(!url)('two /bulk calls at once (THO-968)', () => {
     process.env.DATABASE_URL = url;
     process.env.JWT_SECRET ||= 'integration-secret';
     prisma = require('../../prisma/client.js');
-    signJWT = require('../../auth/signJWT.js');
     await prisma.$executeRawUnsafe(`
       CREATE FUNCTION "${SLOW}"() RETURNS trigger LANGUAGE plpgsql AS $$
       BEGIN PERFORM pg_sleep(2); RETURN NEW; END $$`);
@@ -58,7 +56,9 @@ describe.skipIf(!url)('two /bulk calls at once (THO-968)', () => {
   it('leaves one row for a show both calls carry', async () => {
     const band = await prisma.band.create({ data: { name: `${RUN} band` } });
     const app = express().use(express.json()).use('/data/concerts', require('../../routes/data/bands.js'));
-    const auth = `Bearer ${signJWT({ user: { id: `${RUN}-scraper`, role: 'SYSTEM' } })}`;
+    // The scraper has no account row, so not a login token (THO-898, which
+    // refuses one for a missing account); an `exp` so THO-1016 accepts it.
+    const auth = `Bearer ${require('jsonwebtoken').sign({ id: `${RUN}-scraper`, role: 'SYSTEM' }, process.env.JWT_SECRET, { expiresIn: '1h' })}`;
     // One show as two sources list it, under event ids of their own, so the
     // event_id unique key cannot settle the race: only the duplicate check can.
     const show = (eventId) => ({

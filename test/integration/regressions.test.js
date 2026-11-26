@@ -32,9 +32,10 @@ describe.skipIf(!url)('against Postgres', () => {
   const token = (id, role = 'USER') => `Bearer ${signJWT({ user: { id, email: `${id}@example.test`, role } })}`;
   // For a caller with no account row (the scraper, an admin the test never
   // makes): a login token for a missing account is refused (THO-898), and a
-  // token minted outside the login route, as the service token is, is not.
+  // token minted outside the login route (no `kind`) is not. It has an `exp`,
+  // since a token with neither `exp` nor `jti` is refused (THO-1016).
   const tokenWithoutAccount = (id, role) => `Bearer ${require('jsonwebtoken').sign(
-    { id, email: `${id}@example.test`, role }, process.env.JWT_SECRET,
+    { id, email: `${id}@example.test`, role }, process.env.JWT_SECRET, { expiresIn: '1h' },
   )}`;
   const appWith = (mounts) => {
     const app = express();

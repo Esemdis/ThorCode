@@ -20,9 +20,9 @@ describe.skipIf(!url)('followed-show checker', () => {
   const COUNTRY = 'XF';
   const bearer = (id, role = 'USER') => `Bearer ${require('../../auth/signJWT.js')({ user: { id, role } })}`;
   // The sync service has no account row. A login token for a missing account
-  // is refused (THO-898), and python-crohn's real token, minted by
-  // scripts/generate-service-token.js outside the login route, is not one.
-  const serviceBearerTho779 = (id) => `Bearer ${require('jsonwebtoken').sign({ id, role: 'SYSTEM' }, process.env.JWT_SECRET)}`;
+  // is refused (THO-898), so this is not one (no `kind`); it has an `exp`,
+  // since a token with neither `exp` nor `jti` is refused (THO-1016).
+  const serviceBearerTho779 = (id) => `Bearer ${require('jsonwebtoken').sign({ id, role: 'SYSTEM' }, process.env.JWT_SECRET, { expiresIn: '1h' })}`;
 
   beforeAll(() => {
     process.env.DATABASE_URL = url;
