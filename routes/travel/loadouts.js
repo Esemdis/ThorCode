@@ -240,7 +240,14 @@ router.post("/:id/apply/:tripId", [param("id").isInt(), param("tripId").isInt()]
         // With the gear, as a trip's own items come: the app appends these
         // rows as they are, and a medicine container's fill list (THO-1062),
         // brand and weight are read off gear_item_rel.
-        created: await prisma.$transaction(toAdd.map((item) => prisma.tripItem.create({ data: item, include: { gear_item_rel: true } }))),
+        //
+        // And with its bag's name and photo, selected as GET /travel/trips/:id
+        // does: a bag that is not itself on the trip still gets its header
+        // and photo without a reload (THO-1064).
+        created: await prisma.$transaction(toAdd.map((item) => prisma.tripItem.create({
+          data: item,
+          include: { gear_item_rel: true, bag_rel: { select: { id: true, name: true, brand: true, photo: true } } },
+        }))),
         skipped: loadout.entries.length - toAdd.length,
       };
     });
