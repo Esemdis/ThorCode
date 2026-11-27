@@ -106,7 +106,19 @@ describe('POST /travel/loadouts/:id/apply/:tripId', () => {
     await apply().expect(200);
 
     for (const [args] of prisma.tripItem.create.mock.calls) {
-      expect(args.include).toEqual({ gear_item_rel: true });
+      expect(args.include.gear_item_rel).toBe(true);
+    }
+  });
+
+  // A bag that is not itself on the trip still needs its header and photo
+  // in the list the app appends to; GET /travel/trips/:id selects the same four.
+  it("returns each new item with its bag's name and photo, as the trip itself does (THO-1064)", async () => {
+    await apply().expect(200);
+
+    const THO1064_BAG_SELECT = { select: { id: true, name: true, brand: true, photo: true } };
+    expect(prisma.tripItem.create.mock.calls.length).toBeGreaterThan(0);
+    for (const [args] of prisma.tripItem.create.mock.calls) {
+      expect(args.include.bag_rel).toEqual(THO1064_BAG_SELECT);
     }
   });
 
