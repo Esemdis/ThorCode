@@ -146,7 +146,8 @@ describe.skipIf(!url)('album share links', () => {
     // The bytes: the night's own files as downloads, nobody else's.
     const bytesAt = (id) => request(app).get(`/data/concerts/album-shares/${token}/media/${id}/file`);
     const sent = await bytesAt(f2.id).expect(200);
-    expect(sent.headers['content-disposition']).toMatch(/attachment; filename="IMG_2\.jpg"/);
+    // content-disposition 2.x (express 5.2+) drops the quotes around a plain-token filename; 1.x always quoted it. Accept both.
+    expect(sent.headers['content-disposition']).toMatch(/attachment; filename="?IMG_2\.jpg"?$/);
     await bytesAt(f3.id).expect(404);
     await bytesAt(2147483647).expect(404);
 

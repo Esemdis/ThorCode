@@ -3485,7 +3485,8 @@ describe('GET /media/:id/file', () => {
     await uploadOne();
     const t = signMediaToken({ mediaId: 1, userId: 'user-1' });
     const res = await request(app()).get(`/data/concerts/media/1/file?t=${t}&download=1`).expect(200);
-    expect(res.headers['content-disposition']).toBe('attachment; filename="IMG_1.jpg"');
+    // content-disposition 2.x (express 5.2+) drops the quotes around a plain-token filename; 1.x always quoted it. Accept both.
+    expect(res.headers['content-disposition']).toMatch(/^attachment; filename="?IMG_1\.jpg"?$/);
     expect(res.headers['content-type']).toMatch(/image\/jpeg/);
   });
 
